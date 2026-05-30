@@ -1,0 +1,6 @@
+/target
+/dist
+
+.zed
+.claude
+.DS_Store
