@@ -73,6 +73,14 @@ fn main() -> ExitCode {
         }
     };
 
+    // `#include "..."` paths resolve relative to the input file's directory
+    // (the current directory when reading from stdin).
+    let base_dir = path
+        .as_ref()
+        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
     match mode {
         Mode::Tokens => match lexer::tokenize(&src) {
             Ok(tokens) => {
@@ -86,7 +94,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Ast => match parser::parse(&src) {
+        Mode::Ast => match parser::parse_in_dir(&src, &base_dir) {
             Ok(program) => {
                 println!("{program:#?}");
                 ExitCode::SUCCESS
@@ -96,7 +104,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Check => match parser::parse(&src) {
+        Mode::Check => match parser::parse_in_dir(&src, &base_dir) {
             Ok(program) => {
                 let errors = sema::check_program(&program);
                 if errors.is_empty() {
@@ -116,7 +124,7 @@ fn main() -> ExitCode {
             }
         },
         Mode::Run => {
-            let program = match parser::parse(&src) {
+            let program = match parser::parse_in_dir(&src, &base_dir) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{e}");
@@ -143,7 +151,7 @@ fn main() -> ExitCode {
             }
         }
         Mode::Build => {
-            let program = match parser::parse(&src) {
+            let program = match parser::parse_in_dir(&src, &base_dir) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{e}");

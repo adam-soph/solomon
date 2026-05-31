@@ -112,7 +112,30 @@ impl Layouts {
 
     /// The byte offset of `field` within `class`, if both exist.
     pub fn offset_of(&self, class: &str, field: &str) -> Option<u64> {
-        self.classes.get(class).and_then(|l| l.field(field)).map(|f| f.offset)
+        self.classes
+            .get(class)
+            .and_then(|l| l.field(field))
+            .map(|f| f.offset)
+    }
+
+    /// The byte offset of a (possibly nested) member `path` within `class`, e.g.
+    /// `["lo", "x"]` is the offset of `lo` plus the offset of `x` within `lo`'s
+    /// type. Returns `None` if any class or field along the path is unknown, or
+    /// if a non-final field is not itself a class/union.
+    pub fn nested_offset_of(&self, class: &str, path: &[String]) -> Option<u64> {
+        let mut current = class.to_string();
+        let mut total = 0;
+        for (i, field) in path.iter().enumerate() {
+            let f = self.classes.get(&current)?.field(field)?;
+            total += f.offset;
+            if i + 1 < path.len() {
+                match &f.ty {
+                    Type::Named(n) => current = n.clone(),
+                    _ => return None,
+                }
+            }
+        }
+        Some(total)
     }
 }
 
@@ -193,6 +216,26 @@ impl<'p> Computer<'p> {
                 offset: field_offset,
                 size: s,
             });
+            // An anonymous embedded union promotes its members into this class at
+            // the union's offset, so `obj.member` resolves to the right slot.
+            if crate::sema::is_anon_field(&f.name) {
+                if let Type::Named(inner) = &f.ty {
+                    self.class_layout(inner);
+                    if let Some(inner_layout) = self.out.get(inner) {
+                        let promoted: Vec<FieldLayout> = inner_layout
+                            .fields
+                            .iter()
+                            .map(|mf| FieldLayout {
+                                name: mf.name.clone(),
+                                ty: mf.ty.clone(),
+                                offset: field_offset + mf.offset,
+                                size: mf.size,
+                            })
+                            .collect();
+                        fields.extend(promoted);
+                    }
+                }
+            }
             if def.is_union {
                 offset = offset.max(s);
             } else {
@@ -257,7 +300,7 @@ fn scalar_size(ty: &Type) -> Option<u64> {
         Type::I8 | Type::U8 | Type::Bool => 1,
         Type::I16 | Type::U16 => 2,
         Type::I32 | Type::U32 => 4,
-        Type::I64 | Type::U64 | Type::F64 | Type::Ptr(_) => 8,
+        Type::I64 | Type::U64 | Type::F64 | Type::Ptr(_) | Type::FuncPtr { .. } => 8,
         Type::Named(_) | Type::Array(..) => return None,
     })
 }

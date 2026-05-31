@@ -1,13 +1,14 @@
-# solomon
+# Solomon
 
 A reimplementation of **HolyC** — the C-like language created by Terry A. Davis
 for [TempleOS](https://templeos.org) — written from scratch in Rust.
 
 solomon takes HolyC source through a full compiler front end (lexer →
-preprocessor → parser → semantic analysis → type layout) and runs it with a
-tree-walking interpreter. The interpreter is structured as one *backend* behind
-a small `Backend` trait, so other backends (a bytecode VM, native codegen, …)
-can be added later without touching the front end.
+preprocessor → parser → semantic analysis → type layout) and runs it through one
+of two *backends* behind a small `Backend` trait: a tree-walking **interpreter**,
+or a hand-rolled **AArch64 native code generator** that emits a Mach-O object
+(no LLVM/Cranelift) and links it with the system `cc`. The interpreter is the
+conformance oracle the native backend matches.
 
 ```holyc
 U0 Main()
@@ -33,11 +34,13 @@ Working today:
   multi-char `'AB'` character constants, `//` and `/* */` comments, full
   operator set. Streams tokens on demand.
 - **Preprocessor** — object-like and function-like `#define`, `#undef`, nested
-  macro expansion (with a hide-set guard against runaway recursion), and
-  `#ifdef` / `#ifndef` / `#else` / `#endif` conditionals.
+  macro expansion (with a hide-set guard against runaway recursion),
+  `#ifdef` / `#ifndef` / `#else` / `#endif` conditionals, and `#include "file"`
+  (resolved relative to the including file, with cycle/depth guards).
 - **Parser** — recursive descent with precedence-climbing expressions. A
   two-pass design hoists `class`/`union` names first, so a type can be used
-  before it is defined.
+  before it is defined. Handles function-pointer declarators
+  (`I64 (*fp)(I64)`), `typedef` aliases, and brace/designated initializers.
 - **Semantic analysis** — name resolution and scoping, type inference (it
   produces a *typed* AST), member/field checking with single inheritance, call
   arity (including default and variadic arguments), lvalue and control-flow-context
@@ -48,12 +51,27 @@ Working today:
 - **Interpreter backend** — executes the program, including recursion, all loop
   forms, `switch` with `case lo ... hi:` ranges, `goto`, real pointer semantics
   (arithmetic, indexing, comparison, `&`/`*`/`->`), arrays (including
-  multidimensional and pass-by-reference), structs/unions, casts, and HolyC's
-  implicit print.
+  multidimensional and pass-by-reference), classes/unions, casts, function
+  pointers, a byte-addressable `MAlloc` heap, and HolyC's implicit print.
+- **AArch64 native backend** (`--build`) — hand-emits machine code and a Mach-O
+  relocatable object, then links with `cc`. Type-directed codegen covering the
+  whole implemented subset: control flow (dense `switch`es lower to an O(1)
+  jump table), functions (recursion, default and variadic args), classes by
+  value (sret returns), F64, function pointers (`ADR`+`BLR` for indirect calls),
+  brace/designated initializers, and calls into libc for the built-in library.
+  Targets `aarch64-apple-darwin`.
 
-Not yet implemented: code generation (interpreter only for now), the TempleOS
-core/standard library, `#include` file resolution (the directive parses but
-does not load files), and DolDoc.
+A slice of the **core library** exists as built-ins, shared by both backends:
+`Print`, formatted-string builders `StrPrint`/`CatPrint`/`MStrPrint`, string ops
+(`StrLen`, `StrCmp`/`StrNCmp`, `StrCpy`/`StrNCpy`, `StrCat`, `StrFind`,
+`StrChr`/`StrLastChr`, `StrSpn`/`StrCSpn`, `StrToUpper`/`StrToLower`, `StrRev`),
+number conversion (`StrToI64`/`StrToF64`, `I64ToStr`/`F64ToStr`), memory (`MemCpy`,
+`MemMove`, `MemSet`, `MemCmp`, `MemFind`, `MemSearch`, `MAlloc`, `Free`), char
+(`ToUpper`, `ToLower`), math (`Abs`/`Sign`/`Fabs`, `Sqrt`, `Sin`/`Cos`/`Tan`,
+`ASin`/`ACos`/`ATan`/`ATan2`, `Pow`, `Exp`, `Ln`, `Log10`, `Floor`/`Ceil`/`Round`),
+and a deterministic PRNG (`RandU64`).
+
+Not yet implemented: most of the TempleOS core/standard library and DolDoc.
 
 ## Building
 
@@ -93,28 +111,34 @@ Default targets:
 | Windows x86         | `i686-pc-windows-gnu`         |
 
 Building for an OS other than the host needs a cross linker/toolchain. The
-simplest route is the [`cross`](https://github.com/cross-rs/cross) tool
-(Docker-based):
+Makefile uses the [`cross`](https://github.com/cross-rs/cross) tool (Docker-based)
+for foreign-OS targets automatically, and plain `cargo` for host-OS targets, so a
+single `make all` builds every triple:
 
 ```sh
-cargo install cross
-make all CARGO=cross
+# Install cross from git — the 0.2.5 release predates rustup 1.28 and has no
+# Apple-silicon images, so it fails on a modern macOS host.
+cargo install cross --git https://github.com/cross-rs/cross
+make all
 ```
 
-A native macOS host can build both Apple targets directly after `make targets`.
-Override the target list with `make all TARGETS="x86_64-unknown-linux-gnu ..."`.
+On a macOS host that means both Apple targets build with cargo (after
+`make targets`) and the Linux/Windows targets build with `cross` (which needs
+Docker running). Override the tools with `CARGO=...` / `CROSS=...`, or the
+target list with `make all TARGETS="x86_64-unknown-linux-gnu ..."`.
 
 ## Usage
 
 ```
-solomon [--tokens | --ast | --check | --run] [FILE]
+solomon [--tokens | --ast | --check | --run | --build [-o OUT]] [FILE]
 ```
 
 Reads from `FILE`, or from stdin if no file is given. Modes:
 
 | Flag        | Does                                                            |
 | ----------- | -------------------------------------------------------------- |
-| `--run`     | type-check then execute (the default)                          |
+| `--run`     | type-check then execute with the interpreter (the default)     |
+| `--build`   | compile to a native binary via the AArch64 backend (`-o OUT`, default `a.out`) |
 | `--check`   | parse + semantic analysis; report errors, run nothing          |
 | `--ast`     | parse and dump the AST                                         |
 | `--tokens`  | run the lexer only and dump the token stream (no preprocessing)|
@@ -133,18 +157,43 @@ $ echo 'I64 Sq(I64 x){ return x*x; } "%d\n", Sq(9);' | solomon
 A few things specific to HolyC (and to this implementation):
 
 - The default integer type is `I64`; there is no `F32` (only `F64`).
-- A bare string statement prints itself, and `"fmt", a, b` is printf-style
-  (`%d %u %x %X %c %s %f %p %%`). A bare function name is a call: `Main;` runs
-  `Main()`.
+- A bare string statement prints itself, and `"fmt", a, b` is printf-style:
+  conversions `%d %i %u %x %X %o %c %s %f %e %E %g %G %p %%` with the usual flags,
+  width, and precision (`%-08.3d`, `%+5x`, `%.2f`, `%.3e`, `%*d`). Values are
+  64-bit. A bare function name is a call: `Main;` runs `Main()`.
 - `'A'` is `0x41`; multi-character constants pack little-endian (`'AB'` is
   `0x4241`).
-- Structs use `repr(C)` layout (natural alignment, declaration order).
-- Calls must resolve to a defined function or a built-in (`Print`); there is no
-  implicit-extern fallback yet.
+- HolyC has no `struct` keyword: aggregates are `class` (the struct-equivalent —
+  plain `repr(C)` data, natural alignment, declaration order) and `union`. A
+  `class`/`union` passes and assigns by value, while arrays decay to pointers.
+  Unions can be embedded in a class — anonymously (`union {...};`, members
+  promoted to the parent) or as a named member (`union Bits {...} b;`).
+- Aggregates can be brace-initialized positionally (`I64 a[] = {1,2,3}`,
+  `Pt p = {1,2}`, nested/partial) or with designators (`Pt p = {.x=1, .y=2}`).
+- Function pointers (`I64 (*fp)(I64,I64) = &Add; fp(3,4)`) work as variables,
+  callback parameters, class fields, and dispatch-table arrays. `typedef`
+  registers type aliases, including readable function-pointer ones.
+- Calls must resolve to a defined function or a built-in; there is no
+  implicit-extern fallback. The native backend lowers built-ins to libc.
+- `switch` accepts both `switch (x)` and the bracketed `switch [x]`, and a body
+  may carry `start:` / `end:` sub-labels: `start:` is a prologue run on entry
+  before dispatch, `end:` an epilogue reached by fall-through (a `break` skips
+  it). Because of this, `start` and `end` are **reserved words** — they cannot be
+  used as identifiers (`I64 start;` is a parse error).
 
-See `tests/data/*.hc` for worked examples, from `hello.hc` up to a linked list,
+See `examples/*.hc` for worked examples, from `hello.hc` up to a linked list,
 a stack-machine interpreter, shape-area dispatch via inheritance, a
-preprocessor-heavy math library, and 3×3 matrix multiplication.
+preprocessor-heavy math library, 3×3 matrix multiplication, a core-library tour
+(`stdlib.hc`) exercising the string/memory/math built-ins, a heap-growing dynamic
+array (`vector.hc`), text processing with `StrFind` (`text.hc`), a string-keyed
+hash map with chaining (`hashmap.hc`), a `RandU64`-driven shuffle
+(`shuffle.hc`), and a recursive-descent JSON parser that builds a heap tree of
+tagged nodes — objects, arrays, strings (with escapes), F64 reals, integers,
+and `true`/`false`/`null` — then re-serializes it back to JSON with a `switch
+[tag]` pretty-printer (`json.hc`). Two `StrPrint`/`CatPrint` showcases round it
+out: a formatted sales report with aligned columns (`report.hc`) and a gallery
+rendering numbers in every conversion — decimal/hex/octal/fixed/`%e`/`%g`
+(`gallery.hc`).
 
 ## Project layout
 
@@ -161,7 +210,8 @@ src/
   backend.rs    the Backend trait + error type
   backend/
     interp.rs   tree-walking interpreter
+    arm64.rs    AArch64 native code generator + Mach-O writer
   main.rs       CLI
-tests/          lexer, parser, sema, preproc, layout, interpreter, and
+tests/          lexer, parser, sema, preproc, layout, interpreter, arm64, and
                 whole-program (sample file) tests
 ```

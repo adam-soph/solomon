@@ -2,7 +2,7 @@
 //! hoisting in the two-pass `parse`.
 
 use solomon::lexer::{Lexer, TokenStream};
-use solomon::parser::parse;
+use solomon::parser::{parse, parse_in_dir};
 use solomon::preproc::Preprocessor;
 use solomon::sema::check_program;
 use solomon::token::TokenKind;
@@ -13,7 +13,9 @@ fn pp(src: &str) -> Vec<TokenKind> {
     let mut p = Preprocessor::new(Lexer::new(src));
     let mut out = Vec::new();
     loop {
-        let t = p.next_token().unwrap_or_else(|e| panic!("preprocess failed: {e}"));
+        let t = p
+            .next_token()
+            .unwrap_or_else(|e| panic!("preprocess failed: {e}"));
         if t.kind == TokenKind::Eof {
             break;
         }
@@ -29,11 +31,59 @@ fn id(s: &str) -> TokenKind {
     TokenKind::Ident(s.into())
 }
 
+/// Preprocess `src` with `#include` resolved against `dir`.
+fn pp_in_dir(src: &str, dir: &std::path::Path) -> Vec<TokenKind> {
+    let mut p = Preprocessor::with_base_dir(Lexer::new(src), dir.to_path_buf());
+    let mut out = Vec::new();
+    loop {
+        let t = p
+            .next_token()
+            .unwrap_or_else(|e| panic!("preprocess failed: {e}"));
+        if t.kind == TokenKind::Eof {
+            break;
+        }
+        out.push(t.kind);
+    }
+    out
+}
+
+/// A fresh temp directory unique to this process + `tag` (so parallel tests
+/// don't collide), holding the named `(file, contents)` pairs.
+fn make_files(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("solomon-pp-{}-{tag}", std::process::id()));
+    for sub in files
+        .iter()
+        .filter_map(|(n, _)| std::path::Path::new(n).parent())
+    {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, contents) in files {
+        std::fs::write(dir.join(name), contents).unwrap();
+    }
+    dir
+}
+
+/// The error from preprocessing `src` to completion, or `None` if it succeeds.
+fn pp_err(src: &str, dir: &std::path::Path) -> Option<String> {
+    let mut p = Preprocessor::with_base_dir(Lexer::new(src), dir.to_path_buf());
+    loop {
+        match p.next_token() {
+            Ok(t) if t.kind == TokenKind::Eof => return None,
+            Ok(_) => {}
+            Err(e) => return Some(e.message),
+        }
+    }
+}
+
 // ---- object-like macros ----
 
 #[test]
 fn object_macro_is_substituted() {
-    assert_eq!(pp("#define N 3\nN + N"), vec![int(3), TokenKind::Plus, int(3)]);
+    assert_eq!(
+        pp("#define N 3\nN + N"),
+        vec![int(3), TokenKind::Plus, int(3)]
+    );
 }
 
 #[test]
@@ -65,7 +115,15 @@ fn function_macro_substitutes_arguments() {
     // SQ(2 + 3) -> 2 + 3 * 2 + 3  (body is `a*a`, no parens of its own)
     assert_eq!(
         pp("#define SQ(a) a*a\nSQ(2 + 3)"),
-        vec![int(2), TokenKind::Plus, int(3), TokenKind::Star, int(2), TokenKind::Plus, int(3)]
+        vec![
+            int(2),
+            TokenKind::Plus,
+            int(3),
+            TokenKind::Star,
+            int(2),
+            TokenKind::Plus,
+            int(3)
+        ]
     );
 }
 
@@ -144,16 +202,53 @@ fn define_inside_inactive_branch_is_ignored() {
 // ---- pass-through & errors ----
 
 #[test]
-fn include_is_passed_through() {
+fn include_splices_file_tokens() {
+    // The included file's tokens stream in, then the parent resumes where the
+    // `#include` line left off.
+    let dir = make_files("splice", &[("lib.hc", "1 2")]);
     assert_eq!(
-        pp("#include \"lib.HC\"\n5"),
-        vec![
-            TokenKind::Hash,
-            id("include"),
-            TokenKind::Str("lib.HC".into()),
-            int(5),
-        ]
+        pp_in_dir("#include \"lib.hc\"\n3", &dir),
+        vec![int(1), int(2), int(3)]
     );
+}
+
+#[test]
+fn include_macros_are_visible_after() {
+    // A macro defined in an included file expands in the including file.
+    let dir = make_files("incmac", &[("def.hc", "#define N 42")]);
+    assert_eq!(pp_in_dir("#include \"def.hc\"\nN", &dir), vec![int(42)]);
+}
+
+#[test]
+fn nested_includes_resolve_relative_to_each_file() {
+    let dir = make_files(
+        "nested",
+        &[
+            ("inner.hc", "1"),
+            ("sub/outer.hc", "#include \"../inner.hc\"\n2"),
+        ],
+    );
+    assert_eq!(
+        pp_in_dir("#include \"sub/outer.hc\"\n3", &dir),
+        vec![int(1), int(2), int(3)]
+    );
+}
+
+#[test]
+fn missing_include_errors() {
+    let dir = make_files("missing", &[]);
+    let err = pp_err("#include \"nope.hc\"\n1", &dir).expect("expected an error");
+    assert!(err.contains("cannot open #include"), "got: {err}");
+}
+
+#[test]
+fn recursive_include_is_rejected() {
+    let dir = make_files(
+        "cycle",
+        &[("a.hc", "#include \"b.hc\""), ("b.hc", "#include \"a.hc\"")],
+    );
+    let err = pp_err("#include \"a.hc\"\n1", &dir).expect("expected an error");
+    assert!(err.contains("recursive #include"), "got: {err}");
 }
 
 #[test]
@@ -191,7 +286,10 @@ fn macros_feed_through_to_parsing() {
         I64 buf[N];\n\
         I64 Area(I64 s) { return SQ(s); }";
     let program = parse(src).expect("should parse");
-    assert!(check_program(&program).is_empty(), "should pass semantic analysis");
+    assert!(
+        check_program(&program).is_empty(),
+        "should pass semantic analysis"
+    );
 }
 
 // ---- type hoisting ----
@@ -202,7 +300,10 @@ fn forward_reference_to_a_type_parses() {
     // parse as a declaration rather than a syntax error.
     let src = "U0 Use() { Thing t; t.id = 1; } class Thing { I64 id; }";
     let program = parse(src).expect("forward type reference should parse");
-    assert!(check_program(&program).is_empty(), "should pass semantic analysis");
+    assert!(
+        check_program(&program).is_empty(),
+        "should pass semantic analysis"
+    );
 }
 
 #[test]
@@ -214,4 +315,17 @@ fn forward_reference_without_hoisting_would_be_a_multiply() {
     // Two undeclared identifiers (Foo and x) — proving it was not a declaration.
     let errs = check_program(&program);
     assert!(errs.iter().any(|e| e.message.contains("`Foo`")));
+}
+
+#[test]
+fn type_defined_in_an_include_is_usable() {
+    // Hoisting descends into `#include`d files, so a class declared there parses
+    // as a type and the whole program type-checks.
+    let dir = make_files("inctype", &[("types.hc", "class Pt { I64 x; I64 y; }")]);
+    let src = "#include \"types.hc\"\nU0 Main() { Pt p; p.x = 1; p.y = 2; }";
+    let program = parse_in_dir(src, &dir).expect("type from include should parse");
+    assert!(
+        check_program(&program).is_empty(),
+        "should pass semantic analysis"
+    );
 }

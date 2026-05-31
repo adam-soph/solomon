@@ -32,15 +32,17 @@ pub trait TokenStream {
     fn next_token(&mut self) -> LResult<Token>;
 }
 
-impl TokenStream for Lexer<'_> {
+impl TokenStream for Lexer {
     fn next_token(&mut self) -> LResult<Token> {
         // Delegate to the inherent method of the same name.
         Lexer::next_token(self)
     }
 }
 
-pub struct Lexer<'a> {
-    src: &'a [u8],
+pub struct Lexer {
+    /// The source bytes, owned so a lexer outlives the `&str` it was built from
+    /// (the preprocessor keeps a stack of them for `#include`d files).
+    src: Vec<u8>,
     /// Current byte offset.
     idx: usize,
     /// Current 1-based line.
@@ -49,10 +51,10 @@ pub struct Lexer<'a> {
     col: u32,
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(src: &'a str) -> Self {
+impl Lexer {
+    pub fn new(src: &str) -> Self {
         Lexer {
-            src: src.as_bytes(),
+            src: src.as_bytes().to_vec(),
             idx: 0,
             line: 1,
             col: 1,

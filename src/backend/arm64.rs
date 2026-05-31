@@ -19,7 +19,7 @@
 //!   * `sizeof`, integer casts (truncate / sign-extend).
 //!
 //! Not yet handled: global variables (need a writable `__data` section and
-//! `PAGE21`/`PAGEOFF12` relocations), floats, struct/array parameters or
+//! `PAGE21`/`PAGEOFF12` relocations), floats, class/array parameters or
 //! return-by-value, and aggregate initializers.
 //!
 //! Frame: `stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,#locals`. Locals live
@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::{Backend, BackendError};
 use crate::ast::*;
 use crate::layout::Layouts;
-use crate::token::Pos;
+use crate::token::{Pos, Span};
 
 const RES: u32 = 9; // integer/pointer expression result
 const T2: u32 = 10; // secondary integer temporary
@@ -52,6 +52,10 @@ const XZR: u32 = 31;
 
 const COND_EQ: u32 = 0b0000;
 const COND_NE: u32 = 0b0001;
+const COND_HS: u32 = 0b0010; // unsigned higher-or-same (>=)
+const COND_LO: u32 = 0b0011; // unsigned lower (<)
+const COND_HI: u32 = 0b1000; // unsigned higher (>) — also table bounds
+const COND_LS: u32 = 0b1001; // unsigned lower-or-same (<=)
 const COND_GE: u32 = 0b1010;
 const COND_LT: u32 = 0b1011;
 const COND_GT: u32 = 0b1100;
@@ -107,6 +111,17 @@ impl Arm64 {
                 }
             }
         }
+        // A hidden global word backs `RandU64`'s PRNG state (zero-initialised by
+        // the linker; splitmix64 runs from any seed).
+        {
+            let sym = ndefined + cg.global_order.len() as u32;
+            cg.globals.insert(
+                crate::builtins::RNG_STATE_GLOBAL.to_string(),
+                GlobalInfo { sym, ty: Type::U64 },
+            );
+            cg.global_order
+                .push(crate::builtins::RNG_STATE_GLOBAL.to_string());
+        }
 
         let driver: Vec<&Stmt> = program
             .items
@@ -147,17 +162,26 @@ impl Arm64 {
             .collect();
 
         let image = cg.asm.finish()?;
-        let has_printf = image
-            .relocs
-            .iter()
-            .any(|(_, s, _)| matches!(s, SymRef::Printf));
-        let printf_index = ndefined + commons.len() as u32;
+        // External (libc) symbols, in first-reference order. They are placed in
+        // the symbol table after the defined symbols and common globals, so each
+        // gets index `ndefined + commons.len() + position`.
+        let mut externs: Vec<&'static str> = Vec::new();
+        for (_, sym, _) in &image.relocs {
+            if let SymRef::Extern(name) = sym {
+                if !externs.contains(name) {
+                    externs.push(name);
+                }
+            }
+        }
+        let extern_base = ndefined + commons.len() as u32;
         let relocs: Vec<(u32, u32, u32, bool)> = image
             .relocs
             .iter()
             .map(|(addr, sym, kind)| {
                 let s = match sym {
-                    SymRef::Printf => printf_index,
+                    SymRef::Extern(name) => {
+                        extern_base + externs.iter().position(|e| e == name).unwrap() as u32
+                    }
                     SymRef::Sym(i) => *i,
                 };
                 let (ty, pcrel) = match kind {
@@ -172,7 +196,7 @@ impl Arm64 {
             &image.text,
             &defined,
             &commons,
-            has_printf,
+            &externs,
             &relocs,
         ))
     }
@@ -252,7 +276,7 @@ struct Codegen {
     labels: HashMap<String, usize>,
     /// Return type of the function currently being emitted (drives F64 returns).
     cur_ret: Type,
-    /// Frame offset where the struct-return (sret) pointer is saved, if the
+    /// Frame offset where the class-return (sret) pointer is saved, if the
     /// current function returns an aggregate by value.
     sret_off: Option<u32>,
 }
@@ -375,7 +399,7 @@ impl Codegen {
         }
 
         // AAPCS64: integer/pointer params come in x0.., F64 params in v0..,
-        // each class numbered independently. A by-value struct is passed as a
+        // each class numbered independently. A by-value class is passed as a
         // pointer in an integer register; the callee copies it into a local slot.
         let mut igr = 0u32;
         let mut fpr = 0u32;
@@ -518,8 +542,15 @@ impl Codegen {
                     let off = self.alloc(size.max(1), self.type_align(&d.ty));
                     self.declare(&d.name, off, d.ty.clone());
                     match &d.init {
+                        Some(init) if is_brace_init(init) => {
+                            // Brace initialiser (positional or designated): zero
+                            // the slot, then store the provided elements/fields
+                            // (recursing for nested aggregates).
+                            self.gen_zero_slot(off, size);
+                            self.gen_init_into(&Place::Local(off), &d.ty, 0, init)?;
+                        }
                         Some(init) if matches!(d.ty, Type::Named(_)) => {
-                            // Copy-initialise a struct from another struct value.
+                            // Copy-initialise a class from another class value.
                             self.gen_expr(init)?; // RES = source address
                             self.asm.sub_imm(T2, FP, off);
                             self.gen_memcpy(T2, RES, size, SCRATCH);
@@ -537,7 +568,7 @@ impl Codegen {
                                 self.asm.sub_imm(T2, FP, off);
                                 self.asm.store_mem(RES, T2, 8);
                             } else {
-                                self.gen_expr(init)?;
+                                self.gen_int_expr(init, &d.ty)?;
                                 self.asm.sub_imm(T2, FP, off);
                                 self.gen_store(RES, T2, &d.ty);
                             }
@@ -663,13 +694,12 @@ impl Codegen {
                         self.asm.fmov_reg(0, FRES); // d0 = result
                     }
                     Some(e) => {
-                        // Integer/pointer return; a float value is truncated.
-                        if is_f64(&self.expr_ty(e)) {
-                            self.gen_fexpr(e)?;
-                            self.asm.fcvtzs(RES, FRES);
-                        } else {
-                            self.gen_expr(e)?;
-                        }
+                        // Integer/pointer return; an F64 source converts to the
+                        // return type's signedness, then narrows to its width
+                        // (C truncates the return value to the return type).
+                        let ret = self.cur_ret.clone();
+                        self.gen_int_expr(e, &ret)?;
+                        self.gen_cast(&ret);
                         self.asm.mov_reg(0, RES);
                     }
                     None => self.asm.load_imm(0, 0),
@@ -677,7 +707,10 @@ impl Codegen {
                 self.emit_epilogue();
             }
 
-            StmtKind::Case { .. } | StmtKind::Default => {}
+            StmtKind::Case { .. }
+            | StmtKind::Default
+            | StmtKind::SwitchStart
+            | StmtKind::SwitchEnd => {}
 
             StmtKind::Func(_) | StmtKind::Class(_) => {
                 return Err(BackendError::at(
@@ -699,9 +732,34 @@ impl Codegen {
         self.asm.sub_imm(T2, FP, voff);
         self.gen_store(RES, T2, &Type::I64);
 
+        // HolyC `start:` / `end:` sub-labels partition the body into an optional
+        // prologue (runs on entry, before dispatch) and epilogue (reached by
+        // fall-through; `break` skips it). Sema has checked the ordering.
+        let start_idx = stmts
+            .iter()
+            .position(|s| matches!(s.kind, StmtKind::SwitchStart));
+        let first_case = stmts
+            .iter()
+            .position(|s| matches!(s.kind, StmtKind::Case { .. } | StmtKind::Default));
+        let end_idx = stmts
+            .iter()
+            .position(|s| matches!(s.kind, StmtKind::SwitchEnd));
+        let prologue = start_idx.map(|si| (si + 1)..first_case.unwrap_or(stmts.len()));
+
         let l_end = self.asm.new_label();
+        self.break_targets.push(l_end);
+        self.scopes.push(HashMap::new());
+
+        // Prologue: always runs, before the dispatch compares.
+        if let Some(range) = prologue.clone() {
+            for st in &stmts[range] {
+                self.gen_stmt(st)?;
+            }
+        }
+
         let mut label_at: HashMap<usize, usize> = HashMap::new();
         let mut default_label: Option<usize> = None;
+        let end_label = end_idx.map(|_| self.asm.new_label());
         for (i, st) in stmts.iter().enumerate() {
             match &st.kind {
                 StmtKind::Case { .. } => {
@@ -716,39 +774,51 @@ impl Codegen {
             }
         }
 
-        for (i, st) in stmts.iter().enumerate() {
-            if let StmtKind::Case { lo, hi } = &st.kind {
-                let target = label_at[&i];
-                self.gen_expr(lo)?;
-                self.asm.mov_reg(T2, RES);
-                self.load_local(RES, voff, &Type::I64);
-                self.asm.cmp_reg(RES, T2);
-                match hi {
-                    None => self.asm.b_cond(COND_EQ, target),
-                    Some(hi) => {
-                        let skip = self.asm.new_label();
-                        self.asm.b_cond(COND_LT, skip);
-                        self.gen_expr(hi)?;
-                        self.asm.mov_reg(T2, RES);
-                        self.load_local(RES, voff, &Type::I64);
-                        self.asm.cmp_reg(RES, T2);
-                        self.asm.b_cond(COND_GT, skip);
-                        self.asm.b(target);
-                        self.asm.place(skip);
+        // No case matched: fall to default, else the epilogue, else the exit.
+        let gap_target = default_label.or(end_label).unwrap_or(l_end);
+        // Prefer an O(1) branch table when the cases are dense integer constants;
+        // otherwise fall back to a linear compare-chain.
+        if !self.try_gen_branch_table(stmts, &label_at, voff, gap_target)? {
+            for (i, st) in stmts.iter().enumerate() {
+                if let StmtKind::Case { lo, hi } = &st.kind {
+                    let target = label_at[&i];
+                    self.gen_expr(lo)?;
+                    self.asm.mov_reg(T2, RES);
+                    self.load_local(RES, voff, &Type::I64);
+                    self.asm.cmp_reg(RES, T2);
+                    match hi {
+                        None => self.asm.b_cond(COND_EQ, target),
+                        Some(hi) => {
+                            let skip = self.asm.new_label();
+                            self.asm.b_cond(COND_LT, skip);
+                            self.gen_expr(hi)?;
+                            self.asm.mov_reg(T2, RES);
+                            self.load_local(RES, voff, &Type::I64);
+                            self.asm.cmp_reg(RES, T2);
+                            self.asm.b_cond(COND_GT, skip);
+                            self.asm.b(target);
+                            self.asm.place(skip);
+                        }
                     }
                 }
             }
+            self.asm.b(gap_target);
         }
-        self.asm.b(default_label.unwrap_or(l_end));
 
-        self.break_targets.push(l_end);
-        self.scopes.push(HashMap::new());
         for (i, st) in stmts.iter().enumerate() {
+            if prologue.as_ref().is_some_and(|r| r.contains(&i)) {
+                continue; // already emitted as the prologue
+            }
             if let Some(&l) = label_at.get(&i) {
                 self.asm.place(l);
             }
             match &st.kind {
-                StmtKind::Case { .. } | StmtKind::Default => {}
+                StmtKind::Case { .. } | StmtKind::Default | StmtKind::SwitchStart => {}
+                StmtKind::SwitchEnd => {
+                    if let Some(l) = end_label {
+                        self.asm.place(l);
+                    }
+                }
                 _ => self.gen_stmt(st)?,
             }
         }
@@ -758,12 +828,100 @@ impl Codegen {
         Ok(())
     }
 
+    /// Try to dispatch a switch through an O(1) jump table instead of a linear
+    /// compare-chain. Returns `Ok(true)` when it emitted the table (the caller
+    /// then skips the compare-chain), `Ok(false)` to fall back.
+    ///
+    /// Fires only when every `case` value is a compile-time integer constant and
+    /// the covered value span is small/dense enough to be worth a table. The
+    /// table is `span` 32-bit offset words (`table[k] = label_k - table`);
+    /// dispatch is `idx = v - min`, an unsigned bounds check, then
+    /// `LDRSW off, [table, idx, lsl #2]; BR (table + off)`. Out-of-range and gap
+    /// values go to `gap_target` (the switch's default / epilogue / exit), and
+    /// overlapping ranges resolve to the first covering case — both matching the
+    /// compare-chain's semantics.
+    fn try_gen_branch_table(
+        &mut self,
+        stmts: &[Stmt],
+        label_at: &HashMap<usize, usize>,
+        voff: u32,
+        gap_target: usize,
+    ) -> Result<bool, BackendError> {
+        let mut cases: Vec<(usize, i64, i64)> = Vec::new();
+        for (i, st) in stmts.iter().enumerate() {
+            if let StmtKind::Case { lo, hi } = &st.kind {
+                let Some(lo_v) = const_eval_i64(lo) else {
+                    return Ok(false);
+                };
+                let hi_v = match hi {
+                    Some(h) => match const_eval_i64(h) {
+                        Some(v) => v,
+                        None => return Ok(false),
+                    },
+                    None => lo_v,
+                };
+                if hi_v < lo_v {
+                    return Ok(false);
+                }
+                cases.push((label_at[&i], lo_v, hi_v));
+            }
+        }
+        if cases.len() < 4 {
+            return Ok(false);
+        }
+        let min = cases.iter().map(|c| c.1).min().unwrap();
+        let max = cases.iter().map(|c| c.2).max().unwrap();
+        let span = (max - min + 1) as usize;
+        // Bound the table size, and require a reasonable density vs case count.
+        if span > 1024 || span > cases.len().saturating_mul(4).max(8) {
+            return Ok(false);
+        }
+
+        // Map each value to the first case covering it; gaps fall to gap_target.
+        let mut slots = vec![gap_target; span];
+        let mut filled = vec![false; span];
+        for (label, lo, hi) in &cases {
+            for v in *lo..=*hi {
+                let k = (v - min) as usize;
+                if !filled[k] {
+                    filled[k] = true;
+                    slots[k] = *label;
+                }
+            }
+        }
+
+        self.load_local(RES, voff, &Type::I64);
+        if min != 0 {
+            self.asm.load_imm(T2, min);
+            self.asm.sub(RES, RES, T2); // RES = v - min
+        }
+        self.asm.load_imm(T2, (span - 1) as i64);
+        self.asm.cmp_reg(RES, T2);
+        self.asm.b_cond(COND_HI, gap_target); // unsigned out-of-range -> gap
+        let table = self.asm.new_label();
+        self.asm.adr_label(T2, table); // T2 = &table
+        self.asm.ldrsw_reg(SCRATCH, T2, RES); // SCRATCH = table[idx] (signed)
+        self.asm.add(T2, T2, SCRATCH); // T2 = &table + offset = target
+        self.asm.br(T2); // unconditional — the table data below is never run as code
+        self.asm.place(table);
+        for slot in slots {
+            self.asm.table_word(table, slot);
+        }
+        Ok(true)
+    }
+
     /// Emit the initialiser store for a global variable.
     fn gen_global_init(&mut self, d: &Declarator, init: &Expr) -> Result<(), BackendError> {
         let sym = self.globals[&d.name].sym;
         let ty = d.ty.clone();
+        if is_brace_init(init) {
+            // A global is common storage the linker zeroes, so only the provided
+            // elements/fields need stores.
+            self.gen_init_into(&Place::Global(sym), &ty, 0, init)?;
+            return Ok(());
+        }
         if matches!(ty, Type::Named(_)) {
-            // Copy-initialise a global struct from another struct value.
+            // Copy-initialise a global class from another class value.
             self.gen_expr(init)?; // RES = source address
             self.asm.adrp_global(T2, sym);
             self.asm.add_global(T2, T2, sym);
@@ -784,7 +942,7 @@ impl Codegen {
             self.asm.fmov_to_gpr(RES, FRES);
             self.asm.store_mem(RES, T2, 8);
         } else {
-            self.gen_expr(init)?; // value -> RES
+            self.gen_int_expr(init, &ty)?; // value -> RES
             self.asm.adrp_global(T2, sym);
             self.asm.add_global(T2, T2, sym);
             self.gen_store(RES, T2, &ty);
@@ -819,12 +977,153 @@ impl Codegen {
         }
     }
 
+    /// Address of byte offset `byte_off` within an aggregate at `place`, into `dst`.
+    fn elem_addr(&mut self, dst: u32, place: &Place, byte_off: u32) {
+        match place {
+            // The slot starts at x29 - off; element `byte_off` in is x29 - (off - byte_off).
+            Place::Local(off) => self.asm.sub_imm(dst, FP, off - byte_off),
+            Place::Global(sym) => {
+                self.asm.adrp_global(dst, *sym);
+                self.asm.add_global(dst, dst, *sym);
+                if byte_off > 0 {
+                    self.asm.add_imm(dst, dst, byte_off);
+                }
+            }
+        }
+    }
+
+    /// Zero `size` bytes of the local slot at `x29 - off`, so a partial brace
+    /// initialiser leaves the unset elements zeroed.
+    fn gen_zero_slot(&mut self, off: u32, size: u32) {
+        self.asm.sub_imm(T2, FP, off); // T2 = slot base
+        self.asm.load_imm(RES, 0);
+        let mut o = 0;
+        for chunk in [8u32, 4, 2, 1] {
+            while size - o >= chunk {
+                self.asm.store_mem_off(RES, T2, o, chunk);
+                o += chunk;
+            }
+        }
+    }
+
+    /// Emit the stores for a brace initialiser (or a single leaf value) into the
+    /// aggregate at `place`, at byte offset `byte_off`. Recurses for nested
+    /// arrays/structs; only provided elements are written (locals are zeroed
+    /// first, globals are linker-zeroed).
+    fn gen_init_into(
+        &mut self,
+        place: &Place,
+        ty: &Type,
+        byte_off: u32,
+        init: &Expr,
+    ) -> Result<(), BackendError> {
+        if let ExprKind::InitList(items) = &init.kind {
+            match ty {
+                Type::Array(elem, _) => {
+                    let stride = self.layouts.stride_of(elem) as u32;
+                    for (i, item) in items.iter().enumerate() {
+                        self.gen_init_into(place, elem, byte_off + i as u32 * stride, item)?;
+                    }
+                }
+                Type::Named(class) => {
+                    let fields: Vec<(Type, u32)> = self
+                        .layouts
+                        .get(class)
+                        .map(|l| {
+                            l.fields
+                                .iter()
+                                .map(|f| (f.ty.clone(), f.offset as u32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (item, (fty, foff)) in items.iter().zip(fields.iter()) {
+                        self.gen_init_into(place, fty, byte_off + foff, item)?;
+                    }
+                }
+                _ => {
+                    return Err(BackendError::at(
+                        init.span.pos,
+                        "arm64 backend: an initializer list can only initialize an array, class, or union",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if let ExprKind::DesignatedInit(items) = &init.kind {
+            let Type::Named(class) = ty else {
+                return Err(BackendError::at(
+                    init.span.pos,
+                    "arm64 backend: a designated initializer can only initialize a class or union",
+                ));
+            };
+            // Field name -> (type, offset), captured before the store loop.
+            let fields: Vec<(String, Type, u32)> = self
+                .layouts
+                .get(class)
+                .map(|l| {
+                    l.fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.ty.clone(), f.offset as u32))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (name, value) in items {
+                let Some((_, fty, foff)) = fields.iter().find(|(n, _, _)| n == name) else {
+                    return Err(BackendError::at(
+                        value.span.pos,
+                        format!("arm64 backend: `{class}` has no field `{name}`"),
+                    ));
+                };
+                self.gen_init_into(place, &fty.clone(), byte_off + foff, value)?;
+            }
+            return Ok(());
+        }
+        // A leaf value: scalar, pointer, float, or an aggregate-valued expression.
+        if is_f64(ty) {
+            self.gen_foperand(init)?;
+            self.elem_addr(T2, place, byte_off);
+            self.asm.fmov_to_gpr(RES, FRES);
+            self.asm.store_mem(RES, T2, 8);
+        } else if is_aggregate(ty) {
+            self.gen_expr(init)?; // RES = source address
+            self.elem_addr(T2, place, byte_off);
+            self.gen_memcpy(T2, RES, self.type_size(ty), SCRATCH);
+        } else {
+            self.gen_int_expr(init, ty)?;
+            self.elem_addr(T2, place, byte_off);
+            self.gen_store(RES, T2, ty);
+        }
+        Ok(())
+    }
+
     // ---- expressions: value -> RES ----
 
+    /// Evaluate `e` to an integer in RES for storage into a `target`-typed slot.
+    /// Identical to `gen_expr` except that converting an F64 source to an
+    /// **unsigned** integer target uses `fcvtzu` instead of the default `fcvtzs`
+    /// (they differ past `I64::MAX` and for negatives) — matching C and the
+    /// interpreter's `cast_value`.
+    fn gen_int_expr(&mut self, e: &Expr, target: &Type) -> Result<(), BackendError> {
+        if is_unsigned_int(target) && is_f64(&self.expr_ty(e)) {
+            self.gen_fexpr(e)?;
+            self.asm.fcvtzu(RES, FRES);
+            Ok(())
+        } else {
+            self.gen_expr(e)
+        }
+    }
+
     fn gen_expr(&mut self, e: &Expr) -> Result<(), BackendError> {
-        // F64-typed expressions are evaluated into the FP register file.
+        // F64-typed expressions are evaluated into the FP register file. This
+        // function's contract is "integer/pointer result in RES", so when an
+        // F64 value reaches here it is in integer context (assignment to an int
+        // slot, an int parameter/return, an int array element, …) and must be
+        // truncated to an integer — matching C / the interpreter — rather than
+        // having its raw bit pattern stored.
         if is_f64(&self.expr_ty(e)) {
-            return self.gen_fexpr(e);
+            self.gen_fexpr(e)?;
+            self.asm.fcvtzs(RES, FRES);
+            return Ok(());
         }
         let pos = e.span.pos;
         match &e.kind {
@@ -859,18 +1158,7 @@ impl Codegen {
                 self.asm.place(l_end);
             }
 
-            ExprKind::Call { callee, args } => match &callee.kind {
-                ExprKind::Ident(name) if name == "Print" => {
-                    self.gen_print_call(args, callee.span.pos)?
-                }
-                ExprKind::Ident(name) => self.gen_call(name, args, callee.span.pos)?,
-                _ => {
-                    return Err(BackendError::at(
-                        pos,
-                        "arm64 backend: only direct calls supported",
-                    ));
-                }
-            },
+            ExprKind::Call { callee, args } => self.gen_call_expr(callee, args)?,
 
             ExprKind::Index { .. } | ExprKind::Member { .. } => self.gen_lvalue_value(e)?,
 
@@ -879,7 +1167,11 @@ impl Codegen {
                 // integer/pointer. A float source needs a real conversion.
                 if is_f64(&self.expr_ty(expr)) {
                     self.gen_fexpr(expr)?;
-                    self.asm.fcvtzs(RES, FRES);
+                    if is_unsigned_int(ty) {
+                        self.asm.fcvtzu(RES, FRES);
+                    } else {
+                        self.asm.fcvtzs(RES, FRES);
+                    }
                     self.gen_cast(ty); // narrow to the integer width
                 } else {
                     self.gen_expr(expr)?;
@@ -892,6 +1184,24 @@ impl Codegen {
                     SizeofArg::Expr(e) => self.layouts.size_of(&self.expr_ty(e)),
                 };
                 self.asm.load_imm(RES, n as i64);
+            }
+            ExprKind::Offset { class, path } => {
+                let off = self.layouts.nested_offset_of(class, path).ok_or_else(|| {
+                    BackendError::at(pos, format!("cannot compute offset of `{class}`"))
+                })?;
+                self.asm.load_imm(RES, off as i64);
+            }
+            ExprKind::InitList(_) => {
+                return Err(BackendError::at(
+                    pos,
+                    "arm64 backend: an initializer list is only valid as a variable initializer",
+                ));
+            }
+            ExprKind::DesignatedInit(_) => {
+                return Err(BackendError::at(
+                    pos,
+                    "arm64 backend: a designated initializer is only valid as a variable initializer",
+                ));
             }
             ExprKind::Comma(items) => {
                 for it in items {
@@ -911,7 +1221,7 @@ impl Codegen {
         if self.lookup(name).is_some() || self.globals.contains_key(name) {
             let ty = self.var_type(name).unwrap();
             if is_aggregate(&ty) {
-                // An aggregate "value" is its address: arrays decay, and a struct
+                // An aggregate "value" is its address: arrays decay, and a class
                 // is handled by-reference (callers copy as needed).
                 return self.gen_addr_ident(name, pos);
             }
@@ -954,10 +1264,15 @@ impl Codegen {
             }
             ExprKind::Member { base, field, arrow } => {
                 let class = if *arrow {
-                    self.gen_expr(base)?; // pointer to the struct
+                    self.gen_expr(base)?; // pointer to the class
                     named_of(&self.expr_ty(base).deref_ptr(), pos)?
-                } else {
+                } else if is_place(base) {
                     self.gen_addr(base)?;
+                    named_of(&self.expr_ty(base), pos)?
+                } else {
+                    // The base is an aggregate rvalue (e.g. a class-returning
+                    // call); its value IS the address of its result temporary.
+                    self.gen_expr(base)?;
                     named_of(&self.expr_ty(base), pos)?
                 };
                 let off = self.layouts.offset_of(&class, field).ok_or_else(|| {
@@ -1005,7 +1320,19 @@ impl Codegen {
                 self.asm.cmp_imm0(RES);
                 self.asm.cset(RES, COND_EQ);
             }
-            UnOp::AddrOf => self.gen_addr(inner)?,
+            UnOp::AddrOf => {
+                // `&Func` is the function's code address (a function pointer).
+                if let ExprKind::Ident(name) = &inner.kind {
+                    if !self.is_variable(name) {
+                        if let Some(info) = self.funcs.get(name) {
+                            let label = info.label;
+                            self.asm.adr_label(RES, label);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.gen_addr(inner)?
+            }
             UnOp::Deref => unreachable!("Deref handled in gen_expr"),
             UnOp::PreInc => self.gen_incdec(inner, true, true)?,
             UnOp::PreDec => self.gen_incdec(inner, true, false)?,
@@ -1127,18 +1454,49 @@ impl Codegen {
         match op {
             Eq | Ne | Lt | Gt | Le | Ge => {
                 self.asm.cmp_reg(T2, RES);
+                // Relational compares are unsigned if either operand is unsigned
+                // (C's usual arithmetic conversions); Eq/Ne don't care.
+                let signed = is_signed(&lt) && is_signed(&rt);
                 let cond = match op {
                     Eq => COND_EQ,
                     Ne => COND_NE,
-                    Lt => COND_LT,
-                    Gt => COND_GT,
-                    Le => COND_LE,
-                    Ge => COND_GE,
+                    Lt => {
+                        if signed {
+                            COND_LT
+                        } else {
+                            COND_LO
+                        }
+                    }
+                    Gt => {
+                        if signed {
+                            COND_GT
+                        } else {
+                            COND_HI
+                        }
+                    }
+                    Le => {
+                        if signed {
+                            COND_LE
+                        } else {
+                            COND_LS
+                        }
+                    }
+                    Ge => {
+                        if signed {
+                            COND_GE
+                        } else {
+                            COND_HS
+                        }
+                    }
                     _ => unreachable!(),
                 };
                 self.asm.cset(RES, cond);
             }
-            _ => self.emit_int_binop(op, RES, T2, RES, pos)?,
+            // Shift signedness follows the left operand's type (default signed).
+            _ => {
+                let signed = lhs.ty().as_ref().is_none_or(is_signed);
+                self.emit_int_binop(op, RES, T2, RES, signed, pos)?;
+            }
         }
         Ok(())
     }
@@ -1168,6 +1526,7 @@ impl Codegen {
         rd: u32,
         rn: u32,
         rm: u32,
+        signed: bool,
         pos: Pos,
     ) -> Result<(), BackendError> {
         use BinOp::*;
@@ -1175,15 +1534,24 @@ impl Codegen {
             Add => self.asm.add(rd, rn, rm),
             Sub => self.asm.sub(rd, rn, rm),
             Mul => self.asm.mul(rd, rn, rm),
-            Div => self.asm.sdiv(rd, rn, rm),
+            // `/` and `%` follow the left operand's signedness (C semantics).
+            Div if signed => self.asm.sdiv(rd, rn, rm),
+            Div => self.asm.udiv(rd, rn, rm),
             Mod => {
-                self.asm.sdiv(SCRATCH, rn, rm);
+                if signed {
+                    self.asm.sdiv(SCRATCH, rn, rm);
+                } else {
+                    self.asm.udiv(SCRATCH, rn, rm);
+                }
                 self.asm.msub(rd, SCRATCH, rm, rn);
             }
             BitAnd => self.asm.and(rd, rn, rm),
             BitOr => self.asm.orr(rd, rn, rm),
             BitXor => self.asm.eor(rd, rn, rm),
             Shl => self.asm.lslv(rd, rn, rm),
+            // `>>` is arithmetic for a signed left operand, logical for unsigned
+            // (C semantics) — matching the interpreter.
+            Shr if signed => self.asm.asrv(rd, rn, rm),
             Shr => self.asm.lsrv(rd, rn, rm),
             other => {
                 return Err(BackendError::at(
@@ -1204,7 +1572,7 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let tty = self.expr_ty(target);
         if op == AssignOp::Assign && is_aggregate(&tty) {
-            // Whole-aggregate copy (e.g. struct = struct).
+            // Whole-aggregate copy (e.g. class = class).
             self.gen_addr(target)?;
             self.asm.push(RES);
             self.gen_expr(value)?; // RES = source address
@@ -1217,7 +1585,7 @@ impl Codegen {
         if op == AssignOp::Assign {
             self.gen_addr(target)?;
             self.asm.push(RES);
-            self.gen_expr(value)?;
+            self.gen_int_expr(value, &tty)?;
             self.asm.pop(T2);
             self.gen_store(RES, T2, &tty);
             return Ok(());
@@ -1240,7 +1608,7 @@ impl Codegen {
                 self.asm.sub(RES, T2, RES);
             }
         } else {
-            self.emit_int_binop(compound_binop(op), RES, T2, RES, pos)?;
+            self.emit_int_binop(compound_binop(op), RES, T2, RES, is_signed(&tty), pos)?;
         }
         self.asm.pop(T2); // addr
         self.gen_store(RES, T2, &tty);
@@ -1355,15 +1723,7 @@ impl Codegen {
                     self.asm.scvtf(FRES, RES);
                 }
             }
-            ExprKind::Call { callee, args } => match &callee.kind {
-                ExprKind::Ident(name) => self.gen_call(name, args, callee.span.pos)?,
-                _ => {
-                    return Err(BackendError::at(
-                        pos,
-                        "arm64 backend: only direct calls supported",
-                    ));
-                }
-            },
+            ExprKind::Call { callee, args } => self.gen_call_expr(callee, args)?,
             ExprKind::Comma(items) => {
                 for (i, it) in items.iter().enumerate() {
                     if i + 1 == items.len() {
@@ -1455,6 +1815,82 @@ impl Codegen {
     // ---- calls & printing ----
 
     fn gen_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), BackendError> {
+        // `Sign(x)` = `(x > 0) - (x < 0)` — a computed builtin with no libc
+        // counterpart, emitted inline.
+        if name == "Sign" {
+            self.gen_expr(&args[0])?; // value -> RES
+            self.asm.cmp_imm0(RES);
+            self.asm.cset(T2, COND_GT); // 1 if positive
+            self.asm.cset(RES, COND_LT); // 1 if negative
+            self.asm.sub(RES, T2, RES); // (>0) - (<0)
+            return Ok(());
+        }
+        // `RandU64()` — splitmix64 over a hidden global state word, emitted inline
+        // so its sequence matches the interpreter's `splitmix64`.
+        if name == "RandU64" {
+            let sym = self.globals[crate::builtins::RNG_STATE_GLOBAL].sym;
+            self.asm.adrp_global(T2, sym);
+            self.asm.add_global(T2, T2, sym); // T2 = &state
+            self.asm.load_mem(RES, T2, 8, false);
+            self.asm.load_imm(SCRATCH, 0x9e3779b97f4a7c15u64 as i64);
+            self.asm.add(RES, RES, SCRATCH); // state += golden
+            self.asm.store_mem(RES, T2, 8); // write it back; RES holds z
+            // z = (z ^ (z >> 30)) * C1
+            self.asm.load_imm(SCRATCH, 30);
+            self.asm.lsrv(T2, RES, SCRATCH);
+            self.asm.eor(RES, RES, T2);
+            self.asm.load_imm(SCRATCH, 0xbf58476d1ce4e5b9u64 as i64);
+            self.asm.mul(RES, RES, SCRATCH);
+            // z = (z ^ (z >> 27)) * C2
+            self.asm.load_imm(SCRATCH, 27);
+            self.asm.lsrv(T2, RES, SCRATCH);
+            self.asm.eor(RES, RES, T2);
+            self.asm.load_imm(SCRATCH, 0x94d049bb133111ebu64 as i64);
+            self.asm.mul(RES, RES, SCRATCH);
+            // z ^= z >> 31
+            self.asm.load_imm(SCRATCH, 31);
+            self.asm.lsrv(T2, RES, SCRATCH);
+            self.asm.eor(RES, RES, T2);
+            return Ok(());
+        }
+        // `StrToUpper`/`StrToLower` — ASCII-case a string in place via an inline
+        // loop calling libc `toupper`/`tolower`; return the string.
+        if name == "StrToUpper" || name == "StrToLower" {
+            return self.gen_str_case(&args[0], name == "StrToUpper");
+        }
+        if name == "StrRev" {
+            return self.gen_str_rev(&args[0]);
+        }
+        // A libc-backed builtin (e.g. `StrLen` -> `_strlen`) is an external call;
+        // its argument classes come from the inferred call-site types and its
+        // return type from the builtin registry.
+        if let Some(sym) = crate::builtins::libc_symbol(name) {
+            let params: Vec<Param> = args
+                .iter()
+                .map(|a| Param {
+                    ty: self.expr_ty(a),
+                    name: None,
+                    default: None,
+                    span: Span::dummy(),
+                })
+                .collect();
+            let ret = crate::builtins::all()
+                .into_iter()
+                .find(|b| b.name == name)
+                .map(|b| b.ret)
+                .unwrap_or(Type::I64);
+            self.emit_call(CallTarget::Extern(sym), &params, args, &ret, name, pos)?;
+            if name == "StrCmp" || name == "MemCmp" || name == "StrNCmp" {
+                // libc compare functions may return any (signed) magnitude; reduce
+                // it to a sign in {-1, 0, 1} so the result matches the interpreter.
+                self.asm.sxtw(T2, RES);
+                self.asm.cmp_imm0(T2);
+                self.asm.cset(RES, COND_GT); // 1 if positive
+                self.asm.cset(T2, COND_LT); // 1 if negative
+                self.asm.sub(RES, RES, T2); // sign
+            }
+            return Ok(());
+        }
         let (label, params, ret) = match self.funcs.get(name) {
             Some(info) => (info.label, info.params.clone(), info.ret.clone()),
             None => {
@@ -1464,20 +1900,116 @@ impl Codegen {
                 ));
             }
         };
+        self.emit_call(CallTarget::Label(label), &params, args, &ret, name, pos)
+    }
+
+    /// Whether `name` resolves to a variable (local or global) rather than a
+    /// function — i.e. calling it is an indirect (function-pointer) call.
+    fn is_variable(&self, name: &str) -> bool {
+        self.lookup(name).is_some() || self.globals.contains_key(name)
+    }
+
+    /// Dispatch a call expression: a bare function/builtin name is a direct call;
+    /// anything else (a function-pointer variable or computed value) is indirect.
+    fn gen_call_expr(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), BackendError> {
+        let pos = callee.span.pos;
+        if let ExprKind::Ident(name) = &callee.kind {
+            if name == "Print" {
+                return self.gen_print_call(args, pos);
+            }
+            if name == "StrPrint" {
+                return self.gen_formatted_write(args, pos, false);
+            }
+            if name == "CatPrint" {
+                return self.gen_formatted_write(args, pos, true);
+            }
+            if name == "MStrPrint" {
+                return self.gen_mstrprint(args, pos);
+            }
+            if name == "I64ToStr" {
+                return self.gen_tostr(&args[0], &args[1], "%d", false, pos);
+            }
+            if name == "F64ToStr" {
+                return self.gen_tostr(&args[0], &args[1], "%g", true, pos);
+            }
+            if !self.is_variable(name) {
+                return self.gen_call(name, args, pos);
+            }
+        }
+        self.gen_indirect_call(callee, args, pos)
+    }
+
+    /// Emit an indirect call through a function-pointer value. The callee's
+    /// `FuncPtr` type (from sema) drives argument register classing and the
+    /// return type.
+    fn gen_indirect_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        pos: Pos,
+    ) -> Result<(), BackendError> {
+        let (ret, ptypes) = match self.expr_ty(callee) {
+            Type::FuncPtr { ret, params } => (*ret, params),
+            _ => {
+                return Err(BackendError::at(
+                    pos,
+                    "arm64 backend: called value is not a function pointer",
+                ));
+            }
+        };
+        let params: Vec<Param> = ptypes
+            .into_iter()
+            .map(|ty| Param {
+                ty,
+                name: None,
+                default: None,
+                span: Span::dummy(),
+            })
+            .collect();
+        self.emit_call(
+            CallTarget::Indirect(callee),
+            &params,
+            args,
+            &ret,
+            "<fnptr>",
+            pos,
+        )
+    }
+
+    /// Emit a call to `target`, passing `args` per `params` (the internal ABI:
+    /// integer/pointer args in `x0..`, F64 args in `v0..`, class returns via an
+    /// sret pointer in `x8`). Shared by user functions and libc builtins.
+    fn emit_call(
+        &mut self,
+        target: CallTarget,
+        params: &[Param],
+        args: &[Expr],
+        ret: &Type,
+        name: &str,
+        pos: Pos,
+    ) -> Result<(), BackendError> {
         let n = params.len();
+
+        // For an indirect call, evaluate the function-pointer value up front and
+        // spill it on the stack so it survives argument evaluation (it is popped
+        // back just before the `blr`, after the arg pushes/pops are balanced).
+        if let CallTarget::Indirect(callee) = target {
+            self.gen_expr(callee)?; // RES = function address
+            self.asm.push(RES);
+        }
 
         // A by-value aggregate result is returned through a caller-allocated
         // temporary whose address is handed to the callee in x8.
-        let sret_off = if is_aggregate(&ret) {
-            let size = self.type_size(&ret).max(1);
-            let align = self.type_align(&ret);
+        let sret_off = if is_aggregate(ret) {
+            let size = self.type_size(ret).max(1);
+            let align = self.type_align(ret);
             Some(self.alloc(size, align))
         } else {
             None
         };
 
         // Evaluate each argument left-to-right, spilling its raw 8 bytes (an
-        // integer/pointer or struct address, or the bit pattern of a double).
+        // integer/pointer or class address, or the bit pattern of a double).
         for i in 0..n {
             let arg = if i < args.len() {
                 &args[i]
@@ -1490,7 +2022,7 @@ impl Codegen {
                 self.gen_foperand(arg)?;
                 self.asm.fmov_to_gpr(RES, FRES);
             } else {
-                self.gen_expr(arg)?;
+                self.gen_int_expr(arg, &params[i].ty)?;
             }
             self.asm.push(RES);
         }
@@ -1500,7 +2032,7 @@ impl Codegen {
         let mut igr = 0u32;
         let mut fpr = 0u32;
         let mut targets = Vec::with_capacity(n);
-        for p in &params {
+        for p in params {
             if is_f64(&p.ty) {
                 if fpr > 7 {
                     return Err(BackendError::at(
@@ -1534,10 +2066,19 @@ impl Codegen {
         if let Some(off) = sret_off {
             self.asm.sub_imm(SCRATCH, FP, off); // x8 = &result temp
         }
-        self.asm.bl(label);
+        match target {
+            CallTarget::Label(label) => self.asm.bl(label),
+            CallTarget::Extern(sym) => self.asm.bl_extern(sym),
+            CallTarget::Indirect(_) => {
+                // The function address was spilled first, so it is on top of the
+                // stack now that the arguments have been popped into registers.
+                self.asm.pop(T2);
+                self.asm.blr(T2);
+            }
+        }
         if let Some(off) = sret_off {
             self.asm.sub_imm(RES, FP, off); // result value is the temp's address
-        } else if is_f64(&ret) {
+        } else if is_f64(ret) {
             self.asm.fmov_reg(FRES, 0); // result in d0
         } else {
             self.asm.mov_reg(RES, 0);
@@ -1603,10 +2144,278 @@ impl Codegen {
         }
         Ok(())
     }
+
+    /// `StrPrint(dst, fmt, ...)` / `CatPrint(dst, fmt, ...)` -> `sprintf` into
+    /// `dst` (or `dst + strlen(dst)` when `append`), returning `dst`.
+    fn gen_formatted_write(
+        &mut self,
+        args: &[Expr],
+        pos: Pos,
+        append: bool,
+    ) -> Result<(), BackendError> {
+        let what = if append { "CatPrint" } else { "StrPrint" };
+        let (dst, rest) = args
+            .split_first()
+            .ok_or_else(|| BackendError::at(pos, format!("{what} requires a destination")))?;
+        let (fmt, rest) = match rest.split_first() {
+            Some((first, rest)) => match &first.kind {
+                ExprKind::Str(s) => (s.clone(), rest),
+                _ => {
+                    return Err(BackendError::at(
+                        pos,
+                        format!("arm64 backend: {what}'s format must be a string literal"),
+                    ));
+                }
+            },
+            None => {
+                return Err(BackendError::at(
+                    pos,
+                    format!("{what} requires a format string"),
+                ));
+            }
+        };
+
+        // Evaluate dst and stash it in a frame slot (it survives the SP-relative
+        // variadic area and becomes the result).
+        self.gen_expr(dst)?;
+        let dst_off = self.alloc(8, 8);
+        self.asm.sub_imm(T2, FP, dst_off);
+        self.gen_store(RES, T2, &Type::I64);
+
+        // Compute the sprintf target: dst, or dst + strlen(dst) for an append.
+        let target_off = self.alloc(8, 8);
+        if append {
+            self.load_local(0, dst_off, &Type::I64); // x0 = dst
+            self.asm.bl_extern("_strlen"); // x0 = strlen(dst)
+            self.load_local(T2, dst_off, &Type::I64); // T2 = dst
+            self.asm.add(T2, T2, 0); // T2 = dst + len
+            self.asm.sub_imm(SCRATCH, FP, target_off);
+            self.gen_store(T2, SCRATCH, &Type::I64);
+        } else {
+            self.load_local(RES, dst_off, &Type::I64);
+            self.asm.sub_imm(T2, FP, target_off);
+            self.gen_store(RES, T2, &Type::I64);
+        }
+
+        let c_fmt = translate_format(&fmt)?;
+        let fmt_idx = self.asm.intern_string(&c_fmt);
+        let k = rest.len() as u32;
+        let varsize = align16(k * 8);
+        if varsize > 0 {
+            self.asm.sub_sp_imm(varsize);
+        }
+        for (i, arg) in rest.iter().enumerate() {
+            if is_f64(&self.expr_ty(arg)) {
+                self.gen_fexpr(arg)?;
+                self.asm.fmov_to_gpr(RES, FRES);
+            } else {
+                self.gen_expr(arg)?;
+            }
+            self.asm.str_sp(RES, i as u32 * 8);
+        }
+        self.load_local(0, target_off, &Type::I64); // x0 = target
+        self.asm.adr(1, fmt_idx); // x1 = format
+        self.asm.bl_extern("_sprintf");
+        if varsize > 0 {
+            self.asm.add_sp_imm(varsize);
+        }
+        self.load_local(RES, dst_off, &Type::I64); // return dst
+        Ok(())
+    }
+
+    /// `MStrPrint(fmt, ...)` -> format into a fresh, right-sized buffer: measure
+    /// with `snprintf(NULL, 0, ...)`, `malloc(len + 1)`, then `sprintf`. Returns
+    /// the new buffer. The variadic args stay on the stack across both calls.
+    fn gen_mstrprint(&mut self, args: &[Expr], pos: Pos) -> Result<(), BackendError> {
+        let (fmt, rest) = match args.split_first() {
+            Some((first, rest)) => match &first.kind {
+                ExprKind::Str(s) => (s.clone(), rest),
+                _ => {
+                    return Err(BackendError::at(
+                        pos,
+                        "arm64 backend: MStrPrint's format must be a string literal",
+                    ));
+                }
+            },
+            None => return Err(BackendError::at(pos, "MStrPrint requires a format string")),
+        };
+
+        let buf_off = self.alloc(8, 8);
+        let c_fmt = translate_format(&fmt)?;
+        let fmt_idx = self.asm.intern_string(&c_fmt);
+        let k = rest.len() as u32;
+        let varsize = align16(k * 8);
+        if varsize > 0 {
+            self.asm.sub_sp_imm(varsize);
+        }
+        for (i, arg) in rest.iter().enumerate() {
+            if is_f64(&self.expr_ty(arg)) {
+                self.gen_fexpr(arg)?;
+                self.asm.fmov_to_gpr(RES, FRES);
+            } else {
+                self.gen_expr(arg)?;
+            }
+            self.asm.str_sp(RES, i as u32 * 8);
+        }
+        // snprintf(NULL, 0, fmt, ...) -> required length (an int in w0).
+        self.asm.load_imm(0, 0); // x0 = NULL
+        self.asm.load_imm(1, 0); // x1 = 0
+        self.asm.adr(2, fmt_idx); // x2 = format
+        self.asm.bl_extern("_snprintf");
+        self.asm.ubfm(0, 0, 0, 31); // x0 = (u32) len
+        self.asm.add_imm(0, 0, 1); // + 1 for the NUL
+        self.asm.bl_extern("_malloc"); // x0 = buf
+        self.asm.sub_imm(T2, FP, buf_off);
+        self.gen_store(0, T2, &Type::I64); // save buf
+        // sprintf(buf, fmt, ...) reads the same variadic args still on the stack.
+        self.load_local(0, buf_off, &Type::I64); // x0 = buf
+        self.asm.adr(1, fmt_idx); // x1 = format
+        self.asm.bl_extern("_sprintf");
+        if varsize > 0 {
+            self.asm.add_sp_imm(varsize);
+        }
+        self.load_local(RES, buf_off, &Type::I64); // return buf
+        Ok(())
+    }
+
+    /// `I64ToStr(n, buf)` / `F64ToStr(f, buf)` -> `sprintf(buf, fmt, value)`,
+    /// returning `buf`. `fmt` is a fixed single-conversion format.
+    fn gen_tostr(
+        &mut self,
+        value: &Expr,
+        buf: &Expr,
+        fmt: &str,
+        is_float: bool,
+        _pos: Pos,
+    ) -> Result<(), BackendError> {
+        self.gen_expr(buf)?; // RES = buf
+        let buf_off = self.alloc(8, 8);
+        self.asm.sub_imm(T2, FP, buf_off);
+        self.gen_store(RES, T2, &Type::I64);
+
+        let c_fmt = translate_format(fmt)?;
+        let fmt_idx = self.asm.intern_string(&c_fmt);
+        self.asm.sub_sp_imm(16); // one 16-aligned variadic slot
+        if is_float {
+            self.gen_fexpr(value)?;
+            self.asm.fmov_to_gpr(RES, FRES);
+        } else {
+            self.gen_expr(value)?;
+        }
+        self.asm.str_sp(RES, 0);
+        self.load_local(0, buf_off, &Type::I64); // x0 = buf
+        self.asm.adr(1, fmt_idx); // x1 = format
+        self.asm.bl_extern("_sprintf");
+        self.asm.add_sp_imm(16);
+        self.load_local(RES, buf_off, &Type::I64); // return buf
+        Ok(())
+    }
+
+    /// `StrToUpper(str)` / `StrToLower(str)` — walk `str` to its NUL, replacing
+    /// each byte with `toupper`/`tolower` of it; return `str`. The cursor lives in
+    /// a frame slot since the per-char libc call clobbers the temp registers.
+    fn gen_str_case(&mut self, arg: &Expr, upper: bool) -> Result<(), BackendError> {
+        self.gen_expr(arg)?; // RES = str
+        let str_off = self.alloc(8, 8);
+        self.asm.sub_imm(T2, FP, str_off);
+        self.gen_store(RES, T2, &Type::I64); // save str (the result)
+        let cur_off = self.alloc(8, 8);
+        self.asm.sub_imm(T2, FP, cur_off);
+        self.gen_store(RES, T2, &Type::I64); // cursor = str
+
+        let l_loop = self.asm.new_label();
+        let l_end = self.asm.new_label();
+        self.asm.place(l_loop);
+        self.load_local(T2, cur_off, &Type::I64); // T2 = cursor
+        self.asm.load_mem(RES, T2, 1, false); // RES = *cursor
+        self.asm.cbz(RES, l_end); // NUL -> done
+        self.asm.mov_reg(0, RES); // x0 = char
+        self.asm
+            .bl_extern(if upper { "_toupper" } else { "_tolower" });
+        self.load_local(T2, cur_off, &Type::I64); // reload cursor (call clobbered it)
+        self.asm.store_mem(0, T2, 1); // *cursor = result byte
+        self.asm.add_imm(T2, T2, 1);
+        self.asm.sub_imm(SCRATCH, FP, cur_off);
+        self.gen_store(T2, SCRATCH, &Type::I64); // cursor++
+        self.asm.b(l_loop);
+        self.asm.place(l_end);
+        self.load_local(RES, str_off, &Type::I64); // return str
+        Ok(())
+    }
+
+    /// `StrRev(str)` — reverse `str` in place with two pointers converging from
+    /// the ends, swapping bytes until they meet; return `str`. No call inside the
+    /// loop, so the cursors stay in registers.
+    fn gen_str_rev(&mut self, arg: &Expr) -> Result<(), BackendError> {
+        self.gen_expr(arg)?; // RES = str
+        let str_off = self.alloc(8, 8);
+        self.asm.sub_imm(T2, FP, str_off);
+        self.gen_store(RES, T2, &Type::I64); // save str (base + result)
+
+        // q = str + strlen(str) - 1 ; p stays in a register from the base.
+        self.load_local(0, str_off, &Type::I64);
+        self.asm.bl_extern("_strlen"); // x0 = len
+        self.load_local(RES, str_off, &Type::I64); // p = base
+        self.asm.add(T2, RES, 0); // T2 = base + len
+        self.asm.sub_imm(T2, T2, 1); // q = base + len - 1
+
+        let l_loop = self.asm.new_label();
+        let l_end = self.asm.new_label();
+        self.asm.place(l_loop);
+        self.asm.cmp_reg(RES, T2); // p - q
+        self.asm.b_cond(COND_HS, l_end); // p >= q (unsigned) -> done
+        self.asm.load_mem(SCRATCH, RES, 1, false); // SCRATCH = *p
+        self.asm.load_mem(0, T2, 1, false); // x0 = *q
+        self.asm.store_mem(SCRATCH, T2, 1); // *q = old *p
+        self.asm.store_mem(0, RES, 1); // *p = old *q
+        self.asm.add_imm(RES, RES, 1); // p++
+        self.asm.sub_imm(T2, T2, 1); // q--
+        self.asm.b(l_loop);
+        self.asm.place(l_end);
+        self.load_local(RES, str_off, &Type::I64); // return str
+        Ok(())
+    }
+}
+
+/// Where an aggregate being initialised lives: a local frame slot (`x29 - off`)
+/// or a global symbol.
+enum Place {
+    Local(u32),
+    Global(u32),
+}
+
+/// The callee of an `emit_call`: a local function (resolved by label), an
+/// undefined external libc symbol (resolved by the linker), or an indirect call
+/// through a function-pointer value (the callee expression).
+#[derive(Clone, Copy)]
+enum CallTarget<'a> {
+    Label(usize),
+    Extern(&'static str),
+    Indirect(&'a Expr),
 }
 
 fn is_aggregate(ty: &Type) -> bool {
     matches!(ty, Type::Named(_) | Type::Array(..))
+}
+/// Whether `e` denotes a place (addressable lvalue) rather than a temporary
+/// rvalue. A member of a non-place (e.g. `Mk().x`) must read its base's value,
+/// not its address.
+fn is_place(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Ident(_)
+            | ExprKind::Member { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::Unary {
+                op: UnOp::Deref,
+                ..
+            }
+    )
+}
+/// Whether an initialiser is a brace list (positional or designated), which is
+/// stored element-by-element rather than copied as a single value.
+fn is_brace_init(e: &Expr) -> bool {
+    matches!(e.kind, ExprKind::InitList(_) | ExprKind::DesignatedInit(_))
 }
 fn is_f64(ty: &Type) -> bool {
     matches!(ty, Type::F64)
@@ -1614,10 +2423,16 @@ fn is_f64(ty: &Type) -> bool {
 fn is_signed(ty: &Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
 }
+fn is_unsigned_int(ty: &Type) -> bool {
+    matches!(ty, Type::U8 | Type::U16 | Type::U32 | Type::U64)
+}
 fn named_of(ty: &Type, pos: Pos) -> Result<String, BackendError> {
     match ty {
         Type::Named(n) => Ok(n.clone()),
-        _ => Err(BackendError::at(pos, "member access on a non-struct value")),
+        _ => Err(BackendError::at(
+            pos,
+            "member access on a value that is not a class or union",
+        )),
     }
 }
 trait TypeExt {
@@ -1679,28 +2494,17 @@ fn compound_binop(op: AssignOp) -> BinOp {
 
 fn translate_format(fmt: &str) -> Result<String, BackendError> {
     let mut out = String::new();
-    let mut chars = fmt.chars();
+    let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '%' {
             out.push(c);
             continue;
         }
-        match chars.next() {
-            Some('%') => out.push_str("%%"),
-            Some('d') | Some('i') => out.push_str("%lld"),
-            Some('u') => out.push_str("%llu"),
-            Some('x') => out.push_str("%llx"),
-            Some('X') => out.push_str("%llX"),
-            Some('c') => out.push_str("%c"),
-            Some('s') => out.push_str("%s"),
-            Some('p') => out.push_str("%p"),
-            Some('f') => out.push_str("%f"),
-            Some(other) => {
-                out.push('%');
-                out.push(other);
-            }
-            None => out.push('%'),
-        }
+        // Parse the full spec (flags/width/precision/length) and reconstruct it
+        // with the `ll` length on integer conversions, so libc reads the 64-bit
+        // argument and honors the same flags the interpreter does.
+        let spec = crate::fmt::parse(&mut chars);
+        out.push_str(&crate::fmt::to_c_format(&spec));
     }
     Ok(out)
 }
@@ -1711,14 +2515,23 @@ fn translate_format(fmt: &str) -> Result<String, BackendError> {
 enum Fixup {
     B26,
     B19,
+    /// ADR rd, label — a PC-relative address of an in-`__text` label (a function
+    /// entry), for taking a function's address (`&Func`).
+    Adr,
+    /// A 32-bit jump-table data word: the byte distance from a base label (the
+    /// table start, carried here) to the target label (the tuple's label id).
+    /// `BR (table + word)` then lands on the target — a section-internal offset
+    /// computed at emit time, so it needs no Mach-O relocation.
+    TableRel(usize),
 }
 
-/// The symbol a relocation refers to. `Printf` is resolved to the undefined
-/// `_printf` index late (it depends on the symbol-table layout); `Sym(i)` is an
+/// The symbol a relocation refers to. `Extern(name)` is an undefined external
+/// symbol (a libc function such as `_printf`/`_strlen`); its final symbol index
+/// is resolved late, after the symbol-table layout is known. `Sym(i)` is an
 /// already-final symbol index (a global).
 #[derive(Clone, Copy)]
 enum SymRef {
-    Printf,
+    Extern(&'static str),
     Sym(u32),
 }
 
@@ -1794,6 +2607,22 @@ impl Asm {
             match kind {
                 Fixup::B26 => self.words[*at] |= (off as u32) & 0x03FF_FFFF,
                 Fixup::B19 => self.words[*at] |= ((off as u32) & 0x7_FFFF) << 5,
+                Fixup::Adr => {
+                    let imm = off * 4; // ADR immediate is in bytes
+                    if !(-(1 << 20)..(1 << 20)).contains(&imm) {
+                        return Err(BackendError::new("function too far for ADR (>1MB)", None));
+                    }
+                    let immlo = (imm as u32) & 0x3;
+                    let immhi = ((imm as u32) >> 2) & 0x7_FFFF;
+                    self.words[*at] |= (immlo << 29) | (immhi << 5);
+                }
+                Fixup::TableRel(base) => {
+                    let base_pos = self.label_pos[*base]
+                        .ok_or_else(|| BackendError::new("internal: unplaced table label", None))?;
+                    // Byte distance table_base -> target (positions are word indices).
+                    let off_bytes = (target as i64 - base_pos as i64) * 4;
+                    self.words[*at] = off_bytes as u32; // a full data word, not a field
+                }
             }
         }
         let code_bytes = self.words.len() * 4;
@@ -1844,6 +2673,11 @@ impl Asm {
     fn sub(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0xCB00_0000 | (rm << 16) | (rn << 5) | rd);
     }
+    /// SXTW rd, wn — sign-extend a 32-bit word to 64 bits (an `int` libc return
+    /// leaves the upper 32 bits of the x-register unspecified).
+    fn sxtw(&mut self, rd: u32, rn: u32) {
+        self.emit(0x9340_7C00 | (rn << 5) | rd);
+    }
     fn mul(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x9B00_0000 | (rm << 16) | (XZR << 10) | (rn << 5) | rd);
     }
@@ -1855,6 +2689,9 @@ impl Asm {
     }
     fn sdiv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x9AC0_0C00 | (rm << 16) | (rn << 5) | rd);
+    }
+    fn udiv(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x9AC0_0800 | (rm << 16) | (rn << 5) | rd);
     }
     fn and(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x8A00_0000 | (rm << 16) | (rn << 5) | rd);
@@ -1870,6 +2707,10 @@ impl Asm {
     }
     fn lsrv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd);
+    }
+    /// ASRV Xd, Xn, Xm — arithmetic (sign-preserving) shift right by a register.
+    fn asrv(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.emit(0x9AC0_2800 | (rm << 16) | (rn << 5) | rd);
     }
     fn neg(&mut self, rd: u32, rm: u32) {
         self.sub(rd, XZR, rm);
@@ -1932,6 +2773,11 @@ impl Asm {
     /// FCVTZS Xd, Dn — double to signed 64-bit integer (round toward zero).
     fn fcvtzs(&mut self, xd: u32, dn: u32) {
         self.emit(0x9E78_0000 | (dn << 5) | xd);
+    }
+    /// FCVTZU Xd, Dn — convert a double to a 64-bit *unsigned* integer (toward
+    /// zero, saturating). Used when the destination integer type is unsigned.
+    fn fcvtzu(&mut self, xd: u32, dn: u32) {
+        self.emit(0x9E79_0000 | (dn << 5) | xd);
     }
 
     fn add_imm(&mut self, rd: u32, rn: u32, imm: u32) {
@@ -2043,9 +2889,41 @@ impl Asm {
         self.fixups.push((self.words.len(), label, Fixup::B26));
         self.emit(0x9400_0000);
     }
+    /// BLR Xn — call the function whose entry address is in register `rn`.
+    fn blr(&mut self, rn: u32) {
+        self.emit(0xD63F_0000 | (rn << 5));
+    }
+    /// BR Xn — unconditional branch to the address in `rn` (no link). Used to
+    /// jump into a branch table.
+    fn br(&mut self, rn: u32) {
+        self.emit(0xD61F_0000 | (rn << 5));
+    }
+    /// LDRSW Xt, [Xn, Xm, LSL #2] — load a 32-bit word at `base + index*4`,
+    /// sign-extended to 64 bits. Used to read a jump-table offset entry.
+    fn ldrsw_reg(&mut self, rt: u32, base: u32, index: u32) {
+        self.emit(0xB8A0_7800 | (index << 16) | (base << 5) | rt);
+    }
+    /// Emit a 32-bit jump-table data word holding the byte distance from `base`
+    /// (the table start) to `target`; resolved in `finish` via `Fixup::TableRel`.
+    fn table_word(&mut self, base: usize, target: usize) {
+        self.fixups
+            .push((self.words.len(), target, Fixup::TableRel(base)));
+        self.emit(0);
+    }
+    /// ADR rd, label — load the PC-relative address of an in-`__text` label (a
+    /// function entry) into `rd`.
+    fn adr_label(&mut self, rd: u32, label: usize) {
+        self.fixups.push((self.words.len(), label, Fixup::Adr));
+        self.emit(0x1000_0000 | rd);
+    }
     fn bl_printf(&mut self) {
+        self.bl_extern("_printf");
+    }
+    /// `bl <extern>` — a call to an undefined external (libc) symbol, resolved by
+    /// the linker via a BRANCH26 relocation.
+    fn bl_extern(&mut self, sym: &'static str) {
         self.relocs
-            .push((self.words.len(), SymRef::Printf, RelKind::Branch26));
+            .push((self.words.len(), SymRef::Extern(sym), RelKind::Branch26));
         self.emit(0x9400_0000);
     }
     fn adr(&mut self, rd: u32, sidx: usize) {
@@ -2085,15 +2963,15 @@ const RELOC_PAGE21: u32 = 3;
 const RELOC_PAGEOFF12: u32 = 4;
 
 /// Build the Mach-O object. Symbols are laid out as: defined (`_main` + funcs,
-/// in `__text`), then common globals, then the undefined `_printf` — matching
-/// the indices the relocations were built with. Globals are *common* symbols
-/// (`n_value` = size), so the linker allocates their storage; no data section is
-/// needed.
+/// in `__text`), then common globals, then the undefined externals (libc
+/// functions) — matching the indices the relocations were built with. Globals
+/// are *common* symbols (`n_value` = size), so the linker allocates their
+/// storage; no data section is needed.
 fn write_macho_object(
     text: &[u8],
     defined: &[(String, u64)],
     commons: &[(String, u64, u32)],
-    has_printf: bool,
+    externs: &[&str],
     relocs: &[(u32, u32, u32, bool)],
 ) -> Vec<u8> {
     let mut strtab = vec![0u8];
@@ -2108,14 +2986,10 @@ fn write_macho_object(
         .iter()
         .map(|(n, _, _)| strx(&mut strtab, n))
         .collect();
-    let printf_strx = if has_printf {
-        strx(&mut strtab, "_printf")
-    } else {
-        0
-    };
+    let extern_strx: Vec<u32> = externs.iter().map(|n| strx(&mut strtab, n)).collect();
 
-    let nsyms = defined.len() as u32 + commons.len() as u32 + has_printf as u32;
-    let nundef = commons.len() as u32 + has_printf as u32;
+    let nsyms = defined.len() as u32 + commons.len() as u32 + externs.len() as u32;
+    let nundef = commons.len() as u32 + externs.len() as u32;
 
     const HEADER: usize = 32;
     const SEG_CMD: usize = 72 + 80;
@@ -2224,9 +3098,9 @@ fn write_macho_object(
         put_u16(&mut b, ((align_log2 & 0xF) << 8) as u16); // common alignment
         put_u64(&mut b, *size);
     }
-    if has_printf {
-        put_u32(&mut b, printf_strx);
-        b.push(0x01);
+    for &sx in &extern_strx {
+        put_u32(&mut b, sx);
+        b.push(0x01); // N_UNDF | N_EXT
         b.push(0);
         put_u16(&mut b, 0);
         put_u64(&mut b, 0);
@@ -2235,6 +3109,54 @@ fn write_macho_object(
     debug_assert_eq!(b.len(), str_off);
     b.extend_from_slice(&strtab);
     b
+}
+
+/// Fold a `case` label expression to a constant `i64`, if it is one. Mirrors how
+/// `gen_expr` would evaluate these literal forms, so the branch table dispatches
+/// identically to the compare-chain. Returns `None` for anything non-constant
+/// (the caller then keeps the compare-chain).
+fn const_eval_i64(e: &Expr) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Int(n) | ExprKind::Char(n) => Some(*n),
+        ExprKind::Unary { op, expr } => {
+            let v = const_eval_i64(expr)?;
+            match op {
+                UnOp::Neg => Some(v.wrapping_neg()),
+                UnOp::Pos => Some(v),
+                UnOp::BitNot => Some(!v),
+                UnOp::Not => Some(i64::from(v == 0)),
+                _ => None,
+            }
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            let a = const_eval_i64(lhs)?;
+            let b = const_eval_i64(rhs)?;
+            // `/ % >>` depend on the left operand's signedness, exactly as codegen
+            // does, so the folded value matches what the dispatch would compute.
+            let signed = lhs.ty().as_ref().is_none_or(is_signed);
+            match op {
+                BinOp::Add => Some(a.wrapping_add(b)),
+                BinOp::Sub => Some(a.wrapping_sub(b)),
+                BinOp::Mul => Some(a.wrapping_mul(b)),
+                BinOp::Div if b == 0 => None,
+                BinOp::Div if signed => a.checked_div(b), // None on MIN/-1 -> fall back
+                BinOp::Div => Some(((a as u64) / (b as u64)) as i64),
+                BinOp::Mod if b == 0 => None,
+                BinOp::Mod if signed => a.checked_rem(b),
+                BinOp::Mod => Some(((a as u64) % (b as u64)) as i64),
+                BinOp::BitAnd => Some(a & b),
+                BinOp::BitOr => Some(a | b),
+                BinOp::BitXor => Some(a ^ b),
+                BinOp::Shl => Some(a.wrapping_shl(b as u32)),
+                BinOp::Shr if signed => Some(a.wrapping_shr(b as u32)),
+                BinOp::Shr => Some((a as u64).wrapping_shr(b as u32) as i64),
+                // Comparisons / logical ops are rare as case labels; leaving them
+                // unfolded just keeps such switches on the compare-chain.
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn align8(n: usize) -> usize {

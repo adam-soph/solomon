@@ -8,8 +8,10 @@
 //!   * object-like and function-like macros are expanded inline (with nested
 //!     expansion and a hide-set guard against runaway self-reference),
 //!   * `#ifdef` / `#ifndef` / `#else` / `#endif` include or drop token ranges,
-//!   * `#include` (and any directive we don't recognise) is passed through
-//!     unchanged so the parser can still see it; unknown directives are dropped.
+//!   * `#include "file"` is resolved: the file is read and pushed onto a source
+//!     stack so its tokens splice in (relative to the including file's
+//!     directory; cycles and runaway nesting are rejected); unknown directives
+//!     are dropped.
 //!
 //! Directives run to the end of their line. The lexer discards newlines, but
 //! every token carries `span.pos.line`, so the preprocessor finds line
@@ -21,16 +23,39 @@
 //! C-standard).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
-use crate::lexer::{LexError, TokenStream};
+use crate::lexer::{LexError, Lexer, TokenStream};
 use crate::token::{Keyword, Pos, Token, TokenKind};
 
 type LResult<T> = Result<T, LexError>;
 
+/// A hard cap on `#include` nesting, as a backstop beyond the cycle guard.
+const MAX_INCLUDE_DEPTH: usize = 64;
+
+/// One open `#include`d file on the source stack.
+struct IncludeFrame {
+    /// The lexer streaming the included file's tokens.
+    lexer: Lexer,
+    /// The token already read past the `#include` line in the parent; re-queued
+    /// when this file is exhausted so the parent resumes exactly where it left off.
+    resume: Option<Token>,
+    /// The directory of this file, for resolving its own relative `#include`s.
+    dir: PathBuf,
+    /// The canonical path of this file, for cycle detection.
+    path: PathBuf,
+    /// Conditional-nesting depth when this file was entered, so an unterminated
+    /// `#ifdef` inside it is caught rather than leaking into the parent.
+    cond_depth: usize,
+}
+
 #[derive(Clone)]
 enum Macro {
     Object(Vec<Token>),
-    Func { params: Vec<String>, body: Vec<Token> },
+    Func {
+        params: Vec<String>,
+        body: Vec<Token>,
+    },
 }
 
 /// A token paired with the set of macro names that must not be re-expanded
@@ -58,8 +83,6 @@ pub struct Preprocessor<S: TokenStream> {
     /// One-token push-back for the inner stream (used when a directive reads one
     /// token past its line).
     lookahead: Option<Token>,
-    /// Tokens to emit verbatim (e.g. a passed-through `#include` directive).
-    passthru: VecDeque<Token>,
     /// Buffered/expanded tokens awaiting output, nearest first.
     pending: VecDeque<PpTok>,
     macros: HashMap<String, Macro>,
@@ -67,18 +90,31 @@ pub struct Preprocessor<S: TokenStream> {
     /// Set once we've reported an unterminated-conditional error, to avoid
     /// repeating it on every subsequent Eof read.
     eof_reported: bool,
+    /// Directory the top-level source was read from, for resolving its relative
+    /// `#include` paths.
+    base_dir: PathBuf,
+    /// The stack of currently-open `#include`d files (innermost last). Tokens are
+    /// pulled from the top of this stack before the base `inner` stream.
+    includes: Vec<IncludeFrame>,
 }
 
 impl<S: TokenStream> Preprocessor<S> {
     pub fn new(inner: S) -> Self {
+        Self::with_base_dir(inner, PathBuf::from("."))
+    }
+
+    /// Build a preprocessor that resolves relative `#include` paths against
+    /// `base_dir` (the directory of the top-level source file).
+    pub fn with_base_dir(inner: S, base_dir: PathBuf) -> Self {
         Preprocessor {
             inner,
             lookahead: None,
-            passthru: VecDeque::new(),
             pending: VecDeque::new(),
             macros: HashMap::new(),
             conds: Vec::new(),
             eof_reported: false,
+            base_dir,
+            includes: Vec::new(),
         }
     }
 
@@ -95,10 +131,14 @@ impl<S: TokenStream> Preprocessor<S> {
 
     fn inner_next(&mut self) -> LResult<Token> {
         if let Some(t) = self.lookahead.take() {
-            Ok(t)
-        } else {
-            self.inner.next_token()
+            return Ok(t);
         }
+        // Tokens come from the innermost open `#include` first, then the base
+        // source. A frame's Eof is surfaced to `pull`, which pops the frame.
+        if let Some(frame) = self.includes.last_mut() {
+            return frame.lexer.next_token();
+        }
+        self.inner.next_token()
     }
 
     // ---- layer A: directives & conditionals, no macro expansion ----
@@ -107,18 +147,27 @@ impl<S: TokenStream> Preprocessor<S> {
     /// skipped. Macro names come through unexpanded.
     fn pull(&mut self) -> LResult<Token> {
         loop {
-            if let Some(t) = self.passthru.pop_front() {
-                return Ok(t);
-            }
             let t = self.inner_next()?;
             match &t.kind {
                 TokenKind::Eof => {
+                    // An included file ended: pop its frame, check its conditionals
+                    // were balanced, and resume the parent stream.
+                    if let Some(frame) = self.includes.pop() {
+                        if self.conds.len() != frame.cond_depth {
+                            self.conds.truncate(frame.cond_depth);
+                            return Err(self.err(
+                                t.span.pos,
+                                "unterminated #ifdef/#ifndef in included file (missing #endif)",
+                            ));
+                        }
+                        self.lookahead = frame.resume;
+                        continue;
+                    }
                     if !self.conds.is_empty() && !self.eof_reported {
                         self.eof_reported = true;
-                        return Err(self.err(
-                            t.span.pos,
-                            "unterminated #ifdef/#ifndef (missing #endif)",
-                        ));
+                        return Err(
+                            self.err(t.span.pos, "unterminated #ifdef/#ifndef (missing #endif)")
+                        );
                     }
                     return Ok(t);
                 }
@@ -162,12 +211,7 @@ impl<S: TokenStream> Preprocessor<S> {
 
             Some("define") => self.do_define(&toks),
             Some("undef") => self.do_undef(&toks),
-            Some("include") => {
-                // Pass through so the parser still sees `#include "..."`.
-                self.passthru.push_back(hash);
-                self.passthru.extend(toks);
-                Ok(())
-            }
+            Some("include") => self.do_include(&toks),
             // Unknown directive (e.g. `#help_index`): drop it.
             _ => Ok(()),
         }
@@ -233,6 +277,51 @@ impl<S: TokenStream> Preprocessor<S> {
             }
             _ => Err(self.err(toks[0].span.pos, "#undef is missing a macro name")),
         }
+    }
+
+    /// Resolve and open a `#include "path"`: read the file and push it onto the
+    /// source stack so its tokens stream in next. The path is resolved relative
+    /// to the directory of the file containing the directive; cycles and runaway
+    /// nesting are rejected.
+    fn do_include(&mut self, toks: &[Token]) -> LResult<()> {
+        let pos = toks[0].span.pos;
+        let path_str = match toks.get(1).map(|t| &t.kind) {
+            Some(TokenKind::Str(p)) => p.clone(),
+            _ => return Err(self.err(pos, "#include expects a quoted file path")),
+        };
+        // Relative to the directory of the file doing the including.
+        let cur_dir = self
+            .includes
+            .last()
+            .map(|f| f.dir.clone())
+            .unwrap_or_else(|| self.base_dir.clone());
+        let canon = cur_dir
+            .join(&path_str)
+            .canonicalize()
+            .map_err(|e| self.err(pos, format!("cannot open #include \"{path_str}\": {e}")))?;
+        if self.includes.iter().any(|f| f.path == canon) {
+            return Err(self.err(pos, format!("recursive #include of \"{path_str}\"")));
+        }
+        if self.includes.len() >= MAX_INCLUDE_DEPTH {
+            return Err(self.err(pos, "#include nested too deeply"));
+        }
+        let contents = std::fs::read_to_string(&canon)
+            .map_err(|e| self.err(pos, format!("cannot read #include \"{path_str}\": {e}")))?;
+        let dir = canon
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        // The token already read past the `#include` line resumes the parent
+        // once the included file is exhausted.
+        let resume = self.lookahead.take();
+        self.includes.push(IncludeFrame {
+            lexer: Lexer::new(&contents),
+            resume,
+            dir,
+            path: canon,
+            cond_depth: self.conds.len(),
+        });
+        Ok(())
     }
 
     fn do_ifdef(&mut self, toks: &[Token], want_defined: bool) -> LResult<()> {

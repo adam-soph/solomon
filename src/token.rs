@@ -129,6 +129,7 @@ keywords! {
     // Aggregates / declarations.
     Class => "class", false;
     Union => "union", false;
+    Typedef => "typedef", false;
     Public => "public", false;
     Extern => "extern", false;
     Import => "import", false;

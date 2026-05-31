@@ -5,7 +5,7 @@
 
 use solomon::ast::*;
 use solomon::lexer::Lexer;
-use solomon::parser::{parse, Parser};
+use solomon::parser::{Parser, parse};
 use solomon::token::Span;
 
 /// Parse a program, unwrapping the result.

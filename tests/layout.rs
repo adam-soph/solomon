@@ -2,7 +2,7 @@
 //! inheritance, unions, and error cases (cyclic types, non-constant sizes).
 
 use solomon::ast::Type;
-use solomon::layout::{compute, Layouts};
+use solomon::layout::{Layouts, compute};
 use solomon::parser::parse;
 
 /// Compute layouts for `src`, asserting there were no layout errors.
@@ -15,7 +15,9 @@ fn layouts(src: &str) -> Layouts {
 
 /// (offset, size) of a field.
 fn field(l: &Layouts, class: &str, name: &str) -> (u64, u64) {
-    let layout = l.get(class).unwrap_or_else(|| panic!("no layout for `{class}`"));
+    let layout = l
+        .get(class)
+        .unwrap_or_else(|| panic!("no layout for `{class}`"));
     let f = layout
         .field_offset_size(name)
         .unwrap_or_else(|| panic!("no field `{name}` on `{class}`"));

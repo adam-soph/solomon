@@ -156,8 +156,8 @@ fn punctuation_and_holyc_specials() {
 
 #[test]
 fn a_small_program() {
-    use solomon::token::Keyword as K;
     use TokenKind::*;
+    use solomon::token::Keyword as K;
     let src = r#"U0 Main() {
     I64 i;
     for (i = 0; i < 10; i++)

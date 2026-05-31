@@ -37,6 +37,12 @@ pub enum Type {
     Ptr(Box<Type>),
     /// `T[n]` — the size expression is `None` for unsized arrays like `T[]`.
     Array(Box<Type>, Option<Box<Expr>>),
+    /// A function pointer: `ret (*)(params...)`. An 8-byte scalar like any
+    /// pointer; the signature drives call type-checking and argument classing.
+    FuncPtr {
+        ret: Box<Type>,
+        params: Vec<Type>,
+    },
 }
 
 impl Type {
@@ -252,6 +258,21 @@ pub enum ExprKind {
     /// `sizeof(Type)` or `sizeof(expr)`. The size is computed at compile time
     /// from the type (for an expression, from its statically inferred type).
     Sizeof(SizeofArg),
+    /// `offset(ClassName.field[.field...])` — the byte offset of a (possibly
+    /// nested) member within a class, computed at compile time. HolyC's
+    /// equivalent of C's `offsetof`.
+    Offset {
+        class: String,
+        path: Vec<String>,
+    },
+    /// A brace-enclosed aggregate initializer, e.g. `{1, 2, 3}` or
+    /// `{{1, 2}, {3, 4}}`. Only valid as a variable/field initializer; it is
+    /// type-checked against the declared aggregate type (array or class).
+    InitList(Vec<Expr>),
+    /// A brace-enclosed designated initializer, e.g. `{.x = 1, .y = 2}`. Each
+    /// item names a field of the target class; fields may appear in any order
+    /// and omitted ones take their default (zero). Only valid for class types.
+    DesignatedInit(Vec<(String, Expr)>),
     /// A comma-separated sequence. At statement level this is also how HolyC's
     /// implicit print works: `"x = %d\n", x` is a `Comma([Str, Ident])`.
     Comma(Vec<Expr>),
@@ -308,6 +329,12 @@ pub enum StmtKind {
         hi: Option<Expr>,
     },
     Default,
+    /// HolyC's `start:` switch sub-label — marks the start of a switch prologue
+    /// (statements that run on entry, before dispatch).
+    SwitchStart,
+    /// HolyC's `end:` switch sub-label — marks the start of a switch epilogue
+    /// (statements reached by fall-through; a `break` skips them).
+    SwitchEnd,
     Break,
     Continue,
     Return(Option<Expr>),

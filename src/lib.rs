@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod backend;
 pub mod builtins;
+pub mod fmt;
 pub mod layout;
 pub mod lexer;
 pub mod parser;

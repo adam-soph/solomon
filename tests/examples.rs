@@ -1,6 +1,6 @@
-//! End-to-end tests over real HolyC sample files in `tests/data/`.
+//! End-to-end tests over the real HolyC example programs in `examples/`.
 //!
-//! Each sample is run twice: first through the lexer on its own (to confirm it
+//! Each example is run twice: first through the lexer on its own (to confirm it
 //! tokenizes cleanly), then through the lexer + parser together (to confirm it
 //! produces an AST). The sources are embedded with `include_str!` so the tests
 //! do not depend on the working directory.
@@ -11,19 +11,8 @@ use solomon::parser::parse;
 use solomon::sema::check_program;
 use solomon::token::TokenKind;
 
-/// (name, source) for every sample file under tests/data/.
-const SAMPLES: &[(&str, &str)] = &[
-    ("hello.hc", include_str!("data/hello.hc")),
-    ("fib.hc", include_str!("data/fib.hc")),
-    ("classes.hc", include_str!("data/classes.hc")),
-    ("control.hc", include_str!("data/control.hc")),
-    ("preproc.hc", include_str!("data/preproc.hc")),
-    ("linklist.hc", include_str!("data/linklist.hc")),
-    ("shapes.hc", include_str!("data/shapes.hc")),
-    ("vm.hc", include_str!("data/vm.hc")),
-    ("mathlib.hc", include_str!("data/mathlib.hc")),
-    ("matrix.hc", include_str!("data/matrix.hc")),
-];
+mod common;
+use common::EXAMPLES as SAMPLES;
 
 // ---- the lexer on its own ----
 

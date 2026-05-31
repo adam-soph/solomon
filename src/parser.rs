@@ -8,7 +8,7 @@
 //! of its first token to the end of its last token; the parser tracks the end
 //! of the most recently consumed token in `prev_end`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::ast::*;
@@ -63,6 +63,16 @@ pub struct Parser<S: TokenStream> {
     /// Lets the parser tell `Foo x;` (a declaration) from `Foo * x` (a
     /// multiplication) regardless of definition order.
     known_types: HashSet<String>,
+    /// `typedef` aliases mapping a name to the type it stands for. Resolved at
+    /// parse time, so an alias never reaches the AST as a `Named` type. Aliases
+    /// must be defined before use (the C rule).
+    type_aliases: HashMap<String, Type>,
+    /// Synthetic type definitions produced while parsing (e.g. an inline/anonymous
+    /// `union` embedded in a class). They are injected as top-level items before
+    /// the item that referenced them.
+    pending_types: Vec<Stmt>,
+    /// Counter for naming anonymous embedded unions (`$anonN`).
+    anon_counter: u32,
 }
 
 impl<S: TokenStream> Parser<S> {
@@ -80,6 +90,9 @@ impl<S: TokenStream> Parser<S> {
             buf: VecDeque::new(),
             prev_end: 0,
             known_types,
+            type_aliases: HashMap::new(),
+            pending_types: Vec::new(),
+            anon_counter: 0,
         }
     }
 
@@ -87,7 +100,11 @@ impl<S: TokenStream> Parser<S> {
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut items = Vec::new();
         while !self.at(&TokenKind::Eof)? {
-            items.push(self.parse_stmt()?);
+            let stmt = self.parse_stmt()?;
+            // Synthetic types (embedded unions) defined while parsing this item
+            // are emitted first, so they're laid out/registered before their use.
+            items.append(&mut self.pending_types);
+            items.push(stmt);
         }
         Ok(Program { items })
     }
@@ -236,7 +253,9 @@ impl<S: TokenStream> Parser<S> {
                 message: format!("`{}` is not a type", kw.as_str()),
                 pos: t.span.pos,
             }),
-            TokenKind::Ident(s) => Ok(Type::Named(s)),
+            // A `typedef` alias resolves to its target type; any other identifier
+            // is a class/union name.
+            TokenKind::Ident(s) => Ok(self.type_aliases.get(&s).cloned().unwrap_or(Type::Named(s))),
             other => Err(ParseError {
                 message: format!("expected a type, found {other:?}"),
                 pos: t.span.pos,
@@ -245,15 +264,75 @@ impl<S: TokenStream> Parser<S> {
     }
 
     /// Parse `*`… `name` `[dim]`… given a base type, returning the declared name
-    /// and its fully built type.
+    /// and its fully built type. A `(` after the leading stars introduces a
+    /// function-pointer declarator (`ret (*name)(param-types)`).
     fn parse_declarator(&mut self, base: &Type) -> PResult<(String, Type)> {
         let mut ty = base.clone();
         while self.eat(&TokenKind::Star)? {
             ty = Type::Ptr(Box::new(ty));
         }
+        if self.at(&TokenKind::LParen)? {
+            return self.parse_funcptr_declarator(ty);
+        }
         let name = self.expect_ident()?;
         ty = self.parse_array_suffix(ty)?;
         Ok((name, ty))
+    }
+
+    /// Parse the `( * name [dim]… ) ( param-types )` tail of a function-pointer
+    /// declarator, given the already-parsed return type. An array suffix on the
+    /// name (`(*ops[2])(...)`) makes it an array of function pointers (a dispatch
+    /// table).
+    fn parse_funcptr_declarator(&mut self, ret: Type) -> PResult<(String, Type)> {
+        self.expect(&TokenKind::LParen, "`(`")?;
+        self.expect(&TokenKind::Star, "`*` in a function-pointer declarator")?;
+        let name = self.expect_ident()?;
+        let mut dims = Vec::new();
+        while self.eat(&TokenKind::LBracket)? {
+            let dim = if self.at(&TokenKind::RBracket)? {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()?))
+            };
+            self.expect(&TokenKind::RBracket, "`]`")?;
+            dims.push(dim);
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+        let params = self.parse_param_types()?;
+        let mut ty = Type::FuncPtr {
+            ret: Box::new(ret),
+            params,
+        };
+        // Wrap the function-pointer type in any array dimensions (outermost is
+        // the leftmost `[dim]`).
+        for dim in dims.into_iter().rev() {
+            ty = Type::Array(Box::new(ty), dim);
+        }
+        Ok((name, ty))
+    }
+
+    /// Parse a parenthesised list of parameter *types* (an optional name after
+    /// each is allowed and ignored), as in a function-pointer signature.
+    fn parse_param_types(&mut self) -> PResult<Vec<Type>> {
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let mut params = Vec::new();
+        if !self.at(&TokenKind::RParen)? {
+            loop {
+                let mut ty = self.parse_base_type()?;
+                while self.eat(&TokenKind::Star)? {
+                    ty = Type::Ptr(Box::new(ty));
+                }
+                if matches!(self.peek()?.kind, TokenKind::Ident(_)) {
+                    self.advance()?; // an optional parameter name, ignored
+                }
+                params.push(ty);
+                if !self.eat(&TokenKind::Comma)? {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+        Ok(params)
     }
 
     /// Apply any trailing `[dim]` array suffixes to `ty`.
@@ -313,6 +392,16 @@ impl<S: TokenStream> Parser<S> {
                     self.expect(&TokenKind::Colon, "`:`")?;
                     Ok(self.st(StmtKind::Default, m))
                 }
+                Keyword::Start => {
+                    self.advance()?;
+                    self.expect(&TokenKind::Colon, "`:`")?;
+                    Ok(self.st(StmtKind::SwitchStart, m))
+                }
+                Keyword::End => {
+                    self.advance()?;
+                    self.expect(&TokenKind::Colon, "`:`")?;
+                    Ok(self.st(StmtKind::SwitchEnd, m))
+                }
                 Keyword::Break => {
                     self.advance()?;
                     self.expect(&TokenKind::Semicolon, "`;`")?;
@@ -331,6 +420,7 @@ impl<S: TokenStream> Parser<S> {
                     Ok(self.st(StmtKind::Goto(name), m))
                 }
                 Keyword::Class | Keyword::Union => self.parse_class(m),
+                Keyword::Typedef => self.parse_typedef(m),
                 _ if k.is_type() => self.parse_declaration(m),
                 _ => self.parse_expr_stmt(m),
             },
@@ -504,6 +594,19 @@ impl<S: TokenStream> Parser<S> {
 
     /// A declaration that begins with a type: either a function (def or
     /// prototype) or a variable declaration list.
+    /// `typedef <type> <name>;` — register a type alias. The alias is resolved at
+    /// parse time (so it never reaches the AST as a `Named` type) and produces no
+    /// runtime node (an `Empty` statement). Aliases must precede their use.
+    fn parse_typedef(&mut self, m: Mark) -> PResult<Stmt> {
+        self.advance()?; // `typedef`
+        let base = self.parse_base_type()?;
+        let (name, ty) = self.parse_declarator(&base)?;
+        self.expect(&TokenKind::Semicolon, "`;`")?;
+        self.known_types.insert(name.clone());
+        self.type_aliases.insert(name, ty);
+        Ok(self.st(StmtKind::Empty, m))
+    }
+
     fn parse_declaration(&mut self, m: Mark) -> PResult<Stmt> {
         let base = self.parse_base_type()?;
         let dm = self.mark()?;
@@ -553,16 +656,66 @@ impl<S: TokenStream> Parser<S> {
 
     fn finish_declarator(&mut self, (name, ty): (String, Type), m: Mark) -> PResult<Declarator> {
         let init = if self.eat(&TokenKind::Eq)? {
-            Some(self.parse_assign()?)
+            Some(self.parse_initializer()?)
         } else {
             None
         };
+        // `T a[] = {...}` infers the outermost array length from the list.
+        let ty = infer_array_len(ty, init.as_ref());
         Ok(Declarator {
             name,
             ty,
             init,
             span: self.finish(m),
         })
+    }
+
+    /// An initialiser is either a brace-enclosed aggregate list or an ordinary
+    /// (assignment-level) expression.
+    fn parse_initializer(&mut self) -> PResult<Expr> {
+        if self.at(&TokenKind::LBrace)? {
+            self.parse_init_list()
+        } else {
+            self.parse_assign()
+        }
+    }
+
+    /// `{ init, init, ... }` (nested lists and a trailing comma are allowed), or
+    /// a designated form `{ .field = init, ... }` when the list opens with a `.`.
+    fn parse_init_list(&mut self) -> PResult<Expr> {
+        let m = self.mark()?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        if self.at(&TokenKind::Dot)? {
+            return self.parse_designated_init(m);
+        }
+        let mut items = Vec::new();
+        while !self.at(&TokenKind::RBrace)? {
+            items.push(self.parse_initializer()?);
+            if !self.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(self.ex(ExprKind::InitList(items), m))
+    }
+
+    /// `{ .field = init, ... }` — a designated class initializer (the opening
+    /// `{` is already consumed). Each item is a field name, `=`, and an
+    /// initialiser (itself possibly a nested brace list).
+    fn parse_designated_init(&mut self, m: Mark) -> PResult<Expr> {
+        let mut items = Vec::new();
+        while !self.at(&TokenKind::RBrace)? {
+            self.expect(&TokenKind::Dot, "`.`")?;
+            let name = self.expect_ident()?;
+            self.expect(&TokenKind::Eq, "`=`")?;
+            let value = self.parse_initializer()?;
+            items.push((name, value));
+            if !self.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(self.ex(ExprKind::DesignatedInit(items), m))
     }
 
     fn parse_params(&mut self) -> PResult<(Vec<Param>, bool)> {
@@ -581,13 +734,21 @@ impl<S: TokenStream> Parser<S> {
                 while self.eat(&TokenKind::Star)? {
                     ty = Type::Ptr(Box::new(ty));
                 }
-                // The parameter name is optional (prototypes may omit it).
-                let name = if matches!(self.peek()?.kind, TokenKind::Ident(_)) {
-                    Some(self.expect_ident()?)
+                // A function-pointer parameter: `ret (*name)(types)`.
+                let name = if self.at(&TokenKind::LParen)? {
+                    let (n, fpty) = self.parse_funcptr_declarator(ty)?;
+                    ty = fpty;
+                    Some(n)
                 } else {
-                    None
+                    // The parameter name is optional (prototypes may omit it).
+                    let name = if matches!(self.peek()?.kind, TokenKind::Ident(_)) {
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    ty = self.parse_array_suffix(ty)?;
+                    name
                 };
-                ty = self.parse_array_suffix(ty)?;
                 let default = if self.eat(&TokenKind::Eq)? {
                     Some(self.parse_assign()?)
                 } else {
@@ -622,11 +783,33 @@ impl<S: TokenStream> Parser<S> {
             None
         };
 
+        let fields = self.parse_class_fields()?;
+        self.eat(&TokenKind::Semicolon)?; // optional trailing `;`
+
+        Ok(self.st(
+            StmtKind::Class(ClassDef {
+                is_union,
+                name,
+                base,
+                fields,
+            }),
+            m,
+        ))
+    }
+
+    /// Parse a `{ field; field; … }` aggregate body into its declarators. An
+    /// embedded `union` (anonymous or named) is handled specially.
+    fn parse_class_fields(&mut self) -> PResult<Vec<Declarator>> {
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while !self.at(&TokenKind::RBrace)? {
             if self.at(&TokenKind::Eof)? {
                 return self.err("unexpected end of input in class body, expected `}`");
+            }
+            // An embedded `union` becomes its own synthetic type.
+            if matches!(self.peek_kind()?, TokenKind::Keyword(Keyword::Union)) {
+                self.parse_embedded_union(&mut fields)?;
+                continue;
             }
             let field_base = self.parse_base_type()?;
             let dm = self.mark()?;
@@ -650,17 +833,75 @@ impl<S: TokenStream> Parser<S> {
             self.expect(&TokenKind::Semicolon, "`;`")?;
         }
         self.expect(&TokenKind::RBrace, "`}`")?;
-        self.eat(&TokenKind::Semicolon)?; // optional trailing `;`
+        Ok(fields)
+    }
 
-        Ok(self.st(
-            StmtKind::Class(ClassDef {
-                is_union,
-                name,
-                base,
-                fields,
-            }),
-            m,
-        ))
+    /// Parse a `union` embedded in a class body and append the resulting member.
+    /// Forms:
+    ///   * `union { … };`         — anonymous; its members are *promoted* into the
+    ///     enclosing class (accessed directly, e.g. `obj.field`).
+    ///   * `union Name { … } m;`  — inline named union type plus a member `m`.
+    ///   * `union Name m;`        — a previously-defined union used as a member.
+    ///
+    /// Inline definitions become a synthetic top-level union type. A promoted
+    /// (anonymous) member is given a generated `$anon…` name the later passes
+    /// recognise to flatten its members.
+    fn parse_embedded_union(&mut self, fields: &mut Vec<Declarator>) -> PResult<()> {
+        let dm = self.mark()?;
+        self.advance()?; // `union`
+        let given_name = if matches!(self.peek_kind()?, TokenKind::Ident(_)) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+
+        let type_name = if self.at(&TokenKind::LBrace)? {
+            let n = self.anon_counter;
+            self.anon_counter += 1;
+            let tyname = given_name.unwrap_or_else(|| format!("$Union{n}"));
+            self.known_types.insert(tyname.clone());
+            let body = self.parse_class_fields()?;
+            let def = self.st(
+                StmtKind::Class(ClassDef {
+                    is_union: true,
+                    name: tyname.clone(),
+                    base: None,
+                    fields: body,
+                }),
+                dm,
+            );
+            self.pending_types.push(def);
+            tyname
+        } else {
+            given_name.ok_or_else(|| ParseError {
+                message: "expected a union name or `{` after `union`".into(),
+                pos: self.cur_pos(),
+            })?
+        };
+
+        // A member name → an ordinary named member; otherwise the union is
+        // anonymous and its members are promoted (a `$anon…` placeholder field).
+        if matches!(self.peek_kind()?, TokenKind::Ident(_)) {
+            let member = self.expect_ident()?;
+            let ty = self.parse_array_suffix(Type::Named(type_name))?;
+            fields.push(Declarator {
+                name: member,
+                ty,
+                init: None,
+                span: self.finish(dm),
+            });
+        } else {
+            let n = self.anon_counter;
+            self.anon_counter += 1;
+            fields.push(Declarator {
+                name: format!("$anon{n}"),
+                ty: Type::Named(type_name),
+                init: None,
+                span: self.finish(dm),
+            });
+        }
+        self.expect(&TokenKind::Semicolon, "`;`")?;
+        Ok(())
     }
 
     // ---- expressions ----
@@ -777,6 +1018,9 @@ impl<S: TokenStream> Parser<S> {
         if kind == TokenKind::Keyword(Keyword::Sizeof) {
             return self.parse_sizeof(m);
         }
+        if kind == TokenKind::Keyword(Keyword::Offset) {
+            return self.parse_offset(m);
+        }
 
         // Cast: `(` Type `)` unary. Distinguished from a parenthesised
         // expression by peeking whether a type name follows the `(`.
@@ -806,6 +1050,31 @@ impl<S: TokenStream> Parser<S> {
         };
         self.expect(&TokenKind::RParen, "`)`")?;
         Ok(self.ex(ExprKind::Sizeof(arg), m))
+    }
+
+    /// `offset(ClassName.field[.field...])` — HolyC's `offsetof`. The operand is
+    /// a class name followed by a dotted member path (not a normal expression,
+    /// since the class name is a type rather than a value).
+    fn parse_offset(&mut self, m: Mark) -> PResult<Expr> {
+        self.advance()?; // offset
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let class = match self.parse_base_type()? {
+            Type::Named(name) => name,
+            _ => {
+                return Err(ParseError {
+                    message: "offset() expects a class member, e.g. offset(Class.field)".into(),
+                    pos: m.pos,
+                });
+            }
+        };
+        let mut path = Vec::new();
+        self.expect(&TokenKind::Dot, "`.`")?;
+        path.push(self.expect_ident()?);
+        while self.eat(&TokenKind::Dot)? {
+            path.push(self.expect_ident()?);
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+        Ok(self.ex(ExprKind::Offset { class, path }, m))
     }
 
     fn parse_cast(&mut self, m: Mark) -> PResult<Expr> {
@@ -946,6 +1215,19 @@ impl<S: TokenStream> Parser<S> {
     }
 }
 
+/// If `ty` is an unsized array (`T[]`) initialised with a brace list, fill in
+/// the outermost length from the element count: `I64 a[] = {1,2,3}` becomes
+/// `I64 a[3]`. Inner dimensions must already be explicit.
+fn infer_array_len(ty: Type, init: Option<&Expr>) -> Type {
+    if let (Type::Array(elem, None), Some(e)) = (&ty, init) {
+        if let ExprKind::InitList(items) = &e.kind {
+            let dim = Expr::new(ExprKind::Int(items.len() as i64), e.span);
+            return Type::Array(elem.clone(), Some(Box::new(dim)));
+        }
+    }
+    ty
+}
+
 /// Map an assignment-operator token to its [`AssignOp`].
 fn assign_op(k: &TokenKind) -> Option<AssignOp> {
     Some(match k {
@@ -1002,14 +1284,22 @@ fn infix_op(k: &TokenKind) -> Option<(BinOp, u8)> {
 /// Re-running the deterministic preprocessor is cheap and keeps both passes
 /// lazy.
 pub fn parse(src: &str) -> PResult<Program> {
-    let known_types = hoist_type_names(src)?;
-    let pp = Preprocessor::new(Lexer::new(src));
+    parse_in_dir(src, std::path::Path::new("."))
+}
+
+/// Parse `src`, resolving `#include "..."` relative to `dir` (the directory of
+/// the source file). The CLI passes the input file's parent directory; `parse`
+/// defaults it to the current directory.
+pub fn parse_in_dir(src: &str, dir: &std::path::Path) -> PResult<Program> {
+    let known_types = hoist_type_names(src, dir)?;
+    let pp = Preprocessor::with_base_dir(Lexer::new(src), dir.to_path_buf());
     Parser::with_known_types(pp, known_types).parse_program()
 }
 
-/// Stream the preprocessed tokens and collect every `class`/`union` name.
-fn hoist_type_names(src: &str) -> PResult<HashSet<String>> {
-    let mut pp = Preprocessor::new(Lexer::new(src));
+/// Stream the preprocessed tokens and collect every `class`/`union` name,
+/// descending into `#include`d files (so a type defined there can be used).
+fn hoist_type_names(src: &str, dir: &std::path::Path) -> PResult<HashSet<String>> {
+    let mut pp = Preprocessor::with_base_dir(Lexer::new(src), dir.to_path_buf());
     let mut names = HashSet::new();
     loop {
         let t = pp.next_token()?;
