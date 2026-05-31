@@ -110,7 +110,68 @@ already-checked program.
 - **`backend/arm64.rs`** — hand-emits AArch64 machine code (no LLVM/Cranelift/C),
   writes a Mach-O relocatable object by hand, and links with the system `cc`.
   Codegen is type-directed (uses `Expr::ty()` + the layout pass). It targets
-  `aarch64-apple-darwin` specifically.
+  `aarch64-apple-darwin` specifically. Several **emission-time optimizations** (no
+  separate pass — that would shift instruction positions and break label/fixup
+  offsets): constant subexpressions fold to a single `load_imm` (`gen_expr` +
+  `const_eval_i64`); **immediate-form arithmetic** (`try_imm_binop`) emits
+  `add/sub/cmp #imm` and shift-by-immediate for `<expr> op <small constant>`
+  instead of materializing the constant in a register, and **strength-reduces**
+  `* / %` by a constant power of two (also in `try_imm_binop`): `* 2^k` → `lsl`,
+  and for *unsigned* operands `/ 2^k` → `lsr` and `% 2^k` → `and #2^k-1` (signed
+  `/`/`%` need a round-toward-zero bias, so they keep the generic SDIV/MSUB); a
+  binary op whose rhs is a
+  *simple operand* (`is_simple_operand`: literals, constant folds, scalar
+  variables — codegen that provably touches only RES) keeps its lhs in T2 with a
+  `mov` instead of a stack push/pop (the F64 analogue `is_simple_foperand` keeps
+  the lhs in FT2 with an `fmov`, replacing the `push_f`/`pop_f` GPR+stack
+  round-trip); and no-op `mov xd, xd` / zero-sized `sp` adjusts are elided. There
+  is also a true **post-emission peephole pass**
+  (`Asm::peephole`, run at the start of `finish` before fixups resolve): every
+  `Asm` emitter tags its word with register def/use + a branch class
+  (`inst_def`/`inst_use`/`inst_branch`, parallel to `words`; the conservative
+  `emit` default is "reads everything, is a barrier", and the tagged `e_*`
+  helpers refine it), and the pass runs a liveness scan over the scratch
+  temporaries x9/x10 to drop dead `mov`s — either *removal* (the copy's target is
+  never read again) or *fusion* (the instruction that produced the source is
+  rewritten to write the destination directly). Removing a word remaps every
+  stored word-index position (`label_pos` + the `.0` of
+  fixups/adr_fixups/relocs; label ids and `TableRel`'s base are label indices, so
+  they ride along through `label_pos`). All are behavior-preserving — the
+  interpreter and the all-examples native conformance test are the oracle.
+  Finally, a per-function **register promotion** pass (`plan_registers`, a light
+  register allocator) keeps frequently-used scalar locals/params in callee-saved
+  registers instead of frame slots, eliminating per-access load/store traffic (a
+  big win in loops). Two independent pools: integer/pointer locals → **x19–x28**,
+  F64 locals → the callee-saved double registers **d8–d15**. Candidates are
+  non-address-taken scalars declared exactly once and referenced ≥2 times, where
+  references are **loop-depth-weighted** (`8^depth`) — so a loop-invariant read
+  (a loop bound, say) counts as hot and gets promoted even when its *static* count
+  is one, dropping its per-iteration load (`RegAnalysis` scans the body for `&x`,
+  weighted reference counts, declaration types, and per-name live intervals; the
+  scan's `match`es are exhaustive so a new AST node can't silently hide an
+  address-take). Allocation is **linear scan over live
+  intervals** (`Cand`): locals whose ranges don't overlap **share** a register, so
+  many sequential temporaries collapse onto one register (fewer distinct
+  registers ⇒ less save/restore) and a function may promote more than a pool's
+  worth of locals. When a pool runs out, the scan **spills** the coldest active
+  interval (lowest loop-weighted refs) to a slot if the current candidate is
+  hotter, handing it the register — a whole-range swap, not a split. Soundness
+  rests on conservative *over*-approximated intervals —
+  `[first reference … last reference]` (a declaration counts as the defining
+  reference), widened to cover any structured loop they touch (loop-carried values
+  stay live across the back-edge), and widened to the whole function when the body
+  uses `goto`/labels (then nothing shares); two locals coalesce only when strictly
+  disjoint. A promoted
+  local has `VarLoc.reg = Some(r)` and no slot — the register's range identifies
+  its file (`is_fp_reg`: r < 16 ⇒ a d-register), and the variable's type confirms
+  it. Integer reads are `mov RES, r`, writes/inits/`++` `mov r, RES` (narrowed to
+  the declared width via `gen_cast`, since there's no store to truncate); F64
+  reads/writes are `fmov FRES, r` / `fmov r, FRES` and arithmetic targets the
+  d-register directly. Params move from the arg register (`mov`/`fmov`) into `r`.
+  The prologue spills each used callee-saved register near x29 with a single
+  `stur`/`fstur`; every epilogue restores it with `ldur`/`fldur` (`cs_saves`).
+  Promoted locals survive calls (incl. recursion) precisely because x19–x28 /
+  d8–d15 are callee-saved.
 
 ### builtins: one source of truth
 
@@ -189,11 +250,25 @@ from one `keywords!` table to avoid drift.
   `LDRSW off, [table, idx, lsl #2]; BR (table + off)`. Gaps/out-of-range and
   overlapping ranges resolve exactly as the compare-chain fallback does; sparse
   or non-constant switches keep the linear compare-chain.
+- **Chained range comparisons** are a pure parser desugar (`parse_binary`): a run
+  of relational operators at the same precedence (`a < b < c`, `0 <= i < n`)
+  becomes the conjunction `(a<b) && (b<c)` (`is_chain_cmp` selects `< <= > >=`;
+  `==`/`!=` keep C's `(a==b)==c`). Interior operands are *cloned* into both
+  comparisons (so `a < f() < b` calls twice). Sema and both backends are
+  untouched — they only ever see the standard `&&`-of-comparisons AST.
 - **Scalar stores coerce to the lvalue type** in the interpreter (`coerce_to` in
   `eval_init`/`eval_assign`): `I64 w = 3.14;` truncates to `3` and `F64 x = 5;`
   widens to `5.0`, matching the native backend (which truncates/widens in
   registers). Without this the interpreter kept the source `Value` and diverged
-  on later arithmetic.
+  on later arithmetic. `coerce_to` also decays a **string literal stored into a
+  pointer** to one stable byte buffer, so pointer identity over it (`p - s`,
+  `p == s`, `p++`) is consistent — mirroring the native backend's single `__text`
+  copy (each `as_pointer` of a `Value::Str` would otherwise mint a fresh buffer).
+- **Locals are zero-initialized** when declared without an initializer, in both
+  backends: scalars and *aggregates alike* read back as 0 until written (interp
+  fills its value; native zeroes the slot — `gen_zero_slot` for an aggregate, a
+  store of 0 for a scalar). Reading an untouched local is therefore defined, not
+  stack garbage. (Globals are linker-zeroed.)
 - **Narrow integers (`U8`/`I8`/`U16`/`I16`/`U32`/`I32`) follow C width rules** in
   both backends: arithmetic promotes to `I64` (no mid-expression wrap — `U8 a =
   200; a + 100` is `300`), then the value truncates to the declared width at each

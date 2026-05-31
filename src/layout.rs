@@ -2,9 +2,9 @@
 //! `class`/`union`.
 //!
 //! This is a standalone pass (`compute`) consumed by both semantic analysis
-//! (which folds its errors in) and backends (the interpreter uses it for
-//! `sizeof`; a future codegen backend would use offsets for field access and
-//! pointer arithmetic).
+//! (which folds its errors in) and the backends: the interpreter uses it for
+//! `sizeof`, and the AArch64 codegen backend uses offsets/sizes/strides for
+//! field access, array indexing, and pointer arithmetic.
 //!
 //! Layout model — **natural alignment with padding (the x86-64 C ABI)**:
 //!   * scalar alignments equal their sizes (`I8`=1, `I16`=2, `I32`=4,

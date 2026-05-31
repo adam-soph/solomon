@@ -1,8 +1,11 @@
 //! Recursive-descent parser for HolyC.
 //!
-//! The parser is constructed from a [`Lexer`] and pulls tokens lazily via
-//! [`Lexer::next_token`]. It keeps only a tiny look-ahead buffer (a couple of
-//! tokens), so the complete token stream is never held in memory at once.
+//! The parser is generic over a `TokenStream` and pulls tokens lazily through it
+//! — in practice a `Preprocessor` wrapping a [`Lexer`], so macros and `#include`s
+//! splice in transparently. It keeps only a tiny look-ahead buffer (a couple of
+//! tokens), so the complete token stream is never held in memory at once. Parsing
+//! is two-pass: a first sweep hoists `class`/`union` names (so a type can be used
+//! before it is defined), then the real parse runs.
 //!
 //! Every node it produces carries a [`Span`]. A node's span runs from the start
 //! of its first token to the end of its last token; the parser tracks the end
@@ -975,16 +978,46 @@ impl<S: TokenStream> Parser<S> {
             // All these operators are left-associative, so the right side binds
             // one level tighter.
             let rhs = self.parse_binary(bp + 1)?;
-            lhs = self.ex(
-                ExprKind::Binary {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                m,
-            );
+
+            // HolyC chained range comparisons: `a < b < c` means `a < b && b < c`.
+            // A run of relational operators at the same precedence desugars to a
+            // conjunction of the adjacent comparisons. Each interior operand is
+            // duplicated, so keep it side-effect-free (`a < f() < b` calls twice).
+            if is_chain_cmp(op) && self.next_is_chain_cmp(bp)? {
+                let mut chain = self.bin(op, lhs, rhs.clone(), m);
+                let mut prev = rhs;
+                while self.next_is_chain_cmp(bp)? {
+                    let (op2, _) = infix_op(&self.peek()?.kind).unwrap();
+                    self.advance()?;
+                    let next = self.parse_binary(bp + 1)?;
+                    let cmp = self.bin(op2, prev, next.clone(), m);
+                    chain = self.bin(BinOp::And, chain, cmp, m);
+                    prev = next;
+                }
+                lhs = chain;
+            } else {
+                lhs = self.bin(op, lhs, rhs, m);
+            }
         }
         Ok(lhs)
+    }
+
+    /// Build a binary-expression node.
+    fn bin(&mut self, op: BinOp, lhs: Expr, rhs: Expr, m: Mark) -> Expr {
+        self.ex(
+            ExprKind::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            m,
+        )
+    }
+
+    /// Whether the next token is a relational operator at precedence `bp` — the
+    /// signal to continue a chained comparison.
+    fn next_is_chain_cmp(&mut self, bp: u8) -> PResult<bool> {
+        Ok(matches!(infix_op(&self.peek()?.kind), Some((op, b)) if b == bp && is_chain_cmp(op)))
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
@@ -1244,6 +1277,13 @@ fn assign_op(k: &TokenKind) -> Option<AssignOp> {
         TokenKind::ShrEq => AssignOp::Shr,
         _ => return None,
     })
+}
+
+/// Relational operators participate in HolyC chained range comparisons
+/// (`a < b < c`). Equality (`==`/`!=`) deliberately does not, so `a == b == c`
+/// keeps its standard C meaning `(a == b) == c`.
+fn is_chain_cmp(op: BinOp) -> bool {
+    matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
 }
 
 /// Map an infix-operator token to its [`BinOp`] and binding power. Higher binds

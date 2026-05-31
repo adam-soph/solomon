@@ -1,9 +1,11 @@
 //! Abstract syntax tree for HolyC.
 //!
 //! Every expression and statement carries a [`Span`] locating it in the source,
-//! which later passes (type checking, codegen) use for diagnostics. To keep the
-//! node shapes the focus of tests, `PartialEq` on AST nodes compares *structure
-//! only* and ignores spans — so tests can build expected trees with
+//! which later passes (type checking, codegen) use for diagnostics. Each
+//! `Expr` also carries an interior-mutable inferred type (`ty`, a
+//! `RefCell<Option<Type>>`) that semantic analysis fills in. To keep the node
+//! shapes the focus of tests, `PartialEq` on AST nodes compares *structure only*
+//! and ignores both spans and `ty` — so tests can build expected trees with
 //! [`Span::dummy`].
 
 use std::cell::RefCell;

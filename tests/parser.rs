@@ -113,6 +113,51 @@ fn comparison_and_logical_precedence() {
 }
 
 #[test]
+fn chained_comparison_desugars_to_conjunction() {
+    // HolyC `a < b < c` parses as `(a < b) && (b < c)` — the interior operand `b`
+    // is duplicated into both comparisons.
+    assert_eq!(
+        expr("a < b < c"),
+        bin(
+            BinOp::And,
+            bin(BinOp::Lt, ident("a"), ident("b")),
+            bin(BinOp::Lt, ident("b"), ident("c")),
+        )
+    );
+    // A longer chain folds left: `a < b <= c > d` -> ((a<b && b<=c) && c>d).
+    assert_eq!(
+        expr("a < b <= c > d"),
+        bin(
+            BinOp::And,
+            bin(
+                BinOp::And,
+                bin(BinOp::Lt, ident("a"), ident("b")),
+                bin(BinOp::Le, ident("b"), ident("c")),
+            ),
+            bin(BinOp::Gt, ident("c"), ident("d")),
+        )
+    );
+    // Parentheses suppress chaining: `(a < b) < c` is a plain comparison.
+    assert_eq!(
+        expr("(a < b) < c"),
+        bin(
+            BinOp::Lt,
+            bin(BinOp::Lt, ident("a"), ident("b")),
+            ident("c")
+        ),
+    );
+    // Equality does not chain: `a == b == c` keeps C's `(a == b) == c`.
+    assert_eq!(
+        expr("a == b == c"),
+        bin(
+            BinOp::Eq,
+            bin(BinOp::Eq, ident("a"), ident("b")),
+            ident("c")
+        ),
+    );
+}
+
+#[test]
 fn assignment_is_right_associative() {
     // a = b = 1  ==  a = (b = 1)
     assert_eq!(

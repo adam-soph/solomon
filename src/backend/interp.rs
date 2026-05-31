@@ -2000,13 +2000,15 @@ impl<W: Write> Interpreter<W> {
         env: &mut Env,
         pos: Pos,
     ) -> Result<Value, BackendError> {
-        match v {
-            Value::Ptr(Some(pv)) => {
-                let step = self.ptr_step(pv, expr, env)?;
-                Ok(Value::Ptr(Some(pv.offset(delta * step))))
-            }
-            _ => step_number(v, delta, pos),
+        // A pointer (or an array/string that decays to one — e.g. `I64 *p = a;
+        // p++`) steps by `delta` elements, scaling a heap pointer by its element
+        // size (`ptr_step`); cell pointers step one index. This mirrors pointer
+        // `+`/`-`, which already decay through `as_pointer`. Numbers fall through.
+        if let Some(Some(pv)) = as_pointer(v) {
+            let step = self.ptr_step(&pv, expr, env)?;
+            return Ok(Value::Ptr(Some(pv.offset(delta * step))));
         }
+        step_number(v, delta, pos)
     }
 
     /// Pointer `+`/`-` where a heap (byte-addressed) pointer is involved, scaled
@@ -2727,6 +2729,22 @@ fn coerce_to(ty: &Type, v: Value) -> Value {
         | Type::U32
         | Type::I64
         | Type::U64 => cast_value(ty, v),
+        // A string literal stored into a pointer decays once to a stable byte
+        // buffer, so pointer identity over it — `p - s`, `p == s`, `p++` — stays
+        // consistent (matching the native backend's single `__text` copy). Without
+        // this, each `as_pointer` of a `Value::Str` would mint a fresh buffer and
+        // two pointers into "the same" literal would compare as different objects.
+        Type::Ptr(_) => match v {
+            Value::Str(s) => {
+                let mut bytes = s.as_bytes().to_vec();
+                bytes.push(0);
+                Value::Ptr(Some(PtrVal {
+                    region: Region::Heap(Rc::new(RefCell::new(bytes))),
+                    index: 0,
+                }))
+            }
+            other => other,
+        },
         _ => v,
     }
 }

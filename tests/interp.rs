@@ -36,6 +36,92 @@ fn arithmetic_and_precedence() {
 }
 
 #[test]
+fn mixed_operand_arithmetic() {
+    // Stresses the native backend's operand classification (constant folds,
+    // simple variable/literal operands, and complex sub-expressions) — these must
+    // produce the same result as the interpreter (tests/arm64.rs).
+    let src = r#"
+        U0 Main() {
+            I64 a = 10, b = 3;
+            "%d %d %d %d\n", a + 2 * 3, a * a + b, (a + b) * (a - b), a % 7 - (1 << 2);
+        }
+        Main;
+    "#;
+    // 16, 103, 91, (3 - 4) = -1
+    assert_eq!(run(src), "16 103 91 -1\n");
+}
+
+#[test]
+fn register_live_range_sharing() {
+    // The native backend shares one callee-saved register across locals whose
+    // live ranges don't overlap: in `Chain`, x/a/b/c are each consumed before the
+    // next is born, so they coalesce onto a single register. `Rotate` is the
+    // soundness foil — a, b and sum are loop-carried (live across the back-edge),
+    // so they must NOT share. Both must match the interpreter (tests/arm64.rs).
+    let src = r#"
+        I64 Chain(I64 x) { I64 a = x + x; I64 b = a + a; I64 c = b + b; return c + c; }
+        I64 Rotate(I64 n) {
+            I64 a = 1, b = 2, sum = 0, i;
+            for (i = 0; i < n; i++) { sum = sum + a; a = b; b = sum; }
+            return a + b + sum;
+        }
+        U0 Main() { "%d %d\n", Chain(3), Rotate(6); }
+        Main;
+    "#;
+    assert_eq!(run(src), "48 47\n");
+}
+
+#[test]
+fn register_promotable_f64_locals() {
+    // F64 locals the native backend promotes to callee-saved double registers
+    // (d8..d15): a float accumulator updated in a loop, whose value must survive
+    // the call to `Scale` (which itself promotes a float to d8 and so must
+    // save/restore it). The interpreter is the oracle (tests/arm64.rs).
+    let src = r#"
+        F64 Scale(F64 x) { F64 r = x + x; return r * r; }
+        F64 Run(I64 n) {
+            F64 acc = 0.0, step = 1.5;
+            I64 i;
+            for (i = 0; i < n; i++) acc += Scale(step);
+            return acc;
+        }
+        U0 Main() { "%.2f\n", Run(3); }
+        Main;
+    "#;
+    assert_eq!(run(src), "27.00\n");
+}
+
+#[test]
+fn register_promotable_locals() {
+    // Locals/params the native backend promotes to callee-saved registers: a loop
+    // accumulator + counter (Sum), recursion whose promoted locals must survive
+    // the recursive calls (Fib), and a narrow-width param that wraps (Narrow).
+    // The interpreter is the oracle the native backend matches (tests/arm64.rs).
+    let src = r#"
+        U8 Narrow(U8 x) { x += 200; return x; }
+        I64 Sum(I64 n) { I64 acc = 0, i; for (i = 1; i <= n; i++) acc += i; return acc; }
+        I64 Fib(I64 n) { I64 a, b; if (n < 2) return n; a = Fib(n - 1); b = Fib(n - 2); return a + b; }
+        U0 Main() { "%d %d %d\n", Sum(10), Fib(10), Narrow(100); }
+        Main;
+    "#;
+    assert_eq!(run(src), "55 55 44\n");
+}
+
+#[test]
+fn nested_calls_with_computed_args() {
+    // Nested calls force argument-setup and return moves through the scratch
+    // temporaries — the native backend's peephole fuses those moves away, so its
+    // output must still match the interpreter (tests/arm64.rs).
+    let src = r#"
+        I64 Add(I64 a, I64 b) { return a + b; }
+        I64 Mul(I64 a, I64 b) { return a * b; }
+        U0 Main() { "%d\n", Add(Mul(3, 4), Add(5, 6)); }
+        Main;
+    "#;
+    assert_eq!(run(src), "23\n");
+}
+
+#[test]
 fn float_arithmetic() {
     assert_eq!(run(r#""%f\n", 3.0 / 2.0;"#), "1.500000\n");
 }
@@ -116,6 +202,21 @@ fn do_while_runs_at_least_once() {
 #[test]
 fn ternary_and_logical_short_circuit() {
     assert_eq!(run(r#""%d\n", (3 > 2 && 1) ? 7 : 9;"#), "7\n");
+}
+
+#[test]
+fn chained_range_comparisons() {
+    // HolyC `a < b < c` desugars to `a < b && b < c` (range check); parentheses
+    // disable it. Matches the native backend (tests/arm64.rs).
+    let src = r#"
+        U0 Main() {
+            "%d %d %d %d\n", 2 < 3 < 5, 2 < 2 < 5, 1 < 2 < 3 < 4, 5 < 4 < 3;
+            I64 a = 5;
+            "%d %d\n", (a < 10) < 2, a < 10 < 2;
+        }
+        Main;
+    "#;
+    assert_eq!(run(src), "1 0 1 0\n1 0\n");
 }
 
 #[test]
@@ -1018,6 +1119,76 @@ fn string_literals_index_like_pointers() {
         Main;
     "#;
     assert_eq!(run(src), "97 120 131\n");
+}
+
+#[test]
+fn uninitialized_aggregates_read_as_zero() {
+    // A local aggregate with no initializer is zero-filled — every element/field
+    // reads back as 0 until written. The native backend matches this (tests/arm64.rs);
+    // without it, those reads would be stack garbage.
+    let src = r#"
+        class P { I64 x; I64 y; }
+        class B { I64 t; I64 data[3]; }
+        union U { I64 w; U8 b[8]; }
+        U0 Main() {
+            I64 arr[4]; arr[1] = 5;
+            P p; p.y = 9;
+            P ps[2]; ps[1].x = 7;
+            B b; b.data[2] = 3;
+            U u;
+            "%d %d %d %d %d %d %d %d\n",
+                arr[0] + arr[1], arr[3], p.x + p.y, ps[0].x, ps[1].x,
+                b.data[0] + b.data[2], b.t, u.w;
+        }
+        Main;
+    "#;
+    assert_eq!(run(src), "5 0 9 0 7 3 0 0\n");
+}
+
+#[test]
+fn pointer_increment_and_decrement() {
+    // `++`/`--` on a pointer steps by one element (regression: a pointer holding a
+    // decayed array used to error with "requires a number or pointer"). Covers an
+    // array-decayed local pointer, a pointer parameter walked in a loop, pre/post
+    // forms, a byte-addressed heap pointer (element-scaled), and decrement.
+    let src = r#"
+        I64 ArrSum(I64 *a, I64 n) {
+            I64 *p = a, s = 0, i;
+            for (i = 0; i < n; i++) { s += *p; p++; }
+            return s;
+        }
+        U0 Main() {
+            I64 xs[5], i;
+            for (i = 0; i < 5; i++) xs[i] = i * 7;          // 0 7 14 21 28
+            I64 *p = &xs[4]; p--; p--;                       // -> &xs[2]
+            I64 *h = MAlloc(sizeof(I64) * 3);
+            h[0] = 11; h[1] = 22; h[2] = 33;
+            I64 *q = h; q++; q++;                            // heap, element-scaled
+            I64 *r = xs; I64 a = *(r++); I64 b = *(++r);     // post then pre
+            "%d %d %d %d %d\n", ArrSum(xs, 5), *p, *q, a, b;
+        }
+        Main;
+    "#;
+    // 70, xs[2]=14, 33, post a=xs[0]=0, pre b=xs[2]=14
+    assert_eq!(run(src), "70 14 33 0 14\n");
+}
+
+#[test]
+fn string_literal_pointer_identity() {
+    // A string literal stored in a pointer decays to one stable buffer, so pointer
+    // identity over it is consistent: walking to the NUL and subtracting yields the
+    // length, and `p == s` / `p == s + 1` behave (regression: each decay used to
+    // mint a fresh buffer, so `p - s` errored as "different objects").
+    let src = r#"
+        I64 Len(U8 *s) { U8 *p = s; while (*p) p++; return p - s; }
+        U0 Main() {
+            U8 *s = "abc";
+            U8 *p = s; p++;
+            "%d %d %d %d\n", Len("abcdef"), Len(""), p == s, p == s + 1;
+        }
+        Main;
+    "#;
+    assert_eq!(run(src), "6 0 0 1\n");
 }
 
 #[test]

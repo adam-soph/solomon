@@ -3,33 +3,42 @@
 //! It lowers the program to **hand-emitted AArch64 machine code**, writes a
 //! Mach-O relocatable object, and links it with the system `cc`. No
 //! LLVM/Cranelift/C — the instruction bytes and the object container are
-//! produced here.
+//! produced here. The [interpreter](crate::backend::interp) is the conformance
+//! oracle this backend matches byte-for-byte (see `tests/arm64.rs`).
 //!
-//! ## Scope (milestone 5)
+//! ## Scope
 //!
-//! Adds pointers, arrays, and structs (as locals and parameters) on top of the
-//! earlier milestones (functions/calls/recursion, control flow, integer
-//! arithmetic, `Print`/strings). Codegen is now **type-directed**: it consults
-//! the typed AST (`Expr::ty`) and the [layout pass](crate::layout) for field
-//! offsets, element strides, and access widths.
+//! Codegen is **type-directed**: it consults the typed AST (`Expr::ty`) and the
+//! [layout pass](crate::layout) for field offsets, element strides, and access
+//! widths. It compiles the whole implemented HolyC subset:
 //!
-//!   * `&x`, `*p`, `p->f`, `s.f`, `a[i]`, pointer arithmetic (scaled by the
-//!     pointee size), pointer comparison/difference,
-//!   * width-aware loads/stores (`I8`..`I64`, sign/zero extension),
-//!   * `sizeof`, integer casts (truncate / sign-extend).
+//!   * functions/calls/recursion (incl. default and variadic args), all control
+//!     flow, and `switch` (a dense one lowers to an O(1) jump table);
+//!   * integer arithmetic with C width/signedness rules, `F64` (in the FP
+//!     register file), and `Print`/string formatting via libc;
+//!   * `&x`, `*p`, `p->f`, `s.f`, `a[i]`, pointer arithmetic (pointee-scaled),
+//!     pointer comparison/difference; width-aware loads/stores with sign/zero
+//!     extension; `sizeof`/`offset`, integer casts;
+//!   * classes/unions by value (sret returns), arrays (decay to pointers),
+//!     brace/designated aggregate initializers, function pointers (`ADR`+`BLR`);
+//!   * **global variables** (Mach-O common symbols addressed via
+//!     `PAGE21`/`PAGEOFF12` relocations) and the built-in library (lowered to
+//!     libc externs via `BRANCH26` relocations).
 //!
-//! Not yet handled: global variables (need a writable `__data` section and
-//! `PAGE21`/`PAGEOFF12` relocations), floats, class/array parameters or
-//! return-by-value, and aggregate initializers.
+//! Several optimizations run during/after emission: constant folding,
+//! immediate-form arithmetic, a dead-`mov` peephole, and a linear-scan register
+//! allocator that promotes hot locals to callee-saved registers (see
+//! `plan_registers` / `Asm::peephole`).
 //!
-//! Frame: `stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,#locals`. Locals live
-//! below the frame pointer and are addressed as `x29 - offset`, so the epilogue
-//! (`mov sp,x29; ldp x29,x30,[sp],#16; ret`) needs no frame size and only the
-//! one `sub sp` immediate is back-patched. Expression evaluation is a stack
-//! machine (intermediates spilled to the machine stack) so values survive
-//! calls.
+//! Frame: `stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,#frame`. Locals live
+//! below the frame pointer and are addressed as `x29 - offset`; promoted callee-
+//! saved registers are spilled into the same frame (`stur`/`fstur`, restored in
+//! the epilogue). The epilogue (`mov sp,x29; ldp x29,x30,[sp],#16; ret`) needs no
+//! frame size, and only the one `sub sp` immediate is back-patched. Expression
+//! evaluation is a stack machine (intermediates spilled to the machine stack) so
+//! values survive calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,6 +69,20 @@ const COND_GE: u32 = 0b1010;
 const COND_LT: u32 = 0b1011;
 const COND_GT: u32 = 0b1100;
 const COND_LE: u32 = 0b1101;
+
+// Per-instruction register-liveness tags, used by the peephole pass (`Asm`).
+// `inst_use` is a bitmask over the general-purpose registers x0–x30 (bit r = xr);
+// x31 (SP/XZR) is never tracked. `inst_branch` classifies control flow.
+const GP_ALL: u32 = 0x7FFF_FFFF; // x0..x30 (conservative "reads everything")
+const B_NORMAL: u8 = 0; // straight-line instruction
+const B_CALL: u8 = 1; // bl/blr — clobbers the caller-saved temporaries
+const B_RET: u8 = 2; // ret — only the return value / callee-saved are live-out
+const B_BRANCH: u8 = 3; // any other branch — a barrier for the liveness scan
+
+/// Bit for GP register `r` in an `inst_use` mask (x31 = SP/XZR is not tracked).
+fn gpb(r: u32) -> u32 {
+    if r < 31 { 1 << r } else { 0 }
+}
 
 pub struct Arm64 {
     out_path: PathBuf,
@@ -244,14 +267,17 @@ struct FnInfo {
     ret: Type,
 }
 
-/// A local variable's frame location. Normally the value lives at `x29 - off`.
-/// For an array parameter (which decays to a pointer, C-style), `indirect` is
-/// set: the slot at `x29 - off` holds a *pointer* to the data instead.
+/// A local variable's location. Normally the value lives in the frame at
+/// `x29 - off`. For an array parameter (which decays to a pointer, C-style),
+/// `indirect` is set: the slot at `x29 - off` holds a *pointer* to the data. A
+/// `reg`-promoted local (a non-address-taken scalar — see `plan_registers`)
+/// instead lives entirely in a callee-saved register and has no frame slot.
 #[derive(Clone)]
 struct VarLoc {
     off: u32,
     ty: Type,
     indirect: bool,
+    reg: Option<u32>,
 }
 
 /// A global variable: a symbol the linker allocates as common storage.
@@ -279,6 +305,13 @@ struct Codegen {
     /// Frame offset where the class-return (sret) pointer is saved, if the
     /// current function returns an aggregate by value.
     sret_off: Option<u32>,
+    /// Locals promoted to callee-saved registers in the current function:
+    /// name -> register (x19..x28). See `plan_registers`.
+    promote: HashMap<String, u32>,
+    /// Callee-saved registers used by the current function and where their
+    /// incoming value is spilled, as `(reg, frame_off)` — saved in the prologue
+    /// and restored in every epilogue.
+    cs_saves: Vec<(u32, u32)>,
 }
 
 impl Codegen {
@@ -296,6 +329,8 @@ impl Codegen {
             labels: HashMap::new(),
             cur_ret: Type::I64,
             sret_off: None,
+            promote: HashMap::new(),
+            cs_saves: Vec::new(),
         }
     }
 
@@ -323,10 +358,22 @@ impl Codegen {
         self.declare_loc(name, off, ty, false);
     }
     fn declare_loc(&mut self, name: &str, off: u32, ty: Type, indirect: bool) {
-        self.scopes
-            .last_mut()
-            .unwrap()
-            .insert(name.to_string(), VarLoc { off, ty, indirect });
+        // A register-promoted local has no slot (`plan_registers` only promotes
+        // direct, non-indirect scalars).
+        let reg = if indirect {
+            None
+        } else {
+            self.promote.get(name).copied()
+        };
+        self.scopes.last_mut().unwrap().insert(
+            name.to_string(),
+            VarLoc {
+                off,
+                ty,
+                indirect,
+                reg,
+            },
+        );
     }
     fn lookup(&self, name: &str) -> Option<VarLoc> {
         self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
@@ -378,6 +425,8 @@ impl Codegen {
         self.labels.clear();
         self.cur_ret = ret.clone();
         self.sret_off = None;
+        self.promote = plan_registers(params, body);
+        self.cs_saves.clear();
 
         for s in body {
             collect_labels(s, self);
@@ -387,6 +436,23 @@ impl Codegen {
         self.asm.stp_pre_fp_lr(); // stp x29,x30,[sp,#-16]!
         self.asm.mov_fp_sp(); // x29 = sp
         let sub_idx = self.asm.emit_sub_sp_placeholder();
+
+        // Spill the incoming value of every callee-saved register we'll reuse for
+        // a promoted local, near x29 (one STUR each). Restored in every epilogue.
+        // Distinct registers only — with live-range sharing several locals may map
+        // to the same register, but it is saved/restored once.
+        let mut used: Vec<u32> = self.promote.values().copied().collect();
+        used.sort_unstable();
+        used.dedup();
+        for r in used {
+            let off = self.alloc(8, 8);
+            if is_fp_reg(r) {
+                self.asm.fstur(r, FP, -(off as i32));
+            } else {
+                self.asm.stur(r, FP, -(off as i32));
+            }
+            self.cs_saves.push((r, off));
+        }
 
         // A by-value aggregate result is written through a caller-supplied
         // pointer in x8 (the indirect result register). Save it before any code
@@ -439,6 +505,34 @@ impl Codegen {
                     self.declare(name, off, p.ty.clone());
                 }
                 igr += 1;
+                continue;
+            }
+            // A promoted parameter goes straight into its callee-saved register
+            // with no frame slot: an F64 copied from its v-register, an
+            // integer/pointer narrowed from its x-register.
+            if let Some(r) = p.name.as_ref().and_then(|n| self.promote.get(n).copied()) {
+                if is_f64(&p.ty) {
+                    if fpr > 7 {
+                        return Err(BackendError::at(
+                            p.span.pos,
+                            "arm64 backend: at most 8 floating-point parameters",
+                        ));
+                    }
+                    self.asm.fmov_reg(r, fpr);
+                    fpr += 1;
+                } else {
+                    if igr > 7 {
+                        return Err(BackendError::at(
+                            p.span.pos,
+                            "arm64 backend: at most 8 integer parameters",
+                        ));
+                    }
+                    self.asm.mov_reg(RES, igr);
+                    self.gen_cast(&p.ty); // narrow to the declared width
+                    self.asm.mov_reg(r, RES);
+                    igr += 1;
+                }
+                self.declare(p.name.as_ref().unwrap(), 0, p.ty.clone());
                 continue;
             }
             let off = self.alloc(8, 8);
@@ -498,6 +592,15 @@ impl Codegen {
     }
 
     fn emit_epilogue(&mut self) {
+        // Restore the callee-saved registers we borrowed for promoted locals.
+        // (x10 is free here; this never touches x0/d0 holding the return value.)
+        for (r, off) in self.cs_saves.clone() {
+            if is_fp_reg(r) {
+                self.asm.fldur(r, FP, -(off as i32));
+            } else {
+                self.asm.ldur(r, FP, -(off as i32));
+            }
+        }
         self.asm.mov_sp_fp(); // sp = x29
         self.asm.ldp_post_fp_lr(); // ldp x29,x30,[sp],#16
         self.asm.ret();
@@ -539,6 +642,34 @@ impl Codegen {
                             "arm64 backend: array size must be a positive constant",
                         ));
                     }
+                    // A register-promoted scalar local has no frame slot: evaluate
+                    // its initialiser (always a scalar expression), narrow to the
+                    // declared width, and move it into the register.
+                    if let Some(r) = self.promote.get(&d.name).copied() {
+                        self.declare(&d.name, 0, d.ty.clone());
+                        if is_f64(&d.ty) {
+                            match &d.init {
+                                Some(init) => {
+                                    self.gen_foperand(init)?; // FRES = value
+                                    self.asm.fmov_reg(r, FRES);
+                                }
+                                None => {
+                                    self.asm.load_imm(RES, 0);
+                                    self.asm.fmov_from_gpr(r, RES); // 0.0
+                                }
+                            }
+                        } else {
+                            match &d.init {
+                                Some(init) => {
+                                    self.gen_int_expr(init, &d.ty)?;
+                                    self.gen_cast(&d.ty);
+                                    self.asm.mov_reg(r, RES);
+                                }
+                                None => self.asm.load_imm(r, 0),
+                            }
+                        }
+                        continue;
+                    }
                     let off = self.alloc(size.max(1), self.type_align(&d.ty));
                     self.declare(&d.name, off, d.ty.clone());
                     match &d.init {
@@ -578,7 +709,10 @@ impl Codegen {
                             self.asm.sub_imm(T2, FP, off);
                             self.gen_store(RES, T2, &d.ty);
                         }
-                        None => {} // aggregate left uninitialised
+                        // An uninitialised aggregate is zero-filled, matching the
+                        // interpreter (the conformance oracle) — without this, its
+                        // elements/fields would read back as stack garbage.
+                        None => self.gen_zero_slot(off, size),
                     }
                 }
             }
@@ -1125,6 +1259,15 @@ impl Codegen {
             self.asm.fcvtzs(RES, FRES);
             return Ok(());
         }
+        // Constant-fold a compile-time integer expression to a single `load_imm`.
+        // `const_eval_i64` mirrors the runtime arithmetic exactly (and only
+        // succeeds for pure-integer operand trees), so this can't change behavior.
+        if matches!(&e.kind, ExprKind::Binary { .. } | ExprKind::Unary { .. }) {
+            if let Some(n) = const_eval_i64(e) {
+                self.asm.load_imm(RES, n);
+                return Ok(());
+            }
+        }
         let pos = e.span.pos;
         match &e.kind {
             ExprKind::Int(v) | ExprKind::Char(v) => self.asm.load_imm(RES, *v),
@@ -1224,6 +1367,10 @@ impl Codegen {
                 // An aggregate "value" is its address: arrays decay, and a class
                 // is handled by-reference (callers copy as needed).
                 return self.gen_addr_ident(name, pos);
+            }
+            if let Some(r) = self.lookup(name).and_then(|v| v.reg) {
+                self.asm.mov_reg(RES, r); // value lives in a callee-saved register
+                return Ok(());
             }
             self.gen_addr_ident(name, pos)?;
             self.gen_load(RES, RES, &ty);
@@ -1353,6 +1500,26 @@ impl Codegen {
                 "arm64 backend: pointee too large for ++/--",
             ));
         }
+        // Register-promoted target: step the register in place. The result is the
+        // new value (pre) or the preserved old value (post). The register always
+        // holds the type's narrowed value, so re-narrow after stepping.
+        if let Some(r) = self.target_reg(target) {
+            if !pre {
+                self.asm.mov_reg(T2, r); // keep the old value for the result
+            }
+            self.asm.mov_reg(RES, r);
+            if inc {
+                self.asm.add_imm(RES, RES, delta);
+            } else {
+                self.asm.sub_imm(RES, RES, delta);
+            }
+            self.gen_cast(&tty);
+            self.asm.mov_reg(r, RES);
+            if !pre {
+                self.asm.mov_reg(RES, T2); // result = old value
+            }
+            return Ok(());
+        }
         self.gen_addr(target)?; // RES = address (no calls after this point)
         self.gen_load(SCRATCH, RES, &tty); // SCRATCH = old value
         self.asm.mov_reg(T2, SCRATCH);
@@ -1446,10 +1613,23 @@ impl Codegen {
             }
         }
 
+        // Immediate-form fast path for `<expr> op <small constant>`.
+        if self.try_imm_binop(op, lhs, rhs, &lt, &rt)? {
+            return Ok(());
+        }
+
+        // Evaluate lhs, then rhs, leaving lhs in T2 and rhs in RES. When rhs is a
+        // simple operand (its codegen only touches RES), keep lhs in T2 with a
+        // register move instead of spilling it to the machine stack.
         self.gen_expr(lhs)?;
-        self.asm.push(RES);
-        self.gen_expr(rhs)?;
-        self.asm.pop(T2); // T2 = lhs, RES = rhs
+        if self.is_simple_operand(rhs) {
+            self.asm.mov_reg(T2, RES);
+            self.gen_expr(rhs)?;
+        } else {
+            self.asm.push(RES);
+            self.gen_expr(rhs)?;
+            self.asm.pop(T2);
+        }
 
         match op {
             Eq | Ne | Lt | Gt | Le | Ge => {
@@ -1457,40 +1637,7 @@ impl Codegen {
                 // Relational compares are unsigned if either operand is unsigned
                 // (C's usual arithmetic conversions); Eq/Ne don't care.
                 let signed = is_signed(&lt) && is_signed(&rt);
-                let cond = match op {
-                    Eq => COND_EQ,
-                    Ne => COND_NE,
-                    Lt => {
-                        if signed {
-                            COND_LT
-                        } else {
-                            COND_LO
-                        }
-                    }
-                    Gt => {
-                        if signed {
-                            COND_GT
-                        } else {
-                            COND_HI
-                        }
-                    }
-                    Le => {
-                        if signed {
-                            COND_LE
-                        } else {
-                            COND_LS
-                        }
-                    }
-                    Ge => {
-                        if signed {
-                            COND_GE
-                        } else {
-                            COND_HS
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-                self.asm.cset(RES, cond);
+                self.asm.cset(RES, cmp_cond(op, signed));
             }
             // Shift signedness follows the left operand's type (default signed).
             _ => {
@@ -1499,6 +1646,121 @@ impl Codegen {
             }
         }
         Ok(())
+    }
+
+    /// Immediate-form fast paths for `<expr> op <small constant>` (and the
+    /// commutative `<const> + <expr>`): emit the operation against an immediate
+    /// instead of materializing the constant in a register. Returns whether it
+    /// handled the op. (Fully-constant expressions already fold in `gen_expr`.)
+    fn try_imm_binop(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lt: &Type,
+        rt: &Type,
+    ) -> Result<bool, BackendError> {
+        use BinOp::*;
+        // Add is commutative — the constant may be on either side.
+        if op == Add {
+            let (var, k) = match (const_eval_i64(lhs), const_eval_i64(rhs)) {
+                (_, Some(k)) => (lhs, k),
+                (Some(k), None) => (rhs, k),
+                _ => return Ok(false),
+            };
+            let Some((sub, imm)) = add_sub_imm12(k) else {
+                return Ok(false);
+            };
+            self.gen_expr(var)?;
+            self.emit_addsub_imm(sub, imm);
+            return Ok(true);
+        }
+        // Multiplication by a constant power of two is a left shift (commutative,
+        // signedness-independent — both wrap mod 2^64).
+        if op == Mul {
+            let (var, k) = match (const_eval_i64(lhs), const_eval_i64(rhs)) {
+                (_, Some(k)) => (lhs, k),
+                (Some(k), None) => (rhs, k),
+                _ => return Ok(false),
+            };
+            let Some(sh) = log2_pow2(k) else {
+                return Ok(false);
+            };
+            self.gen_expr(var)?;
+            self.asm.lsl_imm(RES, RES, sh);
+            return Ok(true);
+        }
+        // Every other op only takes a constant right-hand side.
+        let Some(k) = const_eval_i64(rhs) else {
+            return Ok(false);
+        };
+        match op {
+            Sub => {
+                let Some((sub, imm)) = add_sub_imm12(-k) else {
+                    return Ok(false);
+                };
+                self.gen_expr(lhs)?;
+                self.emit_addsub_imm(sub, imm);
+                Ok(true)
+            }
+            // Unsigned divide / modulo by a power of two reduce to a logical
+            // shift / a low-bits mask. (Signed needs a bias to round toward zero,
+            // so it keeps the generic SDIV/MSUB path.)
+            Div if is_unsigned_int(lt) => match log2_pow2(k) {
+                Some(sh) => {
+                    self.gen_expr(lhs)?;
+                    self.asm.lsr_imm(RES, RES, sh);
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            Mod if is_unsigned_int(lt) => match log2_pow2(k) {
+                Some(sh) => {
+                    self.gen_expr(lhs)?;
+                    self.asm.and_imm_lowbits(RES, RES, sh); // x & (2^sh - 1)
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            Eq | Ne | Lt | Gt | Le | Ge if (0..4096).contains(&k) => {
+                self.gen_expr(lhs)?;
+                self.asm.cmp_imm(RES, k as u32);
+                self.asm
+                    .cset(RES, cmp_cond(op, is_signed(lt) && is_signed(rt)));
+                Ok(true)
+            }
+            Shl if (0..64).contains(&k) => {
+                self.gen_expr(lhs)?;
+                if k > 0 {
+                    self.asm.lsl_imm(RES, RES, k as u32);
+                }
+                Ok(true)
+            }
+            Shr if (0..64).contains(&k) => {
+                self.gen_expr(lhs)?;
+                if k > 0 {
+                    if lhs.ty().as_ref().is_none_or(is_signed) {
+                        self.asm.asr_imm(RES, RES, k as u32);
+                    } else {
+                        self.asm.lsr_imm(RES, RES, k as u32);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Emit `RES += imm` (or `RES -= imm`), skipping a zero adjustment.
+    fn emit_addsub_imm(&mut self, sub: bool, imm: u32) {
+        if imm == 0 {
+            return;
+        }
+        if sub {
+            self.asm.sub_imm(RES, RES, imm);
+        } else {
+            self.asm.add_imm(RES, RES, imm);
+        }
     }
 
     fn gen_logical(&mut self, lhs: &Expr, rhs: &Expr, is_or: bool) -> Result<(), BackendError> {
@@ -1563,6 +1825,16 @@ impl Codegen {
         Ok(())
     }
 
+    /// The callee-saved register backing `e`, if `e` is a plain reference to a
+    /// register-promoted local (so a store can `mov` into it instead of
+    /// computing an address).
+    fn target_reg(&self, e: &Expr) -> Option<u32> {
+        match &e.kind {
+            ExprKind::Ident(name) => self.lookup(name).and_then(|v| v.reg),
+            _ => None,
+        }
+    }
+
     fn gen_assign(
         &mut self,
         op: AssignOp,
@@ -1580,6 +1852,31 @@ impl Codegen {
             let n = self.type_size(&tty);
             self.gen_memcpy(T2, RES, n, SCRATCH);
             self.asm.mov_reg(RES, T2); // value of the assignment is the dest addr
+            return Ok(());
+        }
+        // A register-promoted target needs no address: compute into RES (the
+        // assignment's value), narrow to the declared width, and copy into it.
+        if let Some(r) = self.target_reg(target) {
+            if op == AssignOp::Assign {
+                self.gen_int_expr(value, &tty)?;
+            } else {
+                self.gen_expr(value)?; // RES = rhs
+                self.asm.mov_reg(T2, RES);
+                if let (Some(elem), AssignOp::Add | AssignOp::Sub) = (tty.elem(), op) {
+                    let stride = self.layouts.stride_of(&elem) as i64;
+                    self.asm.load_imm(SCRATCH, stride);
+                    self.asm.mul(T2, T2, SCRATCH); // rhs * stride
+                    if op == AssignOp::Add {
+                        self.asm.add(RES, r, T2);
+                    } else {
+                        self.asm.sub(RES, r, T2);
+                    }
+                } else {
+                    self.emit_int_binop(compound_binop(op), RES, r, T2, is_signed(&tty), pos)?;
+                }
+            }
+            self.gen_cast(&tty); // the slot path narrows via the store width
+            self.asm.mov_reg(r, RES);
             return Ok(());
         }
         if op == AssignOp::Assign {
@@ -1658,9 +1955,13 @@ impl Codegen {
                 self.asm.scvtf(FRES, RES);
             }
             ExprKind::Ident(name) => {
-                self.gen_addr_ident(name, pos)?;
-                self.asm.load_mem(RES, RES, 8, false);
-                self.asm.fmov_from_gpr(FRES, RES);
+                if let Some(r) = self.lookup(name).and_then(|v| v.reg) {
+                    self.asm.fmov_reg(FRES, r); // value lives in a callee-saved d-reg
+                } else {
+                    self.gen_addr_ident(name, pos)?;
+                    self.asm.load_mem(RES, RES, 8, false);
+                    self.asm.fmov_from_gpr(FRES, RES);
+                }
             }
             ExprKind::Unary {
                 op: UnOp::Deref, ..
@@ -1690,10 +1991,19 @@ impl Codegen {
                         format!("arm64 backend: operator {op:?} is not supported on F64"),
                     ));
                 }
+                // Evaluate lhs, then rhs, leaving lhs in FT2 and rhs in FRES. A
+                // simple rhs (a literal or scalar that only touches FRES) lets us
+                // keep lhs in FT2 with a register move instead of round-tripping it
+                // through a GPR and the machine stack (push_f/pop_f).
                 self.gen_foperand(lhs)?;
-                self.push_f(FRES);
-                self.gen_foperand(rhs)?;
-                self.pop_f(FT2); // FT2 = lhs, FRES = rhs
+                if self.is_simple_foperand(rhs) {
+                    self.asm.fmov_reg(FT2, FRES);
+                    self.gen_foperand(rhs)?;
+                } else {
+                    self.push_f(FRES);
+                    self.gen_foperand(rhs)?;
+                    self.pop_f(FT2);
+                }
                 match op {
                     Add => self.asm.fadd(FRES, FT2, FRES),
                     Sub => self.asm.fsub(FRES, FT2, FRES),
@@ -1774,6 +2084,32 @@ impl Codegen {
         value: &Expr,
         pos: Pos,
     ) -> Result<(), BackendError> {
+        use BinOp::*;
+        // A register-promoted F64 target (its `reg` is a callee-saved d-register)
+        // needs no address: compute the new value in FRES and copy it across.
+        if let Some(r) = self.target_reg(target) {
+            if op == AssignOp::Assign {
+                self.gen_foperand(value)?; // FRES = value
+            } else {
+                let bop = compound_binop(op);
+                if !matches!(bop, Add | Sub | Mul | Div) {
+                    return Err(BackendError::at(
+                        pos,
+                        format!("arm64 backend: operator {bop:?} is not supported on F64"),
+                    ));
+                }
+                self.gen_foperand(value)?; // FRES = rhs
+                match bop {
+                    Add => self.asm.fadd(FRES, r, FRES),
+                    Sub => self.asm.fsub(FRES, r, FRES),
+                    Mul => self.asm.fmul(FRES, r, FRES),
+                    Div => self.asm.fdiv(FRES, r, FRES),
+                    _ => unreachable!(),
+                }
+            }
+            self.asm.fmov_reg(r, FRES);
+            return Ok(());
+        }
         if op == AssignOp::Assign {
             self.gen_addr(target)?;
             self.asm.push(RES); // [addr]
@@ -1784,7 +2120,6 @@ impl Codegen {
             return Ok(());
         }
         // Compound assignment (`+=`, `-=`, `*=`, `/=`).
-        use BinOp::*;
         let bop = compound_binop(op);
         if !matches!(bop, Add | Sub | Mul | Div) {
             return Err(BackendError::at(
@@ -1907,6 +2242,33 @@ impl Codegen {
     /// function — i.e. calling it is an indirect (function-pointer) call.
     fn is_variable(&self, name: &str) -> bool {
         self.lookup(name).is_some() || self.globals.contains_key(name)
+    }
+
+    /// Whether evaluating `e` provably touches only RES (never the lhs temp T2),
+    /// so a binary op can keep its lhs in T2 rather than spilling to the stack.
+    /// Literals, constant-folded subtrees, and scalar variables qualify; anything
+    /// that recurses through T2 / the stack (nested binops, calls, indexing) does
+    /// not — `gen_addr_ident` and `load_imm` both work only through RES.
+    fn is_simple_operand(&self, e: &Expr) -> bool {
+        if const_eval_i64(e).is_some() {
+            return true;
+        }
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Char(_) => true,
+            ExprKind::Ident(name) => {
+                matches!(name.as_str(), "NULL" | "TRUE" | "FALSE") || self.is_variable(name)
+            }
+            _ => false,
+        }
+    }
+
+    /// The F64 analogue of `is_simple_operand`: whether evaluating `e` as a float
+    /// operand touches only FRES (never the lhs temp FT2). A float literal, or any
+    /// integer/scalar `is_simple_operand` (which converts to a double through
+    /// RES/FRES), qualifies — so an F64 binary op can keep its lhs in FT2 rather
+    /// than spilling it through a GPR and the machine stack.
+    fn is_simple_foperand(&self, e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Float(_)) || self.is_simple_operand(e)
     }
 
     /// Dispatch a call expression: a bare function/builtin name is a direct call;
@@ -2420,11 +2782,415 @@ fn is_brace_init(e: &Expr) -> bool {
 fn is_f64(ty: &Type) -> bool {
     matches!(ty, Type::F64)
 }
+/// A scalar integer/pointer type can be promoted to a register; aggregates,
+/// arrays, F64, and `U0` cannot.
+fn is_promotable_scalar(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::I8
+            | Type::U8
+            | Type::I16
+            | Type::U16
+            | Type::I32
+            | Type::U32
+            | Type::I64
+            | Type::U64
+            | Type::Bool
+            | Type::Ptr(_)
+            | Type::FuncPtr { .. }
+    )
+}
+
+/// Accumulators for the per-function register-promotion analysis. Besides the
+/// eligibility data (address-taken names, reference counts, declaration
+/// count/type), it walks the body assigning each reference a monotonic *program
+/// point* (`pt`) to build a live interval `[first, last]` per name, records each
+/// structured loop's point range (for liveness extension), and notes whether the
+/// function uses `goto`/labels (`unstructured` — then sharing is disabled).
+#[derive(Default)]
+struct RegAnalysis {
+    addr_taken: HashSet<String>,
+    refs: HashMap<String, u32>,
+    decl_count: HashMap<String, u32>,
+    decl_ty: HashMap<String, Type>,
+    pt: u32,
+    first: HashMap<String, u32>,
+    last: HashMap<String, u32>,
+    loops: Vec<(u32, u32)>,
+    unstructured: bool,
+    /// Loop-nesting depth at the current scan point. A use inside a loop counts
+    /// for more (it runs every iteration), so loop-invariant reads — a loop bound,
+    /// say — get promoted even when their *static* count is just one.
+    loop_depth: u32,
+}
+
+impl RegAnalysis {
+    /// Record a reference (definition or use) to `name` at the current point,
+    /// extending its live interval. `is_use` also bumps the reference count,
+    /// weighted by loop depth (`8^depth`, saturating) so hot reads win registers.
+    fn touch(&mut self, name: &str, is_use: bool) {
+        let p = self.pt;
+        self.first.entry(name.to_string()).or_insert(p);
+        self.last.insert(name.to_string(), p);
+        if is_use {
+            let weight = 8u32.saturating_pow(self.loop_depth);
+            let slot = self.refs.entry(name.to_string()).or_default();
+            *slot = slot.saturating_add(weight);
+        }
+        self.pt += 1;
+    }
+
+    fn scan_stmt(&mut self, s: &Stmt) {
+        match &s.kind {
+            StmtKind::Empty
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Default
+            | StmtKind::SwitchStart
+            | StmtKind::SwitchEnd
+            | StmtKind::Include(_) => {}
+            // Arbitrary control flow can carry a value across an edge the
+            // structured-loop analysis doesn't see; disable sharing entirely.
+            StmtKind::Goto(_) | StmtKind::Label(_) => self.unstructured = true,
+            StmtKind::Expr(e) => self.scan_expr(e),
+            StmtKind::Block(stmts) => stmts.iter().for_each(|st| self.scan_stmt(st)),
+            StmtKind::VarDecl { decls } => {
+                for d in decls {
+                    *self.decl_count.entry(d.name.clone()).or_default() += 1;
+                    self.decl_ty.insert(d.name.clone(), d.ty.clone());
+                    if let Some(init) = &d.init {
+                        self.scan_expr(init);
+                    }
+                    // The declaration *defines* the variable; record it after the
+                    // initializer's uses so a `t = expr` over disjoint values can
+                    // still share (the old value is read before the new is written).
+                    self.touch(&d.name, false);
+                }
+            }
+            StmtKind::If { cond, then, else_ } => {
+                self.scan_expr(cond);
+                self.scan_stmt(then);
+                if let Some(e) = else_ {
+                    self.scan_stmt(e);
+                }
+            }
+            StmtKind::While { cond, body } => {
+                let ls = self.pt;
+                self.loop_depth += 1; // cond + body run every iteration
+                self.scan_expr(cond);
+                self.scan_stmt(body);
+                self.loop_depth -= 1;
+                self.loops.push((ls, self.pt));
+            }
+            StmtKind::Switch { cond, body } => {
+                self.scan_expr(cond);
+                self.scan_stmt(body);
+            }
+            StmtKind::DoWhile { body, cond } => {
+                let ls = self.pt;
+                self.loop_depth += 1;
+                self.scan_stmt(body);
+                self.scan_expr(cond);
+                self.loop_depth -= 1;
+                self.loops.push((ls, self.pt));
+            }
+            StmtKind::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                // The init runs once *before* the loop, so it's outside the range
+                // and the depth bump — only cond/step/body repeat each iteration.
+                if let Some(i) = init {
+                    self.scan_stmt(i);
+                }
+                let ls = self.pt;
+                self.loop_depth += 1;
+                if let Some(c) = cond {
+                    self.scan_expr(c);
+                }
+                if let Some(st) = step {
+                    self.scan_expr(st);
+                }
+                self.scan_stmt(body);
+                self.loop_depth -= 1;
+                self.loops.push((ls, self.pt));
+            }
+            StmtKind::Case { lo, hi } => {
+                self.scan_expr(lo);
+                if let Some(h) = hi {
+                    self.scan_expr(h);
+                }
+            }
+            StmtKind::Return(v) => {
+                if let Some(e) = v {
+                    self.scan_expr(e);
+                }
+            }
+            // A nested function/class has its own scope; its body never refers to
+            // this function's locals.
+            StmtKind::Func(_) | StmtKind::Class(_) => {}
+        }
+    }
+
+    fn scan_expr(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::Ident(name) => self.touch(name, true),
+            ExprKind::Unary {
+                op: UnOp::AddrOf,
+                expr,
+            } => {
+                if let ExprKind::Ident(name) = &expr.kind {
+                    self.addr_taken.insert(name.clone());
+                }
+                self.scan_expr(expr);
+            }
+            ExprKind::Unary { expr, .. }
+            | ExprKind::Postfix { expr, .. }
+            | ExprKind::Cast { expr, .. } => self.scan_expr(expr),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.scan_expr(lhs);
+                self.scan_expr(rhs);
+            }
+            ExprKind::Assign { target, value, .. } => {
+                self.scan_expr(target);
+                self.scan_expr(value);
+            }
+            ExprKind::Ternary { cond, then, else_ } => {
+                self.scan_expr(cond);
+                self.scan_expr(then);
+                self.scan_expr(else_);
+            }
+            ExprKind::Call { callee, args } => {
+                self.scan_expr(callee);
+                args.iter().for_each(|a| self.scan_expr(a));
+            }
+            ExprKind::Index { base, index } => {
+                self.scan_expr(base);
+                self.scan_expr(index);
+            }
+            ExprKind::Member { base, .. } => self.scan_expr(base),
+            ExprKind::Sizeof(SizeofArg::Expr(ex)) => self.scan_expr(ex),
+            ExprKind::InitList(items) | ExprKind::Comma(items) => {
+                items.iter().for_each(|i| self.scan_expr(i));
+            }
+            ExprKind::DesignatedInit(items) => {
+                items.iter().for_each(|(_, ex)| self.scan_expr(ex));
+            }
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Sizeof(SizeofArg::Type(_))
+            | ExprKind::Offset { .. } => {}
+        }
+    }
+}
+
+/// One promotion candidate: its (loop-extended) live interval, register file, and
+/// reference count (used to prioritize when registers run short).
+struct Cand {
+    name: String,
+    fp: bool,
+    start: u32,
+    end: u32,
+    refs: u32,
+}
+
+/// Decide which of a function's scalar locals/params live in callee-saved
+/// registers, and *which* register each gets. Eligible candidates (a
+/// non-address-taken scalar declared exactly once and referenced ≥2 times) are
+/// allocated by **linear scan over their live intervals**, so two whose ranges
+/// don't overlap share a register — fewer distinct registers means less
+/// prologue/epilogue save/restore, and more than a pool's worth of locals can be
+/// promoted. Integer/pointer locals draw from x19..x28, F64 locals from d8..d15.
+///
+/// Soundness: a live interval is `[first reference, last reference]` (references
+/// include the defining declaration), conservatively *over*-approximated —
+/// extended to cover any structured loop it touches (so loop-carried values stay
+/// live across the back-edge), and widened to the whole function when the body
+/// uses `goto`/labels (then nothing shares). Two variables get the same register
+/// only when their intervals are strictly disjoint. Deterministic throughout.
+fn plan_registers(params: &[Param], body: &[&Stmt]) -> HashMap<String, u32> {
+    let mut a = RegAnalysis::default();
+    for p in params {
+        if let Some(n) = &p.name {
+            *a.decl_count.entry(n.clone()).or_default() += 1;
+            a.decl_ty.insert(n.clone(), p.ty.clone());
+            // Parameters are live from function entry (point 0).
+            a.first.insert(n.clone(), 0);
+            a.last.insert(n.clone(), 0);
+        }
+    }
+    a.pt = 1;
+    for s in body {
+        a.scan_stmt(s);
+    }
+    let end_pt = a.pt;
+
+    let mut cands: Vec<Cand> = Vec::new();
+    for (name, &count) in &a.decl_count {
+        let refs = a.refs.get(name).copied().unwrap_or(0);
+        if count != 1 || a.addr_taken.contains(name) || refs < 2 {
+            continue;
+        }
+        let fp = match a.decl_ty.get(name) {
+            Some(ty) if is_promotable_scalar(ty) => false,
+            Some(ty) if is_f64(ty) => true,
+            _ => continue,
+        };
+        let (start, end) = if a.unstructured {
+            (0, end_pt) // unstructured control flow: live the whole function
+        } else {
+            (
+                a.first.get(name).copied().unwrap_or(0),
+                a.last.get(name).copied().unwrap_or(0),
+            )
+        };
+        cands.push(Cand {
+            name: name.clone(),
+            fp,
+            start,
+            end,
+            refs,
+        });
+    }
+
+    // Extend each interval to cover any loop it intersects (to a fixpoint, so
+    // nested loops widen outward) — loop-carried values are live across the
+    // back-edge, beyond their textual last reference.
+    if !a.unstructured {
+        loop {
+            let mut changed = false;
+            for c in &mut cands {
+                for &(ls, le) in &a.loops {
+                    if c.start <= le && c.end >= ls {
+                        if c.start > ls {
+                            c.start = ls;
+                            changed = true;
+                        }
+                        if c.end < le {
+                            c.end = le;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    // Linear scan: process intervals by start point; a register frees when its
+    // interval ends strictly before the next one begins. Ties favor the
+    // most-referenced (then name) so hot variables win a scarce register.
+    cands.sort_by(|x, y| {
+        x.start
+            .cmp(&y.start)
+            .then_with(|| y.refs.cmp(&x.refs))
+            .then_with(|| x.name.cmp(&y.name))
+    });
+    // Free pools held descending so `pop()` hands out the lowest-numbered register.
+    let mut int_free: Vec<u32> = (19..=28).rev().collect();
+    let mut f_free: Vec<u32> = (8..=15).rev().collect();
+    let mut active: Vec<(u32, u32, bool, u32, String)> = Vec::new(); // (end, reg, fp, refs, name)
+    let mut promote = HashMap::new();
+    for c in &cands {
+        // Expire intervals that ended before this one starts, freeing registers.
+        let mut i = 0;
+        while i < active.len() {
+            if active[i].0 < c.start {
+                let (_, reg, fp, _, _) = active.remove(i);
+                let pool = if fp { &mut f_free } else { &mut int_free };
+                pool.push(reg);
+                pool.sort_unstable_by(|x, y| y.cmp(x));
+            } else {
+                i += 1;
+            }
+        }
+        let pool = if c.fp { &mut f_free } else { &mut int_free };
+        if let Some(reg) = pool.pop() {
+            promote.insert(c.name.clone(), reg);
+            active.push((c.end, reg, c.fp, c.refs, c.name.clone()));
+            continue;
+        }
+        // Pool full: spill the coldest active interval of this register file if it
+        // is strictly colder than `c`, handing its register to the hotter variable
+        // (a whole-range swap — the evicted one falls back to a frame slot). This
+        // is the standard linear-scan spill, ranked by the same loop-weighted
+        // hotness as promotion rather than by interval end.
+        let victim = active
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.2 == c.fp)
+            .min_by_key(|(_, a)| a.3)
+            .map(|(idx, a)| (idx, a.3, a.1, a.4.clone()));
+        if let Some((idx, vrefs, reg, vname)) = victim {
+            if vrefs < c.refs {
+                promote.remove(&vname);
+                promote.insert(c.name.clone(), reg);
+                active[idx] = (c.end, reg, c.fp, c.refs, c.name.clone());
+            }
+            // else: `c` is no hotter than any active interval — leave it in a slot.
+        }
+    }
+    promote
+}
+
+/// A promoted register number identifies its file by range: d8..d15 (the
+/// callee-saved double registers) for F64 locals, x19..x28 for integers. The two
+/// pools never overlap, so `r < 16` means "FP register".
+fn is_fp_reg(r: u32) -> bool {
+    r < 16
+}
+
 fn is_signed(ty: &Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
 }
 fn is_unsigned_int(ty: &Type) -> bool {
     matches!(ty, Type::U8 | Type::U16 | Type::U32 | Type::U64)
+}
+
+/// The `cset` condition for a comparison `BinOp` with the given operand
+/// signedness. Eq/Ne are signedness-independent.
+fn cmp_cond(op: BinOp, signed: bool) -> u32 {
+    use BinOp::*;
+    match op {
+        Eq => COND_EQ,
+        Ne => COND_NE,
+        Lt => is_signed_or(signed, COND_LT, COND_LO),
+        Gt => is_signed_or(signed, COND_GT, COND_HI),
+        Le => is_signed_or(signed, COND_LE, COND_LS),
+        Ge => is_signed_or(signed, COND_GE, COND_HS),
+        _ => unreachable!("not a comparison op"),
+    }
+}
+fn is_signed_or(signed: bool, s: u32, u: u32) -> u32 {
+    if signed { s } else { u }
+}
+
+/// Encode `+v` as an `add`/`sub` 12-bit immediate. Returns `(is_sub, imm)` where
+/// `imm` is in `0..4096`, or `None` if `v` doesn't fit (caller uses a register).
+fn add_sub_imm12(v: i64) -> Option<(bool, u32)> {
+    if (0..4096).contains(&v) {
+        Some((false, v as u32))
+    } else if (-4095..0).contains(&v) {
+        Some((true, (-v) as u32))
+    } else {
+        None
+    }
+}
+
+/// `log2(v)` when `v` is a power of two greater than 1 (`2..2^63`), for strength
+/// reduction of `* / %` by a power of two; `None` otherwise.
+fn log2_pow2(v: i64) -> Option<u32> {
+    if v > 1 && (v & (v - 1)) == 0 {
+        Some(v.trailing_zeros())
+    } else {
+        None
+    }
 }
 fn named_of(ty: &Type, pos: Pos) -> Result<String, BackendError> {
     match ty {
@@ -2556,6 +3322,10 @@ struct Asm {
     string_dedup: HashMap<Vec<u8>, usize>,
     adr_fixups: Vec<(usize, usize)>,
     relocs: Vec<(usize, SymRef, RelKind)>,
+    // Liveness tags, parallel to `words` (one entry per emitted instruction word).
+    inst_def: Vec<i8>,    // GP register written (0..30), or -1 for none / multi-def
+    inst_use: Vec<u32>,   // bitmask of GP registers read (over-approximated)
+    inst_branch: Vec<u8>, // B_NORMAL / B_CALL / B_RET / B_BRANCH
 }
 
 impl Asm {
@@ -2568,11 +3338,52 @@ impl Asm {
             string_dedup: HashMap::new(),
             adr_fixups: Vec::new(),
             relocs: Vec::new(),
+            inst_def: Vec::new(),
+            inst_use: Vec::new(),
+            inst_branch: Vec::new(),
         }
     }
 
+    /// Emit a word with conservative tags: defines nothing the peephole can use,
+    /// reads everything, and acts as a barrier. Emitters with known register
+    /// behavior call the tagged variants below so the liveness scan can see
+    /// through them; anything left on this path is simply never optimized across.
     fn emit(&mut self, word: u32) {
         self.words.push(word);
+        self.inst_def.push(-1);
+        self.inst_use.push(GP_ALL);
+        self.inst_branch.push(B_BRANCH);
+    }
+    /// Emit a word with explicit liveness tags.
+    fn emit_du(&mut self, word: u32, def: i32, uses: u32, branch: u8) {
+        self.words.push(word);
+        self.inst_def.push(if (0..31).contains(&def) {
+            def as i8
+        } else {
+            -1
+        });
+        self.inst_use.push(uses & GP_ALL);
+        self.inst_branch.push(branch);
+    }
+    /// rd = f(rn, rm)
+    fn e_rrr(&mut self, word: u32, rd: u32, rn: u32, rm: u32) {
+        self.emit_du(word, rd as i32, gpb(rn) | gpb(rm), B_NORMAL);
+    }
+    /// rd = f(rn)
+    fn e_rr(&mut self, word: u32, rd: u32, rn: u32) {
+        self.emit_du(word, rd as i32, gpb(rn), B_NORMAL);
+    }
+    /// rd = constant / from a non-GP source (write-only as far as GP regs go)
+    fn e_wr(&mut self, word: u32, rd: u32) {
+        self.emit_du(word, rd as i32, 0, B_NORMAL);
+    }
+    /// no GP destination; reads `uses` (stores, compares)
+    fn e_use(&mut self, word: u32, uses: u32) {
+        self.emit_du(word, -1, uses, B_NORMAL);
+    }
+    /// touches no GP register the peephole tracks (FP-only / SP-only ops)
+    fn e_nogp(&mut self, word: u32) {
+        self.emit_du(word, -1, 0, B_NORMAL);
     }
     fn new_label(&mut self) -> usize {
         self.label_pos.push(None);
@@ -2599,7 +3410,147 @@ impl Asm {
         i
     }
 
+    /// Whether GP register `reg` (a caller-saved scratch — x9/x10) is dead
+    /// immediately after `words[m]`: overwritten, clobbered by a call, or unused
+    /// through the function's return, before any read. Conservative — any plain
+    /// branch ends the scan as "live" since the scan only follows fall-through.
+    fn dead_after(&self, m: usize, reg: u32) -> bool {
+        let bit = 1u32 << reg;
+        let mut j = m + 1;
+        while j < self.words.len() {
+            match self.inst_branch[j] {
+                B_NORMAL => {
+                    if self.inst_use[j] & bit != 0 {
+                        return false; // read -> live
+                    }
+                    if self.inst_def[j] == reg as i8 {
+                        return true; // overwritten before any read -> dead
+                    }
+                }
+                B_CALL => {
+                    if self.inst_use[j] & bit != 0 {
+                        return false; // the call is *through* this register
+                    }
+                    return true; // x9/x10 are caller-saved: the call clobbers them
+                }
+                B_RET => return true, // x9/x10 are not live-out of a function
+                _ => return false,    // any other branch: conservative barrier
+            }
+            j += 1;
+        }
+        true
+    }
+
+    /// Liveness-driven dead-`mov` elimination, run once before fixups resolve.
+    /// Removes `mov Xd, Xs` moves that can't change observable behavior, then
+    /// remaps every stored word-index position past the removed words. Restricted
+    /// to the pure scratch temporaries x9 (RES) / x10 (T2), which are never live
+    /// across a call or return and are never ABI registers. Two cases:
+    ///   * removal — Xd is dead after the move, so the copy is pointless;
+    ///   * fusion  — the immediately-preceding instruction produced Xs and Xs is
+    ///     dead after the move, so that instruction can target Xd directly.
+    fn peephole(&mut self) {
+        let n = self.words.len();
+        if n == 0 {
+            return;
+        }
+        // A move a label points at is a branch target — never touch it.
+        let mut label_here = vec![false; n + 1];
+        for p in self.label_pos.iter().flatten() {
+            if *p < label_here.len() {
+                label_here[*p] = true;
+            }
+        }
+        // Positions carrying a fixup/reloc. A `mov` never does, but a fused-into
+        // predecessor might; skip those to keep the rewrite reasoning simple.
+        let mut protected = vec![false; n];
+        for (at, _, _) in &self.fixups {
+            protected[*at] = true;
+        }
+        for (at, _) in &self.adr_fixups {
+            protected[*at] = true;
+        }
+        for (at, _, _) in &self.relocs {
+            protected[*at] = true;
+        }
+
+        let mut remove = vec![false; n];
+        for m in 0..n {
+            let w = self.words[m];
+            if (w & 0xFFE0_FFE0) != 0xAA00_03E0 {
+                continue; // not `mov Xd, Xs` (ORR Xd, XZR, Xs, no shift)
+            }
+            if label_here[m] {
+                continue;
+            }
+            let xd = w & 0x1F;
+            let xs = (w >> 16) & 0x1F;
+            if xd == xs {
+                continue;
+            }
+            // Removal: a copy into a scratch register that is never read again.
+            if (xd == RES || xd == T2) && self.dead_after(m, xd) {
+                remove[m] = true;
+                continue;
+            }
+            // Fusion: let the producer of Xs write Xd directly and drop the copy.
+            if (xs == RES || xs == T2)
+                && m >= 1
+                && !remove[m - 1]
+                && !protected[m - 1]
+                && self.inst_def[m - 1] == xs as i8
+                && (self.words[m - 1] & 0xFF80_0000) != 0xF280_0000 // movk reads its own Rd
+                && self.dead_after(m, xs)
+            {
+                self.words[m - 1] = (self.words[m - 1] & !0x1F) | xd;
+                self.inst_def[m - 1] = xd as i8;
+                remove[m] = true;
+            }
+        }
+        if !remove.iter().any(|&r| r) {
+            return;
+        }
+
+        // Compact the word stream and remap every word-index position. Label ids
+        // and `TableRel`'s base are label indices (resolved through label_pos), so
+        // only label_pos entries and the `.0` of fixups/adr_fixups/relocs move.
+        let mut shift = vec![0usize; n + 1];
+        for i in 0..n {
+            shift[i + 1] = shift[i] + remove[i] as usize;
+        }
+        let remap = |p: usize| p - shift[p];
+
+        let keep =
+            |v: &[u32]| -> Vec<u32> { (0..n).filter(|&i| !remove[i]).map(|i| v[i]).collect() };
+        self.words = keep(&self.words);
+        self.inst_use = keep(&self.inst_use);
+        self.inst_def = (0..n)
+            .filter(|&i| !remove[i])
+            .map(|i| self.inst_def[i])
+            .collect();
+        self.inst_branch = (0..n)
+            .filter(|&i| !remove[i])
+            .map(|i| self.inst_branch[i])
+            .collect();
+
+        for lp in self.label_pos.iter_mut() {
+            if let Some(p) = lp {
+                *p = remap(*p);
+            }
+        }
+        for f in self.fixups.iter_mut() {
+            f.0 = remap(f.0);
+        }
+        for a in self.adr_fixups.iter_mut() {
+            a.0 = remap(a.0);
+        }
+        for r in self.relocs.iter_mut() {
+            r.0 = remap(r.0);
+        }
+    }
+
     fn finish(mut self) -> Result<CodeImage, BackendError> {
+        self.peephole();
         for (at, id, kind) in &self.fixups {
             let target = self.label_pos[*id]
                 .ok_or_else(|| BackendError::new("internal: unplaced code label", None))?;
@@ -2659,149 +3610,174 @@ impl Asm {
     // data processing
     fn load_imm(&mut self, rd: u32, value: i64) {
         let v = value as u64;
-        self.emit(0xD280_0000 | ((v as u32 & 0xFFFF) << 5) | rd);
+        self.e_wr(0xD280_0000 | ((v as u32 & 0xFFFF) << 5) | rd, rd); // movz
         for hw in 1..4u32 {
             let half = ((v >> (16 * hw)) & 0xFFFF) as u32;
             if half != 0 {
-                self.emit(0xF280_0000 | (hw << 21) | (half << 5) | rd);
+                // movk reads-modifies rd (its source register *is* its destination),
+                // so it must not be a fusion target.
+                self.e_rr(0xF280_0000 | (hw << 21) | (half << 5) | rd, rd, rd);
             }
         }
     }
     fn add(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x8B00_0000 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0x8B00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn sub(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0xCB00_0000 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0xCB00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     /// SXTW rd, wn — sign-extend a 32-bit word to 64 bits (an `int` libc return
     /// leaves the upper 32 bits of the x-register unspecified).
     fn sxtw(&mut self, rd: u32, rn: u32) {
-        self.emit(0x9340_7C00 | (rn << 5) | rd);
+        self.e_rr(0x9340_7C00 | (rn << 5) | rd, rd, rn);
     }
     fn mul(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x9B00_0000 | (rm << 16) | (XZR << 10) | (rn << 5) | rd);
+        self.e_rrr(
+            0x9B00_0000 | (rm << 16) | (XZR << 10) | (rn << 5) | rd,
+            rd,
+            rn,
+            rm,
+        );
     }
     fn msub(&mut self, rd: u32, rn: u32, rm: u32, ra: u32) {
-        self.emit(0x9B00_8000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+        let w = 0x9B00_8000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+        self.emit_du(w, rd as i32, gpb(rn) | gpb(rm) | gpb(ra), B_NORMAL);
     }
     fn madd(&mut self, rd: u32, rn: u32, rm: u32, ra: u32) {
-        self.emit(0x9B00_0000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+        let w = 0x9B00_0000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+        self.emit_du(w, rd as i32, gpb(rn) | gpb(rm) | gpb(ra), B_NORMAL);
     }
     fn sdiv(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x9AC0_0C00 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0x9AC0_0C00 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn udiv(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x9AC0_0800 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0x9AC0_0800 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn and(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x8A00_0000 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0x8A00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn orr(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0xAA00_0000 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0xAA00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn eor(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0xCA00_0000 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0xCA00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn lslv(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn lsrv(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     /// ASRV Xd, Xn, Xm — arithmetic (sign-preserving) shift right by a register.
     fn asrv(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.emit(0x9AC0_2800 | (rm << 16) | (rn << 5) | rd);
+        self.e_rrr(0x9AC0_2800 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
     fn neg(&mut self, rd: u32, rm: u32) {
         self.sub(rd, XZR, rm);
     }
     fn mvn(&mut self, rd: u32, rm: u32) {
-        self.emit(0xAA20_0000 | (rm << 16) | (XZR << 5) | rd);
+        self.e_rr(0xAA20_0000 | (rm << 16) | (XZR << 5) | rd, rd, rm);
     }
     fn mov_reg(&mut self, rd: u32, rm: u32) {
-        self.orr(rd, XZR, rm);
+        if rd != rm {
+            self.orr(rd, XZR, rm); // a move to itself is a no-op
+        }
     }
     /// SBFM Xd, Xn, #immr, #imms (used for sign-extend casts).
     fn sbfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32) {
-        self.emit(0x9340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd);
+        self.e_rr(
+            0x9340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd,
+            rd,
+            rn,
+        );
     }
     /// UBFM Xd, Xn, #immr, #imms (used for zero-extend casts).
     fn ubfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32) {
-        self.emit(0xD340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd);
+        self.e_rr(
+            0xD340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd,
+            rd,
+            rn,
+        );
     }
 
     // scalar double-precision floating point (F64 lives in v-registers)
     /// FMOV Xd, Dn — move the raw 64 bits of a double into a GPR.
     fn fmov_to_gpr(&mut self, xd: u32, dn: u32) {
-        self.emit(0x9E66_0000 | (dn << 5) | xd);
+        self.e_wr(0x9E66_0000 | (dn << 5) | xd, xd);
     }
     /// FMOV Dd, Xn — move raw 64 bits from a GPR into a double register.
     fn fmov_from_gpr(&mut self, dd: u32, xn: u32) {
-        self.emit(0x9E67_0000 | (xn << 5) | dd);
+        self.e_use(0x9E67_0000 | (xn << 5) | dd, gpb(xn));
     }
     /// FMOV Dd, Dn — copy one double register to another.
     fn fmov_reg(&mut self, dd: u32, dn: u32) {
-        self.emit(0x1E60_4000 | (dn << 5) | dd);
+        self.e_nogp(0x1E60_4000 | (dn << 5) | dd);
     }
     fn fadd(&mut self, dd: u32, dn: u32, dm: u32) {
-        self.emit(0x1E60_2800 | (dm << 16) | (dn << 5) | dd);
+        self.e_nogp(0x1E60_2800 | (dm << 16) | (dn << 5) | dd);
     }
     fn fsub(&mut self, dd: u32, dn: u32, dm: u32) {
-        self.emit(0x1E60_3800 | (dm << 16) | (dn << 5) | dd);
+        self.e_nogp(0x1E60_3800 | (dm << 16) | (dn << 5) | dd);
     }
     fn fmul(&mut self, dd: u32, dn: u32, dm: u32) {
-        self.emit(0x1E60_0800 | (dm << 16) | (dn << 5) | dd);
+        self.e_nogp(0x1E60_0800 | (dm << 16) | (dn << 5) | dd);
     }
     fn fdiv(&mut self, dd: u32, dn: u32, dm: u32) {
-        self.emit(0x1E60_1800 | (dm << 16) | (dn << 5) | dd);
+        self.e_nogp(0x1E60_1800 | (dm << 16) | (dn << 5) | dd);
     }
     fn fneg(&mut self, dd: u32, dn: u32) {
-        self.emit(0x1E61_4000 | (dn << 5) | dd);
+        self.e_nogp(0x1E61_4000 | (dn << 5) | dd);
     }
     /// FCMP Dn, Dm — set NZCV for an ordered comparison.
     fn fcmp(&mut self, dn: u32, dm: u32) {
-        self.emit(0x1E60_2000 | (dm << 16) | (dn << 5));
+        self.e_nogp(0x1E60_2000 | (dm << 16) | (dn << 5));
     }
     /// FCMP Dn, #0.0.
     fn fcmp_zero(&mut self, dn: u32) {
-        self.emit(0x1E60_2008 | (dn << 5));
+        self.e_nogp(0x1E60_2008 | (dn << 5));
     }
     /// SCVTF Dd, Xn — signed 64-bit integer to double.
     fn scvtf(&mut self, dd: u32, xn: u32) {
-        self.emit(0x9E62_0000 | (xn << 5) | dd);
+        self.e_use(0x9E62_0000 | (xn << 5) | dd, gpb(xn));
     }
     /// FCVTZS Xd, Dn — double to signed 64-bit integer (round toward zero).
     fn fcvtzs(&mut self, xd: u32, dn: u32) {
-        self.emit(0x9E78_0000 | (dn << 5) | xd);
+        self.e_wr(0x9E78_0000 | (dn << 5) | xd, xd);
     }
     /// FCVTZU Xd, Dn — convert a double to a 64-bit *unsigned* integer (toward
     /// zero, saturating). Used when the destination integer type is unsigned.
     fn fcvtzu(&mut self, xd: u32, dn: u32) {
-        self.emit(0x9E79_0000 | (dn << 5) | xd);
+        self.e_wr(0x9E79_0000 | (dn << 5) | xd, xd);
     }
 
     fn add_imm(&mut self, rd: u32, rn: u32, imm: u32) {
-        self.emit(0x9100_0000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd);
+        self.e_rr(0x9100_0000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd, rd, rn);
     }
     fn sub_imm(&mut self, rd: u32, rn: u32, imm: u32) {
-        self.emit(0xD100_0000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd);
+        self.e_rr(0xD100_0000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd, rd, rn);
     }
     fn add_sp_imm(&mut self, imm: u32) {
-        self.add_imm(SP, SP, imm);
+        if imm != 0 {
+            self.add_imm(SP, SP, imm); // a 0-byte stack adjust is a no-op
+        }
     }
     fn sub_sp_imm(&mut self, imm: u32) {
-        self.sub_imm(SP, SP, imm);
+        if imm != 0 {
+            self.sub_imm(SP, SP, imm);
+        }
     }
 
     // frame
     fn stp_pre_fp_lr(&mut self) {
         // stp x29, x30, [sp, #-16]!
         let imm7 = (-2i32 as u32) & 0x7F;
-        self.emit(0xA980_0000 | (imm7 << 15) | (LR << 10) | (SP << 5) | FP);
+        let w = 0xA980_0000 | (imm7 << 15) | (LR << 10) | (SP << 5) | FP;
+        self.e_use(w, gpb(FP) | gpb(LR));
     }
     fn ldp_post_fp_lr(&mut self) {
-        // ldp x29, x30, [sp], #16
-        self.emit(0xA8C0_0000 | (2 << 15) | (LR << 10) | (SP << 5) | FP);
+        // ldp x29, x30, [sp], #16 — writes x29/x30 (neither is a peephole
+        // candidate, so it reads as transparent to the x9/x10 liveness scan).
+        self.e_nogp(0xA8C0_0000 | (2 << 15) | (LR << 10) | (SP << 5) | FP);
     }
     fn mov_fp_sp(&mut self) {
         self.add_imm(FP, SP, 0);
@@ -2811,7 +3787,7 @@ impl Asm {
     }
     fn emit_sub_sp_placeholder(&mut self) -> usize {
         let idx = self.words.len();
-        self.emit(0xD100_0000 | (SP << 5) | SP); // sub sp, sp, #0
+        self.e_nogp(0xD100_0000 | (SP << 5) | SP); // sub sp, sp, #0
         idx
     }
     fn patch_sub_sp(&mut self, idx: usize, imm: u32) {
@@ -2839,7 +3815,7 @@ impl Asm {
             _ => 0xF940_0000,
         };
         let imm12 = (byte_off / size) & 0xFFF;
-        self.emit(op | (imm12 << 10) | (base << 5) | dst);
+        self.e_rr(op | (imm12 << 10) | (base << 5) | dst, dst, base);
     }
     fn store_mem_off(&mut self, val: u32, base: u32, byte_off: u32, size: u32) {
         let op = match size {
@@ -2850,58 +3826,112 @@ impl Asm {
             _ => 0xF900_0000,
         };
         let imm12 = (byte_off / size) & 0xFFF;
-        self.emit(op | (imm12 << 10) | (base << 5) | val);
+        self.e_use(op | (imm12 << 10) | (base << 5) | val, gpb(val) | gpb(base));
     }
     /// STR rt, [sp, #off].
     fn str_sp(&mut self, rt: u32, off: u32) {
-        self.emit(0xF900_0000 | ((off / 8) << 10) | (SP << 5) | rt);
+        self.e_use(0xF900_0000 | ((off / 8) << 10) | (SP << 5) | rt, gpb(rt));
     }
     /// STR reg, [sp, #-16]! (push).
     fn push(&mut self, reg: u32) {
         let imm9 = (-16i32 as u32) & 0x1FF;
-        self.emit(0xF800_0C00 | (imm9 << 12) | (SP << 5) | reg);
+        self.e_use(0xF800_0C00 | (imm9 << 12) | (SP << 5) | reg, gpb(reg));
     }
     /// LDR reg, [sp], #16 (pop).
     fn pop(&mut self, reg: u32) {
         let imm9 = 16u32 & 0x1FF;
-        self.emit(0xF840_0400 | (imm9 << 12) | (SP << 5) | reg);
+        self.e_wr(0xF840_0400 | (imm9 << 12) | (SP << 5) | reg, reg);
+    }
+    /// STUR Xt, [Xn, #simm9] — store at an unscaled signed byte offset (used to
+    /// spill a callee-saved register near x29 in one instruction).
+    fn stur(&mut self, rt: u32, base: u32, simm9: i32) {
+        let imm = (simm9 as u32) & 0x1FF;
+        self.e_use(
+            0xF800_0000 | (imm << 12) | (base << 5) | rt,
+            gpb(rt) | gpb(base),
+        );
+    }
+    /// LDUR Xt, [Xn, #simm9] — load at an unscaled signed byte offset.
+    fn ldur(&mut self, rt: u32, base: u32, simm9: i32) {
+        let imm = (simm9 as u32) & 0x1FF;
+        self.e_rr(0xF840_0000 | (imm << 12) | (base << 5) | rt, rt, base);
+    }
+    /// STUR Dt, [Xn, #simm9] — spill a callee-saved double register near x29.
+    fn fstur(&mut self, dt: u32, base: u32, simm9: i32) {
+        let imm = (simm9 as u32) & 0x1FF;
+        self.e_use(0xFC00_0000 | (imm << 12) | (base << 5) | dt, gpb(base));
+    }
+    /// LDUR Dt, [Xn, #simm9] — reload a callee-saved double register.
+    fn fldur(&mut self, dt: u32, base: u32, simm9: i32) {
+        let imm = (simm9 as u32) & 0x1FF;
+        self.e_use(0xFC40_0000 | (imm << 12) | (base << 5) | dt, gpb(base));
     }
 
     fn cmp_reg(&mut self, rn: u32, rm: u32) {
-        self.emit(0xEB00_0000 | (rm << 16) | (rn << 5) | XZR);
+        self.e_use(
+            0xEB00_0000 | (rm << 16) | (rn << 5) | XZR,
+            gpb(rn) | gpb(rm),
+        );
     }
     fn cmp_imm0(&mut self, rn: u32) {
-        self.emit(0xF100_0000 | (rn << 5) | XZR);
+        self.e_use(0xF100_0000 | (rn << 5) | XZR, gpb(rn));
+    }
+    /// CMP Xn, #imm12 — SUBS XZR, Xn, #imm (sets flags, discards the result).
+    fn cmp_imm(&mut self, rn: u32, imm: u32) {
+        self.e_use(
+            0xF100_0000 | ((imm & 0xFFF) << 10) | (rn << 5) | XZR,
+            gpb(rn),
+        );
+    }
+    /// LSL/LSR/ASR Xd, Xn, #shift — shift by an immediate (aliases of UBFM/SBFM).
+    fn lsl_imm(&mut self, rd: u32, rn: u32, sh: u32) {
+        self.ubfm(rd, rn, (64 - sh) & 63, 63 - sh);
+    }
+    fn lsr_imm(&mut self, rd: u32, rn: u32, sh: u32) {
+        self.ubfm(rd, rn, sh, 63);
+    }
+    fn asr_imm(&mut self, rd: u32, rn: u32, sh: u32) {
+        self.sbfm(rd, rn, sh, 63);
+    }
+    /// AND Xd, Xn, #(2^k - 1) — mask to the low `k` bits (1..=63). `2^k-1` is a
+    /// run of `k` low ones, which encodes as the logical immediate N=1, immr=0,
+    /// imms=k-1 (`x % 2^k` for unsigned `x`).
+    fn and_imm_lowbits(&mut self, rd: u32, rn: u32, k: u32) {
+        self.e_rr(0x9240_0000 | ((k - 1) << 10) | (rn << 5) | rd, rd, rn);
     }
     fn cset(&mut self, rd: u32, cond: u32) {
         let inv = cond ^ 1;
-        self.emit(0x9A80_0400 | (XZR << 16) | (inv << 12) | (XZR << 5) | rd);
+        self.e_wr(
+            0x9A80_0400 | (XZR << 16) | (inv << 12) | (XZR << 5) | rd,
+            rd,
+        );
     }
     fn ret(&mut self) {
-        self.emit(0xD65F_03C0);
+        self.emit_du(0xD65F_03C0, -1, 0, B_RET);
     }
 
     fn b(&mut self, label: usize) {
         self.fixups.push((self.words.len(), label, Fixup::B26));
-        self.emit(0x1400_0000);
+        self.emit(0x1400_0000); // barrier (default tags)
     }
     fn bl(&mut self, label: usize) {
         self.fixups.push((self.words.len(), label, Fixup::B26));
-        self.emit(0x9400_0000);
+        self.emit_du(0x9400_0000, -1, 0, B_CALL);
     }
     /// BLR Xn — call the function whose entry address is in register `rn`.
     fn blr(&mut self, rn: u32) {
-        self.emit(0xD63F_0000 | (rn << 5));
+        self.emit_du(0xD63F_0000 | (rn << 5), -1, gpb(rn), B_CALL);
     }
     /// BR Xn — unconditional branch to the address in `rn` (no link). Used to
     /// jump into a branch table.
     fn br(&mut self, rn: u32) {
-        self.emit(0xD61F_0000 | (rn << 5));
+        self.emit(0xD61F_0000 | (rn << 5)); // barrier (default tags)
     }
     /// LDRSW Xt, [Xn, Xm, LSL #2] — load a 32-bit word at `base + index*4`,
     /// sign-extended to 64 bits. Used to read a jump-table offset entry.
     fn ldrsw_reg(&mut self, rt: u32, base: u32, index: u32) {
-        self.emit(0xB8A0_7800 | (index << 16) | (base << 5) | rt);
+        let w = 0xB8A0_7800 | (index << 16) | (base << 5) | rt;
+        self.emit_du(w, rt as i32, gpb(base) | gpb(index), B_NORMAL);
     }
     /// Emit a 32-bit jump-table data word holding the byte distance from `base`
     /// (the table start) to `target`; resolved in `finish` via `Fixup::TableRel`.
@@ -2914,7 +3944,7 @@ impl Asm {
     /// function entry) into `rd`.
     fn adr_label(&mut self, rd: u32, label: usize) {
         self.fixups.push((self.words.len(), label, Fixup::Adr));
-        self.emit(0x1000_0000 | rd);
+        self.e_wr(0x1000_0000 | rd, rd);
     }
     fn bl_printf(&mut self) {
         self.bl_extern("_printf");
@@ -2924,23 +3954,23 @@ impl Asm {
     fn bl_extern(&mut self, sym: &'static str) {
         self.relocs
             .push((self.words.len(), SymRef::Extern(sym), RelKind::Branch26));
-        self.emit(0x9400_0000);
+        self.emit_du(0x9400_0000, -1, 0, B_CALL);
     }
     fn adr(&mut self, rd: u32, sidx: usize) {
         self.adr_fixups.push((self.words.len(), sidx));
-        self.emit(0x1000_0000 | rd);
+        self.e_wr(0x1000_0000 | rd, rd);
     }
     /// ADRP rd, sym@PAGE (the linker fills the immediate via a PAGE21 reloc).
     fn adrp_global(&mut self, rd: u32, sym: u32) {
         self.relocs
             .push((self.words.len(), SymRef::Sym(sym), RelKind::Page21));
-        self.emit(0x9000_0000 | rd);
+        self.e_wr(0x9000_0000 | rd, rd);
     }
     /// ADD rd, rn, sym@PAGEOFF (filled via a PAGEOFF12 reloc).
     fn add_global(&mut self, rd: u32, rn: u32, sym: u32) {
         self.relocs
             .push((self.words.len(), SymRef::Sym(sym), RelKind::PageOff12));
-        self.emit(0x9100_0000 | (rn << 5) | rd);
+        self.e_rr(0x9100_0000 | (rn << 5) | rd, rd, rn);
     }
     fn b_cond(&mut self, cond: u32, label: usize) {
         self.fixups.push((self.words.len(), label, Fixup::B19));

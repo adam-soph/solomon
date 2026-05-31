@@ -1,10 +1,12 @@
 //! Intrinsic functions solomon provides without a user definition.
 //!
 //! This is the single source of truth shared by semantic analysis (which
-//! registers their signatures so calls type-check) and the interpreter (which
-//! implements their behaviour). Adding an intrinsic means adding an entry here
-//! plus a behaviour arm in `backend::interp`. These will be superseded by the
-//! real core / standard library when it lands.
+//! registers their signatures so calls type-check), the interpreter (which
+//! implements their behaviour), and the AArch64 backend (which lowers them — most
+//! via `libc_symbol`). Adding an intrinsic means an entry here plus a behaviour
+//! arm in `backend::interp` and, for a libc-backed one, a `libc_symbol` mapping
+//! (or special-cased emission). These will be superseded by the real core /
+//! standard library when it lands.
 
 use crate::ast::Type;
 

@@ -1,10 +1,10 @@
 //! Backends consume a type-checked [`Program`] and do something with it.
 //!
-//! The tree-walking [`interp`] reter is the first backend; future backends (a
-//! bytecode VM, C-source emission, native codegen, …) implement the same
-//! [`Backend`] trait. Construction is backend-specific — an interpreter is built
-//! with an output sink, a codegen backend with somewhere to emit code — but they
-//! are all driven uniformly through [`Backend::run`].
+//! Two implement the [`Backend`] trait: the tree-walking [`interp`]reter (the
+//! conformance oracle) and the hand-rolled AArch64 native code generator
+//! [`arm64`]. Construction is backend-specific — the interpreter is built with an
+//! output sink, the codegen backend with an output path — but both are driven
+//! uniformly through [`Backend::run`].
 
 pub mod arm64;
 pub mod interp;

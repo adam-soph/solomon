@@ -1,7 +1,9 @@
 //! Solomon: a reimplementation of HolyC.
 //!
-//! This chunk provides the lexer and parser. Later chunks (type checker,
-//! codegen) build on the AST produced here.
+//! A full compiler front end — lexer, preprocessor, parser, semantic analysis,
+//! and type layout — feeding two backends behind the [`Backend`] trait: a
+//! tree-walking interpreter and a hand-rolled AArch64 native code generator. The
+//! interpreter is the conformance oracle the native backend matches byte-for-byte.
 
 pub mod ast;
 pub mod backend;

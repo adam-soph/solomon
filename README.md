@@ -175,6 +175,10 @@ A few things specific to HolyC (and to this implementation):
   registers type aliases, including readable function-pointer ones.
 - Calls must resolve to a defined function or a built-in; there is no
   implicit-extern fallback. The native backend lowers built-ins to libc.
+- Relational operators **chain** as range comparisons: `5 < i < 10` means
+  `5 < i && i < 10`, and `0 <= a <= b < n` reads naturally. Parentheses opt out
+  (`(a < b) < c`); `==`/`!=` keep their plain C meaning. (Interior operands are
+  duplicated, so keep them side-effect-free.)
 - `switch` accepts both `switch (x)` and the bracketed `switch [x]`, and a body
   may carry `start:` / `end:` sub-labels: `start:` is a prologue run on entry
   before dispatch, `end:` an epilogue reached by fall-through (a `break` skips

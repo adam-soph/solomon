@@ -67,6 +67,22 @@ fn build_and_capture(src: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Assert the native backend produces byte-for-byte the same stdout as the
+/// interpreter (the conformance oracle) for `src` — the strongest check, since
+/// it needs no hand-computed expected value.
+fn assert_native_matches_interp(src: &str) {
+    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = check_program(&program);
+    assert!(errs.is_empty(), "semantic errors: {errs:?}");
+    let interp = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    assert!(
+        !interp.is_empty(),
+        "test program produced no interpreter output (likely a parse/build error):\n{src}"
+    );
+    let native = build_and_capture(src);
+    assert_eq!(native, interp, "native != interp for:\n{src}");
+}
+
 #[test]
 fn compiles_integer_expressions_to_exit_code() {
     if !toolchain_available() {
@@ -212,6 +228,481 @@ fn native_division_signedness_matches_interp() {
         Main;
     "#;
     assert_eq!(build_and_capture(src), "4000000000000000 1 -3 -2 3\n");
+}
+
+#[test]
+fn native_live_range_sharing_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Disjoint locals share a register (Chain: x/a/b/c coalesce); loop-carried
+    // locals (Rotate: a/b/sum live across the back-edge) must not. Byte-identical
+    // to the interpreter either way.
+    let src = r#"
+        I64 Chain(I64 x) { I64 a = x + x; I64 b = a + a; I64 c = b + b; return c + c; }
+        I64 Rotate(I64 n) {
+            I64 a = 1, b = 2, sum = 0, i;
+            for (i = 0; i < n; i++) { sum = sum + a; a = b; b = sum; }
+            return a + b + sum;
+        }
+        U0 Main() { "%d %d\n", Chain(3), Rotate(6); }
+        Main;
+    "#;
+    assert_eq!(build_and_capture(src), "48 47\n");
+}
+
+#[test]
+fn native_register_pressure_spills_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // More simultaneously-live promotable locals than the pool holds (13 ints >
+    // x19..x28, 9 doubles > d8..d15): linear scan promotes what fits and leaves
+    // the rest in frame slots. The spilled-vs-promoted mix must still match.
+    assert_native_matches_interp(
+        r#"
+        I64 Many(I64 n) {
+            I64 a=n+1, b=n+2, c=n+3, d=n+4, e=n+5, f=n+6, g=n+7,
+                h=n+8, i=n+9, j=n+10, k=n+11, l=n+12, m=n+13;
+            I64 s = a+b+c+d+e+f+g+h+i+j+k+l+m;
+            s += a*2 + b*2 + m*2;
+            return s;
+        }
+        F64 Big(I64 n) {
+            F64 a=1.0,b=2.0,c=3.0,d=4.0,e=5.0,f=6.0,g=7.0,h=8.0,j=9.0;
+            F64 s = a+b+c+d+e+f+g+h+j;
+            s += a*2.0 + j*2.0;
+            return s + n;
+        }
+        U0 Main() { "%d %.1f\n", Many(0), Big(0); }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_promoted_pointer_locals_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // A pointer local promoted to a register, reassigned and dereferenced across a
+    // loop: a linked-list walk (`p = p->next`) and a strided array walk (`p += 1`).
+    assert_native_matches_interp(
+        r#"
+        class N { I64 v; N *next; }
+        I64 Walk(N *head) {
+            I64 sum = 0;
+            N *p = head;
+            while (p != NULL) { sum += p->v; p = p->next; }
+            return sum;
+        }
+        I64 ArrSum(I64 *a, I64 n) {
+            I64 *p = a, *stop = a + n, s = 0;
+            while (p < stop) { s += *p; p += 1; }
+            return s;
+        }
+        U0 Main() {
+            N a, b, c;
+            a.v = 10; a.next = &b; b.v = 20; b.next = &c; c.v = 30; c.next = NULL;
+            I64 xs[5], i;
+            for (i = 0; i < 5; i++) xs[i] = i * 10;
+            "%d %d\n", Walk(&a), ArrSum(xs, 5);
+        }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_promoted_compound_assignment_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Every compound-assignment operator applied to a register-promoted local,
+    // signed and unsigned (the unsigned path uses UDIV/LSRV) — the register
+    // arithmetic must agree with the interpreter, including the final narrowing.
+    assert_native_matches_interp(
+        r#"
+        I64 Sgn(I64 x) {
+            I64 a = x;
+            a += 5; a -= 2; a *= 3; a /= 2; a %= 7;
+            a &= 0xF; a |= 0x10; a ^= 0x3; a <<= 1; a >>= 1;
+            return a;
+        }
+        U64 Uns(U64 x) { x >>= 2; x /= 3; x %= 1000; return x; }
+        U0 Main() {
+            "%d %d\n", Sgn(10), Sgn(100);
+            "%u %u\n", Uns(0xFFFFFFFFFFFFFFFF), Uns(123456);
+        }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_promoted_locals_survive_calls_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Promoted locals are callee-saved, so they survive an intervening call:
+    // recursion (a/b/c live across `Rec(n-1)`), a libc builtin call (`acc` across
+    // `Sqrt`), and a function mixing both register pools (int `isum`, F64 `acc`).
+    assert_native_matches_interp(
+        r#"
+        I64 Rec(I64 n) {
+            if (n <= 0) return 0;
+            I64 a = n, b = n - 1, c = n - 2;
+            I64 sub = Rec(n - 1);
+            return a + b + c + sub;
+        }
+        I64 Roots(I64 n) {
+            I64 acc = 0, i;
+            for (i = 1; i <= n; i++) { F64 r = Sqrt(i * i * 1.0); acc += (I64)r; }
+            return acc;
+        }
+        F64 Mix(I64 n) {
+            I64 i, isum = 0;
+            F64 acc = 0.0;
+            for (i = 0; i < n; i++) { acc += 1.5; isum += i; }
+            return acc + isum;
+        }
+        U0 Main() { "%d %d %.1f\n", Rec(4), Roots(4), Mix(4); }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_goto_disables_sharing_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // A function with `goto`/labels has unstructured control flow, so the allocator
+    // widens every interval to the whole function (nothing shares) but still
+    // promotes — the conservative fallback must stay correct.
+    assert_native_matches_interp(
+        r#"
+        I64 Loop(I64 n) {
+            I64 sum = 0, i = 0;
+            top:
+            if (i >= n) goto done;
+            sum += i;
+            i++;
+            goto top;
+            done:
+            return sum;
+        }
+        U0 Main() { "%d %d\n", Loop(5), Loop(10); }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_nested_ternary_and_deep_expr_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Nested ternaries, a deeply nested arithmetic tree (exercising the operand
+    // push/pop stack), and a multi-character constant packed little-endian.
+    assert_native_matches_interp(
+        r#"
+        I64 T(I64 x) { return x > 10 ? (x > 20 ? 3 : 2) : (x > 0 ? 1 : 0); }
+        U0 Main() {
+            I64 i;
+            for (i = -5; i <= 25; i += 5) "%d ", T(i);
+            "\n";
+            "%d\n", ((((1+2)*(3+4)) - ((5+6)*(7-8))) + (((9*2)+3) - (4*5)));
+            I64 c = 'AB';
+            "%d %c%c\n", c, c & 0xFF, (c >> 8) & 0xFF;
+        }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_uninitialized_aggregates_zero_filled_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // A local aggregate without an initializer is zero-filled (gen_zero_slot) so
+    // its untouched elements/fields read as 0, matching the interpreter — covers a
+    // plain array, a class, an array of classes, a class with an array field, and
+    // a union. (Scalars were already zeroed; aggregates were stack garbage.)
+    assert_native_matches_interp(
+        r#"
+        class P { I64 x; I64 y; }
+        class B { I64 t; I64 data[3]; }
+        union U { I64 w; U8 b[8]; }
+        U0 Main() {
+            I64 arr[4]; arr[1] = 5;
+            P p; p.y = 9;
+            P ps[2]; ps[1].x = 7;
+            B b; b.data[2] = 3;
+            U u;
+            "%d %d %d %d %d %d %d %d\n",
+                arr[0] + arr[1], arr[3], p.x + p.y, ps[0].x, ps[1].x,
+                b.data[0] + b.data[2], b.t, u.w;
+        }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_pointer_increment_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Pointer `++`/`--` (element-scaled) in its various forms, including a
+    // string-literal walk-and-subtract and pre/post `*p++` — all must agree with
+    // the interpreter (which the matching tests/interp.rs cases pin down).
+    assert_native_matches_interp(
+        r#"
+        I64 Walk(U8 *s) { U8 *p = s; while (*p) p++; return p - s; }
+        I64 ArrSum(I64 *a, I64 n) {
+            I64 *p = a, s = 0, i;
+            for (i = 0; i < n; i++) { s += *p; p++; }
+            return s;
+        }
+        U0 Main() {
+            I64 xs[5], i;
+            for (i = 0; i < 5; i++) xs[i] = i * 7;
+            I64 *p = &xs[4]; p--; p--;
+            U8 *src = "world"; U8 *dst = MAlloc(8); U8 *d = dst;
+            while (*src) *d++ = *src++;
+            *d = 0;
+            "%d %d %d %s\n", Walk("hello"), ArrSum(xs, 5), *p, dst;
+        }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_lvalue_increment_and_compound_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `++`/compound assignment whose target is *not* a plain local: an array
+    // element, a struct field by value and through a pointer, a dereferenced
+    // pointer, and a global — each writes back through the right address.
+    assert_native_matches_interp(
+        r#"
+        class P { I64 x; I64 y; }
+        I64 g = 100;
+        U0 Main() {
+            I64 a[3]; a[0] = 10; a[1] = 0; a[2] = 3;
+            a[0]++; ++a[1]; a[2] *= 4;
+            P p; p.x = 5; p.x++;
+            P *pp = &p; pp->y = 1; pp->y++;
+            I64 v = 10; I64 *ptr = &v; *ptr += 5;
+            g--;
+            "%d %d %d %d %d %d %d\n", a[0], a[1], p.x, pp->y, v, a[2], g;
+        }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_shift_edges_and_cast_chains_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Shift amounts at the edges (0, 62, 63) and chained casts that truncate then
+    // widen (I64 -> U8 -> I64; a 32-bit all-ones constant into I32 sign-extends).
+    assert_native_matches_interp(
+        r#"
+        U0 Main() {
+            I64 x = 1;
+            U64 y = 0x8000000000000000;
+            "%d %d %u %u\n", x << 0, x << 62, y >> 63, y >> 0;
+            I64 a = 300;
+            U8 b = (U8)a;
+            I64 c = (I64)b;
+            I32 d = (I32)0xFFFFFFFF;
+            "%d %d %d\n", b, c, d;
+        }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_strength_reduction_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `* / %` by a constant power of two strength-reduce to `lsl` / (unsigned)
+    // `lsr` / `and #2^k-1`. Signed `*` by a power of two is still a shift (wraps
+    // mod 2^64), but signed `/` / `%` and any non-power-of-two keep the generic
+    // SDIV/UDIV/MUL path. All must stay byte-identical to the interpreter.
+    assert_native_matches_interp(
+        r#"
+        U64 Uns(U64 x) { return x * 8 + x / 4 + x % 16 + x % 1; }
+        I64 Sgn(I64 x) { return x * 4 + (-x) * 2; }
+        I64 Gen(I64 x) { return x * 3 + x / 5 + x % 7 + (-9) / 2; }
+        U0 Main() { "%u %d %d\n", Uns(1000), Sgn(-7), Gen(100); }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_register_spill_prefers_hot_vars_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Twelve cold locals plus a hot loop accumulator/counter compete for ten
+    // integer registers. The linear-scan spill heuristic evicts the coldest active
+    // interval for a hotter one, so the loop variables win registers and the cold
+    // ones fall back to slots — and the result still matches the interpreter.
+    assert_native_matches_interp(
+        r#"
+        I64 F(I64 n) {
+            I64 a=n+1, b=n+2, c=n+3, d=n+4, e=n+5, f=n+6,
+                g=n+7, h=n+8, j=n+9, k=n+10, l=n+11, m=n+12;
+            I64 acc = 0, i;
+            for (i = 0; i < n; i++) acc += i * 2;
+            return acc + a+b+c+d+e+f+g+h+j+k+l+m;
+        }
+        U0 Main() { "%d %d\n", F(8), F(20); }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_f64_mixed_operand_arithmetic_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Guards the F64 simple-operand elision (`is_simple_foperand`): a binary op
+    // whose rhs is a literal or scalar keeps its lhs in FT2 with an `fmov` instead
+    // of the GPR/stack round-trip, while a complex rhs still spills. Mixed simple
+    // and complex float operands must stay byte-identical to the interpreter.
+    assert_native_matches_interp(
+        r#"
+        F64 Calc(F64 a, F64 b) {
+            F64 c = a * b + 2.0 - a;     // simple operands (scalars + a literal)
+            F64 d = (a + b) * (a - b);   // complex operands (parenthesized binaries)
+            return c + d / a;
+        }
+        U0 Main() { "%.4f %.4f\n", Calc(3.0, 4.0), Calc(1.5, 0.5); }
+        Main;
+    "#,
+    );
+}
+
+#[test]
+fn native_f64_register_promotion_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // F64 promotion to callee-saved d8..d15: a loop float accumulator whose value
+    // survives a call to a function that also uses d8 (so it must save/restore).
+    let src = r#"
+        F64 Scale(F64 x) { F64 r = x + x; return r * r; }
+        F64 Run(I64 n) {
+            F64 acc = 0.0, step = 1.5;
+            I64 i;
+            for (i = 0; i < n; i++) acc += Scale(step);
+            return acc;
+        }
+        U0 Main() { "%.2f\n", Run(3); }
+        Main;
+    "#;
+    assert_eq!(build_and_capture(src), "27.00\n");
+}
+
+#[test]
+fn native_register_promotion_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Register promotion: loop accumulator/counter, recursion (promoted locals
+    // survive recursive calls via the callee-saved ABI), and narrow-width wrap.
+    let src = r#"
+        U8 Narrow(U8 x) { x += 200; return x; }
+        I64 Sum(I64 n) { I64 acc = 0, i; for (i = 1; i <= n; i++) acc += i; return acc; }
+        I64 Fib(I64 n) { I64 a, b; if (n < 2) return n; a = Fib(n - 1); b = Fib(n - 2); return a + b; }
+        U0 Main() { "%d %d %d\n", Sum(10), Fib(10), Narrow(100); }
+        Main;
+    "#;
+    assert_eq!(build_and_capture(src), "55 55 44\n");
+}
+
+#[test]
+fn native_nested_calls_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Exercises the peephole's mov fusion (argument-setup + return moves through
+    // x9/x10) — byte-identical to the interpreter.
+    let src = r#"
+        I64 Add(I64 a, I64 b) { return a + b; }
+        I64 Mul(I64 a, I64 b) { return a * b; }
+        U0 Main() { "%d\n", Add(Mul(3, 4), Add(5, 6)); }
+        Main;
+    "#;
+    assert_eq!(build_and_capture(src), "23\n");
+}
+
+#[test]
+fn native_mixed_operand_arithmetic_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Guards the codegen optimizations (constant folding + the simple-operand
+    // push/pop elision) against behavior change — byte-identical to the interp
+    // (mixed_operand_arithmetic in tests/interp.rs).
+    let src = r#"
+        U0 Main() {
+            I64 a = 10, b = 3;
+            "%d %d %d %d\n", a + 2 * 3, a * a + b, (a + b) * (a - b), a % 7 - (1 << 2);
+        }
+        Main;
+    "#;
+    assert_eq!(build_and_capture(src), "16 103 91 -1\n");
+}
+
+#[test]
+fn native_chained_comparisons_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // HolyC chained range comparisons (`a < b < c` = `a<b && b<c`) — byte-identical
+    // to the interpreter (chained_range_comparisons in tests/interp.rs).
+    let src = r#"
+        U0 Main() {
+            "%d %d %d %d\n", 2 < 3 < 5, 2 < 2 < 5, 1 < 2 < 3 < 4, 5 < 4 < 3;
+            I64 a = 5;
+            "%d %d\n", (a < 10) < 2, a < 10 < 2;
+        }
+        Main;
+    "#;
+    assert_eq!(build_and_capture(src), "1 0 1 0\n1 0\n");
 }
 
 #[test]
