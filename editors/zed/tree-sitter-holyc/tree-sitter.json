@@ -10,13 +10,13 @@
         "HC"
       ],
       "highlights": [
-        "../../languages/holyc/highlights.scm"
+        "../languages/holyc/highlights.scm"
       ],
       "brackets": [
-        "../../languages/holyc/brackets.scm"
+        "../languages/holyc/brackets.scm"
       ],
       "indents": [
-        "../../languages/holyc/indents.scm"
+        "../languages/holyc/indents.scm"
       ]
     }
   ],
