@@ -1,0 +1,14 @@
+id = "holyc"
+name = "HolyC"
+version = "0.1.0"
+schema_version = 1
+authors = ["Adam Soph"]
+description = "HolyC language support for Zed (solomon): tree-sitter syntax highlighting, brackets, indentation, and outline."
+repository = "https://github.com/adam-soph/solomon"
+
+[grammars.holyc]
+repository = "https://github.com/adam-soph/solomon"
+path = "editors/zed/grammars/holyc"
+# Set this to the commit that contains editors/zed/grammars/holyc once pushed.
+# Zed fetches and compiles the grammar from git at this exact revision.
+rev = "REPLACE_WITH_COMMIT_SHA"

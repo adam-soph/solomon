@@ -1,0 +1,12 @@
+{
+  "name": "tree-sitter-holyc",
+  "version": "0.1.0",
+  "description": "HolyC grammar for tree-sitter (solomon)",
+  "license": "MIT",
+  "main": "bindings/node",
+  "keywords": [
+    "parser",
+    "tree-sitter",
+    "holyc"
+  ]
+}
