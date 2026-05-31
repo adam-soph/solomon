@@ -9,6 +9,5 @@ repository = "https://github.com/adam-soph/solomon"
 [grammars.holyc]
 repository = "https://github.com/adam-soph/solomon"
 path = "editors/zed/grammars/holyc"
-# Set this to the commit that contains editors/zed/grammars/holyc once pushed.
 # Zed fetches and compiles the grammar from git at this exact revision.
-rev = "REPLACE_WITH_COMMIT_SHA"
+rev = "47e346c20e99199d12f62183fa9d1f43a908ce7b"
