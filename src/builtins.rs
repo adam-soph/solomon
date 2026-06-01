@@ -332,6 +332,22 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 0,
             varargs: false,
         },
+        // `ArgC() -> I64` — the number of command-line arguments (argv[0] is the
+        // program/script name, so the count is ≥ 1). Computed, not libc-backed.
+        BuiltinSig {
+            name: "ArgC",
+            ret: Type::I64,
+            min_args: 0,
+            varargs: false,
+        },
+        // `ArgV(I64 i) -> U8*` — the i-th command-line argument as a NUL-terminated
+        // string (argv[0] is the program name). Out-of-range indices yield NULL.
+        BuiltinSig {
+            name: "ArgV",
+            ret: Type::Ptr(Box::new(Type::U8)),
+            min_args: 1,
+            varargs: false,
+        },
     ]
 }
 
@@ -380,9 +396,9 @@ pub fn libc_symbol(name: &str) -> Option<&'static str> {
         "StrLastChr" => "_strrchr",
         "StrSpn" => "_strspn",
         "StrCSpn" => "_strcspn",
-        // `Sign`/`RandU64` (computed inline), `StrToUpper`/`StrToLower`/`StrRev`
-        // (inline loops), and `Print`/`StrPrint`/`CatPrint`/`MStrPrint`/
-        // `I64ToStr`/`F64ToStr` (specially lowered) are not here.
+        // `Sign`/`RandU64`/`ArgC`/`ArgV` (computed inline), `StrToUpper`/
+        // `StrToLower`/`StrRev` (inline loops), and `Print`/`StrPrint`/`CatPrint`/
+        // `MStrPrint`/`I64ToStr`/`F64ToStr` (specially lowered) are not here.
         _ => return None,
     })
 }

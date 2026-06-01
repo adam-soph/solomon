@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Codegen, CodegenError};
@@ -50,8 +50,11 @@ use crate::token::{Pos, Span};
 
 mod asm;
 mod darwin;
+mod linux;
 
-use asm::Asm;
+pub use linux::Arm64Linux;
+
+use asm::{Asm, CodeImage};
 
 const RES: u32 = 9; // integer/pointer expression result
 const T2: u32 = 10; // secondary integer temporary
@@ -92,6 +95,32 @@ pub struct Arm64Darwin {
     out_path: PathBuf,
 }
 
+/// The per-OS object-format and link policy. The AArch64 instruction encoding
+/// and the code generation are shared between targets; this is the only
+/// Darwin-vs-Linux difference — the relocatable-object container (Mach-O vs ELF,
+/// with their relocation types and symbol-name conventions) and the linker.
+trait ArmTarget {
+    /// Package the machine code + symbolic relocations into a relocatable object.
+    /// `defined` are the `_main` + function symbols (with their `__text` byte
+    /// offsets), `commons` the BSS-allocated globals, `ndefined` the count of
+    /// defined symbols. The Linux writer drops the Mach-O leading underscore.
+    fn write_object(
+        &self,
+        image: &CodeImage,
+        defined: &[(String, u64)],
+        commons: &[(String, u64, u32)],
+        ndefined: u32,
+    ) -> Vec<u8>;
+
+    /// Link the relocatable object `obj` into the executable `out`.
+    fn link(&self, obj: &Path, out: &Path) -> Result<(), CodegenError>;
+
+    /// Whether variadic arguments (to `printf`/`sprintf`/…) are passed in
+    /// registers (standard AAPCS64 — `true`) or all on the stack (Apple's ARM64
+    /// ABI — `false`). The only codegen difference between the two AArch64 OSes.
+    fn variadic_in_registers(&self) -> bool;
+}
+
 impl Arm64Darwin {
     pub fn new(out_path: impl Into<PathBuf>) -> Self {
         Arm64Darwin {
@@ -99,18 +128,20 @@ impl Arm64Darwin {
         }
     }
 
-    /// Emit the Mach-O relocatable object for `program` as raw bytes — the
-    /// exact content [`run`](Arm64Darwin::run) writes to its temp `.o`, but
-    /// without touching the filesystem or invoking `cc`. Exposed so structural
-    /// tests can byte-check the emitted object on **any** host; the link +
-    /// execute path needs `cc` and an Apple-silicon target.
+    /// Emit the Mach-O relocatable object for `program` as raw bytes (no link).
+    /// Exposed so structural tests can byte-check the emitted object on any host.
     pub fn object(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
-        self.compile(program)
+        compile(program, &darwin::Darwin)
     }
+}
 
-    fn compile(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
+/// Emit a relocatable object for `program` using `target`'s container format.
+/// This driver — function/global symbol layout, code emission, fixup resolution
+/// — is shared by every AArch64 target; only `target` differs.
+fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, CodegenError> {
         let (layouts, _) = crate::layout::compute(program);
         let mut cg = Cg::new(layouts);
+        cg.variadic_regs = target.variadic_in_registers();
 
         let main_label = cg.asm.new_label();
         for item in &program.items {
@@ -158,6 +189,18 @@ impl Arm64Darwin {
             cg.global_order
                 .push(crate::builtins::RNG_STATE_GLOBAL.to_string());
         }
+        // When the program reads command-line args, reserve two hidden common
+        // symbols (argc and the argv array pointer) that `_main` populates from
+        // x0/x1; arg-free programs are left untouched.
+        if crate::ast::program_calls_any(program, &["ArgC", "ArgV"]) {
+            cg.uses_args = true;
+            for name in [ARGC_GLOBAL, ARGV_GLOBAL] {
+                let sym = ndefined + cg.global_order.len() as u32;
+                cg.globals
+                    .insert(name.to_string(), GlobalInfo { sym, ty: Type::U64 });
+                cg.global_order.push(name.to_string());
+            }
+        }
 
         let driver: Vec<&Stmt> = program
             .items
@@ -198,10 +241,23 @@ impl Arm64Darwin {
             .collect();
 
         let image = cg.asm.finish()?;
-        // Hand the machine code + symbolic relocations to the Mach-O writer, which
-        // lowers the relocations and packages the relocatable object.
-        Ok(darwin::write_object(&image, &defined, &commons, ndefined))
+        // Hand the machine code + symbolic relocations to the target's object
+        // writer, which lowers the relocations and packages the relocatable object.
+        Ok(target.write_object(&image, &defined, &commons, ndefined))
     }
+
+/// Compile `program`, write the object to a temp file, and link it into
+/// `out_path` with `target`'s linker.
+fn build(program: &Program, out_path: &Path, target: &dyn ArmTarget) -> Result<(), CodegenError> {
+    let obj = compile(program, target)?;
+    static OBJ_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = OBJ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("solomon-{}-{seq}.o", std::process::id()));
+    fs::write(&tmp, &obj)
+        .map_err(|e| CodegenError::new(format!("cannot write object file: {e}"), None))?;
+    let result = target.link(&tmp, out_path);
+    let _ = fs::remove_file(&tmp);
+    result
 }
 
 impl Codegen for Arm64Darwin {
@@ -210,15 +266,7 @@ impl Codegen for Arm64Darwin {
     }
 
     fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
-        let macho = self.compile(program)?;
-        static OBJ_SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = OBJ_SEQ.fetch_add(1, Ordering::Relaxed);
-        let obj = std::env::temp_dir().join(format!("solomon-{}-{seq}.o", std::process::id()));
-        fs::write(&obj, &macho)
-            .map_err(|e| CodegenError::new(format!("cannot write object file: {e}"), None))?;
-        let result = darwin::link(&obj, &self.out_path);
-        let _ = fs::remove_file(&obj);
-        result
+        build(program, &self.out_path, &darwin::Darwin)
     }
 }
 
@@ -275,7 +323,17 @@ struct Cg {
     /// incoming value is spilled, as `(reg, frame_off)` — saved in the prologue
     /// and restored in every epilogue.
     cs_saves: Vec<(u32, u32)>,
+    /// Whether the program calls `ArgC`/`ArgV`. When set, the `_main` entry
+    /// captures the incoming argc/argv (x0/x1) into the hidden globals below.
+    uses_args: bool,
+    /// Whether variadic args go in registers (AAPCS64) vs the stack (Apple).
+    variadic_regs: bool,
 }
+
+/// Hidden globals holding the command line, populated at the entry (only when the
+/// program uses `ArgC`/`ArgV`). Common symbols, like the RNG state word.
+const ARGC_GLOBAL: &str = "__solomon_holyc_argc";
+const ARGV_GLOBAL: &str = "__solomon_holyc_argv";
 
 impl Cg {
     fn new(layouts: Layouts) -> Self {
@@ -294,6 +352,8 @@ impl Cg {
             sret_off: None,
             promote: HashMap::new(),
             cs_saves: Vec::new(),
+            uses_args: false,
+            variadic_regs: false,
         }
     }
 
@@ -523,6 +583,20 @@ impl Cg {
             if let Some(name) = &p.name {
                 self.declare(name, off, p.ty.clone());
             }
+        }
+
+        // At the entry, AArch64/AAPCS hands `_main` argc in x0 and argv in x1.
+        // Stash them in the hidden globals for `ArgC`/`ArgV` (the prologue and the
+        // callee-saved spills above don't touch x0/x1).
+        if is_main && self.uses_args {
+            let csym = self.globals[ARGC_GLOBAL].sym;
+            self.asm.adrp_global(SCRATCH, csym);
+            self.asm.add_global(SCRATCH, SCRATCH, csym);
+            self.asm.store_mem(0, SCRATCH, 8); // __argc = x0
+            let vsym = self.globals[ARGV_GLOBAL].sym;
+            self.asm.adrp_global(SCRATCH, vsym);
+            self.asm.add_global(SCRATCH, SCRATCH, vsym);
+            self.asm.store_mem(1, SCRATCH, 8); // __argv = x1
         }
 
         for &s in body {
@@ -2151,6 +2225,40 @@ impl Cg {
             self.asm.eor(RES, RES, T2);
             return Ok(());
         }
+        // `ArgC()` / `ArgV(i)` — read the command line captured at the entry.
+        if name == "ArgC" {
+            let sym = self.globals[ARGC_GLOBAL].sym;
+            self.asm.adrp_global(T2, sym);
+            self.asm.add_global(T2, T2, sym);
+            self.asm.load_mem(RES, T2, 8, false); // RES = argc
+            return Ok(());
+        }
+        if name == "ArgV" {
+            self.gen_expr(&args[0])?; // RES = i
+            self.asm.mov_reg(T2, RES); // T2 = i (saved across the loads below)
+            let l_null = self.asm.new_label();
+            let l_done = self.asm.new_label();
+            // Out of range (including negative i, via the unsigned compare) -> NULL.
+            let csym = self.globals[ARGC_GLOBAL].sym;
+            self.asm.adrp_global(SCRATCH, csym);
+            self.asm.add_global(SCRATCH, SCRATCH, csym);
+            self.asm.load_mem(SCRATCH, SCRATCH, 8, false); // SCRATCH = argc
+            self.asm.cmp_reg(T2, SCRATCH);
+            self.asm.b_cond(COND_HS, l_null); // unsigned i >= argc
+            // RES = argv[i] = *(argv_base + i*8)
+            let vsym = self.globals[ARGV_GLOBAL].sym;
+            self.asm.adrp_global(RES, vsym);
+            self.asm.add_global(RES, RES, vsym);
+            self.asm.load_mem(RES, RES, 8, false); // RES = argv base pointer
+            self.asm.lsl_imm(SCRATCH, T2, 3); // SCRATCH = i*8
+            self.asm.add(RES, RES, SCRATCH);
+            self.asm.load_mem(RES, RES, 8, false); // RES = argv[i]
+            self.asm.b(l_done);
+            self.asm.place(l_null);
+            self.asm.load_imm(RES, 0); // NULL
+            self.asm.place(l_done);
+            return Ok(());
+        }
         // `StrToUpper`/`StrToLower` — ASCII-case a string in place via an inline
         // loop calling libc `toupper`/`tolower`; return the string.
         if name == "StrToUpper" || name == "StrToLower" {
@@ -2443,29 +2551,114 @@ impl Cg {
         self.gen_print(&fmt, rest)
     }
 
-    fn gen_print(&mut self, fmt: &str, args: &[Expr]) -> Result<(), CodegenError> {
-        let c_fmt = translate_format(fmt)?;
-        let fmt_idx = self.asm.intern_string(&c_fmt);
-        let k = args.len() as u32;
-        let varsize = align16(k * 8);
-        if varsize > 0 {
-            self.asm.sub_sp_imm(varsize);
-        }
+    /// Spill the variadic args to scratch stack slots `[sp + i*8]` (each int or
+    /// double bit-pattern in one 8-byte slot). The slots are how Apple's ARM64 ABI
+    /// passes variadics directly; on Linux [`load_variadic_regs`] then copies them
+    /// into argument registers.
+    fn spill_variadics(&mut self, args: &[Expr], base_off: u32) -> Result<(), CodegenError> {
         for (i, arg) in args.iter().enumerate() {
-            // Apple arm64 passes *all* variadic arguments on the stack, so each
-            // one (int or double) lands in its 8-byte slot the same way.
             if is_f64(&self.expr_ty(arg)) {
                 self.gen_fexpr(arg)?;
                 self.asm.fmov_to_gpr(RES, FRES);
             } else {
                 self.gen_expr(arg)?;
             }
-            self.asm.str_sp(RES, i as u32 * 8);
+            self.asm.str_sp(RES, base_off + i as u32 * 8);
         }
+        Ok(())
+    }
+
+    /// AAPCS64 (Linux): load the spilled variadic args into argument registers —
+    /// integers into `x{ngrn}..x7`, doubles into `v0..v7`. Beyond the register
+    /// capacity they would spill to the stack (unsupported; very rare for printf).
+    /// A no-op under Apple's ABI, where the stack slots are the arguments.
+    fn load_variadic_regs(&mut self, args: &[Expr], base_off: u32, mut ngrn: u32) {
+        if !self.variadic_regs {
+            return;
+        }
+        let mut nsrn = 0u32;
+        for (i, arg) in args.iter().enumerate() {
+            let off = base_off + i as u32 * 8;
+            if is_f64(&self.expr_ty(arg)) {
+                if nsrn <= 7 {
+                    self.asm.load_mem_off(SCRATCH, SP, off, 8, false);
+                    self.asm.fmov_from_gpr(nsrn, SCRATCH);
+                }
+                nsrn += 1;
+            } else {
+                if ngrn <= 7 {
+                    self.asm.load_mem_off(ngrn, SP, off, 8, false);
+                }
+                ngrn += 1;
+            }
+        }
+    }
+
+    /// Pass `args` as variadic arguments, with `named_gp` general-purpose argument
+    /// registers already taken by named args (so integer variadics start at
+    /// `x{named_gp}`). Under Apple's ABI they all go on the stack at `[sp + i*8]`;
+    /// under AAPCS64 integers fill `x{named_gp}..x7`, doubles `v0..v7`, and any
+    /// that overflow are packed contiguously at `[sp + 0..]`. Returns the stack
+    /// space reserved (to add back to `sp` after the call).
+    fn pass_variadics(&mut self, args: &[Expr], named_gp: u32) -> Result<u32, CodegenError> {
+        if !self.variadic_regs {
+            let varsize = align16(args.len() as u32 * 8);
+            if varsize > 0 {
+                self.asm.sub_sp_imm(varsize);
+            }
+            self.spill_variadics(args, 0)?;
+            return Ok(varsize);
+        }
+        // Classify each arg: an argument register, or an overflow stack slot.
+        let (mut gp, mut fp, mut overflow) = (named_gp, 0u32, 0u32);
+        let plan: Vec<(bool, Option<u32>, Option<u32>)> = args
+            .iter()
+            .map(|a| {
+                let f = is_f64(&self.expr_ty(a));
+                if f && fp <= 7 {
+                    fp += 1;
+                    (true, Some(fp - 1), None)
+                } else if !f && gp <= 7 {
+                    gp += 1;
+                    (false, Some(gp - 1), None)
+                } else {
+                    overflow += 1;
+                    (f, None, Some(overflow - 1))
+                }
+            })
+            .collect();
+        // Reserve the overflow block (at sp+0) plus scratch for evaluation (above).
+        let overflow_size = align16(overflow * 8);
+        let total = overflow_size + align16(args.len() as u32 * 8);
+        if total > 0 {
+            self.asm.sub_sp_imm(total);
+        }
+        self.spill_variadics(args, overflow_size)?;
+        for (i, &(f, reg, ov)) in plan.iter().enumerate() {
+            let src = overflow_size + i as u32 * 8;
+            if let Some(r) = reg {
+                if f {
+                    self.asm.load_mem_off(SCRATCH, SP, src, 8, false);
+                    self.asm.fmov_from_gpr(r, SCRATCH);
+                } else {
+                    self.asm.load_mem_off(r, SP, src, 8, false);
+                }
+            } else if let Some(j) = ov {
+                self.asm.load_mem_off(SCRATCH, SP, src, 8, false);
+                self.asm.str_sp(SCRATCH, j * 8); // overflow args packed at sp+0..
+            }
+        }
+        Ok(total)
+    }
+
+    fn gen_print(&mut self, fmt: &str, args: &[Expr]) -> Result<(), CodegenError> {
+        let c_fmt = translate_format(fmt)?;
+        let fmt_idx = self.asm.intern_string(&c_fmt);
+        let sz = self.pass_variadics(args, 1)?; // x0 = fmt, integer variadics from x1
         self.asm.adr(0, fmt_idx);
         self.asm.bl_printf();
-        if varsize > 0 {
-            self.asm.add_sp_imm(varsize);
+        if sz > 0 {
+            self.asm.add_sp_imm(sz);
         }
         Ok(())
     }
@@ -2524,25 +2717,12 @@ impl Cg {
 
         let c_fmt = translate_format(&fmt)?;
         let fmt_idx = self.asm.intern_string(&c_fmt);
-        let k = rest.len() as u32;
-        let varsize = align16(k * 8);
-        if varsize > 0 {
-            self.asm.sub_sp_imm(varsize);
-        }
-        for (i, arg) in rest.iter().enumerate() {
-            if is_f64(&self.expr_ty(arg)) {
-                self.gen_fexpr(arg)?;
-                self.asm.fmov_to_gpr(RES, FRES);
-            } else {
-                self.gen_expr(arg)?;
-            }
-            self.asm.str_sp(RES, i as u32 * 8);
-        }
+        let sz = self.pass_variadics(&rest, 2)?; // sprintf(dst, fmt, ...): variadics from x2
         self.load_local(0, target_off, &Type::I64); // x0 = target
         self.asm.adr(1, fmt_idx); // x1 = format
         self.asm.bl_extern("_sprintf");
-        if varsize > 0 {
-            self.asm.add_sp_imm(varsize);
+        if sz > 0 {
+            self.asm.add_sp_imm(sz);
         }
         self.load_local(RES, dst_off, &Type::I64); // return dst
         Ok(())
@@ -2583,6 +2763,7 @@ impl Cg {
             self.asm.str_sp(RES, i as u32 * 8);
         }
         // snprintf(NULL, 0, fmt, ...) -> required length (an int in w0).
+        self.load_variadic_regs(rest, 0, 3); // variadics from x3 (NULL, 0, fmt named)
         self.asm.load_imm(0, 0); // x0 = NULL
         self.asm.load_imm(1, 0); // x1 = 0
         self.asm.adr(2, fmt_idx); // x2 = format
@@ -2592,9 +2773,11 @@ impl Cg {
         self.asm.bl_extern("_malloc"); // x0 = buf
         self.asm.sub_imm(T2, FP, buf_off);
         self.gen_store(0, T2, &Type::I64); // save buf
-        // sprintf(buf, fmt, ...) reads the same variadic args still on the stack.
+        // sprintf(buf, fmt, ...) reads the same variadic args still on the stack
+        // (reloaded into registers for Linux, since the calls above clobbered them).
         self.load_local(0, buf_off, &Type::I64); // x0 = buf
         self.asm.adr(1, fmt_idx); // x1 = format
+        self.load_variadic_regs(rest, 0, 2); // variadics from x2
         self.asm.bl_extern("_sprintf");
         if varsize > 0 {
             self.asm.add_sp_imm(varsize);
@@ -2630,6 +2813,7 @@ impl Cg {
         self.asm.str_sp(RES, 0);
         self.load_local(0, buf_off, &Type::I64); // x0 = buf
         self.asm.adr(1, fmt_idx); // x1 = format
+        self.load_variadic_regs(std::slice::from_ref(value), 0, 2); // the value from x2/v0
         self.asm.bl_extern("_sprintf");
         self.asm.add_sp_imm(16);
         self.load_local(RES, buf_off, &Type::I64); // return buf

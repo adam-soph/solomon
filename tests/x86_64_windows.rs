@@ -189,6 +189,16 @@ fn printing_lowers_to_getstdhandle_then_writefile() {
 }
 
 #[test]
+fn args_capture_calls_getcommandline() {
+    // A program using ArgC/ArgV captures the command line at the entry: the first
+    // `call [rip]` after the frame prologue is `GetCommandLineA`.
+    let pe = build_pe("\"%d\\n\", ArgC();");
+    // The capture opens with `sub rsp, 32; call [rip]` (shadow space + the call).
+    let at = find_code(&pe, &[0x48, 0x83, 0xEC, 0x20, 0xFF, 0x15]);
+    assert_eq!(call_target(&pe, at + 4), "GetCommandLineA");
+}
+
+#[test]
 fn malloc_lowers_to_virtualalloc() {
     let pe = build_pe("U8 *p = MAlloc(16); p[0] = 7;");
 

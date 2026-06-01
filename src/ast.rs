@@ -377,3 +377,90 @@ impl PartialEq for Param {
         self.ty == other.ty && self.name == other.name && self.default == other.default
     }
 }
+
+/// Whether the program contains a call to any function named in `names`. The
+/// native backends use this to decide whether to emit command-line-argument
+/// capture in the program entry — so a program that never references
+/// `ArgC`/`ArgV` is byte-for-byte unaffected by the feature.
+pub fn program_calls_any(program: &Program, names: &[&str]) -> bool {
+    program.items.iter().any(|s| stmt_calls(s, names))
+}
+
+fn stmt_calls(s: &Stmt, names: &[&str]) -> bool {
+    match &s.kind {
+        StmtKind::Empty
+        | StmtKind::Default
+        | StmtKind::SwitchStart
+        | StmtKind::SwitchEnd
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Goto(_)
+        | StmtKind::Label(_)
+        | StmtKind::Class(_)
+        | StmtKind::Include(_) => false,
+        StmtKind::Expr(e) => expr_calls(e, names),
+        StmtKind::Block(ss) => ss.iter().any(|s| stmt_calls(s, names)),
+        StmtKind::VarDecl { decls } => decls
+            .iter()
+            .any(|d| d.init.as_ref().is_some_and(|e| expr_calls(e, names))),
+        StmtKind::If { cond, then, else_ } => {
+            expr_calls(cond, names)
+                || stmt_calls(then, names)
+                || else_.as_ref().is_some_and(|s| stmt_calls(s, names))
+        }
+        StmtKind::While { cond, body } | StmtKind::Switch { cond, body } => {
+            expr_calls(cond, names) || stmt_calls(body, names)
+        }
+        StmtKind::DoWhile { body, cond } => stmt_calls(body, names) || expr_calls(cond, names),
+        StmtKind::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|s| stmt_calls(s, names))
+                || cond.as_ref().is_some_and(|e| expr_calls(e, names))
+                || step.as_ref().is_some_and(|e| expr_calls(e, names))
+                || stmt_calls(body, names)
+        }
+        StmtKind::Case { lo, hi } => {
+            expr_calls(lo, names) || hi.as_ref().is_some_and(|e| expr_calls(e, names))
+        }
+        StmtKind::Return(e) => e.as_ref().is_some_and(|e| expr_calls(e, names)),
+        StmtKind::Func(f) => f
+            .body
+            .as_ref()
+            .is_some_and(|b| b.iter().any(|s| stmt_calls(s, names))),
+    }
+}
+
+fn expr_calls(e: &Expr, names: &[&str]) -> bool {
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Sizeof(_)
+        | ExprKind::Offset { .. } => false,
+        ExprKind::Call { callee, args } => {
+            matches!(&callee.kind, ExprKind::Ident(n) if names.contains(&n.as_str()))
+                || expr_calls(callee, names)
+                || args.iter().any(|a| expr_calls(a, names))
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Postfix { expr, .. }
+        | ExprKind::Cast { expr, .. } => expr_calls(expr, names),
+        ExprKind::Binary { lhs, rhs, .. } => expr_calls(lhs, names) || expr_calls(rhs, names),
+        ExprKind::Assign { target, value, .. } => {
+            expr_calls(target, names) || expr_calls(value, names)
+        }
+        ExprKind::Ternary { cond, then, else_ } => {
+            expr_calls(cond, names) || expr_calls(then, names) || expr_calls(else_, names)
+        }
+        ExprKind::Index { base, index } => expr_calls(base, names) || expr_calls(index, names),
+        ExprKind::Member { base, .. } => expr_calls(base, names),
+        ExprKind::InitList(es) | ExprKind::Comma(es) => es.iter().any(|e| expr_calls(e, names)),
+        ExprKind::DesignatedInit(fs) => fs.iter().any(|(_, e)| expr_calls(e, names)),
+    }
+}

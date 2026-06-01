@@ -128,9 +128,12 @@ Default targets:
 
 These triples are what the **`holyc` binary itself** is compiled for — every one
 runs the front end and the interpreter (`holyc run`). Native code *generation*
-(the default build, or `--target`) is a separate axis: only `aarch64-apple-darwin`,
-`x86_64-unknown-linux`, and `x86_64-pc-windows` have a backend, so on the other
-platforms `holyc` interprets HolyC but cannot emit a native executable yet.
+(the default build, or `--target`) is a separate axis: `aarch64-apple-darwin`,
+`x86_64-unknown-linux` (its `-gnu` and `-musl` triples are the same freestanding
+static ELF), `x86_64-pc-windows`, and `aarch64-unknown-linux-gnu`/`-musl` (an ELF
+linked with an aarch64 gcc — dynamically against glibc, or statically against
+musl) have a backend. On any other platform `holyc` interprets HolyC but cannot
+emit a native executable yet.
 
 Building for an OS other than the host needs a cross linker/toolchain. The
 Makefile uses the [`cross`](https://github.com/cross-rs/cross) tool (Docker-based)
@@ -169,8 +172,9 @@ select other behavior:
 | `ast`           | parse and dump the AST                                      |
 | `tokens`        | run the lexer only and dump the token stream               |
 
-`--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`, or
-`x86_64-pc-windows`.
+`--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`,
+`x86_64-pc-windows`, and `aarch64-unknown-linux-gnu` — each with `-gnu`/`-musl`
+forms where applicable.
 
 ```sh
 $ holyc check broken.hc
@@ -217,7 +221,7 @@ A few things specific to HolyC (and to this implementation):
 See `examples/*.hc` for worked examples, from `hello.hc` up to a linked list,
 a stack-machine interpreter, shape-area dispatch via inheritance, a
 preprocessor-heavy math library, 3×3 matrix multiplication, a core-library tour
-(`stdlib.hc`) exercising the string/memory/math built-ins, a heap-growing dynamic
+(`builtin.hc`) exercising the string/memory/math built-ins, a heap-growing dynamic
 array (`vector.hc`), text processing with `StrFind` (`text.hc`), a string-keyed
 hash map with chaining (`hashmap.hc`), a `RandU64`-driven shuffle
 (`shuffle.hc`), and a recursive-descent JSON parser that builds a heap tree of

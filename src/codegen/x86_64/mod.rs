@@ -95,6 +95,13 @@ trait OsTarget {
     /// case of the formatted-output sink.
     fn emit_write_stdout(&mut self, asm: &mut Asm);
 
+    /// Emit the entry preamble that captures the command line into the BSS slots
+    /// at `argc_off` / `argv_off` (argv there is a pointer to the argv array).
+    /// Runs just after the entry's frame is set up, so the frame pointer `rbp` is
+    /// valid. Only emitted when the program uses `ArgC`/`ArgV`. Linux reads them
+    /// off the initial stack; Windows builds them from `GetCommandLineA`.
+    fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32);
+
     /// Package the emitted program into a runnable executable. Takes ownership of
     /// the `Asm` so a policy can read its layout (and, on Windows, append an import
     /// table) before calling [`Asm::finish`]; `bss` is the zero-filled BSS that
@@ -134,6 +141,14 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
                 cg.declare_global(&d.name, d.ty.clone());
             }
         }
+    }
+
+    // If the program reads command-line args, reserve the argc/argv BSS slots the
+    // entry will populate; arg-free programs are left byte-for-byte unchanged.
+    if crate::ast::program_calls_any(program, &["ArgC", "ArgV"]) {
+        cg.uses_args = true;
+        cg.argc_off = Some(cg.alloc_bss(8, 8));
+        cg.argv_off = Some(cg.alloc_bss(8, 8));
     }
 
     // The entry runs the top-level statements; a top-level `return` exits with it.
@@ -261,6 +276,12 @@ struct Cg {
     rt_routines: HashMap<&'static str, usize>, // builtin runtime routine -> label (on first use)
     out_ptr_off: Option<i32>, // BSS slot: the formatted-output sink pointer (0 = stdout)
     bignum_off: Option<i32>, // BSS offset of the float-printing bignum (NLIMBS limbs)
+    // Command-line args: BSS slots holding argc and the argv array pointer, set
+    // when the program uses `ArgC`/`ArgV` (the entry captures them). `None`/false
+    // for arg-free programs, which are then byte-for-byte unchanged.
+    argc_off: Option<i32>,
+    argv_off: Option<i32>,
+    uses_args: bool,
 }
 
 impl Cg {
@@ -288,6 +309,9 @@ impl Cg {
             rt_routines: HashMap::new(),
             out_ptr_off: None,
             bignum_off: None,
+            argc_off: None,
+            argv_off: None,
+            uses_args: false,
         }
     }
 
@@ -419,6 +443,11 @@ impl Cg {
         self.cur_ret = Type::I64; // a top-level `return` exits with an int
         self.collect_labels(items);
         let frame = self.asm.prologue();
+        // Capture the command line for `ArgC`/`ArgV` once the frame is set up.
+        if self.uses_args {
+            let (c, v) = (self.argc_off.unwrap(), self.argv_off.unwrap());
+            self.os.emit_capture_args(&mut self.asm, c, v);
+        }
         for item in items {
             match &item.kind {
                 // Function/type definitions aren't statements that run here.
@@ -1616,6 +1645,35 @@ impl Cg {
             "RandU64" => {
                 let l = self.rt_routine("RandU64");
                 self.asm.call(l);
+                Ok(())
+            }
+            // `ArgC()` / `ArgV(i)` — read the command line captured at the entry
+            // into the argc/argv BSS slots.
+            "ArgC" => {
+                let off = self
+                    .argc_off
+                    .expect("argc slot reserved when args are used");
+                self.asm.lea_global(RAX, off);
+                self.asm.load_qword_at(RAX, RAX); // rax = argc
+                Ok(())
+            }
+            "ArgV" => {
+                let (cv, av) = (self.argc_off.unwrap(), self.argv_off.unwrap());
+                self.gen_expr(&args[0])?; // rax = i
+                self.asm.mov_rr(RCX, RAX); // rcx = i
+                self.asm.lea_global(RDX, cv);
+                self.asm.load_qword_at(RDX, RDX); // rdx = argc
+                let null = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.cmp_reg_reg(RCX, RDX);
+                self.asm.jae(null); // unsigned i >= argc (also catches i < 0)
+                self.asm.lea_global(RAX, av);
+                self.asm.load_qword_at(RAX, RAX); // rax = argv base pointer
+                self.asm.load_qword_idx8(RAX, RAX, RCX); // rax = argv[i]
+                self.asm.jmp(done);
+                self.asm.place(null);
+                self.asm.mov_ri(RAX, 0); // NULL
+                self.asm.place(done);
                 Ok(())
             }
             // printf-into-a-buffer (the sprintf family)

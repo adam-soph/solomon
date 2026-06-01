@@ -206,6 +206,29 @@ fn assert_native_matches_interp(src: &str) {
 }
 
 #[test]
+fn native_command_line_args() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Echo argv[1..] (argv[0] is the binary path, which varies) and check that an
+    // out-of-range index is NULL. ArgC/ArgV are captured from x0/x1 at the entry.
+    let src = r#"
+        I64 i;
+        for (i = 1; i < ArgC(); i++) "%s\n", ArgV(i);
+        if (ArgV(99) == NULL) "ok\n";
+    "#;
+    let program = parse(src).unwrap();
+    assert!(check_program(&program).is_empty());
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let out = std::env::temp_dir().join(format!("solomon-arm64-args-{}-{id}", std::process::id()));
+    Arm64Darwin::new(&out).run(&program).unwrap();
+    let output = Command::new(&out).args(["alpha", "beta"]).output().unwrap();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "alpha\nbeta\nok\n");
+}
+
+#[test]
 fn compiles_integer_expressions_to_exit_code() {
     if !toolchain_available() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");

@@ -1426,6 +1426,29 @@ fn goto_to_label_in_enclosing_block() {
     assert_eq!(run(src), "0 1 2 ");
 }
 
+// ---- command-line arguments ----
+
+#[test]
+fn argc_and_argv_expose_the_command_line() {
+    let src = r#"I64 i; for (i = 0; i < ArgC(); i++) "%d=%s\n", i, ArgV(i);"#;
+    let program = parse(src).unwrap();
+    let mut interp = Interpreter::new(Vec::<u8>::new());
+    interp.set_args(vec!["prog".into(), "alpha".into(), "beta".into()]);
+    interp.run(&program).unwrap();
+    let out = String::from_utf8(interp.into_output()).unwrap();
+    assert_eq!(out, "0=prog\n1=alpha\n2=beta\n");
+}
+
+#[test]
+fn argv_out_of_range_is_null() {
+    let src = r#"if (ArgV(99) == NULL) "null\n"; else "no\n";"#;
+    let program = parse(src).unwrap();
+    let mut interp = Interpreter::new(Vec::<u8>::new());
+    interp.set_args(vec!["prog".into()]);
+    interp.run(&program).unwrap();
+    assert_eq!(String::from_utf8(interp.into_output()).unwrap(), "null\n");
+}
+
 // ---- error reporting ----
 
 #[test]

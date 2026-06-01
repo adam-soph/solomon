@@ -8,68 +8,74 @@
 use std::path::Path;
 use std::process::Command;
 
+use super::ArmTarget;
 use super::asm::{CodeImage, RelKind, SymRef};
 use crate::codegen::CodegenError;
 
-/// Lower the encoder's symbolic relocations to Mach-O numbers and write the
-/// relocatable object. `defined` are the `__text` symbols (`_main` + functions,
-/// in symbol-table order), `commons` the BSS-allocated globals, and `ndefined`
-/// the count of defined symbols (so external symbols index after the commons).
-pub(super) fn write_object(
-    image: &CodeImage,
-    defined: &[(String, u64)],
-    commons: &[(String, u64, u32)],
-    ndefined: u32,
-) -> Vec<u8> {
-    // External (libc) symbols, in first-reference order. They are placed in the
-    // symbol table after the defined symbols and common globals, so each gets
-    // index `ndefined + commons.len() + position`.
-    let mut externs: Vec<&'static str> = Vec::new();
-    for (_, sym, _) in &image.relocs {
-        if let SymRef::Extern(name) = sym {
-            if !externs.contains(name) {
-                externs.push(name);
+/// The Darwin object/link policy: a Mach-O relocatable object linked with `cc`.
+pub(super) struct Darwin;
+
+impl ArmTarget for Darwin {
+    fn write_object(
+        &self,
+        image: &CodeImage,
+        defined: &[(String, u64)],
+        commons: &[(String, u64, u32)],
+        ndefined: u32,
+    ) -> Vec<u8> {
+        // External (libc) symbols, in first-reference order. They are placed in
+        // the symbol table after the defined symbols and common globals, so each
+        // gets index `ndefined + commons.len() + position`.
+        let mut externs: Vec<&'static str> = Vec::new();
+        for (_, sym, _) in &image.relocs {
+            if let SymRef::Extern(name) = sym {
+                if !externs.contains(name) {
+                    externs.push(name);
+                }
             }
         }
+        let extern_base = ndefined + commons.len() as u32;
+        let relocs: Vec<(u32, u32, u32, bool)> = image
+            .relocs
+            .iter()
+            .map(|(addr, sym, kind)| {
+                let s = match sym {
+                    SymRef::Extern(name) => {
+                        extern_base + externs.iter().position(|e| e == name).unwrap() as u32
+                    }
+                    SymRef::Sym(i) => *i,
+                };
+                let (ty, pcrel) = match kind {
+                    RelKind::Branch26 => (RELOC_BRANCH26, true),
+                    RelKind::Page21 => (RELOC_PAGE21, true),
+                    RelKind::PageOff12 => (RELOC_PAGEOFF12, false),
+                };
+                (*addr, s, ty, pcrel)
+            })
+            .collect();
+        write_macho_object(&image.text, defined, commons, &externs, &relocs)
     }
-    let extern_base = ndefined + commons.len() as u32;
-    let relocs: Vec<(u32, u32, u32, bool)> = image
-        .relocs
-        .iter()
-        .map(|(addr, sym, kind)| {
-            let s = match sym {
-                SymRef::Extern(name) => {
-                    extern_base + externs.iter().position(|e| e == name).unwrap() as u32
-                }
-                SymRef::Sym(i) => *i,
-            };
-            let (ty, pcrel) = match kind {
-                RelKind::Branch26 => (RELOC_BRANCH26, true),
-                RelKind::Page21 => (RELOC_PAGE21, true),
-                RelKind::PageOff12 => (RELOC_PAGEOFF12, false),
-            };
-            (*addr, s, ty, pcrel)
-        })
-        .collect();
-    write_macho_object(&image.text, defined, commons, &externs, &relocs)
-}
 
-/// Link the relocatable object `obj` into the executable `out` with the system
-/// `cc` (the only place this backend shells out).
-pub(super) fn link(obj: &Path, out: &Path) -> Result<(), CodegenError> {
-    let status = Command::new("cc")
-        .arg(obj)
-        .arg("-o")
-        .arg(out)
-        .status()
-        .map_err(|e| CodegenError::new(format!("failed to invoke linker `cc`: {e}"), None))?;
-    if !status.success() {
-        return Err(CodegenError::new(
-            format!("linker `cc` failed with status {status}"),
-            None,
-        ));
+    /// Link with the system `cc` (the only place this backend shells out).
+    fn link(&self, obj: &Path, out: &Path) -> Result<(), CodegenError> {
+        let status = Command::new("cc")
+            .arg(obj)
+            .arg("-o")
+            .arg(out)
+            .status()
+            .map_err(|e| CodegenError::new(format!("failed to invoke linker `cc`: {e}"), None))?;
+        if !status.success() {
+            return Err(CodegenError::new(
+                format!("linker `cc` failed with status {status}"),
+                None,
+            ));
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn variadic_in_registers(&self) -> bool {
+        false // Apple's ARM64 ABI passes all variadic args on the stack
+    }
 }
 
 const RELOC_BRANCH26: u32 = 2;

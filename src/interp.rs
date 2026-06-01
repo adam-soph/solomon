@@ -340,6 +340,9 @@ pub struct Interpreter<W: Write> {
     /// `RandU64` PRNG state (splitmix64); starts at 0 to match the native
     /// backend's zero-initialised global.
     rng_state: u64,
+    /// Command-line arguments exposed via `ArgC`/`ArgV`. `args[0]` is the program
+    /// (or script) name, mirroring a native binary's argv, so the count is ≥ 1.
+    args: Vec<String>,
 }
 
 impl<W: Write> Interpreter<W> {
@@ -356,7 +359,14 @@ impl<W: Write> Interpreter<W> {
             classes: HashMap::new(),
             layouts: Layouts::empty(),
             rng_state: 0,
+            args: vec!["holyc".to_string()],
         }
+    }
+
+    /// Set the command-line arguments visible to the program through `ArgC`/`ArgV`.
+    /// `args[0]` should be the program/script name (argv[0]).
+    pub fn set_args(&mut self, args: Vec<String>) {
+        self.args = args;
     }
 
     /// Consume the interpreter and recover its output sink.
@@ -1455,6 +1465,14 @@ impl<W: Write> Interpreter<W> {
             "RandU64" => Ok(Value::Int(
                 crate::builtins::splitmix64(&mut self.rng_state) as i64
             )),
+            "ArgC" => Ok(Value::Int(self.args.len() as i64)),
+            "ArgV" => {
+                let i = self.to_i64(args[0].clone(), pos)?;
+                match usize::try_from(i).ok().and_then(|i| self.args.get(i)) {
+                    Some(s) => Ok(Value::Str(Rc::new(s.clone()))),
+                    None => Ok(Value::Ptr(None)), // out of range -> NULL
+                }
+            }
             "StrFind" => {
                 // A pointer to the first occurrence of needle in haystack, or NULL.
                 // Arg order matches libc `strstr`: haystack first.

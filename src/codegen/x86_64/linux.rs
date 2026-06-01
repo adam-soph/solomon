@@ -5,26 +5,36 @@
 
 use std::path::PathBuf;
 
-use super::{Asm, OsTarget, R8, R9, R10, RAX, RDI, RDX};
+use super::{Asm, OsTarget, R8, R9, R10, RAX, RCX, RDI, RDX};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
 /// Compiles a HolyC program to a freestanding static ELF for `x86_64-unknown-linux`.
 pub struct X64Linux {
     out_path: PathBuf,
+    triple: &'static str,
 }
 
 impl X64Linux {
     pub fn new(out_path: impl Into<PathBuf>) -> Self {
+        Self::with_triple(out_path, "x86_64-unknown-linux")
+    }
+
+    /// The same freestanding static ELF, reported under a specific triple. The
+    /// output is libc-independent (it links no libc and makes raw syscalls), so
+    /// the `-gnu` and `-musl` variants are byte-for-byte identical — `-musl`
+    /// just builds through here with its own triple name.
+    pub fn with_triple(out_path: impl Into<PathBuf>, triple: &'static str) -> Self {
         X64Linux {
             out_path: out_path.into(),
+            triple,
         }
     }
 }
 
 impl Codegen for X64Linux {
     fn name(&self) -> &'static str {
-        "x86_64-unknown-linux"
+        self.triple
     }
 
     fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
@@ -69,6 +79,18 @@ impl OsTarget for LinuxTarget {
         asm.emit(&[0xB8, 1, 0, 0, 0]); // mov eax, 1 (SYS_write)
         asm.emit(&[0xBF, 1, 0, 0, 0]); // mov edi, 1 (stdout)
         asm.syscall();
+    }
+
+    fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {
+        // The Linux ELF entry receives `[rsp] = argc`, `[rsp+8] = argv[0]`, …
+        // After the prologue's `push rbp; mov rbp, rsp`, `rbp` = the entry rsp − 8,
+        // so argc is at `[rbp+8]` and the argv array begins at `rbp+16`.
+        asm.emit(&[0x48, 0x8B, 0x45, 0x08]); // mov rax, [rbp+8]   (argc)
+        asm.lea_global(RCX, argc_off);
+        asm.store_qword_at(RCX, RAX); // argc slot = rax
+        asm.emit(&[0x48, 0x8D, 0x45, 0x10]); // lea rax, [rbp+16]  (&argv[0])
+        asm.lea_global(RCX, argv_off);
+        asm.store_qword_at(RCX, RAX); // argv slot = &argv[0]
     }
 
     fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError> {

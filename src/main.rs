@@ -18,7 +18,7 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use solomon::codegen::Codegen;
-use solomon::codegen::arm64::Arm64Darwin;
+use solomon::codegen::arm64::{Arm64Darwin, Arm64Linux};
 use solomon::codegen::x86_64::{X64Linux, X64Windows};
 use solomon::interp::Interpreter;
 use solomon::{lexer, parser, sema};
@@ -29,7 +29,10 @@ use solomon::{lexer, parser, sema};
 enum Target {
     Arm64Darwin,
     X64Linux,
+    X64LinuxMusl,
     X64Windows,
+    Arm64Linux,
+    Arm64LinuxMusl,
 }
 
 impl Target {
@@ -49,14 +52,18 @@ impl Target {
             "aarch64-apple-darwin" | "arm64-apple-darwin" | "aarch64-darwin" | "arm64-darwin" => {
                 Some(Target::Arm64Darwin)
             }
-            "x86_64-unknown-linux"
-            | "x86_64-unknown-linux-gnu"
-            | "x86_64-unknown-linux-musl"
-            | "x86_64-linux" => Some(Target::X64Linux),
+            "x86_64-unknown-linux" | "x86_64-unknown-linux-gnu" | "x86_64-linux" => {
+                Some(Target::X64Linux)
+            }
+            "x86_64-unknown-linux-musl" => Some(Target::X64LinuxMusl),
             "x86_64-pc-windows"
             | "x86_64-pc-windows-gnu"
             | "x86_64-pc-windows-msvc"
             | "x86_64-windows" => Some(Target::X64Windows),
+            "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux" | "aarch64-linux" => {
+                Some(Target::Arm64Linux)
+            }
+            "aarch64-unknown-linux-musl" => Some(Target::Arm64LinuxMusl),
             _ => None,
         }
     }
@@ -64,7 +71,14 @@ impl Target {
         match self {
             Target::Arm64Darwin => Box::new(Arm64Darwin::new(out)),
             Target::X64Linux => Box::new(X64Linux::new(out)),
+            // The freestanding static ELF is libc-independent, so `-musl` reuses
+            // the same backend — only its reported triple differs.
+            Target::X64LinuxMusl => {
+                Box::new(X64Linux::with_triple(out, "x86_64-unknown-linux-musl"))
+            }
             Target::X64Windows => Box::new(X64Windows::new(out)),
+            Target::Arm64Linux => Box::new(Arm64Linux::new(out)),
+            Target::Arm64LinuxMusl => Box::new(Arm64Linux::new_musl(out)),
         }
     }
 }
@@ -80,7 +94,6 @@ enum Mode {
 fn main() -> ExitCode {
     // The default action is to compile a native binary for the host target.
     let mut mode = Mode::Build;
-    let mut path: Option<String> = None;
     let mut out: Option<String> = None;
     let mut target: Option<Target> = None;
 
@@ -119,15 +132,26 @@ fn main() -> ExitCode {
         args.next();
     }
 
+    // Positional tokens: the first is the input FILE; the rest, in `run` mode,
+    // are the program's own arguments (visible via `ArgC`/`ArgV`). `--` ends
+    // option parsing, so option-looking program arguments can be passed through.
+    let mut positionals: Vec<String> = Vec::new();
+    let mut opts_done = false;
     while let Some(arg) = args.next() {
+        if opts_done {
+            positionals.push(arg);
+            continue;
+        }
         match arg.as_str() {
+            "--" => opts_done = true,
             "--target" => match args.next() {
                 Some(t) => match Target::from_triple(&t) {
                     Some(tt) => target = Some(tt),
                     None => {
                         eprintln!(
                             "holyc: unknown target `{t}` (known: aarch64-apple-darwin, \
-                             x86_64-unknown-linux, x86_64-pc-windows)"
+                             x86_64-unknown-linux{{,-gnu,-musl}}, x86_64-pc-windows, \
+                             aarch64-unknown-linux-gnu)"
                         );
                         return ExitCode::FAILURE;
                     }
@@ -152,9 +176,10 @@ fn main() -> ExitCode {
                 eprintln!("holyc: unknown option `{other}`");
                 return ExitCode::FAILURE;
             }
-            other => path = Some(other.to_string()),
+            other => positionals.push(other.to_string()),
         }
     }
+    let path = positionals.first().cloned();
 
     let src = match &path {
         Some(path) => match std::fs::read_to_string(path) {
@@ -244,6 +269,13 @@ fn main() -> ExitCode {
             }
             let stdout = std::io::stdout();
             let mut interp = Interpreter::new(stdout.lock());
+            // argv: the file (argv[0]) plus any trailing program arguments; a bare
+            // `holyc run` (stdin) gets just the program name.
+            interp.set_args(if positionals.is_empty() {
+                vec!["holyc".to_string()]
+            } else {
+                positionals.clone()
+            });
             match interp.run(&program) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -313,9 +345,11 @@ read from stdin when omitted.
 Options:
   -o OUT            output path for the compiled binary (default: a.out)
   --target TRIPLE   cross-compile for a specific target:
-                      aarch64-apple-darwin   Mach-O, linked with cc
-                      x86_64-unknown-linux   freestanding static ELF
-                      x86_64-pc-windows      self-contained PE
+                      aarch64-apple-darwin         Mach-O, linked with cc
+                      x86_64-unknown-linux[-musl]  freestanding static ELF
+                      x86_64-pc-windows            self-contained PE
+                      aarch64-unknown-linux-gnu    ELF, glibc, via aarch64 gcc
+                      aarch64-unknown-linux-musl   ELF, static musl
   -h, --help        show this help
 "
     );

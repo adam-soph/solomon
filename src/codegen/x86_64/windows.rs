@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use super::{Asm, OsTarget};
+use super::{Asm, OsTarget, R8, R9, RAX, RCX, RDI, RDX, RSI};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
@@ -117,6 +117,74 @@ impl OsTarget for WindowsTarget {
         asm.emit(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp+32], 0
         asm.call_extern(wf); // call [WriteFile]
         asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+    }
+
+    fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {
+        // Windows hands the entry no argv, so build one from GetCommandLineA: get
+        // the command line, allocate a page for the argv pointer array, then split
+        // the line on spaces in place (NUL-terminating each token). This runs at
+        // the entry before any program code, so it may clobber any register.
+        let gcl = self.extern_idx("GetCommandLineA");
+        let va = self.extern_idx("VirtualAlloc");
+
+        // rsi = GetCommandLineA()  (rsi is non-volatile, so it survives VirtualAlloc)
+        asm.emit(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32 (shadow)
+        asm.call_extern(gcl);
+        asm.emit(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
+        asm.mov_rr(RSI, RAX);
+
+        // rdi = VirtualAlloc(NULL, 4096, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+        asm.xor_rr(RCX, RCX);
+        asm.mov_ri(RDX, 0x1000);
+        asm.mov_ri(R8, 0x3000);
+        asm.mov_ri(R9, 4);
+        asm.emit(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32
+        asm.call_extern(va);
+        asm.emit(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
+        asm.mov_rr(RDI, RAX); // rdi = argv array base
+
+        // argv slot = &array
+        asm.lea_global(RCX, argv_off);
+        asm.store_qword_at(RCX, RDI);
+
+        // Split rsi into rdi[..], counting tokens in r8 (whitespace-separated).
+        asm.xor_rr(R8, R8); // count = 0
+        let skip = asm.new_label();
+        let tok = asm.new_label();
+        let scan = asm.new_label();
+        let end_tok = asm.new_label();
+        let done = asm.new_label();
+
+        asm.place(skip); // skip spaces between tokens
+        asm.load_byte_zx(RAX, RSI); // al = *cursor
+        asm.cmp_ri(RAX, 0x20);
+        asm.jne(tok);
+        asm.inc_r(RSI);
+        asm.jmp(skip);
+
+        asm.place(tok);
+        asm.test_rr(RAX, RAX);
+        asm.je(done); // end of command line
+        asm.store_qword_idx8(RDI, R8, RSI); // argv[count] = cursor
+        asm.inc_r(R8);
+
+        asm.place(scan); // advance to the next space (or end)
+        asm.load_byte_zx(RAX, RSI);
+        asm.test_rr(RAX, RAX);
+        asm.je(done);
+        asm.cmp_ri(RAX, 0x20);
+        asm.je(end_tok);
+        asm.inc_r(RSI);
+        asm.jmp(scan);
+
+        asm.place(end_tok);
+        asm.store_byte_imm_at(RSI, 0); // NUL-terminate the token
+        asm.inc_r(RSI);
+        asm.jmp(skip);
+
+        asm.place(done);
+        asm.lea_global(RCX, argc_off);
+        asm.store_qword_at(RCX, R8); // argc slot = count
     }
 
     fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError> {
