@@ -18,6 +18,7 @@ pub(super) struct Asm {
     strings: Vec<Vec<u8>>,
     str_fixups: Vec<(usize, usize)>, // (RIP-relative disp32 position, string index)
     global_fixups: Vec<(usize, i32)>, // (RIP-relative disp32 position, BSS byte offset)
+    extern_calls: Vec<(usize, usize)>, // (RIP-relative disp32 position, extern slot index)
 }
 
 impl Asm {
@@ -29,7 +30,29 @@ impl Asm {
             strings: Vec::new(),
             str_fixups: Vec::new(),
             global_fixups: Vec::new(),
+            extern_calls: Vec::new(),
         }
+    }
+
+    /// Current code length, and the total byte length of the interned strings.
+    /// A container writer needs these to place an appended region (e.g. a PE
+    /// import table) at the right address before [`finish`](Asm::finish) runs.
+    pub(super) fn code_len(&self) -> usize {
+        self.code.len()
+    }
+    pub(super) fn strings_total(&self) -> usize {
+        self.strings.iter().map(|s| s.len()).sum()
+    }
+
+    /// `call qword [rip + disp32]` through external slot `idx` — an indirect call
+    /// whose target address lives in a container-supplied table (on Windows, the
+    /// import address table). The disp32 is resolved in [`finish`](Asm::finish)
+    /// against the `iat_offsets` it is given. Purely an indirect call to an
+    /// externally-placed pointer; the encoder knows nothing of imports or DLLs.
+    pub(super) fn call_extern(&mut self, idx: usize) {
+        self.emit(&[0xFF, 0x15]); // call qword ptr [rip + disp32]
+        self.extern_calls.push((self.code.len(), idx));
+        self.emit(&[0, 0, 0, 0]);
     }
     pub(super) fn emit(&mut self, bytes: &[u8]) {
         self.code.extend_from_slice(bytes);
@@ -49,10 +72,20 @@ impl Asm {
         self.strings.push(bytes.to_vec());
         self.strings.len() - 1
     }
-    /// Resolve all fixups and append the string data, returning the final blob:
-    /// rel32 branch displacements (within code) and RIP-relative string
-    /// references (code -> the appended string bytes, contiguously mapped).
-    pub(super) fn finish(mut self) -> Result<Vec<u8>, CodegenError> {
+    /// Resolve all fixups and assemble the final mapped image, laid out
+    /// `[code | strings | import | bss]` as one contiguously-mapped blob — so
+    /// every RIP-relative reference is just `target - (pos + 4)` regardless of the
+    /// load address. `import` (empty on Linux, where there are no imports) is
+    /// appended after the strings; `iat_offsets[idx]` is the byte offset, *within*
+    /// `import`, of the indirect-call target for [`call_extern`](Asm::call_extern)
+    /// slot `idx`. The BSS (`bss` bytes the caller reserves) follows in memory but
+    /// not in the file. With `import = &[]` and no extern calls this is identical
+    /// to the plain `[code | strings | bss]` ELF layout.
+    pub(super) fn finish(
+        mut self,
+        import: &[u8],
+        iat_offsets: &[usize],
+    ) -> Result<Vec<u8>, CodegenError> {
         for &(pos, label) in &self.fixups {
             let target = self.labels[label]
                 .ok_or_else(|| CodegenError::new("x86_64 backend: unplaced label", None))?;
@@ -74,8 +107,17 @@ impl Asm {
         for s in &self.strings {
             self.code.extend_from_slice(s);
         }
-        // The BSS region follows the strings in the address space (zero-filled by
-        // the kernel, never in the file). A global ref resolves to `bss_base + off`.
+        // The import region follows the strings; an extern call resolves to its
+        // IAT slot within it (`import_base + iat_offsets[idx]`).
+        let import_base = self.code.len();
+        for &(pos, idx) in &self.extern_calls {
+            let target = import_base + iat_offsets[idx];
+            let disp = target as i64 - (pos as i64 + 4);
+            self.code[pos..pos + 4].copy_from_slice(&(disp as i32).to_le_bytes());
+        }
+        self.code.extend_from_slice(import);
+        // The BSS region follows everything in the address space (zero-filled, never
+        // in the file). A global ref resolves to `bss_base + off`.
         let bss_base = self.code.len();
         for &(pos, off) in &self.global_fixups {
             let disp = (bss_base as i64 + off as i64) - (pos as i64 + 4);

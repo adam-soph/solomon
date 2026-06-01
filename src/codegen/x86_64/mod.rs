@@ -95,9 +95,13 @@ trait OsTarget {
     /// case of the formatted-output sink.
     fn emit_write_stdout(&mut self, asm: &mut Asm);
 
-    /// Wrap the finished, fully fixed-up code+strings `image` (a zero-filled BSS
-    /// of `bss` bytes follows it in the address space) into a runnable executable.
-    fn wrap(&mut self, image: Vec<u8>, bss: u64) -> Vec<u8>;
+    /// Package the emitted program into a runnable executable. Takes ownership of
+    /// the `Asm` so a policy can read its layout (and, on Windows, append an import
+    /// table) before calling [`Asm::finish`]; `bss` is the zero-filled BSS that
+    /// follows the image in memory. Linux finishes with no imports and wraps the
+    /// blob in an ELF; Windows builds a kernel32 import table, finishes with it,
+    /// and wraps the blob in a PE.
+    fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError>;
 }
 
 /// Compile a type-checked program to a runnable executable image. This driver is
@@ -151,8 +155,7 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
     cg.emit_rt_routines();
 
     let bss = cg.bss as u64;
-    let code = cg.asm.finish()?;
-    Ok(cg.os.wrap(code, bss))
+    cg.os.wrap(cg.asm, bss)
 }
 
 // ---- code generation ----

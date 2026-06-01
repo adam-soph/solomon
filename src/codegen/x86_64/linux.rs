@@ -71,8 +71,11 @@ impl OsTarget for LinuxTarget {
         asm.syscall();
     }
 
-    fn wrap(&mut self, image: Vec<u8>, bss: u64) -> Vec<u8> {
-        write_elf(&image, bss)
+    fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError> {
+        // No imports on Linux: finish with an empty import region (byte-identical
+        // to the former `[code | strings | bss]` layout), then wrap in an ELF.
+        let blob = asm.finish(&[], &[])?;
+        Ok(write_elf(&blob, bss))
     }
 }
 
