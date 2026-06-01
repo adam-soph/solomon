@@ -2199,7 +2199,7 @@ fn native_matches_stdlib_showcase() {
     // The stdlib showcase sample must produce identical output natively and in
     // the interpreter (its `tests/programs.rs` twin checks the same string).
     assert_eq!(
-        build_and_capture(include_str!("../examples/stdlib.hc")),
+        build_and_capture(include_str!("../examples/builtin.hc")),
         "Hello, World! len=13\n\
          HELLO, WORLD!\n\
          cmp=-1 memcmp=0\n\

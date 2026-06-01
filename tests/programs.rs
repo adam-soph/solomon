@@ -64,7 +64,7 @@ fn matrix_multiply_trace() {
 
 #[test]
 fn stdlib_builtins_showcase() {
-    let out = run("stdlib.hc", include_str!("../examples/stdlib.hc"));
+    let out = run("builtin.hc", include_str!("../examples/builtin.hc"));
     assert_eq!(
         out,
         "Hello, World! len=13\n\

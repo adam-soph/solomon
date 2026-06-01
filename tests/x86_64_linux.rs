@@ -693,7 +693,7 @@ fn buildable_examples_match_the_interpreter() {
         ("hello", include_str!("../examples/hello.hc")),
         ("report", include_str!("../examples/report.hc")),
         ("gallery", include_str!("../examples/gallery.hc")),
-        ("stdlib", include_str!("../examples/stdlib.hc")),
+        ("builtin", include_str!("../examples/builtin.hc")),
     ];
     let dir = temp_out();
     std::fs::create_dir_all(&dir).unwrap();

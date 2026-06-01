@@ -12,13 +12,13 @@ use solomon::sema::check_program;
 use solomon::token::TokenKind;
 
 mod common;
-use common::EXAMPLES as SAMPLES;
+use common::EXAMPLES;
 
 // ---- the lexer on its own ----
 
 #[test]
 fn samples_tokenize_cleanly() {
-    for (name, src) in SAMPLES {
+    for (name, src) in EXAMPLES {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{name}: lex failed: {e}"));
 
         // Must be terminated by exactly one Eof, and Eof must not appear early.
@@ -51,7 +51,7 @@ fn samples_tokenize_cleanly() {
 
 #[test]
 fn samples_parse_cleanly() {
-    for (name, src) in SAMPLES {
+    for (name, src) in EXAMPLES {
         let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         assert!(
             !program.items.is_empty(),
@@ -64,7 +64,7 @@ fn samples_parse_cleanly() {
 
 #[test]
 fn samples_pass_semantic_analysis() {
-    for (name, src) in SAMPLES {
+    for (name, src) in EXAMPLES {
         let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let errors = check_program(&program);
         assert!(
@@ -78,7 +78,7 @@ fn samples_pass_semantic_analysis() {
 fn samples_run_without_error() {
     // Every sample should execute to completion. Most define library functions
     // and produce no output; hello.hc calls Main and prints.
-    for (name, src) in SAMPLES {
+    for (name, src) in EXAMPLES {
         let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let out = run_to_string(&program).unwrap_or_else(|e| panic!("{name}: runtime error: {e}"));
         if *name == "hello.hc" {

@@ -1,4 +1,4 @@
-// stdlib.hc — a tour of the core-library built-ins: building strings on the
+// builtin.hc — a tour of the core-library built-ins: building strings on the
 // heap (MAlloc/StrCpy/StrCat/StrLen), in-place character case (ToUpper),
 // comparison (StrCmp/MemCmp), raw memory (MemSet/MemCpy/Free), and the
 // exactly-reproducible math op Sqrt. Output is kept integer-clean so it is
