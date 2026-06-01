@@ -15,8 +15,8 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use solomon::codegen::Codegen;
-use solomon::codegen::arm64_darwin::Arm64Darwin;
-use solomon::codegen::x86_64_linux::X64Linux;
+use solomon::codegen::arm64::Arm64Darwin;
+use solomon::codegen::x86_64::{X64Linux, X64Windows};
 use solomon::interp::Interpreter;
 use solomon::{lexer, parser, sema};
 
@@ -26,6 +26,7 @@ use solomon::{lexer, parser, sema};
 enum Target {
     Arm64Darwin,
     X64Linux,
+    X64Windows,
 }
 
 impl Target {
@@ -49,6 +50,10 @@ impl Target {
             | "x86_64-unknown-linux-gnu"
             | "x86_64-unknown-linux-musl"
             | "x86_64-linux" => Some(Target::X64Linux),
+            "x86_64-pc-windows"
+            | "x86_64-pc-windows-gnu"
+            | "x86_64-pc-windows-msvc"
+            | "x86_64-windows" => Some(Target::X64Windows),
             _ => None,
         }
     }
@@ -56,6 +61,7 @@ impl Target {
         match self {
             Target::Arm64Darwin => Box::new(Arm64Darwin::new(out)),
             Target::X64Linux => Box::new(X64Linux::new(out)),
+            Target::X64Windows => Box::new(X64Windows::new(out)),
         }
     }
 }

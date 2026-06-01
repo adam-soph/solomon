@@ -20,8 +20,8 @@ pub mod sema;
 pub mod token;
 
 pub use ast::{Expr, ExprKind, Program, Stmt, StmtKind, Type};
-pub use codegen::arm64_darwin::Arm64Darwin;
-pub use codegen::x86_64_linux::X64Linux;
+pub use codegen::arm64::Arm64Darwin;
+pub use codegen::x86_64::{X64Linux, X64Windows};
 pub use codegen::{Codegen, CodegenError};
 pub use interp::Interpreter;
 pub use layout::{Layout, Layouts};

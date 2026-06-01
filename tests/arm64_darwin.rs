@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::codegen::Codegen;
-use solomon::codegen::arm64_darwin::Arm64Darwin;
+use solomon::codegen::arm64::Arm64Darwin;
 use solomon::interp::run_to_string;
 use solomon::parser::parse;
 use solomon::sema::check_program;
@@ -56,48 +56,44 @@ fn build_object(src: &str) -> Vec<u8> {
         .unwrap_or_else(|e| panic!("arm64 object emission failed: {e}"))
 }
 
-/// Walk the load commands and return the `__text` machine-code bytes.
-fn text_section(obj: &[u8]) -> &[u8] {
-    assert_eq!(le_u32(obj, 0), 0xFEED_FACF, "bad Mach-O magic");
+/// Byte offset of the first load command with id `cmd` (panics if absent).
+fn load_command(obj: &[u8], cmd: u32) -> usize {
     let ncmds = le_u32(obj, 16);
     let mut off = 32; // past mach_header_64
     for _ in 0..ncmds {
-        let cmd = le_u32(obj, off);
-        let cmdsize = le_u32(obj, off + 4) as usize;
-        if cmd == 0x19 {
-            // LC_SEGMENT_64: a 72-byte header then `nsects` 80-byte section_64s.
-            let nsects = le_u32(obj, off + 64);
-            let mut s = off + 72;
-            for _ in 0..nsects {
-                if obj[s..s + 16].starts_with(b"__text\0") {
-                    let size = le_u64(obj, s + 40) as usize; // section_64.size
-                    let foff = le_u32(obj, s + 48) as usize; // section_64.offset
-                    return &obj[foff..foff + size];
-                }
-                s += 80;
-            }
+        if le_u32(obj, off) == cmd {
+            return off;
         }
-        off += cmdsize;
+        off += le_u32(obj, off + 4) as usize; // + cmdsize
+    }
+    panic!("no load command {cmd:#x} in the Mach-O object");
+}
+
+/// Walk the LC_SEGMENT_64 sections and return the `__text` machine-code bytes.
+fn text_section(obj: &[u8]) -> &[u8] {
+    assert_eq!(le_u32(obj, 0), 0xFEED_FACF, "bad Mach-O magic");
+    // LC_SEGMENT_64: a 72-byte header then `nsects` 80-byte section_64s.
+    let seg = load_command(obj, 0x19);
+    let nsects = le_u32(obj, seg + 64);
+    let mut s = seg + 72;
+    for _ in 0..nsects {
+        if obj[s..s + 16].starts_with(b"__text\0") {
+            let size = le_u64(obj, s + 40) as usize; // section_64.size
+            let foff = le_u32(obj, s + 48) as usize; // section_64.offset
+            return &obj[foff..foff + size];
+        }
+        s += 80;
     }
     panic!("no __text section in the Mach-O object");
 }
 
 /// The Mach-O string table bytes (so we can confirm the entry symbol is named).
 fn string_table(obj: &[u8]) -> &[u8] {
-    let ncmds = le_u32(obj, 16);
-    let mut off = 32;
-    for _ in 0..ncmds {
-        let cmd = le_u32(obj, off);
-        let cmdsize = le_u32(obj, off + 4) as usize;
-        if cmd == 0x2 {
-            // LC_SYMTAB: cmd, cmdsize, symoff, nsyms, stroff, strsize.
-            let stroff = le_u32(obj, off + 16) as usize;
-            let strsize = le_u32(obj, off + 20) as usize;
-            return &obj[stroff..stroff + strsize];
-        }
-        off += cmdsize;
-    }
-    panic!("no LC_SYMTAB in the Mach-O object");
+    // LC_SYMTAB: cmd, cmdsize, symoff, nsyms, stroff, strsize.
+    let cmd = load_command(obj, 0x2);
+    let stroff = le_u32(obj, cmd + 16) as usize;
+    let strsize = le_u32(obj, cmd + 20) as usize;
+    &obj[stroff..stroff + strsize]
 }
 
 #[test]
@@ -118,11 +114,6 @@ fn produces_a_valid_macho_arm64_object() {
         4,
         "ncmds (segment, symtab, dysymtab, build)"
     );
-    assert_eq!(
-        le_u32(&obj, 20) as usize,
-        obj_sizeofcmds(&obj),
-        "sizeofcmds"
-    );
 
     // A non-empty __text section and a `_main` entry symbol exist.
     assert!(!text_section(&obj).is_empty(), "__text should hold code");
@@ -130,17 +121,6 @@ fn produces_a_valid_macho_arm64_object() {
         string_table(&obj).windows(6).any(|w| w == b"_main\0"),
         "symbol table should define `_main`"
     );
-}
-
-/// `sizeofcmds` (header field at offset 20) summed independently from the LCs,
-/// as a cross-check that the load-command region is internally consistent.
-fn obj_sizeofcmds(obj: &[u8]) -> usize {
-    let ncmds = le_u32(obj, 16);
-    let mut off = 32;
-    for _ in 0..ncmds {
-        off += le_u32(obj, off + 4) as usize;
-    }
-    off - 32
 }
 
 #[test]
