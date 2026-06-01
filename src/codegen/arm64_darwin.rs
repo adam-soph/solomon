@@ -95,6 +95,15 @@ impl Arm64Darwin {
         }
     }
 
+    /// Emit the Mach-O relocatable object for `program` as raw bytes — the
+    /// exact content [`run`](Arm64Darwin::run) writes to its temp `.o`, but
+    /// without touching the filesystem or invoking `cc`. Exposed so structural
+    /// tests can byte-check the emitted object on **any** host; the link +
+    /// execute path needs `cc` and an Apple-silicon target.
+    pub fn object(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
+        self.compile(program)
+    }
+
     fn compile(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
         let (layouts, _) = crate::layout::compute(program);
         let mut cg = Cg::new(layouts);

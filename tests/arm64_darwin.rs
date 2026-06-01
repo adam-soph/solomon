@@ -1,9 +1,15 @@
 //! Tests for the hand-rolled AArch64 (`arm64`) backend.
 //!
-//! Each test compiles a small HolyC program to a native executable, runs it, and
-//! checks the process exit status equals the program's `return` value. These
-//! only run where a C toolchain (`cc`) and an arm64-Darwin host are available;
-//! on other platforms they skip (the backend targets aarch64-apple-darwin).
+//! Two layers, mirroring `x86_64_linux.rs`:
+//!
+//! - **Structural checks** byte-inspect the Mach-O *object* the backend emits
+//!   (via [`Arm64Darwin::object`], which stops before the `cc` link step). They
+//!   need no toolchain and run on **every** host — so a green run on a Linux CI
+//!   still exercises the AArch64 emitter, not nothing.
+//! - **End-to-end checks** compile a small HolyC program to a native executable,
+//!   run it, and check the exit status / stdout against the interpreter. These
+//!   shell out to `cc` and execute a Mach-O binary, so they only run on an
+//!   arm64-Darwin host and self-skip elsewhere.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -27,6 +33,142 @@ fn toolchain_available() -> bool {
 }
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// ---------------------------------------------------------------------------
+// Structural checks — byte-inspect the emitted Mach-O object. No `cc`, no
+// execution, so these run on every host (the analogue of the x86_64 ELF checks).
+// ---------------------------------------------------------------------------
+
+fn le_u32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+fn le_u64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+/// Compile `src` to the Mach-O relocatable object (no link).
+fn build_object(src: &str) -> Vec<u8> {
+    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = check_program(&program);
+    assert!(errs.is_empty(), "semantic errors: {errs:?}");
+    Arm64Darwin::new(std::env::temp_dir().join("solomon-arm64-unused"))
+        .object(&program)
+        .unwrap_or_else(|e| panic!("arm64 object emission failed: {e}"))
+}
+
+/// Walk the load commands and return the `__text` machine-code bytes.
+fn text_section(obj: &[u8]) -> &[u8] {
+    assert_eq!(le_u32(obj, 0), 0xFEED_FACF, "bad Mach-O magic");
+    let ncmds = le_u32(obj, 16);
+    let mut off = 32; // past mach_header_64
+    for _ in 0..ncmds {
+        let cmd = le_u32(obj, off);
+        let cmdsize = le_u32(obj, off + 4) as usize;
+        if cmd == 0x19 {
+            // LC_SEGMENT_64: a 72-byte header then `nsects` 80-byte section_64s.
+            let nsects = le_u32(obj, off + 64);
+            let mut s = off + 72;
+            for _ in 0..nsects {
+                if obj[s..s + 16].starts_with(b"__text\0") {
+                    let size = le_u64(obj, s + 40) as usize; // section_64.size
+                    let foff = le_u32(obj, s + 48) as usize; // section_64.offset
+                    return &obj[foff..foff + size];
+                }
+                s += 80;
+            }
+        }
+        off += cmdsize;
+    }
+    panic!("no __text section in the Mach-O object");
+}
+
+/// The Mach-O string table bytes (so we can confirm the entry symbol is named).
+fn string_table(obj: &[u8]) -> &[u8] {
+    let ncmds = le_u32(obj, 16);
+    let mut off = 32;
+    for _ in 0..ncmds {
+        let cmd = le_u32(obj, off);
+        let cmdsize = le_u32(obj, off + 4) as usize;
+        if cmd == 0x2 {
+            // LC_SYMTAB: cmd, cmdsize, symoff, nsyms, stroff, strsize.
+            let stroff = le_u32(obj, off + 16) as usize;
+            let strsize = le_u32(obj, off + 20) as usize;
+            return &obj[stroff..stroff + strsize];
+        }
+        off += cmdsize;
+    }
+    panic!("no LC_SYMTAB in the Mach-O object");
+}
+
+#[test]
+fn produces_a_valid_macho_arm64_object() {
+    let obj = build_object("return 42;");
+
+    // mach_header_64.
+    assert_eq!(le_u32(&obj, 0), 0xFEED_FACF, "magic should be MH_MAGIC_64");
+    assert_eq!(
+        le_u32(&obj, 4),
+        0x0100_000C,
+        "cputype should be CPU_TYPE_ARM64"
+    );
+    assert_eq!(le_u32(&obj, 8), 0, "cpusubtype should be ARM64_ALL");
+    assert_eq!(le_u32(&obj, 12), 1, "filetype should be MH_OBJECT");
+    assert_eq!(
+        le_u32(&obj, 16),
+        4,
+        "ncmds (segment, symtab, dysymtab, build)"
+    );
+    assert_eq!(
+        le_u32(&obj, 20) as usize,
+        obj_sizeofcmds(&obj),
+        "sizeofcmds"
+    );
+
+    // A non-empty __text section and a `_main` entry symbol exist.
+    assert!(!text_section(&obj).is_empty(), "__text should hold code");
+    assert!(
+        string_table(&obj).windows(6).any(|w| w == b"_main\0"),
+        "symbol table should define `_main`"
+    );
+}
+
+/// `sizeofcmds` (header field at offset 20) summed independently from the LCs,
+/// as a cross-check that the load-command region is internally consistent.
+fn obj_sizeofcmds(obj: &[u8]) -> usize {
+    let ncmds = le_u32(obj, 16);
+    let mut off = 32;
+    for _ in 0..ncmds {
+        off += le_u32(obj, off + 4) as usize;
+    }
+    off - 32
+}
+
+#[test]
+fn main_is_framed_and_returns() {
+    // `_main` opens a frame (`stp x29,x30,[sp,#-16]!`) and ends with `ret`.
+    // Exact runtime behavior is pinned by the execute-it tests below; this is
+    // the host-independent instruction-level guard (the AArch64 analogue of
+    // x86_64's `main_is_framed_and_exits_via_syscall`).
+    let code = build_object("return 42;");
+    let text = text_section(&code);
+    assert!(text.len() >= 8, "__text too small: {} bytes", text.len());
+
+    // Both words are frame-size independent, so they pin exactly.
+    assert_eq!(
+        le_u32(text, 0),
+        0xA9BF_7BFD,
+        "first instruction should be `stp x29, x30, [sp, #-16]!`"
+    );
+    assert_eq!(
+        le_u32(text, text.len() - 4),
+        0xD65F_03C0,
+        "last instruction should be `ret`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end checks — build, link with `cc`, and execute. arm64-Darwin only.
+// ---------------------------------------------------------------------------
 
 /// Compile `src`, run the resulting binary, and return its exit status.
 fn build_and_run(src: &str) -> i32 {
