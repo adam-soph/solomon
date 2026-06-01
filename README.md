@@ -125,6 +125,12 @@ Default targets:
 | Windows x86-64      | `x86_64-pc-windows-gnu`       |
 | Windows x86         | `i686-pc-windows-gnu`         |
 
+These triples are what the **solomon binary itself** is compiled for — every one
+runs the front end and the interpreter (`--run`). Native code *generation*
+(`--build` / `--target`) is a separate axis: only `aarch64-apple-darwin` and
+`x86_64-unknown-linux` have a backend, so on the other platforms (Windows
+included) solomon interprets HolyC but cannot emit a native executable yet.
+
 Building for an OS other than the host needs a cross linker/toolchain. The
 Makefile uses the [`cross`](https://github.com/cross-rs/cross) tool (Docker-based)
 for foreign-OS targets automatically, and plain `cargo` for host-OS targets, so a

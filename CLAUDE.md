@@ -40,11 +40,16 @@ the Makefile / README for the target list.
 
 ### Important testing notes
 
-- **The arm64 backend tests (`tests/arm64_darwin.rs`) only run on an `aarch64-apple-darwin`
-  host with `cc` available** — they shell out to compile + link + execute real
-  Mach-O binaries (~14s). On any other platform they self-skip (print "skipping"
-  and pass), so a green `cargo test` elsewhere does **not** mean the native
-  backend was exercised. Verify arm64 changes on an Apple-silicon Mac.
+- **`tests/arm64_darwin.rs` has two layers** (like `tests/x86_64_linux.rs`). The
+  **structural checks** (`produces_a_valid_macho_arm64_object`,
+  `main_is_framed_and_returns`) byte-inspect the emitted Mach-O object via
+  `Arm64Darwin::object` (which stops *before* the `cc` link step), so they run on
+  **every** host with no toolchain. The **end-to-end checks** shell out to `cc`
+  and execute real Mach-O binaries (~14s), so they only run on an
+  `aarch64-apple-darwin` host with `cc` and self-skip elsewhere (print "skipping"
+  and pass). A green `cargo test` off an Apple-silicon Mac therefore exercises the
+  AArch64 *emitter* but not *execution* — verify behavioral arm64 changes on an
+  Apple-silicon Mac.
 - Clippy reports pre-existing stylistic lints across the codebase that are *not*
   enforced; `cargo build` is warning-free and that is the bar. Don't "fix" the
   whole tree — just keep your own additions from adding new warnings.
@@ -474,9 +479,9 @@ with byte-identical output.
 
 ## Status note
 
-The README's "Not yet implemented: code generation" line is stale — the arm64
-native backend (`--build`) now exists and compiles the whole implemented HolyC
-subset, including the `offset` keyword, brace aggregate initializers
+Code generation is implemented for both native targets (`--build` for the host,
+`--target` for a specific triple). The backends compile the whole implemented
+HolyC subset, including the `offset` keyword, brace aggregate initializers
 (`I64 a[] = {1,2,3}`, `Pt p = {1,2}`, nested and partial), designated class
 initializers (`Pt p = {.x = 1, .y = 2}`, out-of-order, partial, and nested), and
 member access on a call result (`Mk().x`, including nested paths and F64 fields).
