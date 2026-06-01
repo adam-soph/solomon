@@ -20,7 +20,7 @@
 # A native macOS host builds both Apple targets with cargo (after `make targets`)
 # and Linux/Windows targets with cross.
 
-BIN         := holyc
+BINS        := hcc hci
 CARGO       ?= cargo
 CROSS       ?= cross
 CARGO_FLAGS ?= --release --locked
@@ -85,22 +85,26 @@ dist: all
 	@mkdir -p $(DIST)
 	@for t in $(TARGETS); do \
 		ext=""; case $$t in *windows*) ext=".exe";; esac; \
-		src="target/$$t/$(PROFILE_DIR)/$(BIN)$$ext"; \
-		if [ -f "$$src" ]; then \
-			cp "$$src" "$(DIST)/$(BIN)-$$t$$ext"; \
-			echo "  packaged $(DIST)/$(BIN)-$$t$$ext"; \
-		else \
-			echo "  SKIP $$t (not built: $$src missing)"; \
-		fi; \
+		for b in $(BINS); do \
+			src="target/$$t/$(PROFILE_DIR)/$$b$$ext"; \
+			if [ -f "$$src" ]; then \
+				cp "$$src" "$(DIST)/$$b-$$t$$ext"; \
+				echo "  packaged $(DIST)/$$b-$$t$$ext"; \
+			else \
+				echo "  SKIP $$b for $$t (not built: $$src missing)"; \
+			fi; \
+		done; \
 	done
 
-# macOS universal binary (arm64 + x86_64) via lipo. macOS host only.
+# macOS universal binaries (arm64 + x86_64) via lipo. macOS host only.
 macos-universal: $(MACOS_TARGETS)
 	@mkdir -p $(DIST)
-	lipo -create -output $(DIST)/$(BIN)-macos-universal \
-		target/aarch64-apple-darwin/$(PROFILE_DIR)/$(BIN) \
-		target/x86_64-apple-darwin/$(PROFILE_DIR)/$(BIN)
-	@echo "  created $(DIST)/$(BIN)-macos-universal"
+	@for b in $(BINS); do \
+		lipo -create -output $(DIST)/$$b-macos-universal \
+			target/aarch64-apple-darwin/$(PROFILE_DIR)/$$b \
+			target/x86_64-apple-darwin/$(PROFILE_DIR)/$$b; \
+		echo "  created $(DIST)/$$b-macos-universal"; \
+	done
 
 # Run the test suite on the host.
 test:
@@ -115,7 +119,7 @@ clean:
 	rm -rf $(DIST)
 
 help:
-	@echo "holyc build targets:"
+	@echo "hcc build targets:"
 	@echo "  make / make native     build for the host machine"
 	@echo "  make targets           rustup target add every triple"
 	@echo "  make all               build every target in TARGETS"

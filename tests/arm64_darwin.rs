@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::codegen::Codegen;
-use solomon::codegen::arm64::Arm64Darwin;
+use solomon::arm64::Arm64Darwin;
 use solomon::interp::run_to_string;
 use solomon::parser::parse;
 use solomon::sema::check_program;

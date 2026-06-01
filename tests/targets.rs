@@ -4,8 +4,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::codegen::Codegen;
-use solomon::codegen::arm64::Arm64Linux;
-use solomon::codegen::x86_64::X64Linux;
+use solomon::arm64::Arm64Linux;
+use solomon::x86_64::X64Linux;
 use solomon::parser::parse;
 use solomon::sema::check_program;
 

@@ -1,17 +1,12 @@
-//! Native code generators behind the [`Codegen`] trait. A codegen backend is a
-//! **target**, not just an architecture — its module is named `<arch>_<os>`
-//! because the object format, syscalls, and ABI all depend on the OS, not only
-//! the CPU. Two implement the trait: [`arm64`] (AArch64 encoder + a Mach-O
-//! container linked via `cc`; `aarch64-apple-darwin`) and [`x86_64`] (the shared
-//! x86-64 codegen with a
-//! per-OS policy; its `X64Linux` target is a freestanding static ELF with raw
-//! Linux syscalls, `x86_64-unknown-linux`, and a Windows PE target is underway).
-//! (The tree-walking
+//! The [`Codegen`] trait and [`CodegenError`] — the shared interface every native
+//! code generator implements. The generators themselves are per-architecture
+//! sibling modules: [`crate::arm64`] (AArch64 — `aarch64-apple-darwin` Mach-O via
+//! `cc`, and `aarch64-unknown-linux-{gnu,musl}` ELF via gcc) and [`crate::x86_64`]
+//! (`x86_64-unknown-linux` freestanding ELF, `x86_64-pc-windows` PE). A backend is
+//! a **target** — an (architecture, OS) pair — since the object format, syscalls,
+//! and ABI depend on the OS, not just the CPU. (The tree-walking
 //! [interpreter](crate::interp) is not a code generator and lives separately; it
 //! is the conformance oracle these backends match byte-for-byte.)
-
-pub mod arm64;
-pub mod x86_64;
 
 use std::fmt;
 

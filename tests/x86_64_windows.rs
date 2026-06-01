@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::codegen::Codegen;
-use solomon::codegen::x86_64::X64Windows;
+use solomon::x86_64::X64Windows;
 use solomon::parser::parse;
 use solomon::sema::check_program;
 

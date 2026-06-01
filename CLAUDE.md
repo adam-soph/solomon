@@ -13,7 +13,7 @@ backend is an (arch, OS) pair, not just a CPU.
 ## Commands
 
 ```sh
-cargo build                 # debug build (CLI binary: target/debug/holyc; the lib crate is `solomon`)
+cargo build                 # debug build (CLIs: target/debug/{hcc,hci}; the lib crate is `solomon`)
 cargo build --release       # release build
 cargo test                  # whole suite
 cargo test --test arm64_darwin     # one integration-test file (each tests/<name>.rs is a crate)
@@ -22,19 +22,21 @@ cargo fmt                   # format (CI-relevant: keep the tree fmt-clean)
 cargo clippy --all-targets  # lint — see note below
 ```
 
-The CLI binary is **`holyc`**. It is **subcommand**-based, and with **no
-subcommand it compiles a native binary for the host's architecture and OS** (the
-default — `-o OUT`, default `a.out`); `--target TRIPLE` cross-compiles. The
-interpreter is the `run` subcommand:
+There are **two CLIs** (`src/hcc.rs`, `src/hci.rs`): **`hcc`** is the compiler —
+with **no subcommand it compiles a native binary for the host** (`-o OUT`,
+default `a.out`); `--target TRIPLE` cross-compiles; `check`/`ast`/`tokens` are
+front-end-only subcommands. **`hci`** is the interpreter — `hci FILE [args]` runs
+the program (the conformance oracle). Run a specific binary with `cargo run
+--bin`:
 
 ```sh
-cargo run -- FILE.hc -o out          # default: native binary for the host target
-cargo run -- --target x86_64-unknown-linux -o out FILE.hc  # cross-compile (a static ELF)
-cargo run -- run FILE.hc             # type-check then interpret
-cargo run -- check FILE.hc           # parse + sema only, report errors
-cargo run -- ast FILE.hc             # dump the parsed AST
-cargo run -- tokens FILE.hc          # raw lexer output (no preprocessing)
-echo 'I64 Sq(I64 x){return x*x;} "%d\n", Sq(9);' | cargo run -- run   # reads stdin if no FILE
+cargo run --bin hcc -- FILE.hc -o out          # compile: native binary for the host
+cargo run --bin hcc -- --target x86_64-unknown-linux -o out FILE.hc  # cross-compile (a static ELF)
+cargo run --bin hci -- FILE.hc                 # interpret (type-check then run)
+cargo run --bin hcc -- check FILE.hc           # parse + sema only, report errors
+cargo run --bin hcc -- ast FILE.hc             # dump the parsed AST
+cargo run --bin hcc -- tokens FILE.hc          # raw lexer output (no preprocessing)
+echo 'I64 Sq(I64 x){return x*x;} "%d\n", Sq(9);' | cargo run --bin hci   # reads stdin if no FILE
 ```
 
 `make` wraps cargo for cross-compilation (`make`, `make all`, `make <triple>`,

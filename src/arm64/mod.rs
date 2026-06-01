@@ -43,8 +43,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Codegen, CodegenError};
 use crate::ast::*;
+use crate::codegen::{Codegen, CodegenError};
 use crate::layout::Layouts;
 use crate::token::{Pos, Span};
 
@@ -139,112 +139,112 @@ impl Arm64Darwin {
 /// This driver — function/global symbol layout, code emission, fixup resolution
 /// — is shared by every AArch64 target; only `target` differs.
 fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, CodegenError> {
-        let (layouts, _) = crate::layout::compute(program);
-        let mut cg = Cg::new(layouts);
-        cg.variadic_regs = target.variadic_in_registers();
+    let (layouts, _) = crate::layout::compute(program);
+    let mut cg = Cg::new(layouts);
+    cg.variadic_regs = target.variadic_in_registers();
 
-        let main_label = cg.asm.new_label();
-        for item in &program.items {
-            if let StmtKind::Func(f) = &item.kind {
-                if f.body.is_some() {
-                    let label = cg.asm.new_label();
-                    cg.funcs.insert(
-                        f.name.clone(),
-                        FnInfo {
-                            label,
-                            params: f.params.clone(),
-                            ret: f.ret.clone(),
-                        },
-                    );
-                }
+    let main_label = cg.asm.new_label();
+    for item in &program.items {
+        if let StmtKind::Func(f) = &item.kind {
+            if f.body.is_some() {
+                let label = cg.asm.new_label();
+                cg.funcs.insert(
+                    f.name.clone(),
+                    FnInfo {
+                        label,
+                        params: f.params.clone(),
+                        ret: f.ret.clone(),
+                    },
+                );
             }
         }
-
-        // Defined symbols are `_main` + functions, in order. Globals follow them
-        // in the symbol table, so a global's symbol index is `ndefined + ordinal`.
-        let ndefined = 1 + cg.funcs.len() as u32;
-        for item in &program.items {
-            if let StmtKind::VarDecl { decls } = &item.kind {
-                for d in decls {
-                    let sym = ndefined + cg.global_order.len() as u32;
-                    cg.globals.insert(
-                        d.name.clone(),
-                        GlobalInfo {
-                            sym,
-                            ty: d.ty.clone(),
-                        },
-                    );
-                    cg.global_order.push(d.name.clone());
-                }
-            }
-        }
-        // A hidden global word backs `RandU64`'s PRNG state (zero-initialised by
-        // the linker; splitmix64 runs from any seed).
-        {
-            let sym = ndefined + cg.global_order.len() as u32;
-            cg.globals.insert(
-                crate::builtins::RNG_STATE_GLOBAL.to_string(),
-                GlobalInfo { sym, ty: Type::U64 },
-            );
-            cg.global_order
-                .push(crate::builtins::RNG_STATE_GLOBAL.to_string());
-        }
-        // When the program reads command-line args, reserve two hidden common
-        // symbols (argc and the argv array pointer) that `_main` populates from
-        // x0/x1; arg-free programs are left untouched.
-        if crate::ast::program_calls_any(program, &["ArgC", "ArgV"]) {
-            cg.uses_args = true;
-            for name in [ARGC_GLOBAL, ARGV_GLOBAL] {
-                let sym = ndefined + cg.global_order.len() as u32;
-                cg.globals
-                    .insert(name.to_string(), GlobalInfo { sym, ty: Type::U64 });
-                cg.global_order.push(name.to_string());
-            }
-        }
-
-        let driver: Vec<&Stmt> = program
-            .items
-            .iter()
-            .filter(|s| !matches!(s.kind, StmtKind::Func(_) | StmtKind::Class(_)))
-            .collect();
-        cg.emit_function(main_label, &[], &Type::I64, &driver, true)?;
-
-        for item in &program.items {
-            if let StmtKind::Func(f) = &item.kind {
-                if let Some(body) = &f.body {
-                    let label = cg.funcs[&f.name].label;
-                    let body_refs: Vec<&Stmt> = body.iter().collect();
-                    cg.emit_function(label, &f.params, &f.ret, &body_refs, false)?;
-                }
-            }
-        }
-
-        // Symbol table: defined (`_main` + funcs, in __text) then common globals.
-        let mut defined = vec![("_main".to_string(), cg.asm.label_byte(main_label)?)];
-        for item in &program.items {
-            if let StmtKind::Func(f) = &item.kind {
-                if f.body.is_some() {
-                    let off = cg.asm.label_byte(cg.funcs[&f.name].label)?;
-                    defined.push((format!("_{}", f.name), off));
-                }
-            }
-        }
-        let commons: Vec<(String, u64, u32)> = cg
-            .global_order
-            .iter()
-            .map(|name| {
-                let g = &cg.globals[name];
-                let size = cg.layouts.size_of(&g.ty).max(1);
-                let align_log2 = cg.layouts.align_of(&g.ty).max(1).trailing_zeros();
-                (format!("_{name}"), size, align_log2)
-            })
-            .collect();
-
-        let image = cg.asm.finish()?;
-        // Hand the machine code + symbolic relocations to the target's object
-        // writer, which lowers the relocations and packages the relocatable object.
-        Ok(target.write_object(&image, &defined, &commons, ndefined))
     }
+
+    // Defined symbols are `_main` + functions, in order. Globals follow them
+    // in the symbol table, so a global's symbol index is `ndefined + ordinal`.
+    let ndefined = 1 + cg.funcs.len() as u32;
+    for item in &program.items {
+        if let StmtKind::VarDecl { decls } = &item.kind {
+            for d in decls {
+                let sym = ndefined + cg.global_order.len() as u32;
+                cg.globals.insert(
+                    d.name.clone(),
+                    GlobalInfo {
+                        sym,
+                        ty: d.ty.clone(),
+                    },
+                );
+                cg.global_order.push(d.name.clone());
+            }
+        }
+    }
+    // A hidden global word backs `RandU64`'s PRNG state (zero-initialised by
+    // the linker; splitmix64 runs from any seed).
+    {
+        let sym = ndefined + cg.global_order.len() as u32;
+        cg.globals.insert(
+            crate::builtins::RNG_STATE_GLOBAL.to_string(),
+            GlobalInfo { sym, ty: Type::U64 },
+        );
+        cg.global_order
+            .push(crate::builtins::RNG_STATE_GLOBAL.to_string());
+    }
+    // When the program reads command-line args, reserve two hidden common
+    // symbols (argc and the argv array pointer) that `_main` populates from
+    // x0/x1; arg-free programs are left untouched.
+    if crate::ast::program_calls_any(program, &["ArgC", "ArgV"]) {
+        cg.uses_args = true;
+        for name in [ARGC_GLOBAL, ARGV_GLOBAL] {
+            let sym = ndefined + cg.global_order.len() as u32;
+            cg.globals
+                .insert(name.to_string(), GlobalInfo { sym, ty: Type::U64 });
+            cg.global_order.push(name.to_string());
+        }
+    }
+
+    let driver: Vec<&Stmt> = program
+        .items
+        .iter()
+        .filter(|s| !matches!(s.kind, StmtKind::Func(_) | StmtKind::Class(_)))
+        .collect();
+    cg.emit_function(main_label, &[], &Type::I64, &driver, true)?;
+
+    for item in &program.items {
+        if let StmtKind::Func(f) = &item.kind {
+            if let Some(body) = &f.body {
+                let label = cg.funcs[&f.name].label;
+                let body_refs: Vec<&Stmt> = body.iter().collect();
+                cg.emit_function(label, &f.params, &f.ret, &body_refs, false)?;
+            }
+        }
+    }
+
+    // Symbol table: defined (`_main` + funcs, in __text) then common globals.
+    let mut defined = vec![("_main".to_string(), cg.asm.label_byte(main_label)?)];
+    for item in &program.items {
+        if let StmtKind::Func(f) = &item.kind {
+            if f.body.is_some() {
+                let off = cg.asm.label_byte(cg.funcs[&f.name].label)?;
+                defined.push((format!("_{}", f.name), off));
+            }
+        }
+    }
+    let commons: Vec<(String, u64, u32)> = cg
+        .global_order
+        .iter()
+        .map(|name| {
+            let g = &cg.globals[name];
+            let size = cg.layouts.size_of(&g.ty).max(1);
+            let align_log2 = cg.layouts.align_of(&g.ty).max(1).trailing_zeros();
+            (format!("_{name}"), size, align_log2)
+        })
+        .collect();
+
+    let image = cg.asm.finish()?;
+    // Hand the machine code + symbolic relocations to the target's object
+    // writer, which lowers the relocations and packages the relocatable object.
+    Ok(target.write_object(&image, &defined, &commons, ndefined))
+}
 
 /// Compile `program`, write the object to a temp file, and link it into
 /// `out_path` with `target`'s linker.

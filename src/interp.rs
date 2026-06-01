@@ -359,7 +359,7 @@ impl<W: Write> Interpreter<W> {
             classes: HashMap::new(),
             layouts: Layouts::empty(),
             rng_state: 0,
-            args: vec!["holyc".to_string()],
+            args: vec!["hcc".to_string()],
         }
     }
 

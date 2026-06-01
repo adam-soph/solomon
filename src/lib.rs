@@ -7,6 +7,7 @@
 //! [`X64Linux`] (`x86_64-unknown-linux`). The native backends match the
 //! interpreter byte-for-byte.
 
+pub mod arm64;
 pub mod ast;
 pub mod builtins;
 pub mod codegen;
@@ -18,10 +19,11 @@ pub mod parser;
 pub mod preproc;
 pub mod sema;
 pub mod token;
+pub mod x86_64;
 
 pub use ast::{Expr, ExprKind, Program, Stmt, StmtKind, Type};
-pub use codegen::arm64::{Arm64Darwin, Arm64Linux};
-pub use codegen::x86_64::{X64Linux, X64Windows};
+pub use arm64::{Arm64Darwin, Arm64Linux};
+pub use x86_64::{X64Linux, X64Windows};
 pub use codegen::{Codegen, CodegenError};
 pub use interp::Interpreter;
 pub use layout::{Layout, Layouts};

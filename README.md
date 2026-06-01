@@ -24,7 +24,7 @@ Main;
 ```
 
 ```
-$ holyc run hello.hc
+$ hci hello.hc
 Hello, World!
 x=42 y=255
 ```
@@ -93,10 +93,10 @@ Not yet implemented: most of the TempleOS core/standard library and DolDoc.
 Requires **Rust 1.85+** (the crate uses the 2024 edition). With Cargo:
 
 ```sh
-cargo build --release         # binary at target/release/holyc
-cargo test                    # run the test suite
-cargo run -- run FILE.hc      # interpret a HolyC file
-cargo run -- FILE.hc -o app   # compile it to a native binary for the host
+cargo build --release             # binaries at target/release/{hcc,hci}
+cargo test                        # run the test suite
+cargo run --bin hci -- FILE.hc    # interpret a HolyC file
+cargo run --bin hcc -- FILE.hc -o app   # compile it to a native binary
 ```
 
 ### Cross-compiling
@@ -126,14 +126,14 @@ Default targets:
 | Windows x86-64      | `x86_64-pc-windows-gnu`       |
 | Windows x86         | `i686-pc-windows-gnu`         |
 
-These triples are what the **`holyc` binary itself** is compiled for — every one
-runs the front end and the interpreter (`holyc run`). Native code *generation*
-(the default build, or `--target`) is a separate axis: `aarch64-apple-darwin`,
-`x86_64-unknown-linux` (its `-gnu` and `-musl` triples are the same freestanding
-static ELF), `x86_64-pc-windows`, and `aarch64-unknown-linux-gnu`/`-musl` (an ELF
-linked with an aarch64 gcc — dynamically against glibc, or statically against
-musl) have a backend. On any other platform `holyc` interprets HolyC but cannot
-emit a native executable yet.
+These triples are what the **`hcc`/`hci` binaries themselves** are compiled for —
+every one can interpret HolyC (`hci`). Native code *generation* (`hcc`) is a
+separate axis: `aarch64-apple-darwin`, `x86_64-unknown-linux` (its `-gnu` and
+`-musl` triples are the same freestanding static ELF), `x86_64-pc-windows`, and
+`aarch64-unknown-linux-gnu`/`-musl` (an ELF linked with an aarch64 gcc —
+dynamically against glibc, or statically against musl) have a backend. On any
+other platform `hci` interprets HolyC but `hcc` cannot emit a native executable
+yet.
 
 Building for an OS other than the host needs a cross linker/toolchain. The
 Makefile uses the [`cross`](https://github.com/cross-rs/cross) tool (Docker-based)
@@ -154,34 +154,38 @@ target list with `make all TARGETS="x86_64-unknown-linux-gnu ..."`.
 
 ## Usage
 
+There are two binaries: **`hci`** runs a HolyC program, **`hcc`** compiles one.
+Both read from `FILE`, or from stdin if no file is given.
+
 ```
-holyc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
-holyc <subcommand> [FILE]
+hci [FILE] [ARGS...]                     run with the tree-walking interpreter
+hcc [--target TRIPLE] [-o OUT] [FILE]    compile a native binary (the default)
+hcc <subcommand> [FILE]
 ```
 
-Reads from `FILE`, or from stdin if no file is given. With **no subcommand**,
-`holyc` compiles a native binary for the host's architecture and OS (`-o OUT`,
-default `a.out`); `--target TRIPLE` cross-compiles instead. The subcommands
-select other behavior:
+`hci` runs the program; arguments after `FILE` become its `argv` (read via
+`ArgC`/`ArgV`). `hcc` with no subcommand compiles a native binary for the host
+(`-o OUT`, default `a.out`); `--target TRIPLE` cross-compiles instead. Its
+subcommands are front-end tools:
 
 | Command         | Does                                                       |
 | --------------- | ---------------------------------------------------------- |
-| *(none)*        | compile a native binary for the host target (`-o OUT`)     |
-| `run`           | type-check then execute with the tree-walking interpreter  |
-| `check`         | parse + semantic analysis; report errors, run nothing      |
-| `ast`           | parse and dump the AST                                      |
-| `tokens`        | run the lexer only and dump the token stream               |
+| `hci FILE`      | type-check then execute with the tree-walking interpreter  |
+| `hcc FILE`      | compile a native binary for the host target (`-o OUT`)     |
+| `hcc check`     | parse + semantic analysis; report errors, run nothing      |
+| `hcc ast`       | parse and dump the AST                                      |
+| `hcc tokens`    | run the lexer only and dump the token stream               |
 
 `--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`,
 `x86_64-pc-windows`, and `aarch64-unknown-linux-gnu` — each with `-gnu`/`-musl`
 forms where applicable.
 
 ```sh
-$ holyc check broken.hc
+$ hcc check broken.hc
 semantic error at 2:3: call to undeclared function `DrawRect`
 1 error(s)
 
-$ echo 'I64 Sq(I64 x){ return x*x; } "%d\n", Sq(9);' | holyc run
+$ echo 'I64 Sq(I64 x){ return x*x; } "%d\n", Sq(9);' | hci
 81
 ```
 
@@ -245,11 +249,13 @@ src/
   layout.rs     type size/alignment/offset pass
   builtins.rs   built-in function registry (shared by all backends)
   interp.rs     tree-walking interpreter (the conformance oracle)
-  codegen.rs    the Codegen trait + CodegenError
-  codegen/
-    arm64_darwin.rs   aarch64-apple-darwin code generator + Mach-O writer
-    x86_64_linux.rs   x86_64-unknown-linux code generator + static-ELF writer
-  main.rs       CLI
-tests/          lexer, parser, sema, preproc, layout, interpreter, and the two
-                native backends (arm64_darwin, x86_64_linux) + whole-program tests
+  codegen.rs    the Codegen trait + CodegenError (the shared backend interface)
+  arm64/        AArch64 backend — asm.rs (encoder), mod.rs (codegen), darwin.rs
+                (Mach-O + cc), linux.rs (ELF + gcc; gnu/musl)
+  x86_64/       x86-64 backend — asm.rs (encoder), mod.rs (codegen + OsTarget),
+                linux.rs (static ELF), windows.rs (self-contained PE)
+  main.rs       the `hcc` compiler CLI
+  bin/hci.rs    the `hci` interpreter CLI
+tests/          lexer, parser, sema, preproc, layout, interpreter, the native
+                backends, target registration, and whole-program tests
 ```

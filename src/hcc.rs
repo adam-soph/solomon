@@ -1,15 +1,15 @@
-//! The `holyc` CLI. Reads HolyC source from a file (or stdin) and, **by default,
-//! compiles a native binary for the host's architecture and OS**. A leading
-//! subcommand selects other behavior.
+//! The `hcc` CLI — the HolyC **compiler**. Reads HolyC source from a file (or
+//! stdin) and, by default, compiles a native binary for the host's architecture
+//! and OS. A leading subcommand selects a front-end-only mode. To *run* a program
+//! with the interpreter, use the matching `hci`.
 //!
 //! Usage:
-//!   holyc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
-//!   holyc run    [FILE]                       run with the tree-walking interpreter
-//!   holyc check  [FILE]                       parse + semantic analysis, report errors
-//!   holyc ast    [FILE]                       dump the parsed AST
-//!   holyc tokens [FILE]                       dump the raw lexer token stream
+//!   hcc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
+//!   hcc check  [FILE]                       parse + semantic analysis, report errors
+//!   hcc ast    [FILE]                       dump the parsed AST
+//!   hcc tokens [FILE]                       dump the raw lexer token stream
 //!
-//! With no subcommand `holyc` builds for the host target (`-o OUT`, default
+//! With no subcommand `hcc` builds for the host target (`-o OUT`, default
 //! `a.out`); `--target TRIPLE` cross-compiles instead (`aarch64-apple-darwin` →
 //! Mach-O via `cc`, `x86_64-unknown-linux` → a freestanding static ELF,
 //! `x86_64-pc-windows` → a self-contained PE).
@@ -17,10 +17,9 @@
 use std::io::Read;
 use std::process::ExitCode;
 
+use solomon::arm64::{Arm64Darwin, Arm64Linux};
 use solomon::codegen::Codegen;
-use solomon::codegen::arm64::{Arm64Darwin, Arm64Linux};
-use solomon::codegen::x86_64::{X64Linux, X64Windows};
-use solomon::interp::Interpreter;
+use solomon::x86_64::{X64Linux, X64Windows};
 use solomon::{lexer, parser, sema};
 
 /// A code-generation target: an (architecture, OS) pair, since the object format,
@@ -87,7 +86,6 @@ enum Mode {
     Tokens,
     Ast,
     Check,
-    Run,
     Build,
 }
 
@@ -104,10 +102,6 @@ fn main() -> ExitCode {
     let is_subcommand = match args.peek().map(String::as_str) {
         Some("build") => {
             mode = Mode::Build;
-            true
-        }
-        Some("run") => {
-            mode = Mode::Run;
             true
         }
         Some("check") => {
@@ -132,24 +126,16 @@ fn main() -> ExitCode {
         args.next();
     }
 
-    // Positional tokens: the first is the input FILE; the rest, in `run` mode,
-    // are the program's own arguments (visible via `ArgC`/`ArgV`). `--` ends
-    // option parsing, so option-looking program arguments can be passed through.
-    let mut positionals: Vec<String> = Vec::new();
-    let mut opts_done = false;
+    // The single positional is the input FILE (stdin if omitted).
+    let mut path: Option<String> = None;
     while let Some(arg) = args.next() {
-        if opts_done {
-            positionals.push(arg);
-            continue;
-        }
         match arg.as_str() {
-            "--" => opts_done = true,
             "--target" => match args.next() {
                 Some(t) => match Target::from_triple(&t) {
                     Some(tt) => target = Some(tt),
                     None => {
                         eprintln!(
-                            "holyc: unknown target `{t}` (known: aarch64-apple-darwin, \
+                            "hcc: unknown target `{t}` (known: aarch64-apple-darwin, \
                              x86_64-unknown-linux{{,-gnu,-musl}}, x86_64-pc-windows, \
                              aarch64-unknown-linux-gnu)"
                         );
@@ -157,14 +143,14 @@ fn main() -> ExitCode {
                     }
                 },
                 None => {
-                    eprintln!("holyc: --target requires a triple");
+                    eprintln!("hcc: --target requires a triple");
                     return ExitCode::FAILURE;
                 }
             },
             "-o" => match args.next() {
                 Some(o) => out = Some(o),
                 None => {
-                    eprintln!("holyc: -o requires an output path");
+                    eprintln!("hcc: -o requires an output path");
                     return ExitCode::FAILURE;
                 }
             },
@@ -173,19 +159,18 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             other if other.starts_with('-') => {
-                eprintln!("holyc: unknown option `{other}`");
+                eprintln!("hcc: unknown option `{other}`");
                 return ExitCode::FAILURE;
             }
-            other => positionals.push(other.to_string()),
+            other => path = Some(other.to_string()),
         }
     }
-    let path = positionals.first().cloned();
 
     let src = match &path {
         Some(path) => match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("holyc: cannot read `{path}`: {e}");
+                eprintln!("hcc: cannot read `{path}`: {e}");
                 return ExitCode::FAILURE;
             }
         },
@@ -193,7 +178,7 @@ fn main() -> ExitCode {
             // No file given: read HolyC source from stdin.
             let mut s = String::new();
             if let Err(e) = std::io::stdin().read_to_string(&mut s) {
-                eprintln!("holyc: cannot read stdin: {e}");
+                eprintln!("hcc: cannot read stdin: {e}");
                 return ExitCode::FAILURE;
             }
             s
@@ -250,47 +235,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Run => {
-            let program = match parser::parse_in_dir(&src, &base_dir) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            // Refuse to run a program that fails semantic analysis.
-            let errors = sema::check_program(&program);
-            if !errors.is_empty() {
-                for e in &errors {
-                    eprintln!("{e}");
-                }
-                eprintln!("{} error(s)", errors.len());
-                return ExitCode::FAILURE;
-            }
-            let stdout = std::io::stdout();
-            let mut interp = Interpreter::new(stdout.lock());
-            // argv: the file (argv[0]) plus any trailing program arguments; a bare
-            // `holyc run` (stdin) gets just the program name.
-            interp.set_args(if positionals.is_empty() {
-                vec!["holyc".to_string()]
-            } else {
-                positionals.clone()
-            });
-            match interp.run(&program) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("{e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Mode::Build => {
             // With no `--target`, compile for the host's native target.
             let target = match target.or_else(Target::host) {
                 Some(t) => t,
                 None => {
                     eprintln!(
-                        "holyc: this host isn't a supported native target; \
+                        "hcc: this host isn't a supported native target; \
                          pass --target aarch64-apple-darwin or --target x86_64-unknown-linux"
                     );
                     return ExitCode::FAILURE;
@@ -315,7 +266,7 @@ fn main() -> ExitCode {
             let mut codegen = target.codegen(&out_path);
             match codegen.run(&program) {
                 Ok(()) => {
-                    eprintln!("holyc: wrote {out_path}");
+                    eprintln!("hcc: wrote {out_path}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -330,17 +281,16 @@ fn main() -> ExitCode {
 fn print_usage() {
     print!(
         "\
-holyc — a HolyC compiler and interpreter
+hcc — the HolyC compiler
 
 Usage:
-  holyc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
-  holyc run    [FILE]                       run with the tree-walking interpreter
-  holyc check  [FILE]                       parse + semantic analysis, report errors
-  holyc ast    [FILE]                       dump the parsed AST
-  holyc tokens [FILE]                       dump the raw lexer token stream
+  hcc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
+  hcc check  [FILE]                       parse + semantic analysis, report errors
+  hcc ast    [FILE]                       dump the parsed AST
+  hcc tokens [FILE]                       dump the raw lexer token stream
 
-With no subcommand, holyc compiles for the host's architecture and OS. FILE is
-read from stdin when omitted.
+With no subcommand, hcc compiles for the host's architecture and OS. FILE is
+read from stdin when omitted. To run a program, use `hci`.
 
 Options:
   -o OUT            output path for the compiled binary (default: a.out)

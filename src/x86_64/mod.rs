@@ -63,8 +63,8 @@
 
 use std::collections::HashMap;
 
-use super::CodegenError;
 use crate::ast::*;
+use crate::codegen::CodegenError;
 use crate::layout::{self, Layouts};
 use crate::token::Pos;
 
