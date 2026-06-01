@@ -4,11 +4,14 @@ A reimplementation of **HolyC** — the C-like language created by Terry A. Davi
 for [TempleOS](https://templeos.org) — written from scratch in Rust.
 
 solomon takes HolyC source through a full compiler front end (lexer →
-preprocessor → parser → semantic analysis → type layout) and runs it through one
-of two *backends* behind a small `Backend` trait: a tree-walking **interpreter**,
-or a hand-rolled **AArch64 native code generator** that emits a Mach-O object
-(no LLVM/Cranelift) and links it with the system `cc`. The interpreter is the
-conformance oracle the native backend matches.
+preprocessor → parser → semantic analysis → type layout) and either interprets it
+with a tree-walking **interpreter** or compiles it with one of two hand-rolled
+native code generators (behind a small `Codegen` trait) named for their target —
+**`aarch64-apple-darwin`** (emits a Mach-O object, no LLVM/Cranelift, links with
+`cc`) and **`x86_64-unknown-linux`** (writes a freestanding static ELF with raw
+syscalls — no linker, no libc). A codegen backend is an (architecture, OS) pair,
+since the object format, syscalls, and ABI depend on the OS, not just the CPU.
+The interpreter is the conformance oracle the native backends match byte-for-byte.
 
 ```holyc
 U0 Main()
@@ -53,23 +56,35 @@ Working today:
   (arithmetic, indexing, comparison, `&`/`*`/`->`), arrays (including
   multidimensional and pass-by-reference), classes/unions, casts, function
   pointers, a byte-addressable `MAlloc` heap, and HolyC's implicit print.
-- **AArch64 native backend** (`--build`) — hand-emits machine code and a Mach-O
+- **`aarch64-apple-darwin` native backend** (`--build` on Apple silicon, or
+  `--target aarch64-apple-darwin`) — hand-emits machine code and a Mach-O
   relocatable object, then links with `cc`. Type-directed codegen covering the
   whole implemented subset: control flow (dense `switch`es lower to an O(1)
   jump table), functions (recursion, default and variadic args), classes by
   value (sret returns), F64, function pointers (`ADR`+`BLR` for indirect calls),
   brace/designated initializers, and calls into libc for the built-in library.
-  Targets `aarch64-apple-darwin`.
+- **`x86_64-unknown-linux` native backend** (`--target x86_64-unknown-linux`) —
+  hand-writes a **freestanding static ELF** with raw Linux syscalls: no linker,
+  no libc, no relocations. Its own `_start` runs the program and `exit`s. Covers
+  the same subset (integers with C signedness, pointers/arrays, classes/unions
+  incl. sret, globals, F64, `switch`/`goto`, and printf with correctly-rounded
+  `%f`/`%e`/`%g`), with the core-library built-ins re-implemented from scratch
+  (an `mmap` bump allocator, inline string/memory loops, splitmix64).
 
-A slice of the **core library** exists as built-ins, shared by both backends:
+A slice of the **core library** exists as built-ins, shared by all backends:
 `Print`, formatted-string builders `StrPrint`/`CatPrint`/`MStrPrint`, string ops
 (`StrLen`, `StrCmp`/`StrNCmp`, `StrCpy`/`StrNCpy`, `StrCat`, `StrFind`,
 `StrChr`/`StrLastChr`, `StrSpn`/`StrCSpn`, `StrToUpper`/`StrToLower`, `StrRev`),
 number conversion (`StrToI64`/`StrToF64`, `I64ToStr`/`F64ToStr`), memory (`MemCpy`,
 `MemMove`, `MemSet`, `MemCmp`, `MemFind`, `MemSearch`, `MAlloc`, `Free`), char
-(`ToUpper`, `ToLower`), math (`Abs`/`Sign`/`Fabs`, `Sqrt`, `Sin`/`Cos`/`Tan`,
-`ASin`/`ACos`/`ATan`/`ATan2`, `Pow`, `Exp`, `Ln`, `Log10`, `Floor`/`Ceil`/`Round`),
-and a deterministic PRNG (`RandU64`).
+(`ToUpper`, `ToLower`), the exactly-reproducible float ops (`Abs`/`Sign`/`Fabs`,
+`Sqrt`, `Floor`/`Ceil`/`Round`), and a deterministic PRNG (`RandU64`).
+
+The transcendental math functions (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…) are
+deliberately **not** built-ins: every built-in has a portable, solomon-defined
+meaning, whereas a transcendental's value would be only "whatever the host libm
+computes" (not reproducible across platforms, and impossible in a freestanding
+target). They belong in a future HolyC standard library with a defined algorithm.
 
 Not yet implemented: most of the TempleOS core/standard library and DolDoc.
 
@@ -130,7 +145,7 @@ target list with `make all TARGETS="x86_64-unknown-linux-gnu ..."`.
 ## Usage
 
 ```
-solomon [--tokens | --ast | --check | --run | --build [-o OUT]] [FILE]
+solomon [--tokens | --ast | --check | --run | --build | --target TRIPLE] [-o OUT] [FILE]
 ```
 
 Reads from `FILE`, or from stdin if no file is given. Modes:
@@ -138,7 +153,8 @@ Reads from `FILE`, or from stdin if no file is given. Modes:
 | Flag        | Does                                                            |
 | ----------- | -------------------------------------------------------------- |
 | `--run`     | type-check then execute with the interpreter (the default)     |
-| `--build`   | compile to a native binary via the AArch64 backend (`-o OUT`, default `a.out`) |
+| `--build`   | compile to a native binary for the host's native target (`-o OUT`, default `a.out`) |
+| `--target TRIPLE` | compile for a specific target — `aarch64-apple-darwin` or `x86_64-unknown-linux` |
 | `--check`   | parse + semantic analysis; report errors, run nothing          |
 | `--ast`     | parse and dump the AST                                         |
 | `--tokens`  | run the lexer only and dump the token stream (no preprocessing)|
@@ -210,12 +226,13 @@ src/
   parser.rs     recursive-descent parser, generic over a TokenStream
   sema.rs       semantic analysis / type checking
   layout.rs     type size/alignment/offset pass
-  builtins.rs   built-in function registry (shared by sema + interpreter)
-  backend.rs    the Backend trait + error type
-  backend/
-    interp.rs   tree-walking interpreter
-    arm64.rs    AArch64 native code generator + Mach-O writer
+  builtins.rs   built-in function registry (shared by all backends)
+  interp.rs     tree-walking interpreter (the conformance oracle)
+  codegen.rs    the Codegen trait + CodegenError
+  codegen/
+    arm64_darwin.rs   aarch64-apple-darwin code generator + Mach-O writer
+    x86_64_linux.rs   x86_64-unknown-linux code generator + static-ELF writer
   main.rs       CLI
-tests/          lexer, parser, sema, preproc, layout, interpreter, arm64, and
-                whole-program (sample file) tests
+tests/          lexer, parser, sema, preproc, layout, interpreter, and the two
+                native backends (arm64_darwin, x86_64_linux) + whole-program tests
 ```

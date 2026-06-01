@@ -1,14 +1,17 @@
 //! Solomon: a reimplementation of HolyC.
 //!
 //! A full compiler front end — lexer, preprocessor, parser, semantic analysis,
-//! and type layout — feeding two backends behind the [`Backend`] trait: a
-//! tree-walking interpreter and a hand-rolled AArch64 native code generator. The
-//! interpreter is the conformance oracle the native backend matches byte-for-byte.
+//! and type layout — feeding a tree-walking [`Interpreter`] (the conformance
+//! oracle) and two native code generators behind the [`Codegen`] trait, each
+//! named for its target: [`Arm64Darwin`] (`aarch64-apple-darwin`) and
+//! [`X64Linux`] (`x86_64-unknown-linux`). The native backends match the
+//! interpreter byte-for-byte.
 
 pub mod ast;
-pub mod backend;
 pub mod builtins;
+pub mod codegen;
 pub mod fmt;
+pub mod interp;
 pub mod layout;
 pub mod lexer;
 pub mod parser;
@@ -17,9 +20,10 @@ pub mod sema;
 pub mod token;
 
 pub use ast::{Expr, ExprKind, Program, Stmt, StmtKind, Type};
-pub use backend::arm64::Arm64;
-pub use backend::interp::Interpreter;
-pub use backend::{Backend, BackendError};
+pub use codegen::arm64_darwin::Arm64Darwin;
+pub use codegen::x86_64_linux::X64Linux;
+pub use codegen::{Codegen, CodegenError};
+pub use interp::Interpreter;
 pub use layout::{Layout, Layouts};
 pub use lexer::{LexError, Lexer, TokenStream, tokenize};
 pub use parser::{ParseError, Parser, parse};

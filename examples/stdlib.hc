@@ -1,8 +1,11 @@
 // stdlib.hc — a tour of the core-library built-ins: building strings on the
 // heap (MAlloc/StrCpy/StrCat/StrLen), in-place character case (ToUpper),
-// comparison (StrCmp/MemCmp), raw memory (MemSet/MemCpy/Free), and math
-// (Sqrt/Pow/Floor/Ceil/Round/Sin/Cos). Output is kept integer-clean so it is
-// identical under both the interpreter and the native backend.
+// comparison (StrCmp/MemCmp), raw memory (MemSet/MemCpy/Free), and the
+// exactly-reproducible math op Sqrt. Output is kept integer-clean so it is
+// identical under the interpreter and both native backends. (Transcendental
+// functions — Sin/Cos/Pow/… — are intentionally not core builtins: their value
+// would be only "whatever the host libm does," with no portable solomon
+// semantics, so they're left to a future HolyC standard library.)
 
 // Uppercase a NUL-terminated string in place; returns its new length.
 I64 Upcase(U8 *s) {
@@ -38,10 +41,8 @@ U0 Main() {
   Free(msg);
   Free(buf);
 
-  // Math, cast to integers so the output is deterministic across backends.
-  "sqrt=%d pow=%d\n", (I64)Sqrt(144.0), (I64)Pow(2.0, 10.0);
-  "floor=%d ceil=%d round=%d\n", (I64)Floor(3.9), (I64)Ceil(3.1), (I64)Round(2.5);
-  "trig=%d\n", (I64)(Sin(0.0) + Cos(0.0)); // 0 + 1
+  // Exactly-reproducible math, cast to an integer so output is deterministic.
+  "sqrt=%d\n", (I64)Sqrt(144.0);
 }
 
 Main;

@@ -1,7 +1,7 @@
 //! Output-level tests for the larger sample programs: they don't just run
 //! cleanly, they compute the right answers.
 
-use solomon::backend::interp::run_to_string;
+use solomon::interp::run_to_string;
 use solomon::parser::parse;
 
 /// Parse and run a sample, returning everything it printed.
@@ -71,9 +71,7 @@ fn stdlib_builtins_showcase() {
          HELLO, WORLD!\n\
          cmp=-1 memcmp=0\n\
          OK---\n\
-         sqrt=12 pow=1024\n\
-         floor=3 ceil=4 round=3\n\
-         trig=1\n"
+         sqrt=12\n"
     );
 }
 

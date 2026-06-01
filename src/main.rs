@@ -2,20 +2,63 @@
 //! token stream or the parsed AST — useful for eyeballing the front end.
 //!
 //! Usage:
-//!   solomon [--tokens|--ast|--check|--run|--build] [-o OUT] [FILE]
+//!   solomon [--tokens|--ast|--check|--run|--build] [--target TRIPLE] [-o OUT] [FILE]
 //!
 //! `--tokens` runs the lexer only; `--ast` runs the parser; `--check` runs the
 //! parser plus semantic analysis; `--run` (the default) checks then executes the
 //! program with the tree-walking interpreter; `--build` compiles to a native
-//! executable (written to OUT, default `a.out`) via the AArch64 backend.
+//! executable (written to OUT, default `a.out`) for the host's native target;
+//! `--target TRIPLE` selects a target explicitly (`aarch64-apple-darwin` →
+//! Mach-O via `cc`, `x86_64-unknown-linux` → a freestanding static ELF).
 
 use std::io::Read;
 use std::process::ExitCode;
 
-use solomon::backend::Backend;
-use solomon::backend::arm64::Arm64;
-use solomon::backend::interp::Interpreter;
+use solomon::codegen::Codegen;
+use solomon::codegen::arm64_darwin::Arm64Darwin;
+use solomon::codegen::x86_64_linux::X64Linux;
+use solomon::interp::Interpreter;
 use solomon::{lexer, parser, sema};
+
+/// A code-generation target: an (architecture, OS) pair, since the object format,
+/// syscalls, and ABI all depend on the OS — not just the CPU.
+#[derive(Clone, Copy)]
+enum Target {
+    Arm64Darwin,
+    X64Linux,
+}
+
+impl Target {
+    /// The target the host machine natively runs, if it is one we can emit.
+    fn host() -> Option<Self> {
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            Some(Target::Arm64Darwin)
+        } else if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            Some(Target::X64Linux)
+        } else {
+            None
+        }
+    }
+    /// Parse a target triple (canonical, plus a couple of common short forms).
+    fn from_triple(s: &str) -> Option<Self> {
+        match s {
+            "aarch64-apple-darwin" | "arm64-apple-darwin" | "aarch64-darwin" | "arm64-darwin" => {
+                Some(Target::Arm64Darwin)
+            }
+            "x86_64-unknown-linux"
+            | "x86_64-unknown-linux-gnu"
+            | "x86_64-unknown-linux-musl"
+            | "x86_64-linux" => Some(Target::X64Linux),
+            _ => None,
+        }
+    }
+    fn codegen(self, out: &str) -> Box<dyn Codegen> {
+        match self {
+            Target::Arm64Darwin => Box::new(Arm64Darwin::new(out)),
+            Target::X64Linux => Box::new(X64Linux::new(out)),
+        }
+    }
+}
 
 enum Mode {
     Tokens,
@@ -29,6 +72,7 @@ fn main() -> ExitCode {
     let mut mode = Mode::Run;
     let mut path: Option<String> = None;
     let mut out: Option<String> = None;
+    let mut target: Option<Target> = None;
 
     let mut args = std::env::args().skip(1);
 
@@ -39,6 +83,25 @@ fn main() -> ExitCode {
             "--check" => mode = Mode::Check,
             "--run" => mode = Mode::Run,
             "--build" => mode = Mode::Build,
+            "--target" => {
+                mode = Mode::Build;
+                match args.next() {
+                    Some(t) => match Target::from_triple(&t) {
+                        Some(tt) => target = Some(tt),
+                        None => {
+                            eprintln!(
+                                "solomon: unknown target `{t}` \
+                                 (known: aarch64-apple-darwin, x86_64-unknown-linux)"
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    None => {
+                        eprintln!("solomon: --target requires a triple");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "-o" => match args.next() {
                 Some(o) => out = Some(o),
                 None => {
@@ -151,6 +214,17 @@ fn main() -> ExitCode {
             }
         }
         Mode::Build => {
+            // `--build` (no `--target`) compiles for the host's native target.
+            let target = match target.or_else(Target::host) {
+                Some(t) => t,
+                None => {
+                    eprintln!(
+                        "solomon: this host isn't a supported native target; \
+                         pass --target aarch64-apple-darwin or --target x86_64-unknown-linux"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
             let program = match parser::parse_in_dir(&src, &base_dir) {
                 Ok(p) => p,
                 Err(e) => {
@@ -167,8 +241,8 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let out_path = out.unwrap_or_else(|| "a.out".to_string());
-            let mut backend = Arm64::new(&out_path);
-            match backend.run(&program) {
+            let mut codegen = target.codegen(&out_path);
+            match codegen.run(&program) {
                 Ok(()) => {
                     eprintln!("solomon: wrote {out_path}");
                     ExitCode::SUCCESS

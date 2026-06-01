@@ -8,9 +8,9 @@
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use solomon::backend::Backend;
-use solomon::backend::arm64::Arm64;
-use solomon::backend::interp::run_to_string;
+use solomon::codegen::Codegen;
+use solomon::codegen::arm64_darwin::Arm64Darwin;
+use solomon::interp::run_to_string;
 use solomon::parser::parse;
 use solomon::sema::check_program;
 
@@ -37,7 +37,7 @@ fn build_and_run(src: &str) -> i32 {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let out = std::env::temp_dir().join(format!("solomon-arm64-test-{}-{id}", std::process::id()));
 
-    let mut backend = Arm64::new(&out);
+    let mut backend = Arm64Darwin::new(&out);
     backend
         .run(&program)
         .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
@@ -57,7 +57,7 @@ fn build_and_capture(src: &str) -> String {
 
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let out = std::env::temp_dir().join(format!("solomon-arm64-out-{}-{id}", std::process::id()));
-    Arm64::new(&out)
+    Arm64Darwin::new(&out)
         .run(&program)
         .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
     let output = Command::new(&out)
@@ -1451,7 +1451,7 @@ fn produces_a_native_binary() {
     }
     let program = parse("return 1;").unwrap();
     let out = std::env::temp_dir().join(format!("solomon-native-file-{}", std::process::id()));
-    Arm64::new(&out).run(&program).unwrap();
+    Arm64Darwin::new(&out).run(&program).unwrap();
     // It's a real Mach-O arm64 executable.
     let header = std::fs::read(&out).unwrap();
     let _ = std::fs::remove_file(&out);
@@ -1916,21 +1916,13 @@ fn compiles_string_memory_and_math_builtins() {
         // ToUpper / ToLower
         ("return ToUpper('a') + ToLower('A');", 162), // 'A' + 'a'
         ("return ToUpper('!') + ToLower('5');", 86),  // unchanged: 33 + 53
-        // Sin / Cos / Pow (libm), values agree with the interpreter
-        ("return Sin(0.0) == 0.0 && Cos(0.0) == 1.0;", 1),
-        ("return (I64)Pow(3.0, 3.0);", 27),
         // MemCmp normalized to a sign (offset to stay >= 0)
         ("return MemCmp(\"abc\", \"abd\", 3) + 5;", 4),
         ("return MemCmp(\"abd\", \"abc\", 3) + 5;", 6),
-        // Floor / Ceil / Round (libm)
+        // Floor / Ceil / Round (algebraic, exactly reproducible)
         ("return (I64)Floor(9.9) + (I64)Ceil(0.1);", 10),
         ("return (I64)Round(2.5) + (I64)Round(2.4);", 5), // half away from zero
         ("return (I64)Floor(-1.5) + 10;", 8),
-        // Exp / Ln / Tan (libm)
-        (
-            "return Exp(0.0) == 1.0 && Ln(1.0) == 0.0 && Tan(0.0) == 0.0;",
-            1,
-        ),
         // StrFind(haystack, needle) returns a pointer into the haystack (or NULL).
         (
             "U8 *s = MAlloc(16); StrCpy(s, \"abcdef\"); return StrFind(s, \"cd\") - s;",
@@ -1940,12 +1932,6 @@ fn compiles_string_memory_and_math_builtins() {
             "U8 *s = MAlloc(16); StrCpy(s, \"abc\"); return StrFind(s, \"zz\") == NULL;",
             1,
         ),
-        // inverse trig + base-10 log (libm)
-        ("return (I64)(ASin(1.0) * 100.0);", 157), // pi/2 * 100
-        ("return (I64)(ACos(0.0) * 100.0);", 157),
-        ("return (I64)(ATan(1.0) * 100.0);", 78), // pi/4 * 100
-        ("return (I64)(ATan2(1.0, 1.0) * 100.0);", 78),
-        ("return (I64)Log10(1000.0);", 3),
         // StrNCmp normalized to a sign (offset to stay >= 0); StrNCpy
         ("return StrNCmp(\"abc\", \"abd\", 2) + 5;", 5), // first 2 chars equal
         ("return StrNCmp(\"abc\", \"abd\", 3) + 5;", 4),
@@ -2096,9 +2082,7 @@ fn native_matches_stdlib_showcase() {
          HELLO, WORLD!\n\
          cmp=-1 memcmp=0\n\
          OK---\n\
-         sqrt=12 pow=1024\n\
-         floor=3 ceil=4 round=3\n\
-         trig=1\n"
+         sqrt=12\n"
     );
     // The heap-growing vector sample also matches natively.
     assert_eq!(
@@ -2174,7 +2158,7 @@ fn unsupported_constructs_are_rejected() {
         "U0 P(){ I64 Q(){ return 1; } }",                                // nested function
     ] {
         let program = parse(src).unwrap();
-        let err = match Arm64::new(&out).run(&program) {
+        let err = match Arm64Darwin::new(&out).run(&program) {
             Ok(()) => panic!("expected build to fail for `{src}`"),
             Err(e) => e,
         };

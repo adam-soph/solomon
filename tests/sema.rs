@@ -107,12 +107,8 @@ fn stdlib_builtins_are_known() {
           MemCpy(p, p, 1); MemSet(p, 0, 1); \
           I64 c = StrCmp(p, \"x\"); I64 u = ToUpper('a'); I64 l = ToLower('A'); \
           I64 m = MemCmp(p, p, 1); \
-          F64 s = Sin(1.0); F64 co = Cos(1.0); F64 w = Pow(2.0, 3.0); \
           F64 fl = Floor(1.5); F64 ce = Ceil(1.5); F64 rd = Round(1.5); \
-          F64 e = Exp(1.0); F64 ln = Ln(1.0); F64 t = Tan(1.0); \
           U8 *f = StrFind(p, \"a\"); \
-          F64 as = ASin(0.5); F64 ac = ACos(0.5); F64 at = ATan(0.5); \
-          F64 a2 = ATan2(1.0, 1.0); F64 l10 = Log10(100.0); \
           I64 nc = StrNCmp(p, \"x\", 1); StrNCpy(p, \"y\", 1); \
           I64 sg = Sign(-1); F64 fa = Fabs(-1.0); U64 r = RandU64(); \
           U8 *sp = StrPrint(p, \"%d\", 1); U8 *cp = CatPrint(p, \"%d\", 2); \
@@ -134,11 +130,9 @@ fn stdlib_builtin_arity_is_checked() {
     has("U0 F() { StrCmp(\"a\"); }", "expects 2 argument(s), got 1");
     has("U0 F() { MAlloc(); }", "expects 1 argument(s), got 0");
     has("U0 F() { MemCpy(0, 0); }", "expects 3 argument(s), got 2");
-    has("U0 F() { Pow(2.0); }", "expects 2 argument(s), got 1");
     has("U0 F() { MemCmp(0, 0); }", "expects 3 argument(s), got 2");
     has("U0 F() { Floor(); }", "expects 1 argument(s), got 0");
     has("U0 F() { StrFind(\"a\"); }", "expects 2 argument(s), got 1");
-    has("U0 F() { ATan2(1.0); }", "expects 2 argument(s), got 1");
     has(
         "U0 F() { StrNCmp(\"a\", \"b\"); }",
         "expects 3 argument(s), got 2",

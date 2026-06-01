@@ -4,9 +4,19 @@
 //! registers their signatures so calls type-check), the interpreter (which
 //! implements their behaviour), and the AArch64 backend (which lowers them — most
 //! via `libc_symbol`). Adding an intrinsic means an entry here plus a behaviour
-//! arm in `backend::interp` and, for a libc-backed one, a `libc_symbol` mapping
+//! arm in `interp` and, for a libc-backed one, a `libc_symbol` mapping
 //! (or special-cased emission). These will be superseded by the real core /
 //! standard library when it lands.
+//!
+//! Every intrinsic here has **backend-independent, solomon-defined semantics**
+//! (e.g. `StrCmp` normalized to a sign, `RandU64` a fixed splitmix64, formatting
+//! pinned by [`crate::fmt`]). That is deliberately why the **transcendental** math
+//! functions (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…) are *not* here: their only meaning
+//! would be "whatever the host libm computes," which isn't reproducible across
+//! platforms (IEEE 754 doesn't require correctly-rounded transcendentals) and
+//! can't exist in a freestanding target. They belong in a future HolyC standard
+//! library with a defined algorithm. The algebraic float ops that *are* exactly
+//! reproducible (`Sqrt`/`Floor`/`Ceil`/`Round`/`Fabs`) stay.
 
 use crate::ast::Type;
 
@@ -245,25 +255,6 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 1,
             varargs: false,
         },
-        // `Sin(F64) -> F64` / `Cos(F64) -> F64` / `Pow(F64, F64) -> F64` (libm).
-        BuiltinSig {
-            name: "Sin",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Cos",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Pow",
-            ret: Type::F64,
-            min_args: 2,
-            varargs: false,
-        },
         // `MemCmp(U8*, U8*, I64 n) -> I64` — compare `n` bytes, normalized to a
         // sign in `{-1, 0, 1}` (libc `memcmp`).
         BuiltinSig {
@@ -272,7 +263,8 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 3,
             varargs: false,
         },
-        // More libm: rounding, exponential/log, and tangent. All `F64 -> F64`.
+        // Rounding (`F64 -> F64`). Exactly reproducible (hardware/`roundsd`), so
+        // unlike the transcendentals these stay as builtins.
         BuiltinSig {
             name: "Floor",
             ret: Type::F64,
@@ -291,25 +283,6 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 1,
             varargs: false,
         },
-        BuiltinSig {
-            name: "Exp",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `Ln` is the natural log (libc `log`).
-        BuiltinSig {
-            name: "Ln",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Tan",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
         // `StrFind(U8* haystack, U8* needle) -> U8*` — a pointer to the first
         // occurrence of `needle` in `haystack`, or `NULL`. Argument order matches
         // libc `strstr` 1:1.
@@ -317,38 +290,6 @@ pub fn all() -> Vec<BuiltinSig> {
             name: "StrFind",
             ret: Type::Ptr(Box::new(Type::U8)),
             min_args: 2,
-            varargs: false,
-        },
-        // Inverse trig + base-10 log (libm). All `F64 -> F64` except `ATan2`.
-        BuiltinSig {
-            name: "ASin",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "ACos",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "ATan",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `ATan2(F64 y, F64 x) -> F64`.
-        BuiltinSig {
-            name: "ATan2",
-            ret: Type::F64,
-            min_args: 2,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Log10",
-            ret: Type::F64,
-            min_args: 1,
             varargs: false,
         },
         // `StrNCmp(U8*, U8*, I64 n) -> I64` — compare up to `n` chars, normalized
@@ -422,21 +363,10 @@ pub fn libc_symbol(name: &str) -> Option<&'static str> {
         "MemSet" => "_memset",
         "ToUpper" => "_toupper",
         "ToLower" => "_tolower",
-        "Sin" => "_sin",
-        "Cos" => "_cos",
-        "Pow" => "_pow",
         "MemCmp" => "_memcmp",
         "Floor" => "_floor",
         "Ceil" => "_ceil",
         "Round" => "_round",
-        "Exp" => "_exp",
-        "Ln" => "_log",
-        "Tan" => "_tan",
-        "ASin" => "_asin",
-        "ACos" => "_acos",
-        "ATan" => "_atan",
-        "ATan2" => "_atan2",
-        "Log10" => "_log10",
         "StrFind" => "_strstr",
         "StrNCmp" => "_strncmp",
         "StrNCpy" => "_strncpy",

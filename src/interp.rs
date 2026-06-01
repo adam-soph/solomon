@@ -26,8 +26,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
 
-use super::{Backend, BackendError};
 use crate::ast::*;
+use crate::codegen::CodegenError;
 use crate::layout::Layouts;
 use crate::token::Pos;
 
@@ -148,14 +148,14 @@ enum Place {
 }
 
 impl Place {
-    fn load(&self, pos: Pos) -> Result<Value, BackendError> {
+    fn load(&self, pos: Pos) -> Result<Value, CodegenError> {
         match self {
             Place::Cell(c) => Ok(c.borrow().clone()),
             Place::Bytes { buf, off, ty } => {
                 let n = scalar_byte_size(ty);
                 let bytes = buf.borrow();
                 if off + n > bytes.len() {
-                    return Err(BackendError::at(pos, "heap read out of bounds"));
+                    return Err(CodegenError::at(pos, "heap read out of bounds"));
                 }
                 let mut le = [0u8; 8];
                 le[..n].copy_from_slice(&bytes[*off..*off + n]);
@@ -174,7 +174,7 @@ impl Place {
         }
     }
 
-    fn store(&self, v: Value, pos: Pos) -> Result<Value, BackendError> {
+    fn store(&self, v: Value, pos: Pos) -> Result<Value, CodegenError> {
         match self {
             Place::Cell(c) => {
                 let stored = by_value(v);
@@ -188,13 +188,13 @@ impl Place {
                 } else {
                     v.as_i64()
                         .ok_or_else(|| {
-                            BackendError::at(pos, "storing a non-scalar into a heap byte buffer")
+                            CodegenError::at(pos, "storing a non-scalar into a heap byte buffer")
                         })?
                         .to_le_bytes()
                 };
                 let mut bytes = buf.borrow_mut();
                 if off + n > bytes.len() {
-                    return Err(BackendError::at(pos, "heap write out of bounds"));
+                    return Err(CodegenError::at(pos, "heap write out of bounds"));
                 }
                 bytes[*off..*off + n].copy_from_slice(&le[..n]);
                 Ok(v)
@@ -219,10 +219,10 @@ impl PtrVal {
     }
 
     /// The cell this pointer currently addresses.
-    fn target(&self, pos: Pos) -> Result<Cell, BackendError> {
+    fn target(&self, pos: Pos) -> Result<Cell, CodegenError> {
         self.region
             .cell_at(self.index)
-            .ok_or_else(|| BackendError::at(pos, "pointer dereference out of bounds"))
+            .ok_or_else(|| CodegenError::at(pos, "pointer dereference out of bounds"))
     }
 }
 
@@ -364,8 +364,8 @@ impl<W: Write> Interpreter<W> {
         self.out
     }
 
-    fn io(&self, e: std::io::Error) -> BackendError {
-        BackendError::new(format!("output error: {e}"), None)
+    fn io(&self, e: std::io::Error) -> CodegenError {
+        CodegenError::new(format!("output error: {e}"), None)
     }
 
     // ---- name resolution ----
@@ -393,7 +393,9 @@ impl<W: Write> Interpreter<W> {
 
     // ---- top-level driver ----
 
-    fn run_program(&mut self, program: &Program) -> Result<(), BackendError> {
+    /// Run an (already semantically-checked) program, writing to the output sink.
+    /// Use [`run_to_string`] or call [`crate::sema::check_program`] first.
+    pub fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
         // Compute type layouts up front so `sizeof` reports real sizes.
         self.layouts = crate::layout::compute(program).0;
 
@@ -422,7 +424,7 @@ impl<W: Write> Interpreter<W> {
 
     // ---- statements ----
 
-    fn exec_stmt(&mut self, s: &Stmt, env: &mut Env) -> Result<Flow, BackendError> {
+    fn exec_stmt(&mut self, s: &Stmt, env: &mut Env) -> Result<Flow, CodegenError> {
         match &s.kind {
             StmtKind::Empty
             | StmtKind::Label(_)
@@ -545,7 +547,7 @@ impl<W: Write> Interpreter<W> {
     /// the enclosing list (so labels in the current or any enclosing block are
     /// reachable). Semantic analysis enforces the same scope rule, so an
     /// unresolved goto reaching the function body is a genuine error.
-    fn exec_stmts(&mut self, stmts: &[Stmt], env: &mut Env) -> Result<Flow, BackendError> {
+    fn exec_stmts(&mut self, stmts: &[Stmt], env: &mut Env) -> Result<Flow, CodegenError> {
         let mut i = 0;
         while i < stmts.len() {
             match self.exec_stmt(&stmts[i], env)? {
@@ -570,7 +572,7 @@ impl<W: Write> Interpreter<W> {
         from: usize,
         to: usize,
         env: &mut Env,
-    ) -> Result<Flow, BackendError> {
+    ) -> Result<Flow, CodegenError> {
         let mut i = from;
         while i < to {
             match self.exec_stmt(&stmts[i], env)? {
@@ -582,15 +584,15 @@ impl<W: Write> Interpreter<W> {
     }
 
     /// Execute a function body and reduce its control flow to a return value.
-    fn exec_func_body(&mut self, stmts: &[Stmt], env: &mut Env) -> Result<Value, BackendError> {
+    fn exec_func_body(&mut self, stmts: &[Stmt], env: &mut Env) -> Result<Value, CodegenError> {
         match self.exec_stmts(stmts, env)? {
             Flow::Return(v) => Ok(v),
             Flow::Normal => Ok(Value::Void),
-            Flow::Goto(label) => Err(BackendError::new(
+            Flow::Goto(label) => Err(CodegenError::new(
                 format!("goto to undefined label `{label}`"),
                 None,
             )),
-            Flow::Break | Flow::Continue => Err(BackendError::new(
+            Flow::Break | Flow::Continue => Err(CodegenError::new(
                 "`break`/`continue` outside of a loop",
                 None,
             )),
@@ -602,7 +604,7 @@ impl<W: Write> Interpreter<W> {
         cond: &Expr,
         body: &Stmt,
         env: &mut Env,
-    ) -> Result<Flow, BackendError> {
+    ) -> Result<Flow, CodegenError> {
         let v = self.to_i64_eval(cond, cond.span.pos, env)?;
         let StmtKind::Block(stmts) = &body.kind else {
             // A non-block switch body is unusual; just run it.
@@ -688,7 +690,7 @@ impl<W: Write> Interpreter<W> {
     }
 
     /// HolyC implicit print at statement level.
-    fn exec_expr_stmt(&mut self, e: &Expr, env: &mut Env) -> Result<(), BackendError> {
+    fn exec_expr_stmt(&mut self, e: &Expr, env: &mut Env) -> Result<(), CodegenError> {
         match &e.kind {
             ExprKind::Str(s) => {
                 write!(self.out, "{s}").map_err(|err| self.io(err))?;
@@ -709,7 +711,7 @@ impl<W: Write> Interpreter<W> {
 
     // ---- expressions (rvalue) ----
 
-    fn eval(&mut self, e: &Expr, env: &mut Env) -> Result<Value, BackendError> {
+    fn eval(&mut self, e: &Expr, env: &mut Env) -> Result<Value, CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
             ExprKind::Int(v) | ExprKind::Char(v) => Ok(Value::Int(*v)),
@@ -756,7 +758,7 @@ impl<W: Write> Interpreter<W> {
                     // `sizeof(expr)` uses the expression's statically inferred
                     // type (filled in by semantic analysis).
                     SizeofArg::Expr(e) => e.ty().ok_or_else(|| {
-                        BackendError::at(
+                        CodegenError::at(
                             pos,
                             "sizeof operand has no inferred type (run semantic analysis first)",
                         )
@@ -766,18 +768,18 @@ impl<W: Write> Interpreter<W> {
             }
             ExprKind::Offset { class, path } => {
                 let off = self.layouts.nested_offset_of(class, path).ok_or_else(|| {
-                    BackendError::at(
+                    CodegenError::at(
                         pos,
                         format!("cannot compute offset of `{class}.{}`", path.join(".")),
                     )
                 })?;
                 Ok(Value::Int(off as i64))
             }
-            ExprKind::InitList(_) => Err(BackendError::at(
+            ExprKind::InitList(_) => Err(CodegenError::at(
                 pos,
                 "an initializer list is only valid as a variable initializer",
             )),
-            ExprKind::DesignatedInit(_) => Err(BackendError::at(
+            ExprKind::DesignatedInit(_) => Err(CodegenError::at(
                 pos,
                 "a designated initializer is only valid as a variable initializer",
             )),
@@ -791,7 +793,7 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    fn eval_ident(&mut self, name: &str, pos: Pos, env: &mut Env) -> Result<Value, BackendError> {
+    fn eval_ident(&mut self, name: &str, pos: Pos, env: &mut Env) -> Result<Value, CodegenError> {
         if let Some(c) = self.resolve(env, name) {
             return Ok(c.borrow().clone());
         }
@@ -799,7 +801,7 @@ impl<W: Write> Interpreter<W> {
         if self.funcs.contains_key(name) {
             return self.call(name, Vec::new(), pos);
         }
-        Err(BackendError::at(pos, format!("undefined symbol `{name}`")))
+        Err(CodegenError::at(pos, format!("undefined symbol `{name}`")))
     }
 
     fn eval_unary(
@@ -808,7 +810,7 @@ impl<W: Write> Interpreter<W> {
         expr: &Expr,
         pos: Pos,
         env: &mut Env,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         match op {
             UnOp::Neg => match self.eval(expr, env)? {
                 Value::Float(f) => Ok(Value::Float(-f)),
@@ -847,7 +849,7 @@ impl<W: Write> Interpreter<W> {
         expr: &Expr,
         pos: Pos,
         env: &mut Env,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         let delta = if matches!(op, PostOp::Inc) { 1 } else { -1 };
         let place = self.eval_place(expr, env)?;
         let old = place.load(pos)?;
@@ -863,7 +865,7 @@ impl<W: Write> Interpreter<W> {
         rhs: &Expr,
         pos: Pos,
         env: &mut Env,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         // Logical operators short-circuit.
         match op {
             BinOp::And => {
@@ -905,7 +907,7 @@ impl<W: Write> Interpreter<W> {
         r: Value,
         signed: bool,
         pos: Pos,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         use BinOp::*;
 
         // Pointer-aware paths (arrays decay to pointers). A null pointer reads as
@@ -930,7 +932,7 @@ impl<W: Write> Interpreter<W> {
                     if a.region.same(&b.region) {
                         return Ok(Value::Int(a.index - b.index));
                     }
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         "subtracting pointers into different objects",
                     ));
@@ -968,7 +970,7 @@ impl<W: Write> Interpreter<W> {
                         Mul => a * b,
                         Div => {
                             if b == 0.0 {
-                                return Err(BackendError::at(pos, "division by zero"));
+                                return Err(CodegenError::at(pos, "division by zero"));
                             }
                             a / b
                         }
@@ -986,7 +988,7 @@ impl<W: Write> Interpreter<W> {
                         // `/` and `%` follow the left operand's signedness.
                         Div => {
                             if b == 0 {
-                                return Err(BackendError::at(pos, "division by zero"));
+                                return Err(CodegenError::at(pos, "division by zero"));
                             }
                             if signed {
                                 a.wrapping_div(b)
@@ -996,7 +998,7 @@ impl<W: Write> Interpreter<W> {
                         }
                         Mod => {
                             if b == 0 {
-                                return Err(BackendError::at(pos, "division by zero"));
+                                return Err(CodegenError::at(pos, "division by zero"));
                             }
                             if signed {
                                 a.wrapping_rem(b)
@@ -1080,7 +1082,7 @@ impl<W: Write> Interpreter<W> {
         e: &Expr,
         elem: &Type,
         env: &mut Env,
-    ) -> Result<Option<Value>, BackendError> {
+    ) -> Result<Option<Value>, CodegenError> {
         let ExprKind::Call { callee, args } = &e.kind else {
             return Ok(None);
         };
@@ -1097,7 +1099,7 @@ impl<W: Write> Interpreter<W> {
     /// Allocate a heap buffer of `bytes` bytes for element type `elem`: a raw
     /// byte region for integer/float scalars, else a region of `bytes /
     /// sizeof(elem)` element cells.
-    fn alloc(&mut self, bytes: i64, elem: &Type, env: &mut Env) -> Result<Value, BackendError> {
+    fn alloc(&mut self, bytes: i64, elem: &Type, env: &mut Env) -> Result<Value, CodegenError> {
         let bytes = bytes.max(0);
         let region = if is_byte_heap_elem(elem) {
             Region::Heap(Rc::new(RefCell::new(vec![0u8; bytes as usize])))
@@ -1119,7 +1121,7 @@ impl<W: Write> Interpreter<W> {
         value: &Expr,
         pos: Pos,
         env: &mut Env,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         let place = self.eval_place(target, env)?;
         let rhs = match target.ty() {
             Some(Type::Ptr(elem)) if op == AssignOp::Assign => {
@@ -1151,7 +1153,7 @@ impl<W: Write> Interpreter<W> {
         callee: &Expr,
         args: &[Expr],
         env: &mut Env,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         let argv = args
             .iter()
             .map(|a| self.eval(a, env))
@@ -1166,11 +1168,11 @@ impl<W: Write> Interpreter<W> {
         // Otherwise the callee evaluates to a function pointer.
         match self.eval(callee, env)? {
             Value::Func(name) => self.call(&name, argv, pos),
-            _ => Err(BackendError::at(pos, "called value is not a function")),
+            _ => Err(CodegenError::at(pos, "called value is not a function")),
         }
     }
 
-    fn call(&mut self, name: &str, args: Vec<Value>, pos: Pos) -> Result<Value, BackendError> {
+    fn call(&mut self, name: &str, args: Vec<Value>, pos: Pos) -> Result<Value, CodegenError> {
         if let Some(f) = self.funcs.get(name).cloned() {
             let mut env = Env::func();
             for (i, p) in f.params.iter().enumerate() {
@@ -1179,7 +1181,7 @@ impl<W: Write> Interpreter<W> {
                 } else if let Some(d) = &p.default {
                     self.eval(d, &mut env)?
                 } else {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         format!("missing argument for `{name}`"),
                     ));
@@ -1193,7 +1195,7 @@ impl<W: Write> Interpreter<W> {
                 }
             }
             let body = f.body.as_ref().ok_or_else(|| {
-                BackendError::at(pos, format!("call to `{name}`, which has no body"))
+                CodegenError::at(pos, format!("call to `{name}`, which has no body"))
             })?;
             // Narrow the result to the declared return width (C truncates the
             // return value to the return type), matching the native backend.
@@ -1206,7 +1208,7 @@ impl<W: Write> Interpreter<W> {
         if crate::builtins::is_builtin(name) {
             return self.call_builtin(name, &args, pos);
         }
-        Err(BackendError::at(
+        Err(CodegenError::at(
             pos,
             format!("call to unknown function `{name}` (external functions are not supported)"),
         ))
@@ -1217,7 +1219,7 @@ impl<W: Write> Interpreter<W> {
         name: &str,
         args: &[Value],
         pos: Pos,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         match name {
             "Print" => {
                 self.print_formatted(args, pos)?;
@@ -1235,10 +1237,13 @@ impl<W: Write> Interpreter<W> {
                 let mut bytes = s.into_bytes();
                 bytes.push(0);
                 let at = if name == "CatPrint" {
+                    // Append: write at dst + StrLen(dst). `dst` may be a pointer,
+                    // an array (decays to a pointer), or a string literal — turn
+                    // any of them into a pointer before applying the offset.
                     let cur = self.cstr_bytes(&args[0], pos)?.len() as i64;
-                    match &args[0] {
-                        Value::Ptr(Some(pv)) => Value::Ptr(Some(pv.offset(cur))),
-                        other => other.clone(),
+                    match as_pointer(&args[0]) {
+                        Some(Some(pv)) => Value::Ptr(Some(pv.offset(cur))),
+                        _ => args[0].clone(),
                     }
                 } else {
                     args[0].clone()
@@ -1396,7 +1401,7 @@ impl<W: Write> Interpreter<W> {
                     Some(Some(p)) => {
                         self.write_bytes(&Value::Ptr(Some(p.offset(dst_len))), &tail, pos)?
                     }
-                    _ => return Err(BackendError::at(pos, "StrCat destination is not a buffer")),
+                    _ => return Err(CodegenError::at(pos, "StrCat destination is not a buffer")),
                 }
                 Ok(args[0].clone())
             }
@@ -1484,36 +1489,24 @@ impl<W: Write> Interpreter<W> {
                 let c = self.to_i64(args[0].clone(), pos)?;
                 Ok(Value::Int(if (65..=90).contains(&c) { c + 32 } else { c }))
             }
-            // F64 math (libm). Values match the native backend because Rust's
-            // float methods route to the same system libm.
-            "Sin" | "Cos" | "Tan" | "Sqrt" | "Floor" | "Ceil" | "Round" | "Exp" | "Ln" | "ASin"
-            | "ACos" | "ATan" | "Log10" | "Fabs" | "Pow" | "ATan2" => {
-                let num = |i: usize| {
-                    args[i]
-                        .as_f64()
-                        .ok_or_else(|| BackendError::at(pos, "math builtin expects a number"))
-                };
-                let a = num(0)?;
+            // Algebraic F64 math — exactly reproducible in every backend (hardware
+            // `sqrt`, rounding, sign-bit clear), so it has well-defined, backend-
+            // independent semantics. (Transcendental functions are not builtins:
+            // they have no solomon-defined value — only "whatever the host libm
+            // does" — so they belong in a future HolyC standard library, not here.)
+            "Sqrt" | "Floor" | "Ceil" | "Round" | "Fabs" => {
+                let a = args[0]
+                    .as_f64()
+                    .ok_or_else(|| CodegenError::at(pos, "math builtin expects a number"))?;
                 Ok(Value::Float(match name {
-                    "Sin" => a.sin(),
-                    "Cos" => a.cos(),
-                    "Tan" => a.tan(),
                     "Sqrt" => a.sqrt(),
                     "Floor" => a.floor(),
                     "Ceil" => a.ceil(),
                     "Round" => a.round(),
-                    "Exp" => a.exp(),
-                    "Ln" => a.ln(),
-                    "ASin" => a.asin(),
-                    "ACos" => a.acos(),
-                    "ATan" => a.atan(),
-                    "Log10" => a.log10(),
-                    "Fabs" => a.abs(),
-                    "ATan2" => a.atan2(num(1)?),
-                    _ => a.powf(num(1)?), // Pow
+                    _ => a.abs(), // Fabs
                 }))
             }
-            _ => Err(BackendError::at(
+            _ => Err(CodegenError::at(
                 pos,
                 format!("builtin `{name}` is not implemented"),
             )),
@@ -1523,11 +1516,11 @@ impl<W: Write> Interpreter<W> {
     /// The bytes of a NUL-terminated string, up to (not including) the
     /// terminator. Accepts a string literal, a pointer into a byte buffer, or an
     /// array that has decayed to one.
-    fn cstr_bytes(&self, s: &Value, pos: Pos) -> Result<Vec<u8>, BackendError> {
+    fn cstr_bytes(&self, s: &Value, pos: Pos) -> Result<Vec<u8>, CodegenError> {
         let cell_byte = |c: &Cell| c.borrow().as_i64().map(|v| v as u8);
         match s {
             Value::Str(s) => Ok(s.as_bytes().to_vec()),
-            Value::Ptr(None) => Err(BackendError::at(pos, "string operation on a null pointer")),
+            Value::Ptr(None) => Err(CodegenError::at(pos, "string operation on a null pointer")),
             // A raw byte heap buffer: read bytes directly up to the NUL.
             Value::Ptr(Some(p)) if matches!(p.region, Region::Heap(_)) => {
                 let Region::Heap(buf) = &p.region else {
@@ -1558,18 +1551,18 @@ impl<W: Write> Interpreter<W> {
                 .map(|c| cell_byte(c).unwrap_or(0))
                 .take_while(|&b| b != 0)
                 .collect()),
-            _ => Err(BackendError::at(pos, "expected a string or pointer")),
+            _ => Err(CodegenError::at(pos, "expected a string or pointer")),
         }
     }
 
     /// Read exactly `n` raw bytes from the buffer `v` points at (for `MemCpy`),
     /// zero-padding past the end. Accepts a string, a pointer, or an array.
-    fn read_n_bytes(&self, v: &Value, n: usize, pos: Pos) -> Result<Vec<u8>, BackendError> {
+    fn read_n_bytes(&self, v: &Value, n: usize, pos: Pos) -> Result<Vec<u8>, CodegenError> {
         let byte_at =
             |get: &dyn Fn(usize) -> Option<u8>| (0..n).map(|i| get(i).unwrap_or(0)).collect();
         match v {
             Value::Str(s) => Ok(byte_at(&|i| s.as_bytes().get(i).copied())),
-            Value::Ptr(None) => Err(BackendError::at(pos, "memory read from a null pointer")),
+            Value::Ptr(None) => Err(CodegenError::at(pos, "memory read from a null pointer")),
             Value::Ptr(Some(p)) if matches!(p.region, Region::Heap(_)) => {
                 let Region::Heap(buf) = &p.region else {
                     unreachable!()
@@ -1593,28 +1586,28 @@ impl<W: Write> Interpreter<W> {
                         .map(|b| b as u8)
                 }))
             }
-            _ => Err(BackendError::at(pos, "expected a pointer or buffer")),
+            _ => Err(CodegenError::at(pos, "expected a pointer or buffer")),
         }
     }
 
     /// Write `bytes` into the buffer `dst` points at (a pointer or array).
     /// A pointer `i` bytes past `base` (a buffer pointer), used by the find
     /// builtins to return a pointer into the searched buffer.
-    fn ptr_at(&self, base: &Value, i: usize) -> Result<Value, BackendError> {
+    fn ptr_at(&self, base: &Value, i: usize) -> Result<Value, CodegenError> {
         Ok(match base {
             Value::Ptr(Some(pv)) => Value::Ptr(Some(pv.offset(i as i64))),
             other => other.clone(),
         })
     }
 
-    fn write_bytes(&self, dst: &Value, bytes: &[u8], pos: Pos) -> Result<(), BackendError> {
-        let put = |c: Option<Cell>, b: u8| -> Result<(), BackendError> {
+    fn write_bytes(&self, dst: &Value, bytes: &[u8], pos: Pos) -> Result<(), CodegenError> {
+        let put = |c: Option<Cell>, b: u8| -> Result<(), CodegenError> {
             match c {
                 Some(c) => {
                     *c.borrow_mut() = Value::Int(b as i64);
                     Ok(())
                 }
-                None => Err(BackendError::at(
+                None => Err(CodegenError::at(
                     pos,
                     "string write past the end of the buffer",
                 )),
@@ -1629,7 +1622,7 @@ impl<W: Write> Interpreter<W> {
                 let mut buf = buf.borrow_mut();
                 let base = p.index.max(0) as usize;
                 if base + bytes.len() > buf.len() {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         "string write past the end of the buffer",
                     ));
@@ -1650,14 +1643,14 @@ impl<W: Write> Interpreter<W> {
                 }
                 Ok(())
             }
-            Value::Ptr(None) => Err(BackendError::at(pos, "string write to a null pointer")),
-            _ => Err(BackendError::at(pos, "string write to a non-buffer")),
+            Value::Ptr(None) => Err(CodegenError::at(pos, "string write to a null pointer")),
+            _ => Err(CodegenError::at(pos, "string write to a non-buffer")),
         }
     }
 
     /// Format `args` as `"fmt", rest...` and write the result. Shared by the
     /// implicit-print statement and the `Print` intrinsic.
-    fn print_formatted(&mut self, args: &[Value], pos: Pos) -> Result<(), BackendError> {
+    fn print_formatted(&mut self, args: &[Value], pos: Pos) -> Result<(), CodegenError> {
         if let Some(Value::Str(fmt)) = args.first() {
             let s = self.format(fmt, &args[1..], pos)?;
             write!(self.out, "{s}").map_err(|e| self.io(e))?;
@@ -1668,12 +1661,12 @@ impl<W: Write> Interpreter<W> {
     // ---- expressions (lvalue) ----
 
     /// The cell an lvalue expression designates (for assignment, `&`, `++/--`).
-    fn eval_lvalue(&mut self, e: &Expr, env: &mut Env) -> Result<Cell, BackendError> {
+    fn eval_lvalue(&mut self, e: &Expr, env: &mut Env) -> Result<Cell, CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
             ExprKind::Ident(name) => self
                 .resolve(env, name)
-                .ok_or_else(|| BackendError::at(pos, format!("undefined variable `{name}`"))),
+                .ok_or_else(|| CodegenError::at(pos, format!("undefined variable `{name}`"))),
             ExprKind::Member { base, field, arrow } => {
                 self.member_cell(base, field, *arrow, pos, env)
             }
@@ -1686,14 +1679,14 @@ impl<W: Write> Interpreter<W> {
                 let place = self.eval_addr(e, env)?;
                 place.target(pos)
             }
-            _ => Err(BackendError::at(pos, "expression is not assignable")),
+            _ => Err(CodegenError::at(pos, "expression is not assignable")),
         }
     }
 
     /// Resolve an lvalue to a writable [`Place`]: a value cell, or — when it
     /// indexes/derefs a raw byte heap pointer — a typed slot inside that buffer.
     /// Reads and writes go through this so heap access serializes scalars.
-    fn eval_place(&mut self, e: &Expr, env: &mut Env) -> Result<Place, BackendError> {
+    fn eval_place(&mut self, e: &Expr, env: &mut Env) -> Result<Place, CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
             ExprKind::Index { .. }
@@ -1721,7 +1714,7 @@ impl<W: Write> Interpreter<W> {
                             ty: fty,
                         });
                     }
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         "cannot assign to this union field in the interpreter",
                     ));
@@ -1734,7 +1727,7 @@ impl<W: Write> Interpreter<W> {
 
     /// The address (region + offset) of an lvalue expression — the value of `&e`
     /// and the basis for indexing and dereference.
-    fn eval_addr(&mut self, e: &Expr, env: &mut Env) -> Result<PtrVal, BackendError> {
+    fn eval_addr(&mut self, e: &Expr, env: &mut Env) -> Result<PtrVal, CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
             // `&union.field` is a pointer into the union's shared byte buffer.
@@ -1769,8 +1762,8 @@ impl<W: Write> Interpreter<W> {
                         };
                         Ok(pv.offset(i * step))
                     }
-                    Some(None) => Err(BackendError::at(pos, "null pointer dereference")),
-                    None => Err(BackendError::at(
+                    Some(None) => Err(CodegenError::at(pos, "null pointer dereference")),
+                    None => Err(CodegenError::at(
                         pos,
                         "cannot index a non-array, non-pointer value",
                     )),
@@ -1783,11 +1776,11 @@ impl<W: Write> Interpreter<W> {
                 let v = self.eval(expr, env)?;
                 match as_pointer(&v) {
                     Some(Some(pv)) => Ok(pv),
-                    Some(None) => Err(BackendError::at(pos, "null pointer dereference")),
-                    None => Err(BackendError::at(pos, "cannot dereference a non-pointer")),
+                    Some(None) => Err(CodegenError::at(pos, "null pointer dereference")),
+                    None => Err(CodegenError::at(pos, "cannot dereference a non-pointer")),
                 }
             }
-            _ => Err(BackendError::at(
+            _ => Err(CodegenError::at(
                 pos,
                 "cannot take the address of this expression",
             )),
@@ -1801,7 +1794,7 @@ impl<W: Write> Interpreter<W> {
         arrow: bool,
         pos: Pos,
         env: &mut Env,
-    ) -> Result<Cell, BackendError> {
+    ) -> Result<Cell, CodegenError> {
         // The cell whose value is the class/union being accessed.
         let class_cell = if arrow {
             let v = self.eval(base, env)?;
@@ -1819,8 +1812,8 @@ impl<W: Write> Interpreter<W> {
                 .borrow()
                 .get(field)
                 .cloned()
-                .ok_or_else(|| BackendError::at(pos, format!("no field `{field}`"))),
-            _ => Err(BackendError::at(
+                .ok_or_else(|| CodegenError::at(pos, format!("no field `{field}`"))),
+            _ => Err(CodegenError::at(
                 pos,
                 "member access on a value that is not a class or union",
             )),
@@ -1839,7 +1832,7 @@ impl<W: Write> Interpreter<W> {
         arrow: bool,
         pos: Pos,
         env: &mut Env,
-    ) -> Result<Option<(Rc<RefCell<Vec<u8>>>, u64, Type)>, BackendError> {
+    ) -> Result<Option<(Rc<RefCell<Vec<u8>>>, u64, Type)>, CodegenError> {
         let bv = self.eval(base, env)?;
         let uv = if arrow {
             match as_pointer(&bv) {
@@ -1895,12 +1888,12 @@ impl<W: Write> Interpreter<W> {
         class: &str,
         field: &str,
         pos: Pos,
-    ) -> Result<(u64, Type), BackendError> {
+    ) -> Result<(u64, Type), CodegenError> {
         self.layouts
             .get(class)
             .and_then(|l| l.fields.iter().find(|f| f.name == field))
             .map(|f| (f.offset, f.ty.clone()))
-            .ok_or_else(|| BackendError::at(pos, format!("no field `{field}`")))
+            .ok_or_else(|| CodegenError::at(pos, format!("no field `{field}`")))
     }
 
     /// Find the anonymous embedded-union field of `class` that promotes `field`,
@@ -1932,7 +1925,7 @@ impl<W: Write> Interpreter<W> {
         off: u64,
         fty: &Type,
         pos: Pos,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         if is_byte_heap_elem(fty) {
             Place::Bytes {
                 buf,
@@ -1946,7 +1939,7 @@ impl<W: Write> Interpreter<W> {
                 index: off as i64,
             })))
         } else {
-            Err(BackendError::at(
+            Err(CodegenError::at(
                 pos,
                 "this union field type is not supported in the interpreter",
             ))
@@ -1959,7 +1952,7 @@ impl<W: Write> Interpreter<W> {
     /// so `sizeof(arr)` agrees with the array the interpreter actually allocated
     /// (which also evaluates the dimension at runtime). Scalar/class sizes come
     /// from the static layout pass.
-    fn size_of_type(&mut self, ty: &Type, env: &mut Env) -> Result<i64, BackendError> {
+    fn size_of_type(&mut self, ty: &Type, env: &mut Env) -> Result<i64, CodegenError> {
         match ty {
             Type::Array(elem, Some(dim)) => {
                 let count = self.to_i64_eval(dim, dim.span.pos, env)?.max(0);
@@ -1980,7 +1973,7 @@ impl<W: Write> Interpreter<W> {
         pv: &PtrVal,
         ptr_expr: &Expr,
         env: &mut Env,
-    ) -> Result<i64, BackendError> {
+    ) -> Result<i64, CodegenError> {
         if !matches!(pv.region, Region::Heap(_)) {
             return Ok(1);
         }
@@ -1999,7 +1992,7 @@ impl<W: Write> Interpreter<W> {
         expr: &Expr,
         env: &mut Env,
         pos: Pos,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         // A pointer (or an array/string that decays to one — e.g. `I64 *p = a;
         // p++`) steps by `delta` elements, scaling a heap pointer by its element
         // size (`ptr_step`); cell pointers step one index. This mirrors pointer
@@ -2022,7 +2015,7 @@ impl<W: Write> Interpreter<W> {
         r: &Value,
         rhs: &Expr,
         env: &mut Env,
-    ) -> Result<Option<Value>, BackendError> {
+    ) -> Result<Option<Value>, CodegenError> {
         let heap = |v: &Value| match v {
             Value::Ptr(Some(pv)) if matches!(pv.region, Region::Heap(_)) => Some(pv.clone()),
             _ => None,
@@ -2061,7 +2054,7 @@ impl<W: Write> Interpreter<W> {
     /// builds an array or class element-by-element (unspecified trailing
     /// elements/fields take their default); any other expression is evaluated
     /// and copied by value, exactly as a plain `=` initialiser.
-    fn eval_init(&mut self, init: &Expr, ty: &Type, env: &mut Env) -> Result<Value, BackendError> {
+    fn eval_init(&mut self, init: &Expr, ty: &Type, env: &mut Env) -> Result<Value, CodegenError> {
         if let ExprKind::DesignatedInit(items) = &init.kind {
             return self.eval_designated_init(init, items, ty, env);
         }
@@ -2118,7 +2111,7 @@ impl<W: Write> Interpreter<W> {
                 }
                 Ok(base)
             }
-            _ => Err(BackendError::at(
+            _ => Err(CodegenError::at(
                 init.span.pos,
                 "an initializer list can only initialize an array, class, or union",
             )),
@@ -2134,9 +2127,9 @@ impl<W: Write> Interpreter<W> {
         items: &[(String, Expr)],
         ty: &Type,
         env: &mut Env,
-    ) -> Result<Value, BackendError> {
+    ) -> Result<Value, CodegenError> {
         let Type::Named(class) = ty else {
-            return Err(BackendError::at(
+            return Err(CodegenError::at(
                 init.span.pos,
                 "a designated initializer can only initialize a class or union",
             ));
@@ -2149,7 +2142,7 @@ impl<W: Write> Interpreter<W> {
             Value::Class(fields) => {
                 for (name, value) in items {
                     let Some((_, fty, _)) = find(name) else {
-                        return Err(BackendError::at(
+                        return Err(CodegenError::at(
                             value.span.pos,
                             format!("`{class}` has no field `{name}`"),
                         ));
@@ -2163,7 +2156,7 @@ impl<W: Write> Interpreter<W> {
             Value::Union(buf) => {
                 for (name, value) in items {
                     let Some((_, fty, off)) = find(name) else {
-                        return Err(BackendError::at(
+                        return Err(CodegenError::at(
                             value.span.pos,
                             format!("`{class}` has no field `{name}`"),
                         ));
@@ -2200,7 +2193,7 @@ impl<W: Write> Interpreter<W> {
         value: &Expr,
         env: &mut Env,
         pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         if is_byte_heap_elem(fty) {
             let v = self.eval(value, env)?;
             Place::Bytes {
@@ -2213,7 +2206,7 @@ impl<W: Write> Interpreter<W> {
         Ok(())
     }
 
-    fn default_value(&mut self, ty: &Type, env: &mut Env) -> Result<Value, BackendError> {
+    fn default_value(&mut self, ty: &Type, env: &mut Env) -> Result<Value, CodegenError> {
         Ok(match ty {
             Type::U0 => Value::Void,
             Type::F64 => Value::Float(0.0),
@@ -2235,9 +2228,9 @@ impl<W: Write> Interpreter<W> {
         })
     }
 
-    fn default_class(&mut self, name: &str) -> Result<Value, BackendError> {
+    fn default_class(&mut self, name: &str) -> Result<Value, CodegenError> {
         let Some(def) = self.classes.get(name).cloned() else {
-            return Err(BackendError::new(format!("unknown type `{name}`"), None));
+            return Err(CodegenError::new(format!("unknown type `{name}`"), None));
         };
         // A union is a single shared byte buffer the size of its largest field.
         if def.is_union {
@@ -2267,32 +2260,32 @@ impl<W: Write> Interpreter<W> {
         Ok(Value::Class(Rc::new(RefCell::new(fields))))
     }
 
-    fn num_err(&self, pos: Pos) -> BackendError {
-        BackendError::at(pos, "operand is not a number")
+    fn num_err(&self, pos: Pos) -> CodegenError {
+        CodegenError::at(pos, "operand is not a number")
     }
 
-    fn to_i64(&self, v: Value, pos: Pos) -> Result<i64, BackendError> {
+    fn to_i64(&self, v: Value, pos: Pos) -> Result<i64, CodegenError> {
         v.as_i64()
-            .ok_or_else(|| BackendError::at(pos, "expected an integer value"))
+            .ok_or_else(|| CodegenError::at(pos, "expected an integer value"))
     }
 
-    fn to_i64_eval(&mut self, e: &Expr, pos: Pos, env: &mut Env) -> Result<i64, BackendError> {
+    fn to_i64_eval(&mut self, e: &Expr, pos: Pos, env: &mut Env) -> Result<i64, CodegenError> {
         let v = self.eval(e, env)?;
         self.to_i64(v, pos)
     }
 
     /// printf-style formatting supporting `%d %u %x %X %c %s %f %p %%`.
-    fn format(&self, fmt: &str, args: &[Value], pos: Pos) -> Result<String, BackendError> {
+    fn format(&self, fmt: &str, args: &[Value], pos: Pos) -> Result<String, CodegenError> {
         use crate::fmt::{render_int, render_str};
         let mut out = String::new();
         let mut chars = fmt.chars().peekable();
         let mut ai = 0;
         // Fetch the next argument for a conversion specifier.
-        let take = |ai: &mut usize| -> Result<Value, BackendError> {
+        let take = |ai: &mut usize| -> Result<Value, CodegenError> {
             let v = args
                 .get(*ai)
                 .cloned()
-                .ok_or_else(|| BackendError::at(pos, "not enough arguments for format string"))?;
+                .ok_or_else(|| CodegenError::at(pos, "not enough arguments for format string"))?;
             *ai += 1;
             Ok(v)
         };
@@ -2428,27 +2421,13 @@ impl<W: Write> Interpreter<W> {
     }
 }
 
-impl<W: Write> Backend for Interpreter<W> {
-    fn name(&self) -> &'static str {
-        "interp"
-    }
-
-    /// Run a program. The program must already have passed semantic analysis —
-    /// the interpreter relies on the typed AST it produces (e.g. for
-    /// `sizeof(expr)`). Use [`run_to_string`] or run [`crate::sema::check_program`]
-    /// first.
-    fn run(&mut self, program: &Program) -> Result<(), BackendError> {
-        self.run_program(program)
-    }
-}
-
 /// Type-check and run a program, returning everything it printed. This is the
 /// safe "compile and run" entry point: it runs semantic analysis first (so the
 /// typed AST the interpreter needs is in place) and reports the first semantic
 /// error if any.
-pub fn run_to_string(program: &Program) -> Result<String, BackendError> {
+pub fn run_to_string(program: &Program) -> Result<String, CodegenError> {
     if let Some(e) = crate::sema::check_program(program).into_iter().next() {
-        return Err(BackendError::at(
+        return Err(CodegenError::at(
             e.pos,
             format!("semantic error: {}", e.message),
         ));
@@ -2483,12 +2462,12 @@ fn compound_binop(op: AssignOp) -> BinOp {
 }
 
 /// Add `delta` to a number or advance a pointer (for `++`/`--`).
-fn step_number(v: &Value, delta: i64, pos: Pos) -> Result<Value, BackendError> {
+fn step_number(v: &Value, delta: i64, pos: Pos) -> Result<Value, CodegenError> {
     match v {
         Value::Int(i) => Ok(Value::Int(i.wrapping_add(delta))),
         Value::Float(f) => Ok(Value::Float(f + delta as f64)),
         Value::Ptr(Some(pv)) => Ok(Value::Ptr(Some(pv.offset(delta)))),
-        _ => Err(BackendError::at(
+        _ => Err(CodegenError::at(
             pos,
             "`++`/`--` requires a number or pointer",
         )),
@@ -2579,11 +2558,11 @@ fn ptr_key(p: &Option<PtrVal>) -> (usize, i64) {
 }
 
 /// Resolve a value used as a pointer to the cell it addresses.
-fn deref_to_cell(v: &Value, pos: Pos) -> Result<Cell, BackendError> {
+fn deref_to_cell(v: &Value, pos: Pos) -> Result<Cell, CodegenError> {
     match as_pointer(v) {
         Some(Some(pv)) => pv.target(pos),
-        Some(None) => Err(BackendError::at(pos, "null pointer dereference")),
-        None => Err(BackendError::at(pos, "cannot dereference a non-pointer")),
+        Some(None) => Err(CodegenError::at(pos, "null pointer dereference")),
+        None => Err(CodegenError::at(pos, "cannot dereference a non-pointer")),
     }
 }
 

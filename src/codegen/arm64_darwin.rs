@@ -3,7 +3,7 @@
 //! It lowers the program to **hand-emitted AArch64 machine code**, writes a
 //! Mach-O relocatable object, and links it with the system `cc`. No
 //! LLVM/Cranelift/C — the instruction bytes and the object container are
-//! produced here. The [interpreter](crate::backend::interp) is the conformance
+//! produced here. The [interpreter](crate::interp) is the conformance
 //! oracle this backend matches byte-for-byte (see `tests/arm64.rs`).
 //!
 //! ## Scope
@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Backend, BackendError};
+use super::{Codegen, CodegenError};
 use crate::ast::*;
 use crate::layout::Layouts;
 use crate::token::{Pos, Span};
@@ -84,20 +84,20 @@ fn gpb(r: u32) -> u32 {
     if r < 31 { 1 << r } else { 0 }
 }
 
-pub struct Arm64 {
+pub struct Arm64Darwin {
     out_path: PathBuf,
 }
 
-impl Arm64 {
+impl Arm64Darwin {
     pub fn new(out_path: impl Into<PathBuf>) -> Self {
-        Arm64 {
+        Arm64Darwin {
             out_path: out_path.into(),
         }
     }
 
-    fn compile(&self, program: &Program) -> Result<Vec<u8>, BackendError> {
+    fn compile(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
         let (layouts, _) = crate::layout::compute(program);
-        let mut cg = Codegen::new(layouts);
+        let mut cg = Cg::new(layouts);
 
         let main_label = cg.asm.new_label();
         for item in &program.items {
@@ -224,15 +224,15 @@ impl Arm64 {
         ))
     }
 
-    fn link(&self, obj: &Path) -> Result<(), BackendError> {
+    fn link(&self, obj: &Path) -> Result<(), CodegenError> {
         let status = Command::new("cc")
             .arg(obj)
             .arg("-o")
             .arg(&self.out_path)
             .status()
-            .map_err(|e| BackendError::new(format!("failed to invoke linker `cc`: {e}"), None))?;
+            .map_err(|e| CodegenError::new(format!("failed to invoke linker `cc`: {e}"), None))?;
         if !status.success() {
-            return Err(BackendError::new(
+            return Err(CodegenError::new(
                 format!("linker `cc` failed with status {status}"),
                 None,
             ));
@@ -241,18 +241,18 @@ impl Arm64 {
     }
 }
 
-impl Backend for Arm64 {
+impl Codegen for Arm64Darwin {
     fn name(&self) -> &'static str {
-        "arm64"
+        "aarch64-apple-darwin"
     }
 
-    fn run(&mut self, program: &Program) -> Result<(), BackendError> {
+    fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
         let macho = self.compile(program)?;
         static OBJ_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = OBJ_SEQ.fetch_add(1, Ordering::Relaxed);
         let obj = std::env::temp_dir().join(format!("solomon-{}-{seq}.o", std::process::id()));
         fs::write(&obj, &macho)
-            .map_err(|e| BackendError::new(format!("cannot write object file: {e}"), None))?;
+            .map_err(|e| CodegenError::new(format!("cannot write object file: {e}"), None))?;
         let result = self.link(&obj);
         let _ = fs::remove_file(&obj);
         result
@@ -287,7 +287,7 @@ struct GlobalInfo {
     ty: Type,
 }
 
-struct Codegen {
+struct Cg {
     asm: Asm,
     layouts: Layouts,
     funcs: HashMap<String, FnInfo>,
@@ -314,9 +314,9 @@ struct Codegen {
     cs_saves: Vec<(u32, u32)>,
 }
 
-impl Codegen {
+impl Cg {
     fn new(layouts: Layouts) -> Self {
-        Codegen {
+        Cg {
             asm: Asm::new(),
             layouts,
             funcs: HashMap::new(),
@@ -387,7 +387,7 @@ impl Codegen {
     }
 
     /// Compute the address of a variable (local or global) into RES.
-    fn gen_addr_ident(&mut self, name: &str, pos: Pos) -> Result<(), BackendError> {
+    fn gen_addr_ident(&mut self, name: &str, pos: Pos) -> Result<(), CodegenError> {
         if let Some(v) = self.lookup(name) {
             self.asm.sub_imm(RES, FP, v.off);
             if v.indirect {
@@ -401,7 +401,7 @@ impl Codegen {
             self.asm.add_global(RES, RES, sym);
             Ok(())
         } else {
-            Err(BackendError::at(
+            Err(CodegenError::at(
                 pos,
                 format!("undeclared variable `{name}`"),
             ))
@@ -417,7 +417,7 @@ impl Codegen {
         ret: &Type,
         body: &[&Stmt],
         is_main: bool,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         self.scopes = vec![HashMap::new()];
         self.depth = 0;
         self.break_targets.clear();
@@ -475,7 +475,7 @@ impl Codegen {
                 // passes the array's address in an integer register. Keep the
                 // array type for indexing, but mark the slot as indirect.
                 if igr > 7 {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         p.span.pos,
                         "arm64 backend: at most 8 integer parameters",
                     ));
@@ -491,7 +491,7 @@ impl Codegen {
             }
             if matches!(p.ty, Type::Named(_)) {
                 if igr > 7 {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         p.span.pos,
                         "arm64 backend: at most 8 integer parameters",
                     ));
@@ -513,7 +513,7 @@ impl Codegen {
             if let Some(r) = p.name.as_ref().and_then(|n| self.promote.get(n).copied()) {
                 if is_f64(&p.ty) {
                     if fpr > 7 {
-                        return Err(BackendError::at(
+                        return Err(CodegenError::at(
                             p.span.pos,
                             "arm64 backend: at most 8 floating-point parameters",
                         ));
@@ -522,7 +522,7 @@ impl Codegen {
                     fpr += 1;
                 } else {
                     if igr > 7 {
-                        return Err(BackendError::at(
+                        return Err(CodegenError::at(
                             p.span.pos,
                             "arm64 backend: at most 8 integer parameters",
                         ));
@@ -539,7 +539,7 @@ impl Codegen {
             self.asm.sub_imm(T2, FP, off);
             if is_f64(&p.ty) {
                 if fpr > 7 {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         p.span.pos,
                         "arm64 backend: at most 8 floating-point parameters",
                     ));
@@ -549,7 +549,7 @@ impl Codegen {
                 fpr += 1;
             } else {
                 if igr > 7 {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         p.span.pos,
                         "arm64 backend: at most 8 integer parameters",
                     ));
@@ -582,7 +582,7 @@ impl Codegen {
 
         let locals = align16(self.depth);
         if locals > 4095 {
-            return Err(BackendError::new(
+            return Err(CodegenError::new(
                 "arm64 backend: function frame too large (>4 KiB of locals)",
                 None,
             ));
@@ -608,7 +608,7 @@ impl Codegen {
 
     // ---- statements ----
 
-    fn gen_stmt(&mut self, s: &Stmt) -> Result<(), BackendError> {
+    fn gen_stmt(&mut self, s: &Stmt) -> Result<(), CodegenError> {
         match &s.kind {
             StmtKind::Empty | StmtKind::Include(_) => {}
 
@@ -618,7 +618,7 @@ impl Codegen {
             }
             StmtKind::Goto(name) => {
                 let id = *self.labels.get(name).ok_or_else(|| {
-                    BackendError::at(s.span.pos, format!("unknown label `{name}`"))
+                    CodegenError::at(s.span.pos, format!("unknown label `{name}`"))
                 })?;
                 self.asm.b(id);
             }
@@ -637,7 +637,7 @@ impl Codegen {
                 for d in decls {
                     let size = self.type_size(&d.ty);
                     if is_aggregate(&d.ty) && size == 0 {
-                        return Err(BackendError::at(
+                        return Err(CodegenError::at(
                             d.span.pos,
                             "arm64 backend: array size must be a positive constant",
                         ));
@@ -687,7 +687,7 @@ impl Codegen {
                             self.gen_memcpy(T2, RES, size, SCRATCH);
                         }
                         Some(_) if is_aggregate(&d.ty) => {
-                            return Err(BackendError::at(
+                            return Err(CodegenError::at(
                                 d.span.pos,
                                 "arm64 backend: array initializers are not supported",
                             ));
@@ -800,7 +800,7 @@ impl Codegen {
 
             StmtKind::Break => {
                 let l = *self.break_targets.last().ok_or_else(|| {
-                    BackendError::at(s.span.pos, "`break` outside of a loop/switch")
+                    CodegenError::at(s.span.pos, "`break` outside of a loop/switch")
                 })?;
                 self.asm.b(l);
             }
@@ -808,7 +808,7 @@ impl Codegen {
                 let l = *self
                     .continue_targets
                     .last()
-                    .ok_or_else(|| BackendError::at(s.span.pos, "`continue` outside of a loop"))?;
+                    .ok_or_else(|| CodegenError::at(s.span.pos, "`continue` outside of a loop"))?;
                 self.asm.b(l);
             }
 
@@ -847,7 +847,7 @@ impl Codegen {
             | StmtKind::SwitchEnd => {}
 
             StmtKind::Func(_) | StmtKind::Class(_) => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     s.span.pos,
                     "arm64 backend: nested functions/classes are not supported",
                 ));
@@ -856,9 +856,9 @@ impl Codegen {
         Ok(())
     }
 
-    fn gen_switch(&mut self, cond: &Expr, body: &Stmt, pos: Pos) -> Result<(), BackendError> {
+    fn gen_switch(&mut self, cond: &Expr, body: &Stmt, pos: Pos) -> Result<(), CodegenError> {
         let StmtKind::Block(stmts) = &body.kind else {
-            return Err(BackendError::at(pos, "switch body must be a block"));
+            return Err(CodegenError::at(pos, "switch body must be a block"));
         };
 
         self.gen_expr(cond)?;
@@ -980,7 +980,7 @@ impl Codegen {
         label_at: &HashMap<usize, usize>,
         voff: u32,
         gap_target: usize,
-    ) -> Result<bool, BackendError> {
+    ) -> Result<bool, CodegenError> {
         let mut cases: Vec<(usize, i64, i64)> = Vec::new();
         for (i, st) in stmts.iter().enumerate() {
             if let StmtKind::Case { lo, hi } = &st.kind {
@@ -1045,7 +1045,7 @@ impl Codegen {
     }
 
     /// Emit the initialiser store for a global variable.
-    fn gen_global_init(&mut self, d: &Declarator, init: &Expr) -> Result<(), BackendError> {
+    fn gen_global_init(&mut self, d: &Declarator, init: &Expr) -> Result<(), CodegenError> {
         let sym = self.globals[&d.name].sym;
         let ty = d.ty.clone();
         if is_brace_init(init) {
@@ -1064,7 +1064,7 @@ impl Codegen {
             return Ok(());
         }
         if is_aggregate(&ty) {
-            return Err(BackendError::at(
+            return Err(CodegenError::at(
                 d.span.pos,
                 "arm64 backend: array initializers are not supported",
             ));
@@ -1150,7 +1150,7 @@ impl Codegen {
         ty: &Type,
         byte_off: u32,
         init: &Expr,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         if let ExprKind::InitList(items) = &init.kind {
             match ty {
                 Type::Array(elem, _) => {
@@ -1175,7 +1175,7 @@ impl Codegen {
                     }
                 }
                 _ => {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         init.span.pos,
                         "arm64 backend: an initializer list can only initialize an array, class, or union",
                     ));
@@ -1185,7 +1185,7 @@ impl Codegen {
         }
         if let ExprKind::DesignatedInit(items) = &init.kind {
             let Type::Named(class) = ty else {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     init.span.pos,
                     "arm64 backend: a designated initializer can only initialize a class or union",
                 ));
@@ -1203,7 +1203,7 @@ impl Codegen {
                 .unwrap_or_default();
             for (name, value) in items {
                 let Some((_, fty, foff)) = fields.iter().find(|(n, _, _)| n == name) else {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         value.span.pos,
                         format!("arm64 backend: `{class}` has no field `{name}`"),
                     ));
@@ -1237,7 +1237,7 @@ impl Codegen {
     /// **unsigned** integer target uses `fcvtzu` instead of the default `fcvtzs`
     /// (they differ past `I64::MAX` and for negatives) — matching C and the
     /// interpreter's `cast_value`.
-    fn gen_int_expr(&mut self, e: &Expr, target: &Type) -> Result<(), BackendError> {
+    fn gen_int_expr(&mut self, e: &Expr, target: &Type) -> Result<(), CodegenError> {
         if is_unsigned_int(target) && is_f64(&self.expr_ty(e)) {
             self.gen_fexpr(e)?;
             self.asm.fcvtzu(RES, FRES);
@@ -1247,7 +1247,7 @@ impl Codegen {
         }
     }
 
-    fn gen_expr(&mut self, e: &Expr) -> Result<(), BackendError> {
+    fn gen_expr(&mut self, e: &Expr) -> Result<(), CodegenError> {
         // F64-typed expressions are evaluated into the FP register file. This
         // function's contract is "integer/pointer result in RES", so when an
         // F64 value reaches here it is in integer context (assignment to an int
@@ -1330,18 +1330,18 @@ impl Codegen {
             }
             ExprKind::Offset { class, path } => {
                 let off = self.layouts.nested_offset_of(class, path).ok_or_else(|| {
-                    BackendError::at(pos, format!("cannot compute offset of `{class}`"))
+                    CodegenError::at(pos, format!("cannot compute offset of `{class}`"))
                 })?;
                 self.asm.load_imm(RES, off as i64);
             }
             ExprKind::InitList(_) => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     pos,
                     "arm64 backend: an initializer list is only valid as a variable initializer",
                 ));
             }
             ExprKind::DesignatedInit(_) => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     pos,
                     "arm64 backend: a designated initializer is only valid as a variable initializer",
                 ));
@@ -1355,7 +1355,7 @@ impl Codegen {
         Ok(())
     }
 
-    fn gen_ident_value(&mut self, name: &str, pos: Pos) -> Result<(), BackendError> {
+    fn gen_ident_value(&mut self, name: &str, pos: Pos) -> Result<(), CodegenError> {
         match name {
             "NULL" | "FALSE" => return Ok(self.asm.load_imm(RES, 0)),
             "TRUE" => return Ok(self.asm.load_imm(RES, 1)),
@@ -1379,14 +1379,14 @@ impl Codegen {
         if self.funcs.contains_key(name) {
             return self.gen_call(name, &[], pos);
         }
-        Err(BackendError::at(
+        Err(CodegenError::at(
             pos,
             format!("arm64 backend: `{name}` is undeclared"),
         ))
     }
 
     /// Load the value of an lvalue expression (Member / Index / Deref).
-    fn gen_lvalue_value(&mut self, e: &Expr) -> Result<(), BackendError> {
+    fn gen_lvalue_value(&mut self, e: &Expr) -> Result<(), CodegenError> {
         let ty = self.expr_ty(e);
         if is_aggregate(&ty) {
             // Aggregates are represented by their address (arrays decay; structs
@@ -1399,7 +1399,7 @@ impl Codegen {
     }
 
     /// Compute the address of an lvalue into RES.
-    fn gen_addr(&mut self, e: &Expr) -> Result<(), BackendError> {
+    fn gen_addr(&mut self, e: &Expr) -> Result<(), CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
             ExprKind::Ident(name) => self.gen_addr_ident(name, pos)?,
@@ -1423,7 +1423,7 @@ impl Codegen {
                     named_of(&self.expr_ty(base), pos)?
                 };
                 let off = self.layouts.offset_of(&class, field).ok_or_else(|| {
-                    BackendError::at(pos, format!("no field `{field}` on `{class}`"))
+                    CodegenError::at(pos, format!("no field `{field}` on `{class}`"))
                 })?;
                 if off != 0 {
                     self.asm.add_imm(RES, RES, off as u32);
@@ -1433,7 +1433,7 @@ impl Codegen {
                 let bty = self.expr_ty(base);
                 let elem = bty
                     .elem()
-                    .ok_or_else(|| BackendError::at(pos, "cannot index a non-array/pointer"))?;
+                    .ok_or_else(|| CodegenError::at(pos, "cannot index a non-array/pointer"))?;
                 let stride = self.layouts.stride_of(&elem) as i64;
                 if matches!(bty, Type::Array(..)) {
                     self.gen_addr(base)?;
@@ -1446,12 +1446,12 @@ impl Codegen {
                 self.asm.load_imm(SCRATCH, stride);
                 self.asm.madd(RES, RES, SCRATCH, T2); // index*stride + base
             }
-            _ => return Err(BackendError::at(pos, "expression is not an lvalue")),
+            _ => return Err(CodegenError::at(pos, "expression is not an lvalue")),
         }
         Ok(())
     }
 
-    fn gen_unary(&mut self, op: UnOp, inner: &Expr) -> Result<(), BackendError> {
+    fn gen_unary(&mut self, op: UnOp, inner: &Expr) -> Result<(), CodegenError> {
         match op {
             UnOp::Pos => self.gen_expr(inner)?,
             UnOp::Neg => {
@@ -1488,14 +1488,14 @@ impl Codegen {
     }
 
     /// `++`/`--`, pre or post. Pointers step by the pointee's size.
-    fn gen_incdec(&mut self, target: &Expr, pre: bool, inc: bool) -> Result<(), BackendError> {
+    fn gen_incdec(&mut self, target: &Expr, pre: bool, inc: bool) -> Result<(), CodegenError> {
         let tty = self.expr_ty(target);
         let delta = match tty.elem() {
             Some(elem) => self.layouts.stride_of(&elem) as u32,
             None => 1,
         };
         if delta > 4095 {
-            return Err(BackendError::at(
+            return Err(CodegenError::at(
                 target.span.pos,
                 "arm64 backend: pointee too large for ++/--",
             ));
@@ -1539,7 +1539,7 @@ impl Codegen {
         lhs: &Expr,
         rhs: &Expr,
         pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         use BinOp::*;
         match op {
             And => return self.gen_logical(lhs, rhs, false),
@@ -1659,7 +1659,7 @@ impl Codegen {
         rhs: &Expr,
         lt: &Type,
         rt: &Type,
-    ) -> Result<bool, BackendError> {
+    ) -> Result<bool, CodegenError> {
         use BinOp::*;
         // Add is commutative — the constant may be on either side.
         if op == Add {
@@ -1763,7 +1763,7 @@ impl Codegen {
         }
     }
 
-    fn gen_logical(&mut self, lhs: &Expr, rhs: &Expr, is_or: bool) -> Result<(), BackendError> {
+    fn gen_logical(&mut self, lhs: &Expr, rhs: &Expr, is_or: bool) -> Result<(), CodegenError> {
         let l_short = self.asm.new_label();
         let l_end = self.asm.new_label();
         self.gen_cond(lhs)?;
@@ -1790,7 +1790,7 @@ impl Codegen {
         rm: u32,
         signed: bool,
         pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         use BinOp::*;
         match op {
             Add => self.asm.add(rd, rn, rm),
@@ -1816,7 +1816,7 @@ impl Codegen {
             Shr if signed => self.asm.asrv(rd, rn, rm),
             Shr => self.asm.lsrv(rd, rn, rm),
             other => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     pos,
                     format!("arm64 backend: bad binop {other:?}"),
                 ));
@@ -1841,7 +1841,7 @@ impl Codegen {
         target: &Expr,
         value: &Expr,
         pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         let tty = self.expr_ty(target);
         if op == AssignOp::Assign && is_aggregate(&tty) {
             // Whole-aggregate copy (e.g. class = class).
@@ -1942,7 +1942,7 @@ impl Codegen {
     }
 
     /// Evaluate an F64-typed expression; the result lands in FRES.
-    fn gen_fexpr(&mut self, e: &Expr) -> Result<(), BackendError> {
+    fn gen_fexpr(&mut self, e: &Expr) -> Result<(), CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
             ExprKind::Float(v) => {
@@ -1986,7 +1986,7 @@ impl Codegen {
             ExprKind::Binary { op, lhs, rhs } => {
                 use BinOp::*;
                 if !matches!(op, Add | Sub | Mul | Div) {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         format!("arm64 backend: operator {op:?} is not supported on F64"),
                     ));
@@ -2044,7 +2044,7 @@ impl Codegen {
                 }
             }
             _ => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     pos,
                     "arm64 backend: unsupported floating-point expression",
                 ));
@@ -2054,7 +2054,7 @@ impl Codegen {
     }
 
     /// Evaluate `e` as a double in FRES, converting from an integer if needed.
-    fn gen_foperand(&mut self, e: &Expr) -> Result<(), BackendError> {
+    fn gen_foperand(&mut self, e: &Expr) -> Result<(), CodegenError> {
         if is_f64(&self.expr_ty(e)) {
             self.gen_fexpr(e)
         } else {
@@ -2065,7 +2065,7 @@ impl Codegen {
     }
 
     /// Evaluate `e` for use as a boolean test; RES is nonzero iff `e` is true.
-    fn gen_cond(&mut self, e: &Expr) -> Result<(), BackendError> {
+    fn gen_cond(&mut self, e: &Expr) -> Result<(), CodegenError> {
         if is_f64(&self.expr_ty(e)) {
             self.gen_fexpr(e)?;
             self.asm.fcmp_zero(FRES);
@@ -2083,7 +2083,7 @@ impl Codegen {
         target: &Expr,
         value: &Expr,
         pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         use BinOp::*;
         // A register-promoted F64 target (its `reg` is a callee-saved d-register)
         // needs no address: compute the new value in FRES and copy it across.
@@ -2093,7 +2093,7 @@ impl Codegen {
             } else {
                 let bop = compound_binop(op);
                 if !matches!(bop, Add | Sub | Mul | Div) {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         format!("arm64 backend: operator {bop:?} is not supported on F64"),
                     ));
@@ -2122,7 +2122,7 @@ impl Codegen {
         // Compound assignment (`+=`, `-=`, `*=`, `/=`).
         let bop = compound_binop(op);
         if !matches!(bop, Add | Sub | Mul | Div) {
-            return Err(BackendError::at(
+            return Err(CodegenError::at(
                 pos,
                 format!("arm64 backend: operator {bop:?} is not supported on F64"),
             ));
@@ -2149,7 +2149,7 @@ impl Codegen {
 
     // ---- calls & printing ----
 
-    fn gen_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), BackendError> {
+    fn gen_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         // `Sign(x)` = `(x > 0) - (x < 0)` — a computed builtin with no libc
         // counterpart, emitted inline.
         if name == "Sign" {
@@ -2229,7 +2229,7 @@ impl Codegen {
         let (label, params, ret) = match self.funcs.get(name) {
             Some(info) => (info.label, info.params.clone(), info.ret.clone()),
             None => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     pos,
                     format!("arm64 backend: cannot call `{name}` (no compiled body)"),
                 ));
@@ -2273,7 +2273,7 @@ impl Codegen {
 
     /// Dispatch a call expression: a bare function/builtin name is a direct call;
     /// anything else (a function-pointer variable or computed value) is indirect.
-    fn gen_call_expr(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), BackendError> {
+    fn gen_call_expr(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), CodegenError> {
         let pos = callee.span.pos;
         if let ExprKind::Ident(name) = &callee.kind {
             if name == "Print" {
@@ -2309,11 +2309,11 @@ impl Codegen {
         callee: &Expr,
         args: &[Expr],
         pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         let (ret, ptypes) = match self.expr_ty(callee) {
             Type::FuncPtr { ret, params } => (*ret, params),
             _ => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     pos,
                     "arm64 backend: called value is not a function pointer",
                 ));
@@ -2349,7 +2349,7 @@ impl Codegen {
         ret: &Type,
         name: &str,
         pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         let n = params.len();
 
         // For an indirect call, evaluate the function-pointer value up front and
@@ -2377,7 +2377,7 @@ impl Codegen {
                 &args[i]
             } else {
                 params[i].default.as_ref().ok_or_else(|| {
-                    BackendError::at(pos, format!("missing argument for `{name}`"))
+                    CodegenError::at(pos, format!("missing argument for `{name}`"))
                 })?
             };
             if is_f64(&params[i].ty) {
@@ -2397,7 +2397,7 @@ impl Codegen {
         for p in params {
             if is_f64(&p.ty) {
                 if fpr > 7 {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         "arm64 backend: at most 8 floating-point arguments",
                     ));
@@ -2406,7 +2406,7 @@ impl Codegen {
                 fpr += 1;
             } else {
                 if igr > 7 {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         "arm64 backend: at most 8 integer arguments",
                     ));
@@ -2448,7 +2448,7 @@ impl Codegen {
         Ok(())
     }
 
-    fn gen_expr_stmt(&mut self, e: &Expr) -> Result<(), BackendError> {
+    fn gen_expr_stmt(&mut self, e: &Expr) -> Result<(), CodegenError> {
         match &e.kind {
             ExprKind::Str(s) => self.gen_print(s, &[]),
             ExprKind::Comma(items) => {
@@ -2464,23 +2464,23 @@ impl Codegen {
         }
     }
 
-    fn gen_print_call(&mut self, args: &[Expr], pos: Pos) -> Result<(), BackendError> {
+    fn gen_print_call(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         let (fmt, rest) = match args.split_first() {
             Some((first, rest)) => match &first.kind {
                 ExprKind::Str(s) => (s.clone(), rest),
                 _ => {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         "arm64 backend: Print's format must be a string literal",
                     ));
                 }
             },
-            None => return Err(BackendError::at(pos, "Print requires a format string")),
+            None => return Err(CodegenError::at(pos, "Print requires a format string")),
         };
         self.gen_print(&fmt, rest)
     }
 
-    fn gen_print(&mut self, fmt: &str, args: &[Expr]) -> Result<(), BackendError> {
+    fn gen_print(&mut self, fmt: &str, args: &[Expr]) -> Result<(), CodegenError> {
         let c_fmt = translate_format(fmt)?;
         let fmt_idx = self.asm.intern_string(&c_fmt);
         let k = args.len() as u32;
@@ -2514,23 +2514,23 @@ impl Codegen {
         args: &[Expr],
         pos: Pos,
         append: bool,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         let what = if append { "CatPrint" } else { "StrPrint" };
         let (dst, rest) = args
             .split_first()
-            .ok_or_else(|| BackendError::at(pos, format!("{what} requires a destination")))?;
+            .ok_or_else(|| CodegenError::at(pos, format!("{what} requires a destination")))?;
         let (fmt, rest) = match rest.split_first() {
             Some((first, rest)) => match &first.kind {
                 ExprKind::Str(s) => (s.clone(), rest),
                 _ => {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         format!("arm64 backend: {what}'s format must be a string literal"),
                     ));
                 }
             },
             None => {
-                return Err(BackendError::at(
+                return Err(CodegenError::at(
                     pos,
                     format!("{what} requires a format string"),
                 ));
@@ -2588,18 +2588,18 @@ impl Codegen {
     /// `MStrPrint(fmt, ...)` -> format into a fresh, right-sized buffer: measure
     /// with `snprintf(NULL, 0, ...)`, `malloc(len + 1)`, then `sprintf`. Returns
     /// the new buffer. The variadic args stay on the stack across both calls.
-    fn gen_mstrprint(&mut self, args: &[Expr], pos: Pos) -> Result<(), BackendError> {
+    fn gen_mstrprint(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         let (fmt, rest) = match args.split_first() {
             Some((first, rest)) => match &first.kind {
                 ExprKind::Str(s) => (s.clone(), rest),
                 _ => {
-                    return Err(BackendError::at(
+                    return Err(CodegenError::at(
                         pos,
                         "arm64 backend: MStrPrint's format must be a string literal",
                     ));
                 }
             },
-            None => return Err(BackendError::at(pos, "MStrPrint requires a format string")),
+            None => return Err(CodegenError::at(pos, "MStrPrint requires a format string")),
         };
 
         let buf_off = self.alloc(8, 8);
@@ -2649,7 +2649,7 @@ impl Codegen {
         fmt: &str,
         is_float: bool,
         _pos: Pos,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), CodegenError> {
         self.gen_expr(buf)?; // RES = buf
         let buf_off = self.alloc(8, 8);
         self.asm.sub_imm(T2, FP, buf_off);
@@ -2676,7 +2676,7 @@ impl Codegen {
     /// `StrToUpper(str)` / `StrToLower(str)` — walk `str` to its NUL, replacing
     /// each byte with `toupper`/`tolower` of it; return `str`. The cursor lives in
     /// a frame slot since the per-char libc call clobbers the temp registers.
-    fn gen_str_case(&mut self, arg: &Expr, upper: bool) -> Result<(), BackendError> {
+    fn gen_str_case(&mut self, arg: &Expr, upper: bool) -> Result<(), CodegenError> {
         self.gen_expr(arg)?; // RES = str
         let str_off = self.alloc(8, 8);
         self.asm.sub_imm(T2, FP, str_off);
@@ -2708,7 +2708,7 @@ impl Codegen {
     /// `StrRev(str)` — reverse `str` in place with two pointers converging from
     /// the ends, swapping bytes until they meet; return `str`. No call inside the
     /// loop, so the cursors stay in registers.
-    fn gen_str_rev(&mut self, arg: &Expr) -> Result<(), BackendError> {
+    fn gen_str_rev(&mut self, arg: &Expr) -> Result<(), CodegenError> {
         self.gen_expr(arg)?; // RES = str
         let str_off = self.alloc(8, 8);
         self.asm.sub_imm(T2, FP, str_off);
@@ -3192,10 +3192,10 @@ fn log2_pow2(v: i64) -> Option<u32> {
         None
     }
 }
-fn named_of(ty: &Type, pos: Pos) -> Result<String, BackendError> {
+fn named_of(ty: &Type, pos: Pos) -> Result<String, CodegenError> {
     match ty {
         Type::Named(n) => Ok(n.clone()),
-        _ => Err(BackendError::at(
+        _ => Err(CodegenError::at(
             pos,
             "member access on a value that is not a class or union",
         )),
@@ -3221,7 +3221,7 @@ impl TypeExt for Type {
     }
 }
 
-fn collect_labels(s: &Stmt, cg: &mut Codegen) {
+fn collect_labels(s: &Stmt, cg: &mut Cg) {
     match &s.kind {
         StmtKind::Label(name) => {
             let id = cg.asm.new_label();
@@ -3258,7 +3258,7 @@ fn compound_binop(op: AssignOp) -> BinOp {
     }
 }
 
-fn translate_format(fmt: &str) -> Result<String, BackendError> {
+fn translate_format(fmt: &str) -> Result<String, CodegenError> {
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
@@ -3392,10 +3392,10 @@ impl Asm {
     fn place(&mut self, id: usize) {
         self.label_pos[id] = Some(self.words.len());
     }
-    fn label_byte(&self, id: usize) -> Result<u64, BackendError> {
+    fn label_byte(&self, id: usize) -> Result<u64, CodegenError> {
         self.label_pos[id]
             .map(|w| (w * 4) as u64)
-            .ok_or_else(|| BackendError::new("internal: unplaced function label", None))
+            .ok_or_else(|| CodegenError::new("internal: unplaced function label", None))
     }
 
     fn intern_string(&mut self, s: &str) -> usize {
@@ -3549,11 +3549,11 @@ impl Asm {
         }
     }
 
-    fn finish(mut self) -> Result<CodeImage, BackendError> {
+    fn finish(mut self) -> Result<CodeImage, CodegenError> {
         self.peephole();
         for (at, id, kind) in &self.fixups {
             let target = self.label_pos[*id]
-                .ok_or_else(|| BackendError::new("internal: unplaced code label", None))?;
+                .ok_or_else(|| CodegenError::new("internal: unplaced code label", None))?;
             let off = target as i64 - *at as i64;
             match kind {
                 Fixup::B26 => self.words[*at] |= (off as u32) & 0x03FF_FFFF,
@@ -3561,7 +3561,7 @@ impl Asm {
                 Fixup::Adr => {
                     let imm = off * 4; // ADR immediate is in bytes
                     if !(-(1 << 20)..(1 << 20)).contains(&imm) {
-                        return Err(BackendError::new("function too far for ADR (>1MB)", None));
+                        return Err(CodegenError::new("function too far for ADR (>1MB)", None));
                     }
                     let immlo = (imm as u32) & 0x3;
                     let immhi = ((imm as u32) >> 2) & 0x7_FFFF;
@@ -3569,7 +3569,7 @@ impl Asm {
                 }
                 Fixup::TableRel(base) => {
                     let base_pos = self.label_pos[*base]
-                        .ok_or_else(|| BackendError::new("internal: unplaced table label", None))?;
+                        .ok_or_else(|| CodegenError::new("internal: unplaced table label", None))?;
                     // Byte distance table_base -> target (positions are word indices).
                     let off_bytes = (target as i64 - base_pos as i64) * 4;
                     self.words[*at] = off_bytes as u32; // a full data word, not a field
@@ -3586,7 +3586,7 @@ impl Asm {
         for (at, sidx) in &self.adr_fixups {
             let imm = str_offsets[*sidx] as i64 - (*at * 4) as i64;
             if !(-(1 << 20)..(1 << 20)).contains(&imm) {
-                return Err(BackendError::new("string too far for ADR (>1MB)", None));
+                return Err(CodegenError::new("string too far for ADR (>1MB)", None));
             }
             let immlo = (imm as u32) & 0x3;
             let immhi = ((imm as u32) >> 2) & 0x7_FFFF;

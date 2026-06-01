@@ -1,7 +1,6 @@
-//! Tests for the tree-walking interpreter backend.
+//! Tests for the tree-walking interpreter.
 
-use solomon::backend::Backend;
-use solomon::backend::interp::{Interpreter, run_to_string};
+use solomon::interp::{Interpreter, run_to_string};
 use solomon::parser::parse;
 use solomon::sema::check_program;
 
@@ -458,6 +457,24 @@ fn catprint_appends_to_a_buffer() {
         run(src),
         "Items: #1=1 #2=4 #3=9 | total=14.0\nret_eq=1 len=34\n"
     );
+}
+
+#[test]
+fn catprint_appends_into_an_array_buffer() {
+    // Regression: `CatPrint` must append at dst + StrLen(dst) even when `dst` is
+    // an *array* (which decays to a pointer), not just a heap `Ptr`. The native
+    // backends always offset correctly; the interpreter must agree.
+    let src = r#"
+        U0 Main() {
+            U8 b[64];
+            StrCpy(b, "start:");
+            CatPrint(b, " a=%d", 1);
+            CatPrint(b, " b=%d", 2);
+            "%s\n", b;
+        }
+        Main;
+    "#;
+    assert_eq!(run(src), "start: a=1 b=2\n");
 }
 
 #[test]
@@ -1048,12 +1065,11 @@ fn string_memory_and_math_builtins() {
             MemCpy(d, "xy", 2); d[2] = 0;
             "%s\n", d;
             "%d %d %d\n", ToUpper('a'), ToLower('Z'), ToUpper('!');  // '!' unchanged
-            "%d %d %d\n", Sin(0.0) == 0.0, Cos(0.0) == 1.0, Pow(2.0, 10.0) == 1024.0;
             Free(s); Free(d);
         }
         Main;
     "#;
-    assert_eq!(run(src), "Hello, World 12\n***\nxy\n65 122 33\n1 1 1\n");
+    assert_eq!(run(src), "Hello, World 12\n***\nxy\n65 122 33\n");
 }
 
 #[test]
@@ -1063,27 +1079,25 @@ fn memcmp_and_more_math_builtins() {
             "%d %d %d\n", MemCmp("abc", "abc", 3), MemCmp("abc", "abd", 3), MemCmp("abd", "abc", 3);
             "%d %d %d\n", (I64)Floor(3.7), (I64)Ceil(3.2), (I64)Round(3.5);
             "%d %d\n", (I64)Floor(-3.2), (I64)Ceil(-3.7);
-            "%d %d %d\n", Exp(0.0) == 1.0, Ln(1.0) == 0.0, Tan(0.0) == 0.0;
         }
         Main;
     "#;
-    assert_eq!(run(src), "0 -1 1\n3 4 4\n-4 -3\n1 1 1\n");
+    assert_eq!(run(src), "0 -1 1\n3 4 4\n-4 -3\n");
 }
 
 #[test]
-fn strfind_and_inverse_trig_builtins() {
+fn strfind_builtin() {
     let src = r#"
         U0 Main() {
             U8 *s = MAlloc(16);
             StrCpy(s, "abcdef");
             U8 *p = StrFind(s, "cd");       // pointer into the buffer at index 2
             "%d %d %d\n", p != NULL, p - s, StrFind(s, "zz") == NULL;
-            "%d %d %d\n", (I64)(ASin(1.0) * 100), (I64)(ATan2(1.0, 1.0) * 100), (I64)Log10(1000.0);
             Free(s);
         }
         Main;
     "#;
-    assert_eq!(run(src), "1 2 1\n157 78 3\n");
+    assert_eq!(run(src), "1 2 1\n");
 }
 
 #[test]
@@ -1429,12 +1443,6 @@ fn null_dereference_is_a_runtime_error() {
     let mut interp = Interpreter::new(Vec::<u8>::new());
     let err = interp.run(&program).unwrap_err();
     assert!(err.message.contains("null pointer"), "got: {err}");
-}
-
-#[test]
-fn backend_name() {
-    let interp = Interpreter::new(Vec::<u8>::new());
-    assert_eq!(interp.name(), "interp");
 }
 
 #[test]

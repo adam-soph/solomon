@@ -5,7 +5,7 @@
 //! produces an AST). The sources are embedded with `include_str!` so the tests
 //! do not depend on the working directory.
 
-use solomon::backend::interp::run_to_string;
+use solomon::interp::run_to_string;
 use solomon::lexer::tokenize;
 use solomon::parser::parse;
 use solomon::sema::check_program;
