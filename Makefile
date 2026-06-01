@@ -20,7 +20,7 @@
 # A native macOS host builds both Apple targets with cargo (after `make targets`)
 # and Linux/Windows targets with cross.
 
-BIN         := solomon
+BIN         := holyc
 CARGO       ?= cargo
 CROSS       ?= cross
 CARGO_FLAGS ?= --release --locked
@@ -115,7 +115,7 @@ clean:
 	rm -rf $(DIST)
 
 help:
-	@echo "solomon build targets:"
+	@echo "holyc build targets:"
 	@echo "  make / make native     build for the host machine"
 	@echo "  make targets           rustup target add every triple"
 	@echo "  make all               build every target in TARGETS"

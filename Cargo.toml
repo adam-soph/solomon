@@ -2,3 +2,8 @@
 name = "solomon"
 version = "0.1.0"
 edition = "2024"
+
+# The library crate stays `solomon`; the CLI binary is `holyc`.
+[[bin]]
+name = "holyc"
+path = "src/main.rs"

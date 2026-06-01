@@ -24,7 +24,7 @@ Main;
 ```
 
 ```
-$ solomon hello.hc
+$ holyc run hello.hc
 Hello, World!
 x=42 y=255
 ```
@@ -56,8 +56,8 @@ Working today:
   (arithmetic, indexing, comparison, `&`/`*`/`->`), arrays (including
   multidimensional and pass-by-reference), classes/unions, casts, function
   pointers, a byte-addressable `MAlloc` heap, and HolyC's implicit print.
-- **`aarch64-apple-darwin` native backend** (`--build` on Apple silicon, or
-  `--target aarch64-apple-darwin`) — hand-emits machine code and a Mach-O
+- **`aarch64-apple-darwin` native backend** (the default build on Apple silicon,
+  or `--target aarch64-apple-darwin`) — hand-emits machine code and a Mach-O
   relocatable object, then links with `cc`. Type-directed codegen covering the
   whole implemented subset: control flow (dense `switch`es lower to an O(1)
   jump table), functions (recursion, default and variadic args), classes by
@@ -93,9 +93,10 @@ Not yet implemented: most of the TempleOS core/standard library and DolDoc.
 Requires **Rust 1.85+** (the crate uses the 2024 edition). With Cargo:
 
 ```sh
-cargo build --release     # binary at target/release/solomon
-cargo test                # run the test suite
-cargo run -- FILE.hc      # build and run a HolyC file
+cargo build --release         # binary at target/release/holyc
+cargo test                    # run the test suite
+cargo run -- run FILE.hc      # interpret a HolyC file
+cargo run -- FILE.hc -o app   # compile it to a native binary for the host
 ```
 
 ### Cross-compiling
@@ -125,11 +126,11 @@ Default targets:
 | Windows x86-64      | `x86_64-pc-windows-gnu`       |
 | Windows x86         | `i686-pc-windows-gnu`         |
 
-These triples are what the **solomon binary itself** is compiled for — every one
-runs the front end and the interpreter (`--run`). Native code *generation*
-(`--build` / `--target`) is a separate axis: only `aarch64-apple-darwin` and
-`x86_64-unknown-linux` have a backend, so on the other platforms (Windows
-included) solomon interprets HolyC but cannot emit a native executable yet.
+These triples are what the **`holyc` binary itself** is compiled for — every one
+runs the front end and the interpreter (`holyc run`). Native code *generation*
+(the default build, or `--target`) is a separate axis: only `aarch64-apple-darwin`,
+`x86_64-unknown-linux`, and `x86_64-pc-windows` have a backend, so on the other
+platforms `holyc` interprets HolyC but cannot emit a native executable yet.
 
 Building for an OS other than the host needs a cross linker/toolchain. The
 Makefile uses the [`cross`](https://github.com/cross-rs/cross) tool (Docker-based)
@@ -151,26 +152,32 @@ target list with `make all TARGETS="x86_64-unknown-linux-gnu ..."`.
 ## Usage
 
 ```
-solomon [--tokens | --ast | --check | --run | --build | --target TRIPLE] [-o OUT] [FILE]
+holyc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
+holyc <subcommand> [FILE]
 ```
 
-Reads from `FILE`, or from stdin if no file is given. Modes:
+Reads from `FILE`, or from stdin if no file is given. With **no subcommand**,
+`holyc` compiles a native binary for the host's architecture and OS (`-o OUT`,
+default `a.out`); `--target TRIPLE` cross-compiles instead. The subcommands
+select other behavior:
 
-| Flag        | Does                                                            |
-| ----------- | -------------------------------------------------------------- |
-| `--run`     | type-check then execute with the interpreter (the default)     |
-| `--build`   | compile to a native binary for the host's native target (`-o OUT`, default `a.out`) |
-| `--target TRIPLE` | compile for a specific target — `aarch64-apple-darwin` or `x86_64-unknown-linux` |
-| `--check`   | parse + semantic analysis; report errors, run nothing          |
-| `--ast`     | parse and dump the AST                                         |
-| `--tokens`  | run the lexer only and dump the token stream (no preprocessing)|
+| Command         | Does                                                       |
+| --------------- | ---------------------------------------------------------- |
+| *(none)*        | compile a native binary for the host target (`-o OUT`)     |
+| `run`           | type-check then execute with the tree-walking interpreter  |
+| `check`         | parse + semantic analysis; report errors, run nothing      |
+| `ast`           | parse and dump the AST                                      |
+| `tokens`        | run the lexer only and dump the token stream               |
+
+`--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`, or
+`x86_64-pc-windows`.
 
 ```sh
-$ solomon --check broken.hc
+$ holyc check broken.hc
 semantic error at 2:3: call to undeclared function `DrawRect`
 1 error(s)
 
-$ echo 'I64 Sq(I64 x){ return x*x; } "%d\n", Sq(9);' | solomon
+$ echo 'I64 Sq(I64 x){ return x*x; } "%d\n", Sq(9);' | holyc run
 81
 ```
 

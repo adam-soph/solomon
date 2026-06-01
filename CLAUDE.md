@@ -13,7 +13,7 @@ backend is an (arch, OS) pair, not just a CPU.
 ## Commands
 
 ```sh
-cargo build                 # debug build (binary: target/debug/solomon)
+cargo build                 # debug build (CLI binary: target/debug/holyc; the lib crate is `solomon`)
 cargo build --release       # release build
 cargo test                  # whole suite
 cargo test --test arm64_darwin     # one integration-test file (each tests/<name>.rs is a crate)
@@ -22,16 +22,19 @@ cargo fmt                   # format (CI-relevant: keep the tree fmt-clean)
 cargo clippy --all-targets  # lint — see note below
 ```
 
-Run a HolyC program through each mode (default is `--run`):
+The CLI binary is **`holyc`**. It is **subcommand**-based, and with **no
+subcommand it compiles a native binary for the host's architecture and OS** (the
+default — `-o OUT`, default `a.out`); `--target TRIPLE` cross-compiles. The
+interpreter is the `run` subcommand:
 
 ```sh
-cargo run -- --run FILE.hc            # type-check then interpret
-cargo run -- --check FILE.hc          # parse + sema only, report errors
-cargo run -- --ast FILE.hc            # dump the parsed AST
-cargo run -- --tokens FILE.hc         # raw lexer output (no preprocessing)
-cargo run -- --build -o out FILE.hc                  # native binary for the host's target
-cargo run -- --target x86_64-unknown-linux -o out FILE.hc  # explicit target (a static ELF)
-echo 'I64 Sq(I64 x){return x*x;} "%d\n", Sq(9);' | cargo run --   # reads stdin if no FILE
+cargo run -- FILE.hc -o out          # default: native binary for the host target
+cargo run -- --target x86_64-unknown-linux -o out FILE.hc  # cross-compile (a static ELF)
+cargo run -- run FILE.hc             # type-check then interpret
+cargo run -- check FILE.hc           # parse + sema only, report errors
+cargo run -- ast FILE.hc             # dump the parsed AST
+cargo run -- tokens FILE.hc          # raw lexer output (no preprocessing)
+echo 'I64 Sq(I64 x){return x*x;} "%d\n", Sq(9);' | cargo run -- run   # reads stdin if no FILE
 ```
 
 `make` wraps cargo for cross-compilation (`make`, `make all`, `make <triple>`,
@@ -479,8 +482,9 @@ with byte-identical output.
 
 ## Status note
 
-Code generation is implemented for both native targets (`--build` for the host,
-`--target` for a specific triple). The backends compile the whole implemented
+Code generation is implemented for all three native targets (the default,
+host-target build, or `--target TRIPLE` for a specific triple). The backends
+compile the whole implemented
 HolyC subset, including the `offset` keyword, brace aggregate initializers
 (`I64 a[] = {1,2,3}`, `Pt p = {1,2}`, nested and partial), designated class
 initializers (`Pt p = {.x = 1, .y = 2}`, out-of-order, partial, and nested), and

@@ -1,15 +1,18 @@
-//! Solomon CLI. Reads HolyC source from a file (or stdin) and either dumps the
-//! token stream or the parsed AST — useful for eyeballing the front end.
+//! The `holyc` CLI. Reads HolyC source from a file (or stdin) and, **by default,
+//! compiles a native binary for the host's architecture and OS**. A leading
+//! subcommand selects other behavior.
 //!
 //! Usage:
-//!   solomon [--tokens|--ast|--check|--run|--build] [--target TRIPLE] [-o OUT] [FILE]
+//!   holyc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
+//!   holyc run    [FILE]                       run with the tree-walking interpreter
+//!   holyc check  [FILE]                       parse + semantic analysis, report errors
+//!   holyc ast    [FILE]                       dump the parsed AST
+//!   holyc tokens [FILE]                       dump the raw lexer token stream
 //!
-//! `--tokens` runs the lexer only; `--ast` runs the parser; `--check` runs the
-//! parser plus semantic analysis; `--run` (the default) checks then executes the
-//! program with the tree-walking interpreter; `--build` compiles to a native
-//! executable (written to OUT, default `a.out`) for the host's native target;
-//! `--target TRIPLE` selects a target explicitly (`aarch64-apple-darwin` →
-//! Mach-O via `cc`, `x86_64-unknown-linux` → a freestanding static ELF).
+//! With no subcommand `holyc` builds for the host target (`-o OUT`, default
+//! `a.out`); `--target TRIPLE` cross-compiles instead (`aarch64-apple-darwin` →
+//! Mach-O via `cc`, `x86_64-unknown-linux` → a freestanding static ELF,
+//! `x86_64-pc-windows` → a self-contained PE).
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -75,48 +78,78 @@ enum Mode {
 }
 
 fn main() -> ExitCode {
-    let mut mode = Mode::Run;
+    // The default action is to compile a native binary for the host target.
+    let mut mode = Mode::Build;
     let mut path: Option<String> = None;
     let mut out: Option<String> = None;
     let mut target: Option<Target> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+
+    // An optional leading subcommand selects a non-default mode; anything else
+    // (a file or an option) leaves the default build mode in place.
+    let is_subcommand = match args.peek().map(String::as_str) {
+        Some("build") => {
+            mode = Mode::Build;
+            true
+        }
+        Some("run") => {
+            mode = Mode::Run;
+            true
+        }
+        Some("check") => {
+            mode = Mode::Check;
+            true
+        }
+        Some("ast") => {
+            mode = Mode::Ast;
+            true
+        }
+        Some("tokens") => {
+            mode = Mode::Tokens;
+            true
+        }
+        Some("-h" | "--help" | "help") => {
+            print_usage();
+            return ExitCode::SUCCESS;
+        }
+        _ => false,
+    };
+    if is_subcommand {
+        args.next();
+    }
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--tokens" => mode = Mode::Tokens,
-            "--ast" => mode = Mode::Ast,
-            "--check" => mode = Mode::Check,
-            "--run" => mode = Mode::Run,
-            "--build" => mode = Mode::Build,
-            "--target" => {
-                mode = Mode::Build;
-                match args.next() {
-                    Some(t) => match Target::from_triple(&t) {
-                        Some(tt) => target = Some(tt),
-                        None => {
-                            eprintln!(
-                                "solomon: unknown target `{t}` \
-                                 (known: aarch64-apple-darwin, x86_64-unknown-linux)"
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    },
+            "--target" => match args.next() {
+                Some(t) => match Target::from_triple(&t) {
+                    Some(tt) => target = Some(tt),
                     None => {
-                        eprintln!("solomon: --target requires a triple");
+                        eprintln!(
+                            "holyc: unknown target `{t}` (known: aarch64-apple-darwin, \
+                             x86_64-unknown-linux, x86_64-pc-windows)"
+                        );
                         return ExitCode::FAILURE;
                     }
-                }
-            }
-            "-o" => match args.next() {
-                Some(o) => out = Some(o),
+                },
                 None => {
-                    eprintln!("solomon: -o requires an output path");
+                    eprintln!("holyc: --target requires a triple");
                     return ExitCode::FAILURE;
                 }
             },
-            other if other.starts_with("--") => {
-                eprintln!("solomon: unknown option `{other}`");
+            "-o" => match args.next() {
+                Some(o) => out = Some(o),
+                None => {
+                    eprintln!("holyc: -o requires an output path");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "-h" | "--help" => {
+                print_usage();
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("holyc: unknown option `{other}`");
                 return ExitCode::FAILURE;
             }
             other => path = Some(other.to_string()),
@@ -127,7 +160,7 @@ fn main() -> ExitCode {
         Some(path) => match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("solomon: cannot read `{path}`: {e}");
+                eprintln!("holyc: cannot read `{path}`: {e}");
                 return ExitCode::FAILURE;
             }
         },
@@ -135,7 +168,7 @@ fn main() -> ExitCode {
             // No file given: read HolyC source from stdin.
             let mut s = String::new();
             if let Err(e) = std::io::stdin().read_to_string(&mut s) {
-                eprintln!("solomon: cannot read stdin: {e}");
+                eprintln!("holyc: cannot read stdin: {e}");
                 return ExitCode::FAILURE;
             }
             s
@@ -220,12 +253,12 @@ fn main() -> ExitCode {
             }
         }
         Mode::Build => {
-            // `--build` (no `--target`) compiles for the host's native target.
+            // With no `--target`, compile for the host's native target.
             let target = match target.or_else(Target::host) {
                 Some(t) => t,
                 None => {
                     eprintln!(
-                        "solomon: this host isn't a supported native target; \
+                        "holyc: this host isn't a supported native target; \
                          pass --target aarch64-apple-darwin or --target x86_64-unknown-linux"
                     );
                     return ExitCode::FAILURE;
@@ -250,7 +283,7 @@ fn main() -> ExitCode {
             let mut codegen = target.codegen(&out_path);
             match codegen.run(&program) {
                 Ok(()) => {
-                    eprintln!("solomon: wrote {out_path}");
+                    eprintln!("holyc: wrote {out_path}");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -260,4 +293,30 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn print_usage() {
+    print!(
+        "\
+holyc — a HolyC compiler and interpreter
+
+Usage:
+  holyc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
+  holyc run    [FILE]                       run with the tree-walking interpreter
+  holyc check  [FILE]                       parse + semantic analysis, report errors
+  holyc ast    [FILE]                       dump the parsed AST
+  holyc tokens [FILE]                       dump the raw lexer token stream
+
+With no subcommand, holyc compiles for the host's architecture and OS. FILE is
+read from stdin when omitted.
+
+Options:
+  -o OUT            output path for the compiled binary (default: a.out)
+  --target TRIPLE   cross-compile for a specific target:
+                      aarch64-apple-darwin   Mach-O, linked with cc
+                      x86_64-unknown-linux   freestanding static ELF
+                      x86_64-pc-windows      self-contained PE
+  -h, --help        show this help
+"
+    );
 }
