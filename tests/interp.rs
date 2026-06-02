@@ -1498,7 +1498,11 @@ fn float_division_by_zero_is_infinity() {
     // it yields ±inf / nan rather than trapping, matching the native backends.
     assert_eq!(run(r#""%f\n", 1.0 / 0.0;"#), "inf\n");
     assert_eq!(run(r#""%f\n", -1.0 / 0.0;"#), "-inf\n");
-    assert_eq!(run(r#""%f\n", 0.0 / 0.0;"#), "NaN\n");
+    // `0/0` is NaN; its sign bit is platform-dependent (x86_64 yields a negative
+    // NaN, aarch64 a positive one), and the renderer mirrors it like libc, so
+    // only assert it is *some* NaN rather than pinning the sign.
+    let nan = run(r#""%f\n", 0.0 / 0.0;"#);
+    assert!(nan == "NaN\n" || nan == "-NaN\n", "got: {nan:?}");
 }
 
 #[test]
