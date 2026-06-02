@@ -819,3 +819,36 @@ fn time_builtins_run_natively() {
     };
     assert_eq!(got[0], "1 1\n", "time builtin properties hold natively");
 }
+
+#[test]
+fn variadic_functions_match_the_interpreter() {
+    // Varargs are deterministic, so the native vararg ABI (a caller-frame buffer +
+    // two hidden args) is held byte-for-byte to the interpreter.
+    let src = r#"
+        I64 SumI(...) { I64 s=0,i=0,n=VarArgCnt(); while(i<n){s+=VarArgI64(i);i++;} return s; }
+        F64 AvgF(...) { F64 s=0.0; I64 i=0,n=VarArgCnt(); while(i<n){s+=VarArgF64(i);i++;} return s/n; }
+        U0 Join(U8 *sep, ...) { I64 i=0,n=VarArgCnt(); while(i<n){ if(i)"%s",sep; "%s",VarArg(i); i++; } "\n"; }
+        U0 Main() {
+          "%d %d\n", SumI(10,20,30,40), SumI(7);
+          "%.3f\n", AvgF(1.0,2.0,6.0);
+          Join(" | ", "x", "y", "z");
+        }
+        Main;
+    "#;
+    let program = parse_src(src);
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "varargs".to_string();
+    X64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("native build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping x86-64 varargs conformance: needs a linux/x86_64 host or docker");
+        return;
+    };
+    assert_eq!(got[0], want, "native != interp for varargs");
+}

@@ -1520,7 +1520,7 @@ fn variadic_functions_read_their_varargs() {
         }
         U0 Join(U8 *sep, ...) {
           I64 i = 0, n = VarArgCnt();
-          while (i < n) { if (i) "%s", sep; "%s", VarArgPtr(i); i++; }
+          while (i < n) { if (i) "%s", sep; "%s", VarArg(i); i++; }
           "\n";
         }
         U0 Main() {

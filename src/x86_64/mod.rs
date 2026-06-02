@@ -138,6 +138,7 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
                 cg.funcs.insert(f.name.clone(), label);
                 let params = f.params.iter().map(|p| p.ty.clone()).collect();
                 cg.funcs_sig.insert(f.name.clone(), (params, f.ret.clone()));
+                cg.funcs_va.insert(f.name.clone(), f.varargs);
             }
         }
     }
@@ -168,7 +169,7 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
         if let StmtKind::Func(f) = &item.kind {
             if let Some(body) = &f.body {
                 let label = cg.funcs[&f.name];
-                cg.emit_function(label, &f.params, &f.ret, body)?;
+                cg.emit_function(label, &f.params, &f.ret, body, f.varargs)?;
             }
         }
     }
@@ -291,9 +292,13 @@ struct Cg {
     sret_off: Option<i32>, // frame slot holding the sret pointer (a class-returning fn)
     labels: HashMap<String, usize>, // named `goto` labels in the current function
     funcs_sig: HashMap<String, (Vec<Type>, Type)>, // name -> (param types, return type)
+    funcs_va: HashMap<String, bool>, // name -> is variadic (`...`)
+    /// For a variadic function being emitted: frame offsets of the two hidden
+    /// params the caller appends — `(va_ptr_off, va_cnt_off)` — read by `VarArg*`.
+    cur_va: Option<(i32, i32)>,
     helpers: HashMap<Helper, usize>, // print runtime routine -> code label (on first use)
     rt_routines: HashMap<&'static str, usize>, // builtin runtime routine -> label (on first use)
-    out_ptr_off: Option<i32>, // BSS slot: the formatted-output sink pointer (0 = stdout)
+    out_ptr_off: Option<i32>,        // BSS slot: the formatted-output sink pointer (0 = stdout)
     // Growing-sink globals (set only when a program uses `MStrPrint`): the base of
     // the owned, reallocating buffer and its current capacity end. `out_limit != 0`
     // is what tells the sink it may grow rather than blindly append (the StrPrint
@@ -327,6 +332,8 @@ impl Cg {
             continue_targets: Vec::new(),
             ret_label: 0,
             cur_ret: Type::I64,
+            funcs_va: HashMap::new(),
+            cur_va: None,
             sret_off: None,
             labels: HashMap::new(),
             funcs_sig: HashMap::new(),
@@ -525,9 +532,11 @@ impl Cg {
         params: &[Param],
         ret: &Type,
         body: &[Stmt],
+        varargs: bool,
     ) -> Result<(), CodegenError> {
         self.begin_function();
         self.cur_ret = ret.clone();
+        self.cur_va = None;
         self.collect_labels(body);
         self.asm.place(label);
         let frame = self.asm.prologue();
@@ -593,6 +602,24 @@ impl Cg {
             self.asm.mov_rdi_rax(); // rdi = dest slot
             self.asm.mov_rcx_imm32(size);
             self.asm.rep_movsb();
+        }
+        // A variadic function takes two hidden integer params after the named ones
+        // (in argreg[gpr], argreg[gpr+1]): the caller's vararg buffer pointer and
+        // the count. Spill them to slots for `VarArg*` to read.
+        if varargs {
+            if gpr + 1 >= ARG_REGS {
+                return Err(CodegenError::at(
+                    Pos::new(0, 0),
+                    "x86_64 backend: too many named params before `...`",
+                ));
+            }
+            let ptr_off = self.alloc(8, 8);
+            self.asm.mov_rax_argreg(gpr);
+            self.asm.store_local(ptr_off, 8);
+            let cnt_off = self.alloc(8, 8);
+            self.asm.mov_rax_argreg(gpr + 1);
+            self.asm.store_local(cnt_off, 8);
+            self.cur_va = Some((ptr_off, cnt_off));
         }
         for s in body {
             self.gen_stmt(s)?;
@@ -1579,12 +1606,23 @@ impl Cg {
         } else {
             None
         };
-        // Class each argument: F64 → an xmm register (xmm0..), everything else →
+        // For a variadic callee, only the named params are register-passed; the
+        // trailing args go into a frame buffer whose address + count are passed as
+        // two hidden integer args (see below).
+        let varargs = self.funcs_va.get(name).copied().unwrap_or(false);
+        let n_named = if varargs {
+            param_tys.len().min(args.len())
+        } else {
+            args.len()
+        };
+        let named = &args[..n_named];
+        let extra = &args[n_named..];
+        // Class each named arg: F64 → an xmm register (xmm0..), everything else →
         // a GP register (rdi..). Reject overflow of either class.
         let mut gpr = 0usize;
         let mut fpr = 0usize;
-        let mut targets = Vec::with_capacity(args.len());
-        for (i, _) in args.iter().enumerate() {
+        let mut targets = Vec::with_capacity(named.len());
+        for (i, _) in named.iter().enumerate() {
             let pty = param_tys.get(i).cloned().unwrap_or(Type::I64);
             if is_f64(&pty) {
                 if fpr >= 8 {
@@ -1606,9 +1644,9 @@ impl Cg {
                 gpr += 1;
             }
         }
-        // Evaluate args left to right, each spilled to the machine stack (a float
-        // is moved through a GPR first), then popped into its class's register.
-        for (arg, (is_float, _, pty)) in args.iter().zip(&targets) {
+        // Evaluate named args left to right, each spilled to the machine stack (a
+        // float is moved through a GPR first).
+        for (arg, (is_float, _, pty)) in named.iter().zip(&targets) {
             if *is_float {
                 self.gen_foperand(arg)?; // xmm0 = value
                 self.asm.movq_r_from_xmm(RAX, 0);
@@ -1617,6 +1655,40 @@ impl Cg {
                 self.gen_int_expr(arg, pty)?; // rax = value
                 self.asm.push_rax();
             }
+        }
+        // Variadic: stage the trailing args into a frame buffer (8 bytes each, an
+        // F64 by its bit pattern), then push va_ptr + va_cnt for the next two int
+        // registers. Buffer element j is at slot offset `off - j*8`.
+        let va = if varargs && !extra.is_empty() {
+            if gpr + 1 >= ARG_REGS {
+                return Err(CodegenError::at(
+                    pos,
+                    "x86_64 backend: too many integer args before `...`",
+                ));
+            }
+            let k = extra.len() as i32;
+            let off = self.alloc(k * 8, 8);
+            for (j, arg) in extra.iter().enumerate() {
+                if is_f64(&self.expr_ty(arg)) {
+                    self.gen_foperand(arg)?;
+                    self.asm.movq_r_from_xmm(RAX, 0);
+                } else {
+                    self.gen_expr(arg)?;
+                }
+                self.asm.store_local(off - j as i32 * 8, 8);
+            }
+            self.asm.lea_local(off); // va_ptr = &buffer
+            self.asm.push_rax();
+            self.asm.mov_ri(RAX, k);
+            self.asm.push_rax(); // va_cnt
+            Some(gpr)
+        } else {
+            None
+        };
+        // Pop the hidden args first (they were pushed last): va_cnt then va_ptr.
+        if let Some(gpr_named) = va {
+            self.asm.pop_argreg(gpr_named + 1); // va_cnt
+            self.asm.pop_argreg(gpr_named); // va_ptr
         }
         for (is_float, idx, _) in targets.iter().rev() {
             if *is_float {
@@ -1775,6 +1847,29 @@ impl Cg {
                 self.asm.xor_rr(RSI, RSI); // rem = NULL
                 self.asm.mov_ri(RAX, 35); // SYS_nanosleep
                 self.asm.syscall();
+                Ok(())
+            }
+            // Variadic-argument access: read the hidden va buffer the prologue saved.
+            "VarArgCnt" => {
+                let (_, cnt_off) = self.cur_va.ok_or_else(|| {
+                    CodegenError::at(pos, "x86_64 backend: VarArg* outside a variadic function")
+                })?;
+                self.asm.load_local(cnt_off, 8, false); // rax = va_cnt
+                Ok(())
+            }
+            "VarArgI64" | "VarArg" | "VarArgF64" => {
+                let (ptr_off, _) = self.cur_va.ok_or_else(|| {
+                    CodegenError::at(pos, "x86_64 backend: VarArg* outside a variadic function")
+                })?;
+                self.gen_expr(&args[0])?; // rax = i
+                self.asm.imul_rax_imm32(8); // rax = i*8
+                self.asm.mov_rr(RCX, RAX); // rcx = i*8
+                self.asm.load_local(ptr_off, 8, false); // rax = va_ptr
+                self.asm.add_rr(RAX, RCX); // rax = va_ptr + i*8
+                self.asm.load_qword_at(RAX, RAX); // rax = slot bits
+                if name == "VarArgF64" {
+                    self.asm.movq_xmm_from_r(0, RAX); // reinterpret as a double in xmm0
+                }
                 Ok(())
             }
             // `ArgC()` / `ArgV(i)` — read the command line captured at the entry

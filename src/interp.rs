@@ -1520,7 +1520,7 @@ impl<W: Write> Interpreter<W> {
             "VarArgCnt" => Ok(Value::Int(
                 self.va_stack.last().map(|v| v.len()).unwrap_or(0) as i64,
             )),
-            "VarArgI64" | "VarArgF64" | "VarArgPtr" => {
+            "VarArgI64" | "VarArgF64" | "VarArg" => {
                 let i = self.to_i64(args[0].clone(), pos)?;
                 let slot = usize::try_from(i)
                     .ok()
@@ -1529,8 +1529,8 @@ impl<W: Write> Interpreter<W> {
                 Ok(match (name, slot) {
                     ("VarArgF64", Some(v)) => Value::Float(value_as_f64(&v)),
                     ("VarArgF64", None) => Value::Float(0.0),
-                    ("VarArgPtr", Some(v)) => v,
-                    ("VarArgPtr", None) => Value::Ptr(None),
+                    ("VarArg", Some(v)) => v,
+                    ("VarArg", None) => Value::Ptr(None),
                     (_, Some(v)) => Value::Int(value_as_i64(&v)),
                     (_, None) => Value::Int(0),
                 })

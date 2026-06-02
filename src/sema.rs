@@ -918,7 +918,7 @@ impl Analyzer {
                 // backends have no va frame to read).
                 if matches!(
                     name.as_str(),
-                    "VarArgCnt" | "VarArgI64" | "VarArgF64" | "VarArgPtr"
+                    "VarArgCnt" | "VarArgI64" | "VarArgF64" | "VarArg"
                 ) && !self.cur_varargs
                 {
                     self.error(

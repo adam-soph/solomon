@@ -90,7 +90,7 @@ pub fn all() -> Vec<BuiltinSig> {
         sig("VarArgCnt", i64(), vec![], false),
         sig("VarArgI64", i64(), vec![i64()], false),
         sig("VarArgF64", f64(), vec![i64()], false),
-        sig("VarArgPtr", u8p(), vec![i64()], false),
+        sig("VarArg", u8p(), vec![i64()], false),
     ];
     // The `Is*` ctype predicates — each `(I64) -> I64` returning 0/1.
     sigs.extend(

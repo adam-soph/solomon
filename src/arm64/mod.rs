@@ -199,6 +199,7 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
                         label,
                         params: f.params.clone(),
                         ret: f.ret.clone(),
+                        varargs: f.varargs,
                     },
                 );
             }
@@ -278,14 +279,14 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
         .iter()
         .filter(|s| !matches!(s.kind, StmtKind::Func(_) | StmtKind::Class(_)))
         .collect();
-    cg.emit_function(main_label, &[], &Type::I64, &driver, true)?;
+    cg.emit_function(main_label, &[], &Type::I64, &driver, true, false)?;
 
     for item in &program.items {
         if let StmtKind::Func(f) = &item.kind {
             if let Some(body) = &f.body {
                 let label = cg.funcs[&f.name].label;
                 let body_refs: Vec<&Stmt> = body.iter().collect();
-                cg.emit_function(label, &f.params, &f.ret, &body_refs, false)?;
+                cg.emit_function(label, &f.params, &f.ret, &body_refs, false, f.varargs)?;
             }
         }
     }
@@ -381,6 +382,7 @@ struct FnInfo {
     label: usize,
     params: Vec<Param>,
     ret: Type,
+    varargs: bool,
 }
 
 /// A local variable's location. Normally the value lives in the frame at
@@ -428,6 +430,9 @@ struct Cg {
     /// incoming value is spilled, as `(reg, frame_off)` — saved in the prologue
     /// and restored in every epilogue.
     cs_saves: Vec<(u32, u32)>,
+    /// For a variadic (`...`) function: the frame offsets of the two hidden params
+    /// the caller appends — `(va_ptr_off, va_cnt_off)` — that `VarArg*` read.
+    cur_va: Option<(u32, u32)>,
     /// Whether the program calls `ArgC`/`ArgV`. When set, the `_main` entry
     /// captures the incoming argc/argv (x0/x1) into the hidden globals below.
     uses_args: bool,
@@ -477,6 +482,7 @@ impl Cg {
             sret_off: None,
             promote: HashMap::new(),
             cs_saves: Vec::new(),
+            cur_va: None,
             uses_args: false,
             variadic_regs: false,
             freestanding: false,
@@ -603,6 +609,7 @@ impl Cg {
         ret: &Type,
         body: &[&Stmt],
         is_main: bool,
+        varargs: bool,
     ) -> Result<(), CodegenError> {
         self.scopes = vec![HashMap::new()];
         self.depth = 0;
@@ -611,6 +618,7 @@ impl Cg {
         self.labels.clear();
         self.cur_ret = ret.clone();
         self.sret_off = None;
+        self.cur_va = None;
         self.promote = plan_registers(params, body);
         self.cs_saves.clear();
 
@@ -746,6 +754,25 @@ impl Cg {
             if let Some(name) = &p.name {
                 self.declare(name, off, p.ty.clone());
             }
+        }
+
+        // A variadic function receives two hidden integer params after the named
+        // ones (in x{igr}, x{igr+1}): a pointer to the caller's vararg buffer and
+        // the count. Spill them to frame slots for `VarArg*` to read.
+        if varargs {
+            if igr + 1 > 7 {
+                return Err(CodegenError::at(
+                    Pos::new(0, 0),
+                    "arm64 backend: too many named params before `...`",
+                ));
+            }
+            let ptr_off = self.alloc(8, 8);
+            self.asm.sub_imm(T2, FP, ptr_off);
+            self.asm.store_mem(igr, T2, 8); // va_ptr
+            let cnt_off = self.alloc(8, 8);
+            self.asm.sub_imm(T2, FP, cnt_off);
+            self.asm.store_mem(igr + 1, T2, 8); // va_cnt
+            self.cur_va = Some((ptr_off, cnt_off));
         }
 
         // At the entry, AArch64/AAPCS hands `_main` argc in x0 and argv in x1.
@@ -2426,6 +2453,29 @@ impl Cg {
         if name == "Sleep" {
             return self.gen_sleep(&args[0], pos);
         }
+        // Variadic-argument access: read the hidden va buffer the prologue saved.
+        if let Some(name) = name
+            .strip_prefix("VarArg")
+            .filter(|_| matches!(name, "VarArgCnt" | "VarArgI64" | "VarArgF64" | "VarArg"))
+        {
+            let (ptr_off, cnt_off) = self.cur_va.ok_or_else(|| {
+                CodegenError::at(pos, "arm64 backend: VarArg* outside a variadic function")
+            })?;
+            if name == "Cnt" {
+                self.load_local(RES, cnt_off, &Type::I64);
+                return Ok(());
+            }
+            // addr = va_ptr + i*8, then load the 8-byte slot.
+            self.gen_expr(&args[0])?; // RES = i
+            self.asm.lsl_imm(RES, RES, 3); // i*8
+            self.load_local(T2, ptr_off, &Type::I64); // T2 = va_ptr
+            self.asm.add(T2, T2, RES);
+            self.asm.load_mem(RES, T2, 8, false); // RES = slot bits
+            if name == "F64" {
+                self.asm.fmov_from_gpr(FRES, RES); // reinterpret as a double
+            }
+            return Ok(());
+        }
         // `StrToUpper`/`StrToLower` — ASCII-case a string in place via an inline
         // loop calling libc `toupper`/`tolower`; return the string.
         if name == "StrToUpper" || name == "StrToLower" {
@@ -2459,7 +2509,15 @@ impl Cg {
                 })
                 .collect();
             let ret = crate::builtins::ret_of(name).unwrap_or(Type::I64);
-            self.emit_call(CallTarget::Extern(sym), &params, args, &ret, name, pos)?;
+            self.emit_call(
+                CallTarget::Extern(sym),
+                &params,
+                args,
+                &ret,
+                name,
+                pos,
+                false,
+            )?;
             if name == "StrCmp" || name == "MemCmp" || name == "StrNCmp" {
                 // libc compare functions may return any (signed) magnitude; reduce
                 // it to a sign in {-1, 0, 1} so the result matches the interpreter.
@@ -2476,8 +2534,13 @@ impl Cg {
 
     /// Emit a direct call to a user-defined function's compiled body.
     fn emit_user_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        let (label, params, ret) = match self.funcs.get(name) {
-            Some(info) => (info.label, info.params.clone(), info.ret.clone()),
+        let (label, params, ret, varargs) = match self.funcs.get(name) {
+            Some(info) => (
+                info.label,
+                info.params.clone(),
+                info.ret.clone(),
+                info.varargs,
+            ),
             None => {
                 return Err(CodegenError::at(
                     pos,
@@ -2485,7 +2548,15 @@ impl Cg {
                 ));
             }
         };
-        self.emit_call(CallTarget::Label(label), &params, args, &ret, name, pos)
+        self.emit_call(
+            CallTarget::Label(label),
+            &params,
+            args,
+            &ret,
+            name,
+            pos,
+            varargs,
+        )
     }
 
     /// Whether `name` resolves to a variable (local or global) rather than a
@@ -2580,6 +2651,7 @@ impl Cg {
             &ret,
             "<fnptr>",
             pos,
+            false,
         )
     }
 
@@ -2594,6 +2666,7 @@ impl Cg {
         ret: &Type,
         name: &str,
         pos: Pos,
+        varargs: bool,
     ) -> Result<(), CodegenError> {
         let n = params.len();
 
@@ -2634,6 +2707,30 @@ impl Cg {
             self.asm.push(RES);
         }
 
+        // Variadic call: stage the trailing args (past the named params) into a
+        // frame buffer — 8 bytes each, an F64 by its bit pattern. The buffer lives
+        // in our frame (so it outlives the call); its address and count are passed
+        // as two hidden integer args after the named ones. `va_ptr = FP - off`
+        // (element 0); element j is at `FP - (off - j*8)`.
+        let va = if varargs && args.len() > n {
+            let extra = &args[n..];
+            let k = extra.len() as u32;
+            let off = self.alloc(k * 8, 8);
+            for (j, arg) in extra.iter().enumerate() {
+                if is_f64(&self.expr_ty(arg)) {
+                    self.gen_foperand(arg)?;
+                    self.asm.fmov_to_gpr(RES, FRES);
+                } else {
+                    self.gen_expr(arg)?;
+                }
+                self.asm.sub_imm(T2, FP, off - (j as u32) * 8);
+                self.asm.store_mem(RES, T2, 8);
+            }
+            Some((off, k))
+        } else {
+            None
+        };
+
         // Assign each argument to its ABI register: x0.. for integers, v0.. for
         // doubles, numbered independently.
         let mut igr = 0u32;
@@ -2668,6 +2765,19 @@ impl Cg {
             } else {
                 self.asm.pop(reg);
             }
+        }
+
+        // The hidden variadic args go in the next two integer registers (`igr` is
+        // the integer named-param count): `x{igr}` = va_ptr, `x{igr+1}` = va_cnt.
+        if let Some((off, k)) = va {
+            if igr + 1 > 7 {
+                return Err(CodegenError::at(
+                    pos,
+                    "arm64 backend: too many integer args before `...`",
+                ));
+            }
+            self.asm.sub_imm(igr, FP, off); // va_ptr = &buffer
+            self.asm.load_imm(igr + 1, k as i64); // va_cnt
         }
 
         if let Some(off) = sret_off {
@@ -3507,7 +3617,15 @@ impl Cg {
             .collect();
         let ret = crate::builtins::ret_of(name).unwrap_or(Type::I64);
         let label = self.fs_routine(sname);
-        self.emit_call(CallTarget::Label(label), &params, args, &ret, name, pos)
+        self.emit_call(
+            CallTarget::Label(label),
+            &params,
+            args,
+            &ret,
+            name,
+            pos,
+            false,
+        )
     }
 
     /// Emit the freestanding runtime routines the program uses, once, in a fixed
