@@ -683,13 +683,19 @@ impl<S: TokenStream> Parser<S> {
     }
 
     fn finish_declarator(&mut self, (name, ty): (String, Type), m: Mark) -> PResult<Declarator> {
-        let init = if self.eat(&TokenKind::Eq)? {
+        let mut init = if self.eat(&TokenKind::Eq)? {
             Some(self.parse_initializer()?)
         } else {
             None
         };
-        // `T a[] = {...}` infers the outermost array length from the list.
+        // `T a[] = {...}` / `U8 s[] = "..."` infers the outermost array length.
         let ty = infer_array_len(ty, init.as_ref());
+        // `U8 s[N] = "..."` desugars to a byte brace list (after the size is known).
+        if let Some(e) = &init {
+            if let Some(list) = string_array_init(&ty, e) {
+                init = Some(list);
+            }
+        }
         Ok(Declarator {
             name,
             ty,
@@ -1279,17 +1285,54 @@ impl<S: TokenStream> Parser<S> {
     }
 }
 
-/// If `ty` is an unsized array (`T[]`) initialised with a brace list, fill in
-/// the outermost length from the element count: `I64 a[] = {1,2,3}` becomes
-/// `I64 a[3]`. Inner dimensions must already be explicit.
+/// If `ty` is an unsized array (`T[]`) initialised with a brace list or a string,
+/// fill in the outermost length: `I64 a[] = {1,2,3}` becomes `I64 a[3]`, and
+/// `U8 s[] = "abc"` becomes `U8 s[4]` (the bytes plus the NUL). Inner dimensions
+/// must already be explicit.
 fn infer_array_len(ty: Type, init: Option<&Expr>) -> Type {
     if let (Type::Array(elem, None), Some(e)) = (&ty, init) {
-        if let ExprKind::InitList(items) = &e.kind {
-            let dim = Expr::new(ExprKind::Int(items.len() as i64), e.span);
+        let len = match &e.kind {
+            ExprKind::InitList(items) => Some(items.len()),
+            ExprKind::Str(s) => Some(s.len() + 1), // bytes + NUL terminator
+            _ => None,
+        };
+        if let Some(n) = len {
+            let dim = Expr::new(ExprKind::Int(n as i64), e.span);
             return Type::Array(elem.clone(), Some(Box::new(dim)));
         }
     }
     ty
+}
+
+/// Desugar a string initialiser for a **char array** into a byte brace list, so
+/// the ordinary brace-init path (interpreter + both backends) handles it:
+/// `U8 s[6] = "abc"` becomes `U8 s[6] = {'a','b','c',0}` (then the brace-init zeroes
+/// `s[4]`/`s[5]`). The NUL is appended, then the list is capped to a constant size,
+/// so an exactly-filled array (`U8 s[3] = "abc"`) drops it — matching C. A string
+/// initialiser for a *pointer* (`U8 *p = "abc"`) is left alone (a pointer to the
+/// literal). Returns `None` when this isn't a string-into-char-array initialiser.
+fn string_array_init(ty: &Type, init: &Expr) -> Option<Expr> {
+    let Type::Array(elem, dim) = ty else {
+        return None;
+    };
+    if !matches!(**elem, Type::U8 | Type::I8) {
+        return None;
+    }
+    let ExprKind::Str(s) = &init.kind else {
+        return None;
+    };
+    let mut bytes: Vec<u8> = s.as_bytes().to_vec();
+    bytes.push(0); // NUL terminator
+    if let Some(d) = dim {
+        if let ExprKind::Int(n) = d.kind {
+            bytes.truncate(n.max(0) as usize);
+        }
+    }
+    let items = bytes
+        .into_iter()
+        .map(|b| Expr::new(ExprKind::Int(b as i64), init.span))
+        .collect();
+    Some(Expr::new(ExprKind::InitList(items), init.span))
 }
 
 /// Map an assignment-operator token to its [`AssignOp`].

@@ -98,22 +98,18 @@ fn print_intrinsic_is_known() {
 
 #[test]
 fn stdlib_builtins_are_known() {
-    // The core-library intrinsics are registered, so calls type-check and yield
-    // their declared return types.
-    // The remaining intrinsics (after the string/integer helpers moved to the
-    // `lib/string.hc` stdlib). The moved ones are now ordinary library calls.
+    // The remaining irreducible intrinsics are registered, so calls type-check and
+    // yield their declared return types. (The reducible string/memory/ctype/PRNG
+    // helpers moved to the `lib/*.hc` stdlib — they're ordinary library calls now,
+    // covered by the `tests/stdlib.rs` conformance suite.)
     ok("U0 F() { F64 r = Sqrt(2.0); F64 fa = Fabs(-1.0); }");
     ok("U0 F() { \
           U8 *p = MAlloc(16); \
-          MemCpy(p, p, 1); MemSet(p, 0, 1); MemMove(p, p, 1); \
-          I64 u = ToUpper('a'); I64 l = ToLower('A'); \
-          I64 m = MemCmp(p, p, 1); \
           F64 sq = Sqrt(2.0); F64 fa = Fabs(-1.0); \
-          U64 r = RandU64(); \
           U8 *sp = StrPrint(p, \"%d\", 1); U8 *cp = CatPrint(p, \"%d\", 2); \
           U8 *mp = MStrPrint(\"%d\", 3); \
           F64 fv = StrToF64(\"1.5\"); U8 *fs = F64ToStr(1.5, p); \
-          U8 *mf = MemFind(p, 65, 1); U8 *ml = MemSearch(p, 1, \"x\", 1); \
+          I64 ns = UnixNS(); I64 mn = NanoNS(); Sleep(0); \
           Free(p); \
         }");
 }
@@ -122,20 +118,11 @@ fn stdlib_builtins_are_known() {
 fn stdlib_builtin_arity_is_checked() {
     has("U0 F() { Sqrt(1.0, 2.0); }", "got 2");
     has("U0 F() { MAlloc(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { MemCpy(0, 0); }", "expects 3 argument(s), got 2");
-    has("U0 F() { MemCmp(0, 0); }", "expects 3 argument(s), got 2");
     has("U0 F() { Sqrt(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { RandU64(7); }", "got 1");
     has("U0 F() { StrPrint(0); }", "at least 2 argument(s), got 1");
     has("U0 F() { CatPrint(0); }", "at least 2 argument(s), got 1");
     has("U0 F() { MStrPrint(); }", "at least 1 argument(s), got 0");
     has("U0 F() { StrToF64(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { MemMove(0, 0); }", "expects 3 argument(s), got 2");
-    has("U0 F() { MemFind(0, 0); }", "expects 3 argument(s), got 2");
-    has(
-        "U0 F() { MemSearch(0, 1, 0); }",
-        "expects 4 argument(s), got 3",
-    );
     has("U0 F() { F64ToStr(1.5); }", "expects 2 argument(s), got 1");
 }
 

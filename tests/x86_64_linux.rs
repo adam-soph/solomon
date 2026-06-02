@@ -27,19 +27,25 @@ fn temp_out() -> std::path::PathBuf {
 }
 
 /// Parse a program/source with the standard library available (so `#include
-/// <string.hc>` resolves). Examples carry the include; inline sources don't, so it
-/// is prepended when absent (the moved string builtins now live in `lib/string.hc`;
-/// the extra unused defs don't change a program's output).
+/// <string.hc>`/`<math.hc>` resolve). Examples carry their own includes; inline
+/// sources don't, so each is prepended when absent (the reducible builtins now live
+/// in `lib/string.hc` and `lib/math.hc`; the extra unused defs don't change a
+/// program's output).
 fn parse_src(src: &str) -> solomon::Program {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let owned;
-    let s = if src.contains("#include <string.hc>") {
-        src
-    } else {
-        owned = format!("#include <string.hc>\n{src}");
-        &owned
-    };
-    parse_with(s, std::path::Path::new("."), &[lib]).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    let mut s = String::new();
+    if !src.contains("#include <string.hc>") {
+        s.push_str("#include <string.hc>\n");
+    }
+    // `math.hc` only when the source uses the moved `RandU64` PRNG — see the note
+    // on `common::with_stdlib_prelude` (prepending the rest collides with the
+    // examples that define their own `Pow`/`Floor`/…).
+    if src.contains("RandU64") && !src.contains("#include <math.hc>") {
+        s.push_str("#include <math.hc>\n");
+    }
+    s.push_str(src);
+    parse_with(&s, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"))
 }
 
 /// Compile `src` to the ELF image (written to a temp file, then read back).
@@ -672,6 +678,33 @@ fn printing_matches_the_interpreter() {
         r#"U0 Main(){ "%.100d\n", 7; } Main;"#,
         r#"U0 Main(){ "[%2000s]\n", "tail"; } Main;"#,
         r#"U0 Main(){ "%.700e\n", 1.5; } Main;"#,
+        // Brace/designated aggregate initializers (local and global): partial array
+        // (rest zeroed), positional & out-of-order designated class init, nested
+        // class-in-class, array of classes, and a float array — each must match the
+        // interpreter byte-for-byte.
+        r#"U0 Main(){ I64 a[5] = {1, 2, 3}; I64 i; for(i=0;i<5;i++) "%d ", a[i]; "\n"; } Main;"#,
+        r#"class Pt{I64 x;I64 y;} U0 Main(){ Pt p = {11, 22}; Pt q = {.y=5,.x=4}; "%d %d %d %d\n", p.x,p.y,q.x,q.y; } Main;"#,
+        r#"class Pt{I64 x;I64 y;} class Ln{Pt a;Pt b;I64 t;} U0 Main(){ Ln l = {{1,2},{3,4},7}; "%d %d %d %d %d\n", l.a.x,l.a.y,l.b.x,l.b.y,l.t; } Main;"#,
+        r#"class Pt{I64 x;I64 y;} U0 Main(){ Pt ps[3] = {{1,2},{3,4}}; "%d %d %d %d %d %d\n", ps[0].x,ps[0].y,ps[1].x,ps[1].y,ps[2].x,ps[2].y; } Main;"#,
+        r#"U0 Main(){ F64 f[3] = {1.5, 2.5}; "%.1f %.1f %.1f\n", f[0], f[1], f[2]; } Main;"#,
+        r#"class Pt{I64 x;I64 y;} I64 g[] = {10,20,30}; Pt gp = {.y=7}; U0 Main(){ "%d %d %d %d %d\n", g[0],g[1],g[2],gp.x,gp.y; } Main;"#,
+        // `offset()` (simple, nested, and a field after padding) — a compile-time
+        // byte offset, matching the interpreter / arm64.
+        r#"class In{I64 a;I64 b;} class Out{I64 t;In n;U8 f;} U0 Main(){ "%d %d %d %d\n", offset(Out.t), offset(Out.n), offset(Out.n.b), offset(Out.f); } Main;"#,
+        // Pointer compound assignment `p += n` / `p -= n` — pointee-scaled for I64*
+        // (stride 8), U8* (stride 1), and a class* (stride = sizeof), plus a cursor
+        // driven by `c += 1` in a loop.
+        r#"U0 Main(){ I64 a[6]={0,10,20,30,40,50}; I64 *p=a; p+=3; I64 x=*p; p-=2; "%d %d\n", x, *p; } Main;"#,
+        r#"U0 Main(){ U8 *s="abcdef"; s+=4; "%c", *s; s-=1; "%c\n", *s; } Main;"#,
+        r#"class Pt{I64 x;I64 y;} U0 Main(){ Pt arr[3]={{1,2},{3,4},{5,6}}; Pt *q=arr; q+=2; "%d %d\n", q->x, q->y; } Main;"#,
+        r#"U0 Main(){ I64 a[5]={1,2,3,4,5}; I64 s=0; I64 *c=a; I64 i; for(i=0;i<5;i++){ s+=*c; c+=1; } "%d\n", s; } Main;"#,
+        // String-literal array initializers: size-inferred `[]`, zero-padded `[N]`,
+        // exact fit (keeps NUL), truncation (drops NUL), a global, and a plain
+        // pointer (left as a pointer to the literal, not desugared).
+        r#"U0 Main(){ U8 s[] = "hello"; "%s|", s; "%c%c\n", s[4], s[5]; } Main;"#,
+        r#"U0 Main(){ U8 p[8] = "hi"; "%c%c%d%d\n", p[0], p[1], p[2], p[7]; } Main;"#,
+        r#"U0 Main(){ U8 t[3] = "abc"; "%c%c%c\n", t[0], t[1], t[2]; } Main;"#,
+        r#"U8 g[] = "global"; U0 Main(){ U8 *q = "ptr"; "%s %s\n", g, q; } Main;"#,
     ];
 
     let dir = temp_out();
@@ -853,6 +886,133 @@ fn variadic_functions_match_the_interpreter() {
         return;
     };
     assert_eq!(got[0], want, "native != interp for varargs");
+}
+
+#[test]
+fn function_pointers_match_the_interpreter() {
+    // Indirect calls in every form — a fn-pointer variable, a fn-pointer parameter,
+    // an F64-returning pointer, an array of pointers, a pointer class field, a
+    // pointer returning a class (sret), and calling a returned pointer — must match
+    // the interpreter byte-for-byte.
+    let src = r#"
+        I64 Add(I64 a, I64 b) { return a + b; }
+        I64 Sub(I64 a, I64 b) { return a - b; }
+        I64 Inc(I64 x) { return x + 1; }
+        F64 Scale(F64 x) { return x * 2.0; }
+        I64 Apply(I64 (*f)(I64), I64 v) { return f(v); }
+        class Pt { I64 x; I64 y; }
+        Pt MkPt(I64 a, I64 b) { Pt p = {a, b}; return p; }
+        class Dispatch { I64 (*op)(I64, I64); }
+        typedef I64 (*BinOp)(I64, I64);
+        BinOp Pick(I64 sub) { if (sub) return &Sub; return &Add; }
+        U0 Main() {
+          I64 (*f)(I64, I64) = &Add;
+          "%d %d\n", f(3, 4), Apply(&Inc, 10);
+          F64 (*g)(F64) = &Scale;
+          "%.1f\n", g(2.5);
+          I64 (*ops[])(I64, I64) = {&Add, &Sub};
+          "%d %d\n", ops[0](10, 3), ops[1](10, 3);
+          Dispatch d; d.op = &Sub;
+          "%d\n", d.op(20, 8);
+          Pt (*mk)(I64, I64) = &MkPt;
+          Pt p = mk(7, 9);
+          "%d %d\n", p.x, p.y;
+          "%d %d\n", Pick(0)(5, 2), Pick(1)(5, 2);
+        }
+        Main;
+    "#;
+    let program = parse_src(src);
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "fnptr".to_string();
+    X64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("native build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!(
+            "skipping x86-64 function-pointer conformance: needs a linux/x86_64 host or docker"
+        );
+        return;
+    };
+    assert_eq!(got[0], want, "native != interp for function pointers");
+}
+
+#[test]
+fn msize_matches_the_interpreter() {
+    // `MSize` (the gated size-header path) returns the requested allocation size
+    // byte-for-byte with the interpreter, with the data unaffected by the header.
+    let src = r#"
+        U0 Main() {
+          U8 *p = MAlloc(40); "%d ", MSize(p);
+          U8 *q = MAlloc(7);  "%d ", MSize(q);
+          "%d\n", MSize(NULL);
+          StrCpy(p, "header-safe"); "%s\n", p;
+          U8 *r = MAlloc(16);
+          r = ReAlloc(r, 16, 80); "%d ", MSize(r);
+          r = ReAlloc(r, 80, 300); "%d\n", MSize(r);
+        }
+        Main;
+    "#;
+    let program = parse_src(src);
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "msize".to_string();
+    X64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("native build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping x86-64 MSize conformance: needs a linux/x86_64 host or docker");
+        return;
+    };
+    assert_eq!(got[0], want, "native != interp for MSize");
+}
+
+#[test]
+fn string_object_matches_the_interpreter() {
+    // The owning, growable `Str` from lib/string.hc (heap buffer via MAlloc, class
+    // by pointer, reallocation on growth) is held byte-for-byte to the interpreter.
+    let src = r#"
+        U0 Main() {
+          Str s;
+          StrPushCStr(&s, "Hello, ");
+          StrPushStr(&s, &s);          // append self
+          StrPushChar(&s, '!');
+          "%s | len=%d\n", StrCStr(&s), s.len;
+          StrMakeUpper(&s);
+          "%s\n", StrCStr(&s);
+          Str t; StrSet(&t, "   padded   "); StrTrim(&t);
+          "[%s]\n", StrCStr(&t);
+          Str g; I64 i;
+          for (i = 0; i < 200; i++) StrPushChar(&g, 'a' + i % 26);
+          "grow=%d head=%c tail=%c\n", g.len, g.ptr[0], g.ptr[g.len - 1];
+          StrFree(&s); StrFree(&t); StrFree(&g);
+        }
+        Main;
+    "#;
+    let program = parse_src(src);
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "strobj".to_string();
+    X64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("native build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping x86-64 Str conformance: needs a linux/x86_64 host or docker");
+        return;
+    };
+    assert_eq!(got[0], want, "native != interp for the Str object");
 }
 
 #[test]

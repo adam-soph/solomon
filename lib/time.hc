@@ -1,3 +1,5 @@
+#ifndef _TIME_HC
+#define _TIME_HC
 // time.hc — calendar math on top of the impure `UnixNS` clock primitive.
 //
 // `FromUnix`/`ToUnix`/`FmtISO` are pure (a defined algorithm — Howard Hinnant's
@@ -65,3 +67,5 @@ U8 *FmtISO(U8 *buf, DateTime dt)
 
 // Current wall-clock UTC time, broken down. Impure (reads the clock).
 DateTime Now() { return FromUnix(UnixNS() / 1000000000); }
+
+#endif

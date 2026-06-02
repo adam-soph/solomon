@@ -7,7 +7,11 @@
 //! the conformance oracle.
 //!
 //! Implemented: top-level code and **functions** (recursion, up to six integer/
-//! pointer args via the System V registers), **locals** (a `rbp` frame,
+//! pointer args via the System V registers), **function pointers** (`&Func` is a
+//! RIP-relative `lea`; an indirect call `fp(args)` — incl. fn-pointer params,
+//! array elements `ops[i](..)`, class fields `s.m(..)`, and a returned pointer —
+//! evaluates the target, spills it, and `call`s through the register, with arg
+//! classing driven by the callee's `Type::FuncPtr`), **locals** (a `rbp` frame,
 //! `[rbp - off]`), **control flow** (`if`/`else`, `while`, `for`, `do`, `break`,
 //! `continue`, `switch`/`case`/`default` incl. `lo ... hi` ranges and the
 //! `start:`/`end:` sub-labels via a compare-chain, and `goto`/labels),
@@ -24,6 +28,9 @@
 //! caller hands a result-temp pointer to the callee in r11), member access on a
 //! class-returning call (`Mk().x`), arrays of classes, and union aliasing —
 //! anonymous-embedded unions resolve through the promoted offset),
+//! **brace/designated aggregate initializers** (`gen_init_into`: positional,
+//! `.field =` designated/out-of-order, nested, partial, and arrays of classes —
+//! for locals and globals alike),
 //! **globals** (top-level variables live in a zero-filled BSS region and are
 //! reachable from any function), **F64** (SSE2: `xmm0`/`xmm1` as the float
 //! result/temp, args in `xmm0..xmm7` and returns in `xmm0`; arithmetic, `-`,
@@ -33,13 +40,14 @@
 //! `%[flags][width][.prec]conv` grammar for `%d %i %u %x %X %o %c %s %%`
 //! (flags `-0+ #`, `*` width/precision), **`%f`/`%e`/`%g` float printing** —
 //! correctly-rounded via a bignum (matches Rust's `{:.P}`/`{:.Pe}` byte-for-byte,
-//! including round-half-to-even ties) — and a slice of the **core-library
+//! including round-half-to-even ties) — and the irreducible **core-library
 //! builtins**, lowered with no libc: `MAlloc`/`Free` (an `mmap`-backed bump
-//! allocator), the string/memory ops (`StrLen`/`StrCmp`/`StrCpy`/`StrCat`/…,
-//! `MemCpy`/`MemMove`/`MemSet`/`MemCmp`/…) as emitted routines, `ToUpper`/
-//! `ToLower`/`Abs`/`Sign`, `RandU64` (splitmix64), SSE `Sqrt`/`Fabs`, and the
-//! **sprintf family** (`StrPrint`/`CatPrint`/`I64ToStr` — printf into a buffer via
-//! an output sink, see below). The transcendental math builtins
+//! allocator), SSE `Sqrt`/`Fabs`, and the **sprintf family**
+//! (`StrPrint`/`CatPrint`/`MStrPrint`/`F64ToStr` — printf into a buffer via an
+//! output sink, see below; the lone string routine still emitted is `StrLen`, used
+//! internally by `CatPrint`'s append). The reducible string/memory/ctype/PRNG ops
+//! are pure HolyC in `lib/*.hc` now and compile as ordinary functions. The
+//! transcendental math builtins
 //! (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…) are **deliberately absent**: a freestanding
 //! static ELF has no libm, and — like Rust's `core` (which omits them; they live
 //! in `std` for the platform libm) — we don't fake them with approximations,
@@ -159,6 +167,9 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
         }
     }
 
+    // `MSize` makes `MAlloc` prepend an 8-byte size header; gate it so programs that
+    // never call `MSize` keep the lean, header-free heap byte-for-byte.
+    cg.uses_msize = crate::ast::program_calls_any(program, &["MSize"]);
     // If the program reads command-line args, reserve the argc/argv BSS slots the
     // entry will populate; arg-free programs are left byte-for-byte unchanged.
     if crate::ast::program_calls_any(program, &["ArgC", "ArgV"]) {
@@ -292,6 +303,7 @@ struct Cg {
     digbuf: Option<i32>,
     outbuf: Option<i32>,
     charbuf: Option<i32>,
+    heap_bss: Option<(i32, i32)>, // bump allocator's (heap_ptr, heap_end) BSS slots
     break_targets: Vec<usize>,
     continue_targets: Vec<usize>,
     ret_label: usize, // `return` jumps here: the epilogue (function) or exit (main)
@@ -319,6 +331,7 @@ struct Cg {
     argc_off: Option<i32>,
     argv_off: Option<i32>,
     uses_args: bool,
+    uses_msize: bool, // program calls `MSize` ⇒ `MAlloc` prepends a size header
 }
 
 impl Cg {
@@ -335,6 +348,7 @@ impl Cg {
             digbuf: None,
             outbuf: None,
             charbuf: None,
+            heap_bss: None,
             break_targets: Vec::new(),
             continue_targets: Vec::new(),
             ret_label: 0,
@@ -353,6 +367,7 @@ impl Cg {
             argc_off: None,
             argv_off: None,
             uses_args: false,
+            uses_msize: false,
         }
     }
 
@@ -738,10 +753,17 @@ impl Cg {
                                 self.gen_expr(init)?; // rax = source address
                                 self.gen_memcpy_to_local(off, size);
                             }
+                            // Brace initialiser (positional or designated): zero the
+                            // slot, then store the provided elements/fields (recursing
+                            // for nested aggregates) so a partial init leaves the rest 0.
+                            Some(init) if is_brace_init(init) => {
+                                self.gen_zero(off, size);
+                                self.gen_init_into(Place::Local(off), &d.ty, 0, init)?;
+                            }
                             Some(_) => {
                                 return Err(CodegenError::at(
                                     d.span.pos,
-                                    "x86_64 backend: array/brace initializers are unsupported yet",
+                                    "x86_64 backend: unsupported aggregate initializer",
                                 ));
                             }
                         }
@@ -1038,10 +1060,14 @@ impl Cg {
             self.asm.mov_rdi_rax();
             self.asm.mov_rcx_imm32(size);
             self.asm.rep_movsb();
+        } else if is_brace_init(init) {
+            // Brace initialiser into the (linker-zeroed) BSS global: only the
+            // provided elements/fields are written, so a partial init stays zero.
+            self.gen_init_into(Place::Global(off), &d.ty, 0, init)?;
         } else {
             return Err(CodegenError::at(
                 d.span.pos,
-                "x86_64 backend: array/brace global initializers are unsupported yet",
+                "x86_64 backend: unsupported global initializer",
             ));
         }
         Ok(())
@@ -1091,6 +1117,17 @@ impl Cg {
                 };
                 self.asm.mov_rax_imm(n as i64);
             }
+            ExprKind::Offset { class, path } => {
+                // `offset(Class.field…)` is the compile-time byte offset of the
+                // (possibly nested) field within the class.
+                let off = self.layouts.nested_offset_of(class, path).ok_or_else(|| {
+                    CodegenError::at(
+                        pos,
+                        format!("x86_64 backend: cannot compute offset of `{class}`"),
+                    )
+                })?;
+                self.asm.mov_rax_imm(off as i64);
+            }
             ExprKind::Str(s) => {
                 // A string literal is a pointer to its NUL-terminated bytes.
                 let mut bytes = s.clone().into_bytes();
@@ -1133,7 +1170,20 @@ impl Cg {
             ExprKind::Unary {
                 op: UnOp::AddrOf,
                 expr,
-            } => self.gen_addr(expr)?,
+            } => {
+                // `&Func` is the function's code address (a function pointer); any
+                // other `&lvalue` is the lvalue's address.
+                if let ExprKind::Ident(name) = &expr.kind {
+                    if self.lookup(name).is_none()
+                        && !self.globals.contains_key(name)
+                        && let Some(&label) = self.funcs.get(name)
+                    {
+                        self.asm.lea_rax_label(label);
+                        return Ok(());
+                    }
+                }
+                self.gen_addr(expr)?
+            }
             ExprKind::Unary {
                 op: UnOp::Deref, ..
             }
@@ -1432,11 +1482,13 @@ impl Cg {
             self.asm.store_through(size); // [rcx] = rax (low `size` bytes)
             return Ok(()); // assignment's value is in rax
         }
-        // Compound `x op= value` on an integer scalar lvalue.
-        if !is_scalar(&tty) || elem_of(&tty).is_some() {
+        // Compound `x op= value` on a scalar lvalue. A pointer is a scalar and
+        // supports `+=`/`-=` (the rhs is scaled by the pointee size, like `++`);
+        // only aggregates/arrays are rejected.
+        if !is_scalar(&tty) {
             return Err(CodegenError::at(
                 pos,
-                "x86_64 backend: compound assignment to a pointer/aggregate is unsupported yet",
+                "x86_64 backend: compound assignment to a non-scalar is unsupported",
             ));
         }
         self.gen_addr(target)?; // rax = &x
@@ -1444,7 +1496,14 @@ impl Cg {
         self.asm.load_through(size, type_signed(&tty)); // rax = current x
         self.asm.push_rax();
         self.gen_expr(value)?; // rax = value
-        self.asm.mov_rcx_rax(); // rcx = value
+        // `p += n` / `p -= n`: scale the integer rhs by the pointee size.
+        if let (Some(elem), AssignOp::Add | AssignOp::Sub) = (elem_of(&tty), op) {
+            let stride = self.stride_of(&elem);
+            if stride != 1 {
+                self.asm.imul_rax_imm32(stride); // rax = value * stride
+            }
+        }
+        self.asm.mov_rcx_rax(); // rcx = (scaled) value
         self.asm.pop_rax(); // rax = current x
         // `>>=`/`/=`/`%=` are directed by the lvalue's signedness.
         self.apply_int_binop(compound_binop(op), !is_unsigned_int(&tty))?; // rax = x op value
@@ -1573,14 +1632,128 @@ impl Cg {
         self.asm.rep_movsb();
     }
 
-    fn gen_call(&mut self, callee: &Expr, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        match &callee.kind {
-            ExprKind::Ident(n) => self.gen_call_by_name(n, args, pos),
-            _ => Err(CodegenError::at(
-                pos,
-                "x86_64 backend: only direct function calls are supported yet",
-            )),
+    /// `rax = ` the address of byte offset `byte_off` within the aggregate at
+    /// `place`.
+    fn elem_addr(&mut self, place: Place, byte_off: i32) {
+        match place {
+            // The slot starts at `rbp - off`; element `byte_off` in is `rbp -
+            // (off - byte_off)`.
+            Place::Local(off) => self.asm.lea_local(off - byte_off),
+            // Globals grow upward in BSS, so the element is `byte_off` higher.
+            Place::Global(off) => self.asm.lea_rax_global(off + byte_off),
         }
+    }
+
+    /// Emit the stores for a brace initialiser (or a single leaf value) into the
+    /// aggregate at `place`, at byte offset `byte_off`. Recurses for nested
+    /// arrays/classes; only the provided elements/fields are written (local slots
+    /// are zeroed first, globals are linker-zeroed), so partial initialisers leave
+    /// the rest zero. Mirrors the arm64 backend's `gen_init_into`.
+    fn gen_init_into(
+        &mut self,
+        place: Place,
+        ty: &Type,
+        byte_off: i32,
+        init: &Expr,
+    ) -> Result<(), CodegenError> {
+        if let ExprKind::InitList(items) = &init.kind {
+            match ty {
+                Type::Array(elem, _) => {
+                    let stride = self.stride_of(elem);
+                    for (i, item) in items.iter().enumerate() {
+                        self.gen_init_into(place, elem, byte_off + i as i32 * stride, item)?;
+                    }
+                }
+                Type::Named(class) => {
+                    let fields: Vec<(Type, i32)> = self
+                        .layouts
+                        .get(class)
+                        .map(|l| {
+                            l.fields
+                                .iter()
+                                .map(|f| (f.ty.clone(), f.offset as i32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (item, (fty, foff)) in items.iter().zip(fields.iter()) {
+                        self.gen_init_into(place, fty, byte_off + foff, item)?;
+                    }
+                }
+                _ => {
+                    return Err(CodegenError::at(
+                        init.span.pos,
+                        "x86_64 backend: an initializer list can only initialize an array, class, or union",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if let ExprKind::DesignatedInit(items) = &init.kind {
+            let Type::Named(class) = ty else {
+                return Err(CodegenError::at(
+                    init.span.pos,
+                    "x86_64 backend: a designated initializer can only initialize a class or union",
+                ));
+            };
+            // Field name -> (type, offset), captured before the store loop.
+            let fields: Vec<(String, Type, i32)> = self
+                .layouts
+                .get(class)
+                .map(|l| {
+                    l.fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.ty.clone(), f.offset as i32))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (name, value) in items {
+                let Some((_, fty, foff)) = fields.iter().find(|(n, _, _)| n == name) else {
+                    return Err(CodegenError::at(
+                        value.span.pos,
+                        format!("x86_64 backend: `{class}` has no field `{name}`"),
+                    ));
+                };
+                self.gen_init_into(place, &fty.clone(), byte_off + foff, value)?;
+            }
+            return Ok(());
+        }
+        // A leaf value: scalar, pointer, float, or an aggregate-valued expression.
+        if is_f64(ty) {
+            self.gen_foperand(init)?; // xmm0 = value
+            self.elem_addr(place, byte_off); // rax = dest
+            self.asm.movsd_store_at(RAX); // [rax] = xmm0
+        } else if is_aggregate(ty) {
+            let size = self.size_of(ty);
+            self.gen_expr(init)?; // rax = source address
+            self.asm.push_rax();
+            self.elem_addr(place, byte_off); // rax = dest
+            self.asm.mov_rdi_rax(); // rdi = dest
+            self.asm.pop_rax();
+            self.asm.mov_rsi_rax(); // rsi = src
+            self.asm.mov_rcx_imm32(size);
+            self.asm.rep_movsb();
+        } else {
+            let size = self.size_of(ty);
+            self.gen_int_expr(init, ty)?; // rax = value (float source converts per signedness)
+            self.asm.push_rax();
+            self.elem_addr(place, byte_off); // rax = dest
+            self.asm.mov_rcx_rax(); // rcx = dest
+            self.asm.pop_rax(); // rax = value
+            self.asm.store_through(size); // [rcx] = rax
+        }
+        Ok(())
+    }
+
+    /// Dispatch a call: a bare name that isn't a variable is a direct
+    /// function/builtin call; a function-pointer *variable* (or any computed
+    /// callee, e.g. `s.method` or `ops[i]`) is an indirect call.
+    fn gen_call(&mut self, callee: &Expr, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        if let ExprKind::Ident(n) = &callee.kind {
+            if self.lookup(n).is_none() && !self.globals.contains_key(n) {
+                return self.gen_call_by_name(n, args, pos);
+            }
+        }
+        self.gen_indirect_call(callee, args, pos)
     }
 
     fn gen_call_by_name(
@@ -1606,17 +1779,77 @@ impl Cg {
             .get(name)
             .cloned()
             .unwrap_or_else(|| (Vec::new(), Type::I64));
-        // A class-returning function uses an sret pointer: the caller allocates a
+        let varargs = self.funcs_va.get(name).copied().unwrap_or(false);
+        self.emit_call_abi(
+            CallTarget::Direct(label),
+            &param_tys,
+            &ret_ty,
+            varargs,
+            args,
+            pos,
+        )
+    }
+
+    /// Emit an indirect call through a function-pointer value (`callee`). Its
+    /// `FuncPtr` type (from sema) supplies the parameter and return types; a
+    /// function pointer is never variadic.
+    fn gen_indirect_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        pos: Pos,
+    ) -> Result<(), CodegenError> {
+        let (param_tys, ret_ty) = match self.expr_ty(callee) {
+            Type::FuncPtr { ret, params } => (params, *ret),
+            _ => {
+                return Err(CodegenError::at(
+                    pos,
+                    "x86_64 backend: called value is not a function pointer",
+                ));
+            }
+        };
+        self.emit_call_abi(
+            CallTarget::Indirect(callee),
+            &param_tys,
+            &ret_ty,
+            false,
+            args,
+            pos,
+        )
+    }
+
+    /// The shared call ABI (System V): pass `args` per `param_tys` — integer/pointer
+    /// args in rdi.., F64 args in xmm0.., a class return via an sret pointer in r11 —
+    /// then transfer to `target`. A `Direct` target is a known label; an `Indirect`
+    /// target's function-pointer value is evaluated and spilled up front so it
+    /// survives argument evaluation. `varargs` stages the trailing args into a frame
+    /// buffer passed as a (ptr, count) pair.
+    fn emit_call_abi(
+        &mut self,
+        target: CallTarget,
+        param_tys: &[Type],
+        ret_ty: &Type,
+        varargs: bool,
+        args: &[Expr],
+        pos: Pos,
+    ) -> Result<(), CodegenError> {
+        // For an indirect call, evaluate the function-pointer value first and spill
+        // it (deepest on the stack) so it survives argument evaluation; it is popped
+        // back into rax just before the `call` (after sret setup, the last use of rax).
+        if let CallTarget::Indirect(callee) = target {
+            self.gen_expr(callee)?; // rax = function address
+            self.asm.push_rax();
+        }
+        // A class-returning callee uses an sret pointer: the caller allocates a
         // result temp in its frame and hands its address to the callee in r11.
         let sret_slot = if matches!(ret_ty, Type::Named(_)) {
-            Some(self.alloc(self.size_of(&ret_ty).max(1), self.align_of(&ret_ty)))
+            Some(self.alloc(self.size_of(ret_ty).max(1), self.align_of(ret_ty)))
         } else {
             None
         };
         // For a variadic callee, only the named params are register-passed; the
         // trailing args go into a frame buffer whose address + count are passed as
         // two hidden integer args (see below).
-        let varargs = self.funcs_va.get(name).copied().unwrap_or(false);
         let n_named = if varargs {
             param_tys.len().min(args.len())
         } else {
@@ -1711,7 +1944,15 @@ impl Cg {
             self.asm.lea_local(off); // rax = &temp
             self.asm.mov_rr(R11, RAX);
         }
-        self.asm.call(label);
+        match target {
+            CallTarget::Direct(label) => self.asm.call(label),
+            CallTarget::Indirect(_) => {
+                // The function address was spilled first, so it is on top of the
+                // stack now that the args are in registers (rax is free post-sret).
+                self.asm.pop_rax();
+                self.asm.call_reg(RAX);
+            }
+        }
         if let Some(off) = sret_slot {
             self.asm.lea_local(off); // the class rvalue *is* the temp's address
         }
@@ -1760,45 +2001,6 @@ impl Cg {
                 self.asm.andpd(0, 1);
                 return Ok(());
             }
-            "Floor" => {
-                self.gen_foperand(&args[0])?;
-                self.asm.roundsd(0, 0, 1); // toward −∞
-                return Ok(());
-            }
-            "Ceil" => {
-                self.gen_foperand(&args[0])?;
-                self.asm.roundsd(0, 0, 2); // toward +∞
-                return Ok(());
-            }
-            "Round" => {
-                // Round half *away from zero* (matching `f64::round` / arm64
-                // `frinta`), which `roundsd`'s nearest-*even* mode does not do.
-                // Take t = trunc(x), the exact fractional part d = x − t, and bump
-                // t by copysign(1, x) when |d| ≥ 0.5. Scratch: xmm1..xmm5.
-                self.gen_foperand(&args[0])?; // xmm0 = x
-                self.asm.roundsd(1, 0, 3); // xmm1 = t = trunc(x)
-                self.asm.movsd_rr(2, 0); // xmm2 = x
-                self.asm.subsd(2, 1); // xmm2 = d = x − t
-                self.asm.mov_ri64(RAX, 0x7FFF_FFFF_FFFF_FFFF);
-                self.asm.movq_xmm_from_r(3, RAX);
-                self.asm.andpd(2, 3); // xmm2 = |d|
-                self.asm.mov_ri64(RAX, 0x3FE0_0000_0000_0000); // 0.5
-                self.asm.movq_xmm_from_r(3, RAX);
-                let skip = self.asm.new_label();
-                self.asm.ucomisd(2, 3); // |d| vs 0.5
-                self.asm.jb(skip); // |d| < 0.5 → no bump
-                // bump = copysign(1.0, x) = 1.0 | (x & signbit)
-                self.asm.mov_ri64(RAX, 0x3FF0_0000_0000_0000); // 1.0
-                self.asm.movq_xmm_from_r(4, RAX);
-                self.asm.mov_ri64(RAX, 0x8000_0000_0000_0000u64); // sign mask
-                self.asm.movq_xmm_from_r(5, RAX);
-                self.asm.andpd(5, 0); // xmm5 = x & signbit
-                self.asm.orpd(4, 5); // xmm4 = copysign(1.0, x)
-                self.asm.addsd(1, 4); // t += bump
-                self.asm.place(skip);
-                self.asm.movsd_rr(0, 1); // result in xmm0
-                return Ok(());
-            }
             _ => {}
         }
         match name {
@@ -1806,11 +2008,6 @@ impl Cg {
             // the argument for its side effects.
             "Free" => {
                 self.gen_expr(&args[0])?;
-                Ok(())
-            }
-            "RandU64" => {
-                let l = self.rt_routine("RandU64");
-                self.asm.call(l);
                 Ok(())
             }
             // Clock/time primitives via the Linux syscalls (clock_gettime nr 228,
@@ -1886,46 +2083,10 @@ impl Cg {
             "StrPrint" => self.gen_strprint(args, false, pos),
             "CatPrint" => self.gen_strprint(args, true, pos),
             "MStrPrint" => self.gen_mstrprint(args, pos),
-            "I64ToStr" => self.gen_i64tostr(args, pos),
             "F64ToStr" => self.gen_f64tostr(args, pos),
-            // one integer/pointer argument
             "MAlloc" => self.call_rt("MAlloc", &[&args[0]]),
-            "StrLen" => self.call_rt("StrLen", &[&args[0]]),
-            "StrToUpper" => self.call_rt("StrToUpper", &[&args[0]]),
-            "StrToLower" => self.call_rt("StrToLower", &[&args[0]]),
-            "StrRev" => self.call_rt("StrRev", &[&args[0]]),
-            "Abs" => self.call_rt("Abs", &[&args[0]]),
-            "Sign" => self.call_rt("Sign", &[&args[0]]),
-            "ToUpper" => self.call_rt("ToUpper", &[&args[0]]),
-            "ToLower" => self.call_rt("ToLower", &[&args[0]]),
-            // two arguments
-            "StrCmp" => self.call_rt("StrCmp", &[&args[0], &args[1]]),
-            "StrCpy" => self.call_rt("StrCpy", &[&args[0], &args[1]]),
-            "StrCat" => self.call_rt("StrCat", &[&args[0], &args[1]]),
-            "StrChr" => self.call_rt("StrChr", &[&args[0], &args[1]]),
-            "StrLastChr" => self.call_rt("StrLastChr", &[&args[0], &args[1]]),
-            "StrFind" => self.call_rt("StrFind", &[&args[0], &args[1]]),
-            "StrSpn" => self.call_rt("StrSpn", &[&args[0], &args[1]]),
-            "StrCSpn" => self.call_rt("StrCSpn", &[&args[0], &args[1]]),
-            // three arguments
-            "StrNCmp" => self.call_rt("StrNCmp", &[&args[0], &args[1], &args[2]]),
-            "StrNCpy" => self.call_rt("StrNCpy", &[&args[0], &args[1], &args[2]]),
-            "MemCpy" => self.call_rt("MemCpy", &[&args[0], &args[1], &args[2]]),
-            "MemMove" => self.call_rt("MemMove", &[&args[0], &args[1], &args[2]]),
-            "MemSet" => self.call_rt("MemSet", &[&args[0], &args[1], &args[2]]),
-            "MemCmp" => self.call_rt("MemCmp", &[&args[0], &args[1], &args[2]]),
-            "MemFind" => self.call_rt("MemFind", &[&args[0], &args[1], &args[2]]),
-            // four arguments
-            "MemSearch" => self.call_rt("MemSearch", &[&args[0], &args[1], &args[2], &args[3]]),
-            // the `Is*` ctype predicates — each emitted as an inline range-check
-            // routine (see `emit_rt_ctype`).
-            n if crate::builtins::ctype_ranges(n).is_some() => {
-                let name = *crate::builtins::CTYPE_NAMES
-                    .iter()
-                    .find(|&&s| s == n)
-                    .unwrap();
-                self.call_rt(name, &[&args[0]])
-            }
+            "HeapExtend" => self.call_rt("HeapExtend", &[&args[0], &args[1], &args[2]]),
+            "MSize" => self.call_rt("MSize", &[&args[0]]),
             other => Err(CodegenError::at(
                 pos,
                 format!("x86_64 backend: builtin `{other}` is not supported yet"),
@@ -1966,28 +2127,6 @@ impl Cg {
         self.gen_print(&fmt, &args[2..], pos)?; // appends to the buffer
         self.finish_buffer_write(out);
         self.asm.load_local(dslot, 8, false); // return dst
-        Ok(())
-    }
-
-    /// `I64ToStr(n, buf)`: format `n` as a decimal string into `buf`; return `buf`.
-    fn gen_i64tostr(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
-        let out = self.out_ptr_global();
-        self.gen_expr(&args[1])?; // buf
-        let dslot = self.alloc(8, 8);
-        self.asm.store_local(dslot, 8);
-        self.asm.load_local(dslot, 8, false);
-        self.asm.lea_global(R8, out);
-        self.asm.store_qword_at(R8, RAX); // out_ptr = buf
-        self.gen_int_expr(&args[0], &Type::I64)?; // n
-        self.asm.mov_rdi_rax();
-        self.asm.mov_ri(RSI, 10); // radix
-        self.asm.mov_ri(RDX, F_SIGNED); // signed decimal, no flags
-        self.asm.mov_ri(RCX, 0); // width
-        self.asm.mov_ri(R8, -1); // precision
-        let l = self.helper(Helper::FmtInt);
-        self.asm.call(l);
-        self.finish_buffer_write(out);
-        self.asm.load_local(dslot, 8, false); // return buf
         Ok(())
     }
 
@@ -2068,34 +2207,10 @@ impl Cg {
     /// order for reproducibility). Each follows the internal ABI: arguments in
     /// rdi/rsi/rdx/rcx, result in rax, clobbering only volatile registers.
     fn emit_rt_routines(&mut self) {
-        const ORDER: &[&str] = &[
-            "MAlloc",
-            "RandU64",
-            "StrLen",
-            "StrCmp",
-            "StrNCmp",
-            "StrCpy",
-            "StrNCpy",
-            "StrCat",
-            "StrChr",
-            "StrLastChr",
-            "StrFind",
-            "StrSpn",
-            "StrCSpn",
-            "StrToUpper",
-            "StrToLower",
-            "StrRev",
-            "MemCpy",
-            "MemMove",
-            "MemSet",
-            "MemCmp",
-            "MemFind",
-            "MemSearch",
-            "ToUpper",
-            "ToLower",
-            "Abs",
-            "Sign",
-        ];
+        // Only `MAlloc` (heap) and `StrLen` (used internally by the `CatPrint`
+        // append) remain emitted runtime routines; the string/memory/ctype/PRNG
+        // ops are now pure HolyC in `lib/*.hc` and compile as ordinary functions.
+        const ORDER: &[&str] = &["MAlloc", "HeapExtend", "MSize", "StrLen"];
         for &name in ORDER {
             let Some(&label) = self.rt_routines.get(name) else {
                 continue;
@@ -2103,73 +2218,41 @@ impl Cg {
             self.asm.place(label);
             match name {
                 "MAlloc" => self.emit_rt_malloc(),
-                "RandU64" => self.emit_rt_randu64(),
+                "HeapExtend" => self.emit_rt_heapextend(),
+                "MSize" => self.emit_rt_msize(),
                 "StrLen" => self.emit_rt_strlen(),
-                "StrCmp" => self.emit_rt_strcmp(),
-                "StrNCmp" => self.emit_rt_strncmp(),
-                "StrCpy" => self.emit_rt_strcpy(),
-                "StrNCpy" => self.emit_rt_strncpy(),
-                "StrCat" => self.emit_rt_strcat(),
-                "StrChr" => self.emit_rt_strchr(),
-                "StrLastChr" => self.emit_rt_strlastchr(),
-                "StrFind" => self.emit_rt_strfind(),
-                "StrSpn" => self.emit_rt_strspn(),
-                "StrCSpn" => self.emit_rt_strcspn(),
-                "StrToUpper" => self.emit_rt_strcase(true),
-                "StrToLower" => self.emit_rt_strcase(false),
-                "StrRev" => self.emit_rt_strrev(),
-                "MemCpy" => self.emit_rt_memcpy(),
-                "MemMove" => self.emit_rt_memmove(),
-                "MemSet" => self.emit_rt_memset(),
-                "MemCmp" => self.emit_rt_memcmp(),
-                "MemFind" => self.emit_rt_memfind(),
-                "MemSearch" => self.emit_rt_memsearch(),
-                "ToUpper" => self.emit_rt_tocase(true),
-                "ToLower" => self.emit_rt_tocase(false),
-                "Abs" => self.emit_rt_abs(),
-                "Sign" => self.emit_rt_sign(),
                 _ => {}
-            }
-        }
-        // The `Is*` ctype predicates (registered via `call_rt`), each an inline
-        // range-check routine driven by the shared `ctype_ranges` table.
-        for &name in crate::builtins::CTYPE_NAMES {
-            if let Some(&label) = self.rt_routines.get(name) {
-                self.asm.place(label);
-                self.emit_rt_ctype(crate::builtins::ctype_ranges(name).unwrap());
             }
         }
     }
 
-    /// An `Is*` ctype predicate routine: `rdi` = the character, result `0`/`1` in
-    /// `rax`. Returns 1 on the first range `[lo, hi]` that contains the byte, else
-    /// 0 — matching `builtins::ctype_ranges` and the arm64 backend.
-    fn emit_rt_ctype(&mut self, ranges: &[(u8, u8)]) {
-        for &(lo, hi) in ranges {
-            let skip = self.asm.new_label();
-            self.asm.cmp_ri(RDI, lo as i32);
-            self.asm.jl(skip); // c < lo
-            self.asm.cmp_ri(RDI, hi as i32);
-            self.asm.jg(skip); // c > hi
-            self.asm.mov_ri(RAX, 1);
-            self.asm.emit(&[0xC3]); // ret (hit)
-            self.asm.place(skip);
+    /// The bump allocator's `(heap_ptr, heap_end)` BSS slots, allocated once and
+    /// shared by `MAlloc` and `HeapExtend`.
+    fn heap_globals(&mut self) -> (i32, i32) {
+        if let Some(g) = self.heap_bss {
+            return g;
         }
-        self.asm.mov_ri(RAX, 0);
-        self.asm.emit(&[0xC3]); // ret (no range matched)
+        let g = (self.alloc_bss(8, 8), self.alloc_bss(8, 8));
+        self.heap_bss = Some(g);
+        g
     }
 
     /// `MAlloc(rdi=n)`: a bump allocator over `mmap`'d chunks (1 MiB, page-aligned),
     /// 16-byte-aligned allocations. `Free` is a no-op, so chunks are never reused.
     fn emit_rt_malloc(&mut self) {
-        let hp = self.alloc_bss(8, 8); // heap bump pointer
-        let he = self.alloc_bss(8, 8); // heap end
+        let (hp, he) = self.heap_globals(); // heap bump pointer, heap end
         let alloc = self.asm.new_label();
         let sized = self.asm.new_label();
         self.asm.emit(&[0x53]); // push rbx (preserve; rbx survives the syscall)
+        if self.uses_msize {
+            self.asm.emit(&[0x57]); // push rdi — keep the original n for the header
+        }
         self.asm.add_ri(RDI, 15);
         self.asm.and_ri(RDI, -16);
-        self.asm.mov_rr(RBX, RDI); // rbx = aligned n
+        if self.uses_msize {
+            self.asm.add_ri(RDI, 16); // reserve a 16-byte size header before the block
+        }
+        self.asm.mov_rr(RBX, RDI); // rbx = total bytes to bump
         self.asm.lea_global(R9, hp);
         self.asm.load_qword_at(RAX, R9); // rax = *heap_ptr
         self.asm.lea_global(R10, he);
@@ -2199,33 +2282,74 @@ impl Cg {
         self.asm.add_rr(RCX, RBX);
         self.asm.lea_global(R9, hp);
         self.asm.store_qword_at(R9, RCX);
+        if self.uses_msize {
+            self.asm.emit(&[0x59]); // pop rcx — the original n
+            self.asm.store_qword_at(RAX, RCX); // [base] = n (the size header)
+            self.asm.add_ri(RAX, 16); // return base + 16 (past the header)
+        }
         self.asm.emit(&[0x5B]); // pop rbx
         self.asm.emit(&[0xC3]); // ret
     }
 
-    /// `RandU64()`: a deterministic splitmix64 over a hidden zero-seeded global,
-    /// matching `builtins::splitmix64` (and the interpreter) bit for bit.
-    fn emit_rt_randu64(&mut self) {
-        let st = self.alloc_bss(8, 8); // PRNG state (seed 0)
-        self.asm.lea_global(R8, st);
-        self.asm.load_qword_at(RAX, R8);
-        self.asm.mov_ri64(RCX, 0x9e37_79b9_7f4a_7c15);
-        self.asm.add_rr(RAX, RCX);
-        self.asm.store_qword_at(R8, RAX); // state += GOLDEN
-        self.asm.mov_rr(RCX, RAX);
-        self.asm.shr_ri(RCX, 30);
-        self.asm.xor_rr(RAX, RCX); // z ^= z >> 30
-        self.asm.mov_ri64(RCX, 0xbf58_476d_1ce4_e5b9);
-        self.asm.imul_rr(RAX, RCX);
-        self.asm.mov_rr(RCX, RAX);
-        self.asm.shr_ri(RCX, 27);
-        self.asm.xor_rr(RAX, RCX);
-        self.asm.mov_ri64(RCX, 0x94d0_49bb_1331_11eb);
-        self.asm.imul_rr(RAX, RCX);
-        self.asm.mov_rr(RCX, RAX);
-        self.asm.shr_ri(RCX, 31);
-        self.asm.xor_rr(RAX, RCX);
+    /// `HeapExtend(rdi=ptr, rsi=old, rdx=new) -> rax`: if `ptr` is the bump
+    /// allocator's last block (it ends exactly at `*heap_ptr`) and growing it to
+    /// `new` still fits the chunk, advance `*heap_ptr` and return `ptr`; else NULL.
+    /// No copy, no allocation — the move path lives in the HolyC `ReAlloc`.
+    fn emit_rt_heapextend(&mut self) {
+        let (hp, he) = self.heap_globals();
+        let null = self.asm.new_label();
+        self.asm.test_rr(RDI, RDI);
+        self.asm.je(null); // NULL ptr never extends
+        // rax = align16(old), rcx = align16(new)
+        self.asm.mov_rr(RAX, RSI);
+        self.asm.add_ri(RAX, 15);
+        self.asm.and_ri(RAX, -16);
+        self.asm.mov_rr(RCX, RDX);
+        self.asm.add_ri(RCX, 15);
+        self.asm.and_ri(RCX, -16);
+        // last block? ptr + align16(old) == *heap_ptr
+        self.asm.mov_rr(R8, RDI);
+        self.asm.add_rr(R8, RAX); // r8 = block end
+        self.asm.lea_global(R9, hp);
+        self.asm.load_qword_at(R10, R9); // r10 = *heap_ptr
+        self.asm.cmp_reg_reg(R8, R10);
+        self.asm.jne(null);
+        // fits? ptr + align16(new) <= *heap_end
+        self.asm.mov_rr(R8, RDI);
+        self.asm.add_rr(R8, RCX); // r8 = ptr + align16(new)
+        self.asm.lea_global(R11, he);
+        self.asm.load_qword_at(RAX, R11); // rax = *heap_end
+        self.asm.cmp_reg_reg(RAX, R8);
+        self.asm.jb(null); // *heap_end < ptr + anew ⇒ doesn't fit
+        // extend in place: *heap_ptr = ptr + anew; return ptr
+        self.asm.store_qword_at(R9, R8);
+        if self.uses_msize {
+            // Keep the size header current so MSize reflects the grown block.
+            self.asm.mov_rr(RCX, RDI);
+            self.asm.add_ri(RCX, -16);
+            self.asm.store_qword_at(RCX, RDX); // [ptr-16] = new size
+        }
+        self.asm.mov_rr(RAX, RDI);
         self.asm.emit(&[0xC3]); // ret
+        self.asm.place(null);
+        self.asm.mov_ri(RAX, 0);
+        self.asm.emit(&[0xC3]); // ret (NULL)
+    }
+
+    /// `MSize(rdi=ptr) -> rax`: the requested byte size stored in `ptr`'s header
+    /// (`*(ptr-16)`), or 0 for NULL. Only emitted when the program uses `MSize`, so
+    /// every block carries a header.
+    fn emit_rt_msize(&mut self) {
+        let nz = self.asm.new_label();
+        self.asm.test_rr(RDI, RDI);
+        self.asm.jne(nz);
+        self.asm.mov_ri(RAX, 0); // MSize(NULL) == 0
+        self.asm.emit(&[0xC3]);
+        self.asm.place(nz);
+        self.asm.mov_rr(RAX, RDI);
+        self.asm.add_ri(RAX, -16);
+        self.asm.load_qword_at(RAX, RAX); // rax = *(ptr - 16)
+        self.asm.emit(&[0xC3]);
     }
 
     fn emit_rt_strlen(&mut self) {
@@ -2239,497 +2363,6 @@ impl Cg {
         self.asm.jmp(l);
         self.asm.place(d);
         self.asm.sub_rr(RAX, RDI);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strcmp(&mut self) {
-        let l = self.asm.new_label();
-        let diff = self.asm.new_label();
-        let done = self.asm.new_label();
-        let eq = self.asm.new_label();
-        self.asm.place(l);
-        self.asm.load_byte_zx(RCX, RDI);
-        self.asm.load_byte_zx(RDX, RSI);
-        self.asm.cmp_reg_reg(RCX, RDX);
-        self.asm.jne(diff);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(eq);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(RSI);
-        self.asm.jmp(l);
-        self.asm.place(diff);
-        self.asm.mov_ri(RAX, 1);
-        self.asm.cmp_reg_reg(RCX, RDX);
-        self.asm.jg(done);
-        self.asm.mov_ri(RAX, -1);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-        self.asm.place(eq);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strncmp(&mut self) {
-        let l = self.asm.new_label();
-        let diff = self.asm.new_label();
-        let done = self.asm.new_label();
-        let eq = self.asm.new_label();
-        self.asm.place(l);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(eq);
-        self.asm.load_byte_zx(RCX, RDI);
-        self.asm.load_byte_zx(R8, RSI);
-        self.asm.cmp_reg_reg(RCX, R8);
-        self.asm.jne(diff);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(eq);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(RSI);
-        self.asm.dec_r(RDX);
-        self.asm.jmp(l);
-        self.asm.place(diff);
-        self.asm.mov_ri(RAX, 1);
-        self.asm.cmp_reg_reg(RCX, R8);
-        self.asm.jg(done);
-        self.asm.mov_ri(RAX, -1);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-        self.asm.place(eq);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strcpy(&mut self) {
-        let l = self.asm.new_label();
-        let d = self.asm.new_label();
-        self.asm.mov_rr(RAX, RDI); // return dst
-        self.asm.place(l);
-        self.asm.load_byte_zx(RCX, RSI);
-        self.asm.store_byte_at(RDI, RCX);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(d);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(RSI);
-        self.asm.jmp(l);
-        self.asm.place(d);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strncpy(&mut self) {
-        let l = self.asm.new_label();
-        let pad = self.asm.new_label();
-        let p = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.mov_rr(RAX, RDI); // return dst
-        self.asm.place(l);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(done);
-        self.asm.load_byte_zx(RCX, RSI);
-        self.asm.store_byte_at(RDI, RCX);
-        self.asm.inc_r(RDI);
-        self.asm.dec_r(RDX);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(pad);
-        self.asm.inc_r(RSI);
-        self.asm.jmp(l);
-        self.asm.place(pad);
-        self.asm.place(p);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(done);
-        self.asm.store_byte_imm_at(RDI, 0);
-        self.asm.inc_r(RDI);
-        self.asm.dec_r(RDX);
-        self.asm.jmp(p);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strcat(&mut self) {
-        let f = self.asm.new_label();
-        let cp = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.mov_rr(RAX, RDI); // return dst
-        self.asm.place(f);
-        self.asm.cmp_byte_imm_at(RDI, 0);
-        self.asm.je(cp);
-        self.asm.inc_r(RDI);
-        self.asm.jmp(f);
-        self.asm.place(cp);
-        self.asm.load_byte_zx(RCX, RSI);
-        self.asm.store_byte_at(RDI, RCX);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(done);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(RSI);
-        self.asm.jmp(cp);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strchr(&mut self) {
-        let l = self.asm.new_label();
-        let nf = self.asm.new_label();
-        let found = self.asm.new_label();
-        self.asm.and_ri(RSI, 0xFF);
-        self.asm.mov_rr(RAX, RDI);
-        self.asm.place(l);
-        self.asm.load_byte_zx(RCX, RAX);
-        self.asm.cmp_reg_reg(RCX, RSI);
-        self.asm.je(found);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(nf);
-        self.asm.inc_r(RAX);
-        self.asm.jmp(l);
-        self.asm.place(nf);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.place(found);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strlastchr(&mut self) {
-        let l = self.asm.new_label();
-        let skip = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.and_ri(RSI, 0xFF);
-        self.asm.mov_ri(RAX, 0); // result = NULL
-        self.asm.mov_rr(R8, RDI); // cursor
-        self.asm.place(l);
-        self.asm.load_byte_zx(RCX, R8);
-        self.asm.cmp_reg_reg(RCX, RSI);
-        self.asm.jne(skip);
-        self.asm.mov_rr(RAX, R8); // remember this match
-        self.asm.place(skip);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(done);
-        self.asm.inc_r(R8);
-        self.asm.jmp(l);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strfind(&mut self) {
-        let outer = self.asm.new_label();
-        let inner = self.asm.new_label();
-        let next = self.asm.new_label();
-        let matched = self.asm.new_label();
-        let nf = self.asm.new_label();
-        // empty needle → return haystack
-        self.asm.load_byte_zx(RCX, RSI);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(matched);
-        self.asm.place(outer);
-        self.asm.load_byte_zx(RCX, RDI);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(nf); // haystack exhausted
-        self.asm.mov_rr(R8, RDI); // haystack cursor
-        self.asm.mov_rr(R9, RSI); // needle cursor
-        self.asm.place(inner);
-        self.asm.load_byte_zx(RCX, R9);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(matched); // needle exhausted → match at rdi
-        self.asm.load_byte_zx(RDX, R8);
-        self.asm.cmp_reg_reg(RCX, RDX);
-        self.asm.jne(next);
-        self.asm.inc_r(R8);
-        self.asm.inc_r(R9);
-        self.asm.jmp(inner);
-        self.asm.place(next);
-        self.asm.inc_r(RDI);
-        self.asm.jmp(outer);
-        self.asm.place(matched);
-        self.asm.mov_rr(RAX, RDI);
-        self.asm.emit(&[0xC3]);
-        self.asm.place(nf);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// Shared body for `StrSpn`/`StrCSpn`: count the initial run of chars that are
-    /// in (`want_in`) or not in (`!want_in`) the set. rdi=str, rsi=set → rax=len.
-    fn emit_rt_strspn_impl(&mut self, want_in: bool) {
-        let l = self.asm.new_label();
-        let scan = self.asm.new_label();
-        let cont = self.asm.new_label();
-        let stop = self.asm.new_label();
-        self.asm.mov_ri(RAX, 0);
-        self.asm.place(l);
-        self.asm.load_byte_zx(RCX, RDI);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(stop); // end of string
-        self.asm.mov_rr(R8, RSI); // set cursor
-        self.asm.place(scan);
-        self.asm.load_byte_zx(RDX, R8);
-        self.asm.test_rr(RDX, RDX);
-        // end of set: for StrSpn the char is NOT in the set (stop); for StrCSpn it
-        // is not in the set (continue counting).
-        if want_in {
-            self.asm.je(stop);
-        } else {
-            self.asm.je(cont);
-        }
-        self.asm.cmp_reg_reg(RCX, RDX);
-        if want_in {
-            self.asm.je(cont); // found in set → keep counting
-        } else {
-            self.asm.je(stop); // found in set → stop
-        }
-        self.asm.inc_r(R8);
-        self.asm.jmp(scan);
-        self.asm.place(cont);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(RAX);
-        self.asm.jmp(l);
-        self.asm.place(stop);
-        self.asm.emit(&[0xC3]);
-    }
-    fn emit_rt_strspn(&mut self) {
-        self.emit_rt_strspn_impl(true);
-    }
-    fn emit_rt_strcspn(&mut self) {
-        self.emit_rt_strspn_impl(false);
-    }
-
-    /// `StrToUpper`/`StrToLower` (rdi=str → rax=str): ASCII-case in place.
-    fn emit_rt_strcase(&mut self, upper: bool) {
-        let l = self.asm.new_label();
-        let skip = self.asm.new_label();
-        let done = self.asm.new_label();
-        let (lo, hi, delta) = if upper {
-            (b'a', b'z', -32)
-        } else {
-            (b'A', b'Z', 32)
-        };
-        self.asm.mov_rr(RAX, RDI); // return str
-        self.asm.place(l);
-        self.asm.load_byte_zx(RCX, RDI);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(done);
-        self.asm.cmp_ri(RCX, lo as i32);
-        self.asm.jl(skip);
-        self.asm.cmp_ri(RCX, hi as i32);
-        self.asm.jg(skip);
-        self.asm.add_ri(RCX, delta);
-        self.asm.store_byte_at(RDI, RCX);
-        self.asm.place(skip);
-        self.asm.inc_r(RDI);
-        self.asm.jmp(l);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_strrev(&mut self) {
-        let fe = self.asm.new_label();
-        let ge = self.asm.new_label();
-        let loop_l = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.mov_rr(RAX, RDI); // return str
-        self.asm.mov_rr(R8, RDI); // left
-        self.asm.mov_rr(R9, RDI); // right (scans to NUL)
-        self.asm.place(fe);
-        self.asm.cmp_byte_imm_at(R9, 0);
-        self.asm.je(ge);
-        self.asm.inc_r(R9);
-        self.asm.jmp(fe);
-        self.asm.place(ge);
-        self.asm.place(loop_l);
-        self.asm.dec_r(R9); // move right toward the start
-        self.asm.cmp_reg_reg(R8, R9);
-        self.asm.jae(done); // left >= right → done
-        self.asm.load_byte_zx(RCX, R8);
-        self.asm.load_byte_zx(RDX, R9);
-        self.asm.store_byte_at(R8, RDX);
-        self.asm.store_byte_at(R9, RCX);
-        self.asm.inc_r(R8);
-        self.asm.jmp(loop_l);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_memcpy(&mut self) {
-        self.asm.mov_rr(RAX, RDI); // return dst
-        self.asm.mov_rr(RCX, RDX); // count
-        self.asm.rep_movsb();
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_memmove(&mut self) {
-        let fwd = self.asm.new_label();
-        let done = self.asm.new_label();
-        let bloop = self.asm.new_label();
-        self.asm.mov_rr(RAX, RDI); // return dst
-        self.asm.cmp_reg_reg(RDI, RSI);
-        self.asm.jb(fwd); // dst < src → forward copy is safe
-        self.asm.je(done); // dst == src → nothing to do
-        // backward copy: from the high end down
-        self.asm.mov_rr(RCX, RDX); // counter
-        self.asm.mov_rr(R8, RDI);
-        self.asm.add_rr(R8, RDX); // r8 = dst + n
-        self.asm.mov_rr(R9, RSI);
-        self.asm.add_rr(R9, RDX); // r9 = src + n
-        self.asm.place(bloop);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(done);
-        self.asm.dec_r(R8);
-        self.asm.dec_r(R9);
-        self.asm.load_byte_zx(RDX, R9);
-        self.asm.store_byte_at(R8, RDX);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(bloop);
-        self.asm.place(fwd);
-        self.asm.mov_rr(RCX, RDX);
-        self.asm.rep_movsb();
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_memset(&mut self) {
-        let l = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.mov_rr(RAX, RDI); // return dst
-        self.asm.mov_rr(R8, RDI); // cursor
-        self.asm.place(l);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(done);
-        self.asm.store_byte_at(R8, RSI); // store low byte of c
-        self.asm.inc_r(R8);
-        self.asm.dec_r(RDX);
-        self.asm.jmp(l);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_memcmp(&mut self) {
-        let l = self.asm.new_label();
-        let diff = self.asm.new_label();
-        let done = self.asm.new_label();
-        let eq = self.asm.new_label();
-        self.asm.place(l);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(eq);
-        self.asm.load_byte_zx(RCX, RDI);
-        self.asm.load_byte_zx(R8, RSI);
-        self.asm.cmp_reg_reg(RCX, R8);
-        self.asm.jne(diff);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(RSI);
-        self.asm.dec_r(RDX);
-        self.asm.jmp(l);
-        self.asm.place(diff);
-        self.asm.mov_ri(RAX, 1);
-        self.asm.cmp_reg_reg(RCX, R8);
-        self.asm.jg(done);
-        self.asm.mov_ri(RAX, -1);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-        self.asm.place(eq);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_memfind(&mut self) {
-        let l = self.asm.new_label();
-        let nf = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.and_ri(RSI, 0xFF);
-        self.asm.mov_rr(RAX, RDI);
-        self.asm.place(l);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(nf);
-        self.asm.load_byte_zx(RCX, RAX);
-        self.asm.cmp_reg_reg(RCX, RSI);
-        self.asm.je(done);
-        self.asm.inc_r(RAX);
-        self.asm.dec_r(RDX);
-        self.asm.jmp(l);
-        self.asm.place(nf);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_memsearch(&mut self) {
-        let outer = self.asm.new_label();
-        let inner = self.asm.new_label();
-        let next = self.asm.new_label();
-        let matched = self.asm.new_label();
-        let nf = self.asm.new_label();
-        // empty needle → return haystack
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(matched);
-        // positions = hlen - nlen + 1 → r8 (in [1, ...]); negative ⇒ not found
-        self.asm.mov_rr(R8, RSI);
-        self.asm.sub_rr(R8, RCX);
-        self.asm.js(nf);
-        self.asm.inc_r(R8);
-        self.asm.place(outer);
-        self.asm.test_rr(R8, R8);
-        self.asm.je(nf);
-        self.asm.mov_rr(R9, RDI); // haystack cursor
-        self.asm.mov_rr(R10, RDX); // needle cursor
-        self.asm.mov_rr(R11, RCX); // needle remaining
-        self.asm.place(inner);
-        self.asm.test_rr(R11, R11);
-        self.asm.je(matched);
-        self.asm.load_byte_zx(RAX, R9);
-        self.asm.load_byte_zx(RSI, R10);
-        self.asm.cmp_reg_reg(RAX, RSI);
-        self.asm.jne(next);
-        self.asm.inc_r(R9);
-        self.asm.inc_r(R10);
-        self.asm.dec_r(R11);
-        self.asm.jmp(inner);
-        self.asm.place(next);
-        self.asm.inc_r(RDI);
-        self.asm.dec_r(R8);
-        self.asm.jmp(outer);
-        self.asm.place(matched);
-        self.asm.mov_rr(RAX, RDI);
-        self.asm.emit(&[0xC3]);
-        self.asm.place(nf);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// `ToUpper`/`ToLower` (rdi=c → rax): ASCII-case a single character.
-    fn emit_rt_tocase(&mut self, upper: bool) {
-        let done = self.asm.new_label();
-        let (lo, hi, delta) = if upper {
-            (b'a', b'z', -32)
-        } else {
-            (b'A', b'Z', 32)
-        };
-        self.asm.mov_rr(RAX, RDI);
-        self.asm.cmp_ri(RAX, lo as i32);
-        self.asm.jl(done);
-        self.asm.cmp_ri(RAX, hi as i32);
-        self.asm.jg(done);
-        self.asm.add_ri(RAX, delta);
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_abs(&mut self) {
-        let done = self.asm.new_label();
-        self.asm.mov_rr(RAX, RDI);
-        self.asm.test_rr(RAX, RAX);
-        self.asm.jns(done);
-        self.asm.neg_rax();
-        self.asm.place(done);
-        self.asm.emit(&[0xC3]);
-    }
-
-    fn emit_rt_sign(&mut self) {
-        let pos = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.mov_ri(RAX, 0);
-        self.asm.test_rr(RDI, RDI);
-        self.asm.jg(pos);
-        self.asm.je(done);
-        self.asm.mov_ri(RAX, -1);
-        self.asm.emit(&[0xC3]);
-        self.asm.place(pos);
-        self.asm.mov_ri(RAX, 1);
-        self.asm.place(done);
         self.asm.emit(&[0xC3]);
     }
 
@@ -2870,18 +2503,9 @@ impl Cg {
                 // Target is F64 (gen_fexpr is only entered for F64-typed exprs).
                 self.gen_foperand(expr)?;
             }
-            ExprKind::Call { callee, args } => {
-                // A float-returning call leaves its result in xmm0.
-                match &callee.kind {
-                    ExprKind::Ident(n) => self.gen_call_by_name(n, args, pos)?,
-                    _ => {
-                        return Err(CodegenError::at(
-                            pos,
-                            "x86_64 backend: only direct function calls are supported yet",
-                        ));
-                    }
-                }
-            }
+            // A float-returning call (direct or through a function pointer) leaves
+            // its result in xmm0 — the same dispatch as the integer path.
+            ExprKind::Call { callee, args } => self.gen_call(callee, args, pos)?,
             _ => {
                 return Err(CodegenError::at(
                     pos,
@@ -4901,6 +4525,22 @@ fn is_place(e: &Expr) -> bool {
 }
 fn is_brace_init(e: &Expr) -> bool {
     matches!(&e.kind, ExprKind::InitList(_) | ExprKind::DesignatedInit(_))
+}
+
+/// The destination of a brace initialiser: a local frame slot (`rbp - off`) or a
+/// BSS global (RIP-relative at `off`). Used by `gen_init_into`/`elem_addr`.
+#[derive(Clone, Copy)]
+enum Place {
+    Local(i32),
+    Global(i32),
+}
+
+/// The destination of a call: a known function's code `label` (a direct `call
+/// rel32`), or a function-pointer value to evaluate and call indirectly.
+#[derive(Clone, Copy)]
+enum CallTarget<'a> {
+    Direct(usize),
+    Indirect(&'a Expr),
 }
 /// The pointee/element type of a pointer or array.
 fn elem_of(ty: &Type) -> Option<Type> {

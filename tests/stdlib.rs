@@ -88,6 +88,94 @@ fn math_extended_functions() {
 }
 
 #[test]
+fn realloc_preserves_contents() {
+    // ReAlloc keeps the first min(old, new) bytes across a grow and a shrink, and
+    // NULL behaves like MAlloc. (Pointer identity is impl-defined — in-place on a
+    // bump allocator, moved on libc/interp — so only the bytes are asserted.)
+    let out = run_with_stdlib(
+        r#"
+        #include <string.hc>
+        U0 Main() {
+          U8 *p = ReAlloc(NULL, 0, 8);   // == MAlloc(8)
+          StrCpy(p, "abcdef");
+          p = ReAlloc(p, 8, 64);          // grow
+          "%s\n", p;
+          p = ReAlloc(p, 64, 4);          // shrink (keeps first 4)
+          "%c%c%c%c\n", p[0], p[1], p[2], p[3];
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "abcdef\nabcd\n");
+}
+
+#[test]
+fn msize_reports_the_requested_allocation_size() {
+    // `MSize` returns the byte size MAlloc was asked for (0 for NULL), survives the
+    // size header transparently, and tracks through a ReAlloc grow.
+    let out = run_with_stdlib(
+        r#"
+        #include <string.hc>
+        U0 Main() {
+          U8 *p = MAlloc(40); "%d ", MSize(p);
+          U8 *q = MAlloc(7);  "%d ", MSize(q);
+          "%d\n", MSize(NULL);
+          StrCpy(p, "ok"); "%s\n", p;       // contents unaffected by the header
+          U8 *r = MAlloc(16); "%d ", MSize(r);
+          r = ReAlloc(r, 16, 80); "%d\n", MSize(r);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "40 7 0\nok\n16 80\n");
+}
+
+#[test]
+fn string_object_grows_and_transforms() {
+    // The owning, growable `Str`: push (cstr + char), grow across reallocations,
+    // set/trim, deep clone + equality, in-place upper/reverse, and free.
+    let out = run_with_stdlib(
+        r#"
+        #include <string.hc>
+        U0 Main() {
+          Str s;                       // zero-init == empty
+          StrPushCStr(&s, "Hello");
+          StrPushChar(&s, '!');
+          "%s len=%d capok=%d\n", StrCStr(&s), s.len, s.cap >= s.len;
+
+          Str t; StrSet(&t, "  trim me  ");
+          StrTrim(&t);
+          "[%s] len=%d\n", StrCStr(&t), t.len;
+
+          Str u; StrClone(&u, &s);
+          StrMakeUpper(&u);
+          "u=%s s=%s eq=%d\n", StrCStr(&u), StrCStr(&s), StrEq(&u, &s);
+
+          StrReverse(&t);
+          "%s\n", StrCStr(&t);
+
+          Str g; I64 i;
+          for (i = 0; i < 50; i++) StrPushCStr(&g, "xy");
+          "grow len=%d first=%c last=%c\n", g.len, g.ptr[0], g.ptr[g.len - 1];
+
+          StrFree(&s); StrFree(&t); StrFree(&u); StrFree(&g);
+          Str e; "empty=[%s]\n", StrCStr(&e);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "Hello! len=6 capok=1\n\
+         [trim me] len=7\n\
+         u=HELLO! s=Hello! eq=0\n\
+         em mirt\n\
+         grow len=100 first=x last=y\n\
+         empty=[]\n"
+    );
+}
+
+#[test]
 fn time_calendar_math() {
     // FromUnix/FmtISO/ToUnix over fixed epochs (pure → reproducible). Covers the
     // epoch, a leap year, and a pre-1970 negative timestamp.

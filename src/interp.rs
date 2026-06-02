@@ -337,9 +337,6 @@ pub struct Interpreter<W: Write> {
     funcs: HashMap<String, Rc<FuncDef>>,
     classes: HashMap<String, ClassDef>,
     layouts: Layouts,
-    /// `RandU64` PRNG state (splitmix64); starts at 0 to match the native
-    /// backend's zero-initialised global.
-    rng_state: u64,
     /// Command-line arguments exposed via `ArgC`/`ArgV`. `args[0]` is the program
     /// (or script) name, mirroring a native binary's argv, so the count is ≥ 1.
     args: Vec<String>,
@@ -347,6 +344,9 @@ pub struct Interpreter<W: Write> {
     /// call. `VarArgCnt`/`VarArg{I64,F64,Ptr}` read the top frame (sema restricts
     /// them to `...` bodies, so the top is always the current function's varargs).
     va_stack: Vec<Vec<Value>>,
+    /// Requested byte size of each `MAlloc`'d heap region, keyed by region identity,
+    /// for `MSize` (the native backends use a size header instead).
+    heap_sizes: HashMap<usize, i64>,
 }
 
 impl<W: Write> Interpreter<W> {
@@ -362,9 +362,9 @@ impl<W: Write> Interpreter<W> {
             funcs: HashMap::new(),
             classes: HashMap::new(),
             layouts: Layouts::empty(),
-            rng_state: 0,
             args: vec!["hcc".to_string()],
             va_stack: Vec::new(),
+            heap_sizes: HashMap::new(),
         }
     }
 
@@ -1136,6 +1136,8 @@ impl<W: Write> Interpreter<W> {
                 .collect::<Result<Vec<_>, _>>()?;
             Region::Array(Rc::new(RefCell::new(cells)))
         };
+        // Record the requested byte size for `MSize` (keyed by region identity).
+        self.heap_sizes.insert(region.base_addr(), bytes);
         Ok(Value::Ptr(Some(PtrVal { region, index: 0 })))
     }
 
@@ -1285,26 +1287,6 @@ impl<W: Write> Interpreter<W> {
                 self.write_bytes(&at, &bytes, pos)?;
                 Ok(args[0].clone())
             }
-            "Abs" => Ok(Value::Int(self.to_i64(args[0].clone(), pos)?.abs())),
-            "StrLen" => Ok(Value::Int(self.cstr_bytes(&args[0], pos)?.len() as i64)),
-            "StrCmp" => {
-                let a = self.cstr_bytes(&args[0], pos)?;
-                let b = self.cstr_bytes(&args[1], pos)?;
-                // Normalized to a sign so the result matches the native backend
-                // (libc strcmp's magnitude is unspecified).
-                Ok(Value::Int(match a.cmp(&b) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
-                }))
-            }
-            "StrCpy" => {
-                // Copy src's bytes plus the NUL terminator into dst; return dst.
-                let mut bytes = self.cstr_bytes(&args[1], pos)?;
-                bytes.push(0);
-                self.write_bytes(&args[0], &bytes, pos)?;
-                Ok(args[0].clone())
-            }
             "MAlloc" => {
                 // A bare allocation with no element-type context: a raw byte
                 // buffer (a typed `T *p = MAlloc(...)` is retyped by
@@ -1312,6 +1294,23 @@ impl<W: Write> Interpreter<W> {
                 let n = self.to_i64(args[0].clone(), pos)?.max(0);
                 let mut env = Env::top_level();
                 self.alloc(n, &Type::U8, &mut env)
+            }
+            // `HeapExtend` never extends in place here (the interpreter's heap has no
+            // bump-pointer model); returning NULL routes `ReAlloc` through the
+            // MAlloc+copy path, matching the libc/Darwin heaps.
+            "HeapExtend" => Ok(Value::Ptr(None)),
+            // `MSize(ptr)` — the requested byte size of `ptr`'s heap region (0 for a
+            // non-`MAlloc`'d pointer), tracked in `heap_sizes` at allocation time.
+            "MSize" => {
+                let n = match &args[0] {
+                    Value::Ptr(Some(p)) => self
+                        .heap_sizes
+                        .get(&p.region.base_addr())
+                        .copied()
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                Ok(Value::Int(n))
             }
             "MStrPrint" => {
                 // Format into a freshly allocated, right-sized buffer; return it.
@@ -1327,168 +1326,20 @@ impl<W: Write> Interpreter<W> {
                 self.write_bytes(&buf, &bytes, pos)?;
                 Ok(buf)
             }
-            "StrToI64" => {
-                let bytes = self.cstr_bytes(&args[0], pos)?;
-                Ok(Value::Int(parse_atoll(&bytes)))
-            }
             "StrToF64" => {
                 let bytes = self.cstr_bytes(&args[0], pos)?;
                 Ok(Value::Float(parse_atof(&bytes)))
             }
-            "StrToUpper" | "StrToLower" => {
-                // ASCII-case the string in place, then return it.
-                let up = name == "StrToUpper";
-                let mut bytes = self.cstr_bytes(&args[0], pos)?;
-                for b in bytes.iter_mut() {
-                    *b = if up {
-                        b.to_ascii_uppercase()
-                    } else {
-                        b.to_ascii_lowercase()
-                    };
-                }
-                bytes.push(0);
-                self.write_bytes(&args[0], &bytes, pos)?;
-                Ok(args[0].clone())
-            }
-            "StrRev" => {
-                // Reverse the string in place, then return it.
-                let mut bytes = self.cstr_bytes(&args[0], pos)?;
-                bytes.reverse();
-                bytes.push(0);
-                self.write_bytes(&args[0], &bytes, pos)?;
-                Ok(args[0].clone())
-            }
-            "MemFind" => {
-                // Pointer to the first byte == c in buf[0..n], or NULL.
-                let c = self.to_i64(args[1].clone(), pos)? as u8;
-                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
-                let bytes = self.read_n_bytes(&args[0], n, pos)?;
-                match bytes.iter().position(|&b| b == c) {
-                    Some(i) => self.ptr_at(&args[0], i),
-                    None => Ok(Value::Ptr(None)),
-                }
-            }
-            "MemSearch" => {
-                // Pointer to the first occurrence of needle[0..nlen] in
-                // hay[0..hlen], or NULL (memmem; an empty needle -> hay start).
-                let hlen = self.to_i64(args[1].clone(), pos)?.max(0) as usize;
-                let nlen = self.to_i64(args[3].clone(), pos)?.max(0) as usize;
-                let hay = self.read_n_bytes(&args[0], hlen, pos)?;
-                let needle = self.read_n_bytes(&args[2], nlen, pos)?;
-                let idx = if nlen == 0 {
-                    Some(0)
-                } else if nlen > hay.len() {
-                    None
-                } else {
-                    hay.windows(nlen).position(|w| w == needle.as_slice())
-                };
-                match idx {
-                    Some(i) => self.ptr_at(&args[0], i),
-                    None => Ok(Value::Ptr(None)),
-                }
-            }
-            "I64ToStr" | "F64ToStr" => {
-                // Format the value into buf with a fixed conversion; return buf.
-                let fmt = if name == "I64ToStr" { "%d" } else { "%g" };
-                let s = self.format(fmt, std::slice::from_ref(&args[0]), pos)?;
+            "F64ToStr" => {
+                // Format the value into buf with the `%g` conversion; return buf.
+                let s = self.format("%g", std::slice::from_ref(&args[0]), pos)?;
                 let mut bytes = s.into_bytes();
                 bytes.push(0);
                 self.write_bytes(&args[1], &bytes, pos)?;
                 Ok(args[1].clone())
             }
-            "StrSpn" | "StrCSpn" => {
-                // Length of the initial run of str whose chars are in / not in set.
-                let s = self.cstr_bytes(&args[0], pos)?;
-                let set = self.cstr_bytes(&args[1], pos)?;
-                let want_in = name == "StrSpn";
-                let n = s
-                    .iter()
-                    .take_while(|&&b| set.contains(&b) == want_in)
-                    .count();
-                Ok(Value::Int(n as i64))
-            }
-            "StrChr" | "StrLastChr" => {
-                // Pointer to the first/last `c` in str (the NUL counts, so c==0
-                // finds the terminator), or NULL.
-                let c = self.to_i64(args[1].clone(), pos)? as u8;
-                let bytes = self.cstr_bytes(&args[0], pos)?;
-                let idx = if c == 0 {
-                    Some(bytes.len()) // the terminating NUL
-                } else if name == "StrChr" {
-                    bytes.iter().position(|&b| b == c)
-                } else {
-                    bytes.iter().rposition(|&b| b == c)
-                };
-                match idx {
-                    Some(i) => self.ptr_at(&args[0], i),
-                    None => Ok(Value::Ptr(None)),
-                }
-            }
             // Storage is reclaimed by `Rc`; freeing is a no-op.
             "Free" => Ok(Value::Void),
-            "StrCat" => {
-                // Append src (plus a NUL) at the end of dst's current string.
-                let dst_len = self.cstr_bytes(&args[0], pos)?.len() as i64;
-                let mut tail = self.cstr_bytes(&args[1], pos)?;
-                tail.push(0);
-                match as_pointer(&args[0]) {
-                    Some(Some(p)) => {
-                        self.write_bytes(&Value::Ptr(Some(p.offset(dst_len))), &tail, pos)?
-                    }
-                    _ => return Err(CodegenError::at(pos, "StrCat destination is not a buffer")),
-                }
-                Ok(args[0].clone())
-            }
-            // MemMove is overlap-safe; the interpreter reads all `n` bytes before
-            // writing, so it is identical to MemCpy here.
-            "MemCpy" | "MemMove" => {
-                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
-                let bytes = self.read_n_bytes(&args[1], n, pos)?;
-                self.write_bytes(&args[0], &bytes, pos)?;
-                Ok(args[0].clone())
-            }
-            "MemSet" => {
-                let byte = self.to_i64(args[1].clone(), pos)? as u8;
-                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
-                self.write_bytes(&args[0], &vec![byte; n], pos)?;
-                Ok(args[0].clone())
-            }
-            "MemCmp" => {
-                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
-                let a = self.read_n_bytes(&args[0], n, pos)?;
-                let b = self.read_n_bytes(&args[1], n, pos)?;
-                // Normalized to a sign, matching the native backend.
-                Ok(Value::Int(match a.cmp(&b) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
-                }))
-            }
-            "StrNCmp" => {
-                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
-                let mut a = self.cstr_bytes(&args[0], pos)?;
-                a.truncate(n);
-                let mut b = self.cstr_bytes(&args[1], pos)?;
-                b.truncate(n);
-                Ok(Value::Int(match a.cmp(&b) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
-                }))
-            }
-            "StrNCpy" => {
-                // Copy up to n chars from src, NUL-padding to n; return dst.
-                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
-                let mut bytes = self.cstr_bytes(&args[1], pos)?;
-                bytes.truncate(n);
-                bytes.resize(n, 0);
-                self.write_bytes(&args[0], &bytes, pos)?;
-                Ok(args[0].clone())
-            }
-            "Sign" => Ok(Value::Int(self.to_i64(args[0].clone(), pos)?.signum())),
-            "RandU64" => Ok(Value::Int(
-                crate::builtins::splitmix64(&mut self.rng_state) as i64
-            )),
             // Clock/time primitives — impure (read the host clock or sleep).
             "UnixNS" => Ok(Value::Int(
                 std::time::SystemTime::now()
@@ -1535,61 +1386,17 @@ impl<W: Write> Interpreter<W> {
                     (_, None) => Value::Int(0),
                 })
             }
-            "StrFind" => {
-                // A pointer to the first occurrence of needle in haystack, or NULL.
-                // Arg order matches libc `strstr`: haystack first.
-                let haystack = self.cstr_bytes(&args[0], pos)?;
-                let needle = self.cstr_bytes(&args[1], pos)?;
-                match subslice_index(&haystack, &needle) {
-                    None => Ok(Value::Ptr(None)),
-                    Some(off) => match as_pointer(&args[0]) {
-                        // A real pointer into the haystack buffer.
-                        Some(Some(p)) => Ok(Value::Ptr(Some(p.offset(off as i64)))),
-                        // A bare string literal has no buffer; hand back a pointer
-                        // into a fresh region so found-ness is still correct.
-                        _ => {
-                            let cells = haystack
-                                .iter()
-                                .map(|&b| cell(Value::Int(b as i64)))
-                                .collect();
-                            let region = Region::Array(Rc::new(RefCell::new(cells)));
-                            Ok(Value::Ptr(Some(PtrVal {
-                                region,
-                                index: off as i64,
-                            })))
-                        }
-                    },
-                }
-            }
-            "ToUpper" => {
-                let c = self.to_i64(args[0].clone(), pos)?;
-                Ok(Value::Int(if (97..=122).contains(&c) { c - 32 } else { c }))
-            }
-            "ToLower" => {
-                let c = self.to_i64(args[0].clone(), pos)?;
-                Ok(Value::Int(if (65..=90).contains(&c) { c + 32 } else { c }))
-            }
-            // The `Is*` ctype classification predicates — ASCII membership tests,
-            // shared with both backends via `builtins::ctype_ranges`.
-            _ if crate::builtins::ctype_ranges(name).is_some() => {
-                let c = self.to_i64(args[0].clone(), pos)?;
-                Ok(Value::Int(crate::builtins::ctype_test(name, c) as i64))
-            }
-            // Algebraic F64 math — exactly reproducible in every backend (hardware
-            // `sqrt`, rounding, sign-bit clear), so it has well-defined, backend-
-            // independent semantics. (Transcendental functions are not builtins:
-            // they have no solomon-defined value — only "whatever the host libm
-            // does" — so they belong in a future HolyC standard library, not here.)
-            "Sqrt" | "Floor" | "Ceil" | "Round" | "Fabs" => {
+            // The two irreducible algebraic F64 primitives — exactly reproducible in
+            // every backend (hardware `sqrt`, a sign-bit clear). Rounding and the
+            // transcendentals are reducible and live in `lib/math.hc`.
+            "Sqrt" | "Fabs" => {
                 let a = args[0]
                     .as_f64()
                     .ok_or_else(|| CodegenError::at(pos, "math builtin expects a number"))?;
-                Ok(Value::Float(match name {
-                    "Sqrt" => a.sqrt(),
-                    "Floor" => a.floor(),
-                    "Ceil" => a.ceil(),
-                    "Round" => a.round(),
-                    _ => a.abs(), // Fabs
+                Ok(Value::Float(if name == "Sqrt" {
+                    a.sqrt()
+                } else {
+                    a.abs()
                 }))
             }
             _ => Err(CodegenError::at(
@@ -1641,51 +1448,7 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Read exactly `n` raw bytes from the buffer `v` points at (for `MemCpy`),
-    /// zero-padding past the end. Accepts a string, a pointer, or an array.
-    fn read_n_bytes(&self, v: &Value, n: usize, pos: Pos) -> Result<Vec<u8>, CodegenError> {
-        let byte_at =
-            |get: &dyn Fn(usize) -> Option<u8>| (0..n).map(|i| get(i).unwrap_or(0)).collect();
-        match v {
-            Value::Str(s) => Ok(byte_at(&|i| s.as_bytes().get(i).copied())),
-            Value::Ptr(None) => Err(CodegenError::at(pos, "memory read from a null pointer")),
-            Value::Ptr(Some(p)) if matches!(p.region, Region::Heap(_)) => {
-                let Region::Heap(buf) = &p.region else {
-                    unreachable!()
-                };
-                let buf = buf.borrow();
-                let base = p.index.max(0) as usize;
-                Ok(byte_at(&|i| buf.get(base + i).copied()))
-            }
-            Value::Ptr(Some(p)) => Ok(byte_at(&|i| {
-                p.region
-                    .cell_at(p.index + i as i64)
-                    .and_then(|c| c.borrow().as_i64())
-                    .map(|b| b as u8)
-            })),
-            Value::Array(elems) => {
-                let elems = elems.borrow();
-                Ok(byte_at(&|i| {
-                    elems
-                        .get(i)
-                        .and_then(|c| c.borrow().as_i64())
-                        .map(|b| b as u8)
-                }))
-            }
-            _ => Err(CodegenError::at(pos, "expected a pointer or buffer")),
-        }
-    }
-
     /// Write `bytes` into the buffer `dst` points at (a pointer or array).
-    /// A pointer `i` bytes past `base` (a buffer pointer), used by the find
-    /// builtins to return a pointer into the searched buffer.
-    fn ptr_at(&self, base: &Value, i: usize) -> Result<Value, CodegenError> {
-        Ok(match base {
-            Value::Ptr(Some(pv)) => Value::Ptr(Some(pv.offset(i as i64))),
-            other => other.clone(),
-        })
-    }
-
     fn write_bytes(&self, dst: &Value, bytes: &[u8], pos: Pos) -> Result<(), CodegenError> {
         let put = |c: Option<Cell>, b: u8| -> Result<(), CodegenError> {
             match c {
@@ -2631,15 +2394,6 @@ fn is_signed_scalar(ty: &Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
 }
 
-/// The byte index of the first occurrence of `needle` in `haystack` (an empty
-/// needle matches at 0), or `None`. The basis for `StrFind`/`strstr`.
-fn subslice_index(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
 /// The element type a pointer or array type points at.
 fn elem_of(ty: &Type) -> Option<Type> {
     match ty {
@@ -2713,32 +2467,6 @@ fn values_equal(l: &Value, r: &Value) -> bool {
             _ => false,
         },
     }
-}
-
-/// Parse a base-10 integer like libc `atoll`: skip leading whitespace, an
-/// optional sign, then decimal digits, stopping at the first non-digit.
-fn parse_atoll(bytes: &[u8]) -> i64 {
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let neg = match bytes.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    let mut n: i64 = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        n = n.wrapping_mul(10).wrapping_add((bytes[i] - b'0') as i64);
-        i += 1;
-    }
-    if neg { n.wrapping_neg() } else { n }
 }
 
 /// Parse a floating value like libc `atof`: skip leading whitespace, then take

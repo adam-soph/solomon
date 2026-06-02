@@ -382,11 +382,6 @@ impl Asm {
     pub(super) fn sub(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0xCB00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
-    /// SXTW rd, wn — sign-extend a 32-bit word to 64 bits (an `int` libc return
-    /// leaves the upper 32 bits of the x-register unspecified).
-    pub(super) fn sxtw(&mut self, rd: u32, rn: u32) {
-        self.e_rr(0x9340_7C00 | (rn << 5) | rd, rd, rn);
-    }
     pub(super) fn mul(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(
             0x9B00_0000 | (rm << 16) | (XZR << 10) | (rn << 5) | rd,
@@ -510,22 +505,13 @@ impl Asm {
     pub(super) fn fneg(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E61_4000 | (dn << 5) | dd);
     }
-    /// FABS / FSQRT / FRINTM (floor) / FRINTP (ceil) / FRINTA (round, ties away) —
-    /// scalar double-precision unary FP ops used by the algebraic math builtins.
+    /// FABS / FSQRT — scalar double-precision unary FP ops for the two algebraic
+    /// math builtins (`Fabs`/`Sqrt`); rounding moved to `lib/math.hc`.
     pub(super) fn fabs(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E60_C000 | (dn << 5) | dd);
     }
     pub(super) fn fsqrt(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E61_C000 | (dn << 5) | dd);
-    }
-    pub(super) fn frintm(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E65_4000 | (dn << 5) | dd);
-    }
-    pub(super) fn frintp(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E64_C000 | (dn << 5) | dd);
-    }
-    pub(super) fn frinta(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E66_4000 | (dn << 5) | dd);
     }
     /// FCMP Dn, Dm — set NZCV for an ordered comparison.
     pub(super) fn fcmp(&mut self, dn: u32, dm: u32) {

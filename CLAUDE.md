@@ -222,13 +222,17 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   runtime (lazily emitted once at the end of `__text`, registered via `fs_routine`):
   the redirectable sink `OutWrite` (stdout `write`, or append to a `StrPrint` buffer
   via the `out_ptr` global), the full `FmtInt`/`FmtStr` (all flags/width/precision,
+  incl. `*` width/precision from args — `fs_width_prec_flags` pushes the starred
+  args before the value and pops them back, a negative `*` width left-justifying —
   mirroring `fmt::render_int`/`render_str`), the correctly-rounded **bignum float
   formatters** `FmtFloat` (`%f`) and `FmtFloatEg` (`%e`/`%g`) over a 48-limb `BIGNUM`
   with `BnMul`/`BnDiv10`/`BnShl`/`BnShr` (round-half-even in `BnShr`; `÷10` via a
   64-iteration shift/subtract since AArch64 has no 128÷64 divide), the bump allocator
-  `MAlloc` over `mmap`, the string/memory ops, `StrFind`, the sprintf family, and the
-  FP algebraic ops (`Sqrt`/`Fabs`/`Floor`/`Ceil`/`Round` = single AArch64 FP
-  instructions). `tests/arm64_linux.rs` compiles **all 18 examples** freestanding and
+  `MAlloc` over `mmap`, the sprintf family (and the lone `StrLen` routine its
+  `CatPrint` append calls), and the FP algebraic ops `Sqrt`/`Fabs` (single AArch64
+  FP instructions). The reducible string/memory/ctype/PRNG ops are pure HolyC in
+  `lib/*.hc` now, so they compile as ordinary functions rather than emitted
+  runtime. `tests/arm64_linux.rs` compiles **all 18 examples** freestanding and
   runs them under `docker --platform linux/arm64` (native on Apple silicon, no qemu),
   asserting byte-for-byte equality with the interpreter; it self-skips with no docker.
 
@@ -303,26 +307,18 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   (`mov_rr`/`mov_ri`/`alu_rr`/byte loads-stores, etc.). String literals live
   *after* the code, RIP-relative addressed; `Asm::finish` resolves rel32 branch
   fixups, the string references and the global references, then appends the string
-  bytes (the BSS follows in vaddr space). A **libc-free slice of the core-library
-  builtins** is lowered inline or to emitted runtime routines (`gen_builtin` +
+  bytes (the BSS follows in vaddr space). The **irreducible core-library builtins**
+  are lowered inline or to emitted runtime routines (`gen_builtin` +
   `emit_rt_routines`): `MAlloc`/`Free` (a bump allocator over `mmap`'d 1 MiB
-  chunks; `Free` is a no-op), the string/memory ops (`StrLen`/`StrCmp`/`StrCpy`/
-  `StrCat`/`StrNCmp`/`StrNCpy`/`StrChr`/`StrLastChr`/`StrFind`/`StrSpn`/`StrCSpn`/
-  `StrToUpper`/`StrToLower`/`StrRev`, `MemCpy`/`MemMove`/`MemSet`/`MemCmp`/
-  `MemFind`/`MemSearch`) as byte-at-a-time loop routines, `ToUpper`/`ToLower`/
-  `Abs`/`Sign`, the `Is*` ctype predicates (`emit_rt_ctype`, one inline range-check
-  routine per class from the shared `builtins::ctype_ranges` table), `RandU64` (the
-  shared splitmix64 over a zero-seeded BSS word, so
-  its sequence matches the interpreter), SSE `Sqrt`/`Fabs`, and the **sprintf
-  family** `StrPrint`/`CatPrint`/`I64ToStr` (printf into a buffer via the output
-  sink; `CatPrint` appends at `dst + StrLen(dst)`). The transcendentals aren't
-  builtins at all (see the `builtins.rs` note — they're excluded project-wide, not
-  just here), so nothing math-related is missing from this backend; the algebraic
-  ops `Sqrt`/`Fabs`/`Floor`/`Ceil`/`Round` are all done — `Floor`/`Ceil` are a
-  single `roundsd` (modes 1/2), and `Round` is `trunc` (`roundsd` mode 3) plus a
-  `copysign` bump so it rounds **half away from zero** like the interpreter's
-  `f64::round` and arm64's `frinta` (`roundsd`'s nearest mode is half-to-even, which
-  would diverge).
+  chunks; `Free` is a no-op), SSE `Sqrt`/`Fabs`, and the **sprintf family**
+  `StrPrint`/`CatPrint`/`F64ToStr` (printf into a buffer via the output sink;
+  `CatPrint` appends at `dst + StrLen(dst)`, so `StrLen` is the one string runtime
+  routine still emitted). The reducible string/memory/ctype/PRNG ops are pure HolyC
+  in `lib/*.hc` now and compile as ordinary functions — the per-op `emit_rt_*`
+  routines, the `emit_rt_ctype` range-checker and the `RandU64` splitmix were
+  removed with the migration. The transcendentals aren't builtins at all (see the
+  `builtins.rs` note — they're excluded project-wide), so nothing math-related is
+  missing; `Sqrt`/`Fabs` are single SSE ops (`sqrtsd`, a sign-bit `andpd`).
   `MStrPrint` (a **growing sink** like libc's `vasprintf`: `MAlloc` a small owned
   buffer, then format in one pass while the sink reallocs-and-copies on overflow —
   `Helper::GrowSink`, doubling capacity — so the result is just `out_base` when
@@ -342,53 +338,67 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
 `is_builtin()`, `libc_symbol()`). **sema seeds its signatures from here; the
 interpreter dispatches behavior from here; the arm64 backend lowers them via
 `libc_symbol()`.** Adding/altering a builtin means touching this module so the
-backends stay in sync. Current set: `Print` (→ `printf`), `StrPrint` (→
-`sprintf`, returns dst), `CatPrint` (sprintf-append, into `dst+strlen(dst)`) and
-`MStrPrint` (asprintf-style: `snprintf` to measure, `malloc`, `sprintf`); number
-conversion `I64ToStr`/`F64ToStr` (→ `sprintf` fixed format) and `StrToI64` (→
-`atoll`) / `StrToF64` (→ `atof`); strings
-`StrLen`/`StrCmp`/`StrNCmp`/`StrCpy`/`StrNCpy`/`StrCat`/`StrFind`/`StrChr`/`StrLastChr`/`StrSpn`/`StrCSpn`,
-in-place `StrToUpper`/`StrToLower`/`StrRev` (inline loops); `Abs` (→
-`llabs`); memory
-`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`/`MAlloc`/`Free`; char
-`ToUpper`/`ToLower` and the ASCII `Is*` classification predicates (`IsDigit`/
-`IsAlpha`/`IsAlNum`/`IsSpace`/`IsUpper`/`IsLower`/`IsXDigit`/`IsPunct`/`IsCntrl`/
-`IsPrint`/`IsGraph`/`IsBlank`) — these are *computed inline* in both backends from a
-shared range table (`builtins::ctype_ranges`), **not** libc-backed, since libc's
-`isdigit` etc. return an unspecified nonzero that wouldn't match the interpreter's
-0/1; and the two **irreducible** float primitives `Sqrt` (a correctly-rounded
-hardware instruction) and `Fabs` (a sign-bit clear the interpreter models
-specially); plus `RandU64`. (`Floor`/`Ceil`/`Round` are reducible — an exact I64
-cast + adjust — so they live in `lib/math.hc`, not here. The **transcendentals** —
-`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/… — are
-deliberately *not* builtins: an intrinsic must have a portable, solomon-defined
-value, but a transcendental's would be only "whatever the host libm computes,"
-which isn't reproducible across platforms and can't exist in a freestanding
-target. They instead live in the **HolyC standard library** (`lib/*.hc`, e.g.
-`lib/math.hc`'s `Exp`/`Ln`/`Pow`/`Sin`/`Cos`) — ordinary HolyC built on the
-deterministic F64 ops + these algebraic builtins, so each function's *defined
+backends stay in sync. The set has been **pared down to the irreducible
+primitives** — anything expressible as reproducible HolyC has moved to the
+standard library (`lib/*.hc`). Current set: the printf family `Print` (→
+`printf`), `StrPrint` (→ `sprintf`, returns dst), `CatPrint` (sprintf-append, into
+`dst+strlen(dst)`) and `MStrPrint` (asprintf-style) — variadic, so they can't yet
+be ordinary library code; float parse/format `StrToF64` (→ `atof`) / `F64ToStr`
+(correctly-rounded `%g`); heap `MAlloc`/`Free` (a syscall/libc primitive),
+`HeapExtend(ptr, old, new)` (the one irreducible bit of `realloc` — grow a bump
+allocator's last block in place, else NULL; the move+copy `ReAlloc` is HolyC in
+`lib/string.hc`) and `MSize(ptr)` (the requested size of a block — when a program
+uses it, `MAlloc` prepends an 8-byte size header, **gated** so size-agnostic
+programs keep the lean header-free heap byte-for-byte; the interpreter keeps a side
+table, Darwin wraps libc `malloc`/`free` with the header); the two
+**algebraic** float ops `Sqrt` (a correctly-rounded hardware instruction) and
+`Fabs` (a sign-bit clear the interpreter models specially — it can't byte-pun a
+local); the captured command line `ArgC`/`ArgV`; the variadic-argument accessors
+`VarArgCnt`/`VarArgI64`/`VarArgF64`/`VarArg` (need ABI support); and the impure
+clock primitives `UnixNS`/`NanoNS`/`Sleep` (below). `NULL`/`TRUE`/`FALSE` are const
+builtins. **Everything reducible now lives in `lib/*.hc`** as pure HolyC built on
+the deterministic F64/integer ops + these primitives, so each function's *defined
 algorithm* computes identically on the interpreter and every backend; pull it in
-with an angle include, `#include <math.hc>`. See the `builtins.rs` module doc.)
-`NULL`/`TRUE`/`FALSE` are
-const builtins seeded in each. `Print`/`StrPrint`/`CatPrint`/`MStrPrint` are
-*not* in `libc_symbol`: all are special-cased in the arm64 backend
+with an angle include (`#include <string.hc>` / `#include <math.hc>`). Each lib
+file is wrapped in an `#ifndef _NAME_HC` include guard, so a module can include
+another (or a program can include the same one twice) without a redefinition error.
+
+- `lib/string.hc` — two layers. **(1)** the C-style `U8 *` primitives: the string
+  ops (`StrLen`/`StrCmp`/`StrCpy`/`StrCat`/`StrFind`/`StrChr`/`StrSpn`/`StrToUpper`/
+  `StrRev`/…), number conversion (`I64ToStr`/`StrToI64`), `Abs`/`Sign`, the memory
+  ops (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`, plus `ReAlloc`
+  over the `HeapExtend` builtin), ASCII case
+  (`ToUpper`/`ToLower`) and the `Is*` ctype predicates (`IsDigit`/`IsAlpha`/
+  `IsSpace`/…, inline ASCII range checks returning 0/1 — deliberately not libc's
+  `isdigit`, whose unspecified nonzero would diverge). **(2)** `class Str` — an
+  owning, growable string built on layer 1: the caller owns the struct, methods
+  take `Str *`, the heap buffer (`MAlloc`/`Free`) stays NUL-terminated, and a
+  zero-filled `Str` is already a valid empty string. `StrInit`/`StrFree`/`StrClear`/
+  `StrReserve`, `StrPushChar`/`StrPushCStr`/`StrPushStr`/`StrSet`, `StrCStr`/`StrEq`/
+  `StrClone`, and in-place `StrMakeUpper`/`StrMakeLower`/`StrReverse`/`StrTrim`. It
+  owns its buffer — duplicate with `StrClone`, not `=`.
+- `lib/math.hc` — rounding (`Floor`/`Ceil`/`Round`/`Trunc`/`Fmod`, exact via an I64
+  cast + adjust), the transcendentals (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…, each with a
+  *defined* series so it's reproducible — unlike a libm call), and the deterministic
+  `RandU64` splitmix64 (over a `__rand_state` global, fixed zero seed).
+
+(The transcendentals are deliberately *not* builtins: an intrinsic must have a
+portable, solomon-defined value, but a transcendental's would be only "whatever the
+host libm computes," not reproducible across platforms and impossible in a
+freestanding target — so they belong in the library with a defined algorithm.)
+`Print`/`StrPrint`/`CatPrint`/`MStrPrint` are *not* in `libc_symbol`: all are
+special-cased in the arm64 backend
 (`gen_print`/`gen_formatted_write`/`gen_mstrprint`) to translate the format
 string (`translate_format`) and pass variadic args on the stack (Apple ABI); the
-interpreter renders them with the shared `fmt` module. `I64ToStr`/`F64ToStr`
-(`gen_tostr`) likewise lower to `sprintf` with a fixed format. `StrToUpper`/
-`StrToLower` (`gen_str_case`) and `StrRev` (`gen_str_rev`) are also special —
-inline loops, no `strupr`/`strrev` in libc.
-Each *libc-backed* builtin keeps its HolyC
-signature 1:1 with the libc one (e.g. `StrFind(haystack, needle)` ≙ `strstr`), so
-it lowers through the generic path with no special-casing. The *computed*
-builtins have no libc equivalent and are emitted inline by both backends:
-`Sign` (`(x>0)-(x<0)`); the `Is*` ctype predicates (inline ASCII range checks from
-the shared `builtins::ctype_ranges` table — deliberately not libc's `isdigit` etc.,
-whose unspecified nonzero return wouldn't match the interpreter's 0/1); and
-`RandU64` — a deterministic splitmix64 (`builtins::splitmix64`, fixed zero seed) so
-its sequence is identical in both backends; the native backend keeps the state in a
-hidden `RNG_STATE_GLOBAL` common symbol the interpreter mirrors with
-`Interpreter::rng_state`. The **clock/time primitives** `UnixNS` (wall-clock ns,
+interpreter renders them with the shared `fmt` module. The remaining libc-backed
+builtins (`Sqrt`/`Fabs`/`MAlloc`/`Free`/`StrToF64`) keep their HolyC signature 1:1
+with the libc one, so they lower through the generic path with no special-casing.
+(The string/memory/ctype/PRNG lowering machinery the backends used to carry —
+`gen_str_case`, the `ctype_ranges` emitter, the `RNG_STATE_GLOBAL` splitmix, the
+per-op `emit_rt_*`/`emit_fs_*` routines — has been **removed**: those ops are
+ordinary `lib/*.hc` functions now. Each backend keeps only the runtime routines its
+own machinery still needs — e.g. `StrLen`, which `CatPrint`'s append calls
+internally.) The **clock/time primitives** `UnixNS` (wall-clock ns,
 CLOCK_REALTIME), `NanoNS` (monotonic ns, CLOCK_MONOTONIC) and `Sleep(ns)` are the
 one **impure, non-reproducible** group: the clock differs between an interpreter
 run and a native run, so the byte-for-byte conformance is *relaxed* for them —
@@ -450,6 +460,15 @@ from one `keywords!` table to avoid drift.
   `==`/`!=` keep C's `(a==b)==c`). Interior operands are *cloned* into both
   comparisons (so `a < f() < b` calls twice). Sema and both backends are
   untouched — they only ever see the standard `&&`-of-comparisons AST.
+- **String array initializers** are a pure parser desugar
+  (`string_array_init`/`infer_array_len` in `finish_declarator`): `U8 s[] = "abc"`
+  sizes the array to the byte count plus the NUL (`s[4]`), then both forms desugar
+  the string to a byte brace list — `U8 s[N] = "abc"` becomes
+  `{'a','b','c',0}` — so the ordinary brace-init path (interpreter + every backend)
+  handles it with no new code. The NUL is appended then the list is capped to a
+  constant `N`, so an exactly-filled array (`U8 s[3] = "abc"`) drops it, matching C;
+  a string initialiser for a *pointer* (`U8 *p = "abc"`) is left as a pointer to
+  the literal.
 - **Scalar stores coerce to the lvalue type** in the interpreter (`coerce_to` in
   `eval_init`/`eval_assign`): `I64 w = 3.14;` truncates to `3` and `F64 x = 5;`
   widens to `5.0`, matching the native backend (which truncates/widens in
@@ -562,13 +581,20 @@ HolyC subset, including the `offset` keyword, brace aggregate initializers
 (`I64 a[] = {1,2,3}`, `Pt p = {1,2}`, nested and partial), designated class
 initializers (`Pt p = {.x = 1, .y = 2}`, out-of-order, partial, and nested), and
 member access on a call result (`Mk().x`, including nested paths and F64 fields).
+Brace/designated initializers are implemented identically across **all** backends
+(arm64 Darwin + freestanding, x86-64) via a shared recursive `gen_init_into` per
+backend — positional, designated/out-of-order, nested, partial, and arrays of
+classes, for both locals (slot zeroed first) and globals (BSS-zeroed).
 `#include "file"` is resolved (read + spliced, relative to the including file,
-with cycle/depth guards), and a first slice of the core library exists as
-builtins (`Abs`, `Sqrt`, `StrLen`, `StrCmp`, `StrCpy`, `MAlloc`, `Free`; see the
-`builtins.rs` note above). Function pointers work end to end: the `ret (*name)
+with cycle/depth guards), and the irreducible core-library primitives are
+builtins (`Sqrt`, `Fabs`, `MAlloc`, `Free`, the printf family, …; the reducible
+ops moved to `lib/*.hc` — see the `builtins.rs` note above). Function pointers
+work end to end: the `ret (*name)
 (types)` declarator (in var decls and as callback parameters), `&Func` to take a
-function's address, and calls through a pointer (`fp(args)`) — the native backend
-emits `ADR`+`BLR` for indirect calls (`Type::FuncPtr`). This extends to the
+function's address, and calls through a pointer (`fp(args)`) — both native backends
+lower indirect calls off the callee's `Type::FuncPtr` (arm64 `ADR`+`BLR`; x86-64
+`lea`s the function address for `&Func` and `call`s through a register, spilling
+the target across argument evaluation). This extends to the
 dispatch-table / vtable patterns: function-pointer **class fields**
 (`s.method(args)`), **arrays** of function pointers (`I64 (*ops[])(...) = {&A,
 &B}`, indexed and called), and brace-initialising them with `&Func`.

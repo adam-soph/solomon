@@ -224,17 +224,9 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
             }
         }
     }
-    // A hidden global word backs `RandU64`'s PRNG state (zero-initialised by
-    // the linker; splitmix64 runs from any seed).
-    {
-        let sym = ndefined + cg.global_order.len() as u32;
-        cg.globals.insert(
-            crate::builtins::RNG_STATE_GLOBAL.to_string(),
-            GlobalInfo { sym, ty: Type::U64 },
-        );
-        cg.global_order
-            .push(crate::builtins::RNG_STATE_GLOBAL.to_string());
-    }
+    // `MSize` makes `MAlloc` prepend an 8-byte size header; gate it so size-agnostic
+    // programs keep the lean, header-free heap byte-for-byte.
+    cg.uses_msize = crate::ast::program_calls_any(program, &["MSize"]);
     // When the program reads command-line args, reserve two hidden common
     // symbols (argc and the argv array pointer) that `_main` populates from
     // x0/x1; arg-free programs are left untouched.
@@ -436,6 +428,8 @@ struct Cg {
     /// Whether the program calls `ArgC`/`ArgV`. When set, the `_main` entry
     /// captures the incoming argc/argv (x0/x1) into the hidden globals below.
     uses_args: bool,
+    /// Whether the program calls `MSize` ⇒ `MAlloc` prepends a size header.
+    uses_msize: bool,
     /// Whether variadic args go in registers (AAPCS64) vs the stack (Apple).
     variadic_regs: bool,
     /// Whether this is a freestanding target (own `_start`, raw syscalls, no
@@ -445,6 +439,9 @@ struct Cg {
     /// (digit string), `outbuf` (the padded field), `charbuf` (`%c`), and `out_ptr`
     /// (the sink: 0 = stdout, else the current `StrPrint` write cursor).
     fs_scratch_off: Option<[u64; 4]>,
+    /// Bump allocator's `(heap_ptr, heap_end)` BSS words, shared by the freestanding
+    /// `MAlloc` and `HeapExtend`, allocated once.
+    heap_fs_off: Option<(u64, u64)>,
     /// Float-formatter BSS: `(BIGNUM offset, digit-buffer offset)`, allocated once.
     fs_float_off: Option<(u64, u64)>,
     /// `%e`/`%g` scratch BSS: `(egdig, sigbuf, bodybuf)`, allocated once.
@@ -484,9 +481,11 @@ impl Cg {
             cs_saves: Vec::new(),
             cur_va: None,
             uses_args: false,
+            uses_msize: false,
             variadic_regs: false,
             freestanding: false,
             fs_scratch_off: None,
+            heap_fs_off: None,
             fs_float_off: None,
             fs_eg_off: None,
             global_bss: HashMap::new(),
@@ -2378,43 +2377,6 @@ impl Cg {
         if !crate::builtins::is_builtin(name) {
             return self.emit_user_call(name, args, pos);
         }
-        // `Sign(x)` = `(x > 0) - (x < 0)` — a computed builtin with no libc
-        // counterpart, emitted inline.
-        if name == "Sign" {
-            self.gen_expr(&args[0])?; // value -> RES
-            self.asm.cmp_imm0(RES);
-            self.asm.cset(T2, COND_GT); // 1 if positive
-            self.asm.cset(RES, COND_LT); // 1 if negative
-            self.asm.sub(RES, T2, RES); // (>0) - (<0)
-            return Ok(());
-        }
-        // `RandU64()` — splitmix64 over a hidden global state word, emitted inline
-        // so its sequence matches the interpreter's `splitmix64`.
-        if name == "RandU64" {
-            let sym = self.globals[crate::builtins::RNG_STATE_GLOBAL].sym;
-            self.addr_global(T2, sym); // T2 = &state
-            self.asm.load_mem(RES, T2, 8, false);
-            self.asm.load_imm(SCRATCH, 0x9e3779b97f4a7c15u64 as i64);
-            self.asm.add(RES, RES, SCRATCH); // state += golden
-            self.asm.store_mem(RES, T2, 8); // write it back; RES holds z
-            // z = (z ^ (z >> 30)) * C1
-            self.asm.load_imm(SCRATCH, 30);
-            self.asm.lsrv(T2, RES, SCRATCH);
-            self.asm.eor(RES, RES, T2);
-            self.asm.load_imm(SCRATCH, 0xbf58476d1ce4e5b9u64 as i64);
-            self.asm.mul(RES, RES, SCRATCH);
-            // z = (z ^ (z >> 27)) * C2
-            self.asm.load_imm(SCRATCH, 27);
-            self.asm.lsrv(T2, RES, SCRATCH);
-            self.asm.eor(RES, RES, T2);
-            self.asm.load_imm(SCRATCH, 0x94d049bb133111ebu64 as i64);
-            self.asm.mul(RES, RES, SCRATCH);
-            // z ^= z >> 31
-            self.asm.load_imm(SCRATCH, 31);
-            self.asm.lsrv(T2, RES, SCRATCH);
-            self.asm.eor(RES, RES, T2);
-            return Ok(());
-        }
         // `ArgC()` / `ArgV(i)` — read the command line captured at the entry.
         if name == "ArgC" {
             let sym = self.globals[ARGC_GLOBAL].sym;
@@ -2476,28 +2438,66 @@ impl Cg {
             }
             return Ok(());
         }
-        // `StrToUpper`/`StrToLower` — ASCII-case a string in place via an inline
-        // loop calling libc `toupper`/`tolower`; return the string.
-        if name == "StrToUpper" || name == "StrToLower" {
-            return self.gen_str_case(&args[0], name == "StrToUpper");
+        // `HeapExtend`: the in-place bump-grow primitive. Freestanding has a real
+        // implementation; the hosted libc heap exposes no in-place API, so it returns
+        // NULL — `ReAlloc` then takes the copy path, where libc `free` reclaims.
+        if name == "HeapExtend" {
+            if self.freestanding {
+                return self.gen_builtin_fs(name, args, pos);
+            }
+            for a in args {
+                self.gen_expr(a)?; // evaluate for side effects, discard
+            }
+            self.asm.load_imm(RES, 0);
+            return Ok(());
         }
-        if name == "StrRev" {
-            return self.gen_str_rev(&args[0]);
+        // `MSize(ptr)` — the requested size from `ptr`'s header (`*(ptr-16)`), 0 for
+        // NULL. Freestanding uses an emitted routine; hosted reads the header inline.
+        // (Only reached when the program uses `MSize`, so every block has a header.)
+        if name == "MSize" {
+            if self.freestanding {
+                return self.gen_builtin_fs(name, args, pos);
+            }
+            self.gen_expr(&args[0])?; // RES = ptr
+            let l_null = self.asm.new_label();
+            let l_done = self.asm.new_label();
+            self.asm.cbz(RES, l_null);
+            self.asm.sub_imm(T2, RES, 16);
+            self.asm.load_mem(RES, T2, 8, false); // RES = *(ptr - 16)
+            self.asm.b(l_done);
+            self.asm.place(l_null);
+            self.asm.load_imm(RES, 0);
+            self.asm.place(l_done);
+            return Ok(());
         }
-        // The `Is*` ctype predicates — emitted inline as ASCII range checks (libc's
-        // `isdigit` etc. return an unspecified nonzero, which wouldn't match the
-        // interpreter's 0/1), giving 0 or 1 in RES.
-        if let Some(ranges) = crate::builtins::ctype_ranges(name) {
-            return self.gen_ctype(&args[0], ranges);
+        // Hosted `MAlloc`/`Free` with the size header (only when the program uses
+        // `MSize`): wrap libc `malloc`/`free` so a block carries its requested size in
+        // an 8-byte header before the data. Freestanding handles this in its bump
+        // routine; a header-free hosted program keeps the plain libc calls below.
+        if self.uses_msize && !self.freestanding && name == "MAlloc" {
+            self.gen_expr(&args[0])?; // RES = n
+            self.asm.add_imm(0, RES, 16); // x0 = n + 16
+            self.asm.push(RES); // keep n across the call
+            self.asm.bl_extern("_malloc"); // x0 = base
+            self.asm.pop(T2); // T2 = n
+            self.asm.store_mem(T2, 0, 8); // [base] = n (the size header)
+            self.asm.add_imm(RES, 0, 16); // RES = base + 16
+            return Ok(());
+        }
+        if self.uses_msize && !self.freestanding && name == "Free" {
+            self.gen_expr(&args[0])?; // RES = ptr
+            self.asm.sub_imm(0, RES, 16); // x0 = ptr - 16 (the real block)
+            self.asm.bl_extern("_free");
+            return Ok(());
         }
         // Freestanding: lower libc-backed builtins to emitted AArch64 routines (or
         // inline sequences) instead of libc calls.
         if self.freestanding && crate::builtins::libc_symbol(name).is_some() {
             return self.gen_builtin_fs(name, args, pos);
         }
-        // A libc-backed builtin (e.g. `StrLen` -> `_strlen`) is an external call;
-        // its argument classes come from the inferred call-site types and its
-        // return type from the builtin registry.
+        // A libc-backed builtin (`Sqrt`/`Fabs`/`MAlloc`/`Free`/`StrToF64` →
+        // `_sqrt`/`_fabs`/…) is an external call; its argument classes come from the
+        // inferred call-site types and its return type from the builtin registry.
         if let Some(sym) = crate::builtins::libc_symbol(name) {
             let params: Vec<Param> = args
                 .iter()
@@ -2518,15 +2518,6 @@ impl Cg {
                 pos,
                 false,
             )?;
-            if name == "StrCmp" || name == "MemCmp" || name == "StrNCmp" {
-                // libc compare functions may return any (signed) magnitude; reduce
-                // it to a sign in {-1, 0, 1} so the result matches the interpreter.
-                self.asm.sxtw(T2, RES);
-                self.asm.cmp_imm0(T2);
-                self.asm.cset(RES, COND_GT); // 1 if positive
-                self.asm.cset(T2, COND_LT); // 1 if negative
-                self.asm.sub(RES, RES, T2); // sign
-            }
             return Ok(());
         }
         self.emit_user_call(name, args, pos)
@@ -3015,18 +3006,34 @@ impl Cg {
             }
             self.emit_literal_fs(&lit);
             lit.clear();
-            if spec.width_star || spec.prec_star {
-                return Err(CodegenError::new(
-                    "freestanding aarch64-linux: `*` width/precision not supported yet",
+            // `*` width/precision each consume an integer arg before the value
+            // (left to right). Push them now so they survive the value evaluation;
+            // `fs_width_prec_flags` pops them back afterward.
+            let too_few = || {
+                CodegenError::new(
+                    "freestanding aarch64-linux: too few arguments for format string",
                     None,
-                ));
+                )
+            };
+            if spec.width_star {
+                if arg_i >= args.len() {
+                    return Err(too_few());
+                }
+                self.gen_expr(&args[arg_i])?;
+                self.asm.push(RES);
+                arg_i += 1;
+            }
+            if spec.prec_star {
+                if arg_i >= args.len() {
+                    return Err(too_few());
+                }
+                self.gen_expr(&args[arg_i])?;
+                self.asm.push(RES);
+                arg_i += 1;
             }
             let i = arg_i;
             if i >= args.len() {
-                return Err(CodegenError::new(
-                    "freestanding aarch64-linux: too few arguments for format string",
-                    None,
-                ));
+                return Err(too_few());
             }
             arg_i += 1;
             let mut flags: i64 = 0;
@@ -3045,13 +3052,10 @@ impl Cg {
             if spec.hash {
                 flags |= F_HASH;
             }
-            let width = spec.width.unwrap_or(0) as i64;
-            let prec = if spec.has_precision {
-                spec.precision as i64
-            } else {
-                -1
-            };
             self.fs_routine("OutWrite"); // ensure the sink is emitted
+            // Each conversion evaluates its value, then `fs_width_prec_flags` puts
+            // width → x13, precision → x14, (sign-adjusted) flags → x15 (popping any
+            // `*` args), which the conversion moves into its routine's ABI registers.
             match spec.conv {
                 'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
                     let (radix, extra) = match spec.conv {
@@ -3062,11 +3066,12 @@ impl Cg {
                         _ => (8, 0), // 'o'
                     };
                     self.gen_expr(&args[i])?;
-                    self.asm.mov_reg(0, RES);
+                    self.asm.mov_reg(0, RES); // x0 = value
                     self.asm.load_imm(1, radix);
-                    self.asm.load_imm(2, flags | extra);
-                    self.asm.load_imm(3, width);
-                    self.asm.load_imm(4, prec);
+                    self.fs_width_prec_flags(&spec, flags | extra, false);
+                    self.asm.mov_reg(2, 15); // flags
+                    self.asm.mov_reg(3, 13); // width
+                    self.asm.mov_reg(4, 14); // precision
                     let l = self.fs_routine("FmtInt");
                     self.asm.bl(l);
                 }
@@ -3077,9 +3082,10 @@ impl Cg {
                     self.asm.store_mem(RES, 5, 1);
                     self.asm.adr_global_fs(0, charbuf);
                     self.asm.load_imm(1, 1); // length 1
-                    self.asm.load_imm(2, flags);
-                    self.asm.load_imm(3, width);
-                    self.asm.load_imm(4, -1); // %c ignores precision
+                    self.fs_width_prec_flags(&spec, flags, true); // %c ignores precision
+                    self.asm.mov_reg(2, 15);
+                    self.asm.mov_reg(3, 13);
+                    self.asm.mov_reg(4, 14);
                     let l = self.fs_routine("FmtStr");
                     self.asm.bl(l);
                 }
@@ -3087,18 +3093,21 @@ impl Cg {
                     self.gen_expr(&args[i])?;
                     self.asm.mov_reg(0, RES);
                     self.asm.load_imm(1, -1); // length -1 ⇒ strlen
-                    self.asm.load_imm(2, flags);
-                    self.asm.load_imm(3, width);
-                    self.asm.load_imm(4, prec);
+                    self.fs_width_prec_flags(&spec, flags, false);
+                    self.asm.mov_reg(2, 15);
+                    self.asm.mov_reg(3, 13);
+                    self.asm.mov_reg(4, 14);
                     let l = self.fs_routine("FmtStr");
                     self.asm.bl(l);
                 }
                 'f' => {
                     self.gen_fexpr(&args[i])?; // FRES = value
                     self.asm.fmov_reg(0, FRES); // d0 = value
-                    self.asm.load_imm(0, if prec < 0 { 6 } else { prec }); // %f default precision 6
-                    self.asm.load_imm(1, flags);
-                    self.asm.load_imm(2, width);
+                    self.fs_width_prec_flags(&spec, flags, false);
+                    self.fs_default_prec(6); // %f default precision 6
+                    self.asm.mov_reg(0, 14); // x0 = precision
+                    self.asm.mov_reg(1, 15); // x1 = flags
+                    self.asm.mov_reg(2, 13); // x2 = width
                     let l = self.fs_routine("FmtFloat");
                     self.asm.bl(l);
                 }
@@ -3111,9 +3120,11 @@ impl Cg {
                     };
                     self.gen_fexpr(&args[i])?;
                     self.asm.fmov_reg(0, FRES); // d0 = value
-                    self.asm.load_imm(0, if prec < 0 { 6 } else { prec });
-                    self.asm.load_imm(1, flags);
-                    self.asm.load_imm(2, width);
+                    self.fs_width_prec_flags(&spec, flags, false);
+                    self.fs_default_prec(6);
+                    self.asm.mov_reg(0, 14); // precision
+                    self.asm.mov_reg(1, 15); // flags
+                    self.asm.mov_reg(2, 13); // width
                     self.asm.load_imm(3, conv);
                     let l = self.fs_routine("FmtFloatEg");
                     self.asm.bl(l);
@@ -3131,6 +3142,57 @@ impl Cg {
         }
         self.emit_literal_fs(&lit);
         Ok(())
+    }
+
+    /// After a conversion's value is in place, materialise width → x13,
+    /// precision → x14, and the (possibly `-`-adjusted) flags → x15 for a `Fmt*`
+    /// call, consuming any `*` args pushed before the value (precision was pushed
+    /// last, so it is popped first). A negative `*` width means left-justify with
+    /// the absolute value; a negative `*` precision means "no precision"; matching
+    /// the interpreter / hosted libc. `force_prec_none` (for `%c`) drops precision
+    /// but still pops a pushed `*` arg.
+    fn fs_width_prec_flags(&mut self, spec: &crate::fmt::Spec, flags: i64, force_prec_none: bool) {
+        // Precision → x14 (−1 ⇒ none).
+        if spec.prec_star {
+            self.asm.pop(14);
+            if force_prec_none {
+                self.asm.load_imm(14, -1);
+            } else {
+                let done = self.asm.new_label();
+                self.asm.cmp_imm0(14);
+                self.asm.b_cond(COND_GE, done); // keep a non-negative precision
+                self.asm.load_imm(14, -1);
+                self.asm.place(done);
+            }
+        } else if spec.has_precision && !force_prec_none {
+            self.asm.load_imm(14, spec.precision as i64);
+        } else {
+            self.asm.load_imm(14, -1);
+        }
+        // Flags → x15, width → x13.
+        self.asm.load_imm(15, flags);
+        if spec.width_star {
+            self.asm.pop(13);
+            let done = self.asm.new_label();
+            self.asm.cmp_imm0(13);
+            self.asm.b_cond(COND_GE, done); // non-negative width: nothing to adjust
+            self.asm.neg(13, 13); // |width|
+            self.asm.load_imm(SCRATCH, F_MINUS);
+            self.asm.orr(15, 15, SCRATCH); // negative width ⇒ left-justify
+            self.asm.place(done);
+        } else {
+            self.asm.load_imm(13, spec.width.unwrap_or(0) as i64);
+        }
+    }
+
+    /// `x14 = (x14 < 0 ? default : x14)` — apply a default precision (6 for floats)
+    /// at runtime, since a `*` precision isn't known at compile time.
+    fn fs_default_prec(&mut self, default: i64) {
+        let done = self.asm.new_label();
+        self.asm.cmp_imm0(14);
+        self.asm.b_cond(COND_GE, done);
+        self.asm.load_imm(14, default);
+        self.asm.place(done);
     }
 
     /// Write a literal run through the output sink (so it honours a `StrPrint`
@@ -3546,42 +3608,14 @@ impl Cg {
     /// to an emitted runtime routine (same ABI as the libc function it replaces).
     fn gen_builtin_fs(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         match name {
-            // `Abs`: negate when negative.
-            "Abs" => {
-                self.gen_expr(&args[0])?;
-                let skip = self.asm.new_label();
-                self.asm.cmp_imm0(RES);
-                self.asm.b_cond(COND_GE, skip);
-                self.asm.neg(RES, RES);
-                self.asm.place(skip);
-                return Ok(());
-            }
-            // ASCII case conversion: shift a letter by 32.
-            "ToUpper" | "ToLower" => {
-                self.gen_expr(&args[0])?;
-                let upper = name == "ToUpper";
-                let lo = if upper { b'a' } else { b'A' } as u32;
-                let skip = self.asm.new_label();
-                self.asm.sub_imm(T2, RES, lo); // T2 = c - 'a'/'A'
-                self.asm.cmp_imm(T2, 25);
-                self.asm.b_cond(COND_HI, skip); // not a letter in range
-                if upper {
-                    self.asm.sub_imm(RES, RES, 32);
-                } else {
-                    self.asm.add_imm(RES, RES, 32);
-                }
-                self.asm.place(skip);
-                return Ok(());
-            }
-            // Algebraic F64 math — single AArch64 FP instructions.
-            "Sqrt" | "Fabs" | "Floor" | "Ceil" | "Round" => {
+            // The two irreducible algebraic F64 primitives — single AArch64 FP
+            // instructions. (Rounding/transcendentals are reducible HolyC now.)
+            "Sqrt" | "Fabs" => {
                 self.gen_fexpr(&args[0])?; // FRES = value
-                match name {
-                    "Sqrt" => self.asm.fsqrt(FRES, FRES),
-                    "Fabs" => self.asm.fabs(FRES, FRES),
-                    "Floor" => self.asm.frintm(FRES, FRES),
-                    "Ceil" => self.asm.frintp(FRES, FRES),
-                    _ => self.asm.frinta(FRES, FRES), // Round (ties away)
+                if name == "Sqrt" {
+                    self.asm.fsqrt(FRES, FRES);
+                } else {
+                    self.asm.fabs(FRES, FRES);
                 }
                 return Ok(());
             }
@@ -3591,14 +3625,8 @@ impl Cg {
         let sname: &'static str = match name {
             "MAlloc" => "MAlloc",
             "Free" => "Free",
-            "StrLen" => "StrLen",
-            "StrCpy" => "StrCpy",
-            "StrCmp" => "StrCmp",
-            "StrCat" => "StrCat",
-            "StrFind" => "StrFind",
-            "MemCpy" => "MemCpy",
-            "MemSet" => "MemSet",
-            "MemCmp" => "MemCmp",
+            "HeapExtend" => "HeapExtend",
+            "MSize" => "MSize",
             other => {
                 return Err(CodegenError::at(
                     pos,
@@ -3643,15 +3671,13 @@ impl Cg {
             "BnShl",
             "BnShr",
             "MAlloc",
+            "HeapExtend",
+            "MSize",
             "Free",
+            // `StrLen` is the lone string routine still emitted — the freestanding
+            // `CatPrint` append uses it internally. The rest of the string/memory
+            // ops are pure HolyC in `lib/string.hc` now.
             "StrLen",
-            "StrCpy",
-            "StrCmp",
-            "StrCat",
-            "StrFind",
-            "MemCpy",
-            "MemSet",
-            "MemCmp",
         ];
         for &name in ORDER {
             let Some(&l) = self.fs_routines.get(name) else {
@@ -3669,15 +3695,10 @@ impl Cg {
                 "BnShl" => self.emit_fs_bn_shl(),
                 "BnShr" => self.emit_fs_bn_shr(),
                 "MAlloc" => self.emit_fs_malloc(),
+                "HeapExtend" => self.emit_fs_heapextend(),
+                "MSize" => self.emit_fs_msize(),
                 "Free" => self.asm.ret(), // a no-op bump allocator never frees
                 "StrLen" => self.emit_fs_strlen(),
-                "StrCpy" => self.emit_fs_strcpy(),
-                "StrCmp" => self.emit_fs_strcmp(),
-                "StrCat" => self.emit_fs_strcat(),
-                "StrFind" => self.emit_fs_strfind(),
-                "MemCpy" => self.emit_fs_memcpy(),
-                "MemSet" => self.emit_fs_memset(),
-                "MemCmp" => self.emit_fs_memcmp(),
                 _ => {}
             }
         }
@@ -3686,15 +3707,31 @@ impl Cg {
     /// `MAlloc(x0=n) -> x0`: a bump allocator over `mmap`'d chunks (≥1 MiB,
     /// page-aligned), 16-byte-aligned allocations, state in two BSS words. `Free`
     /// is a no-op, so chunks are never reused.
+    /// The bump allocator's `(heap_ptr, heap_end)` BSS words, allocated once and
+    /// shared by `MAlloc` and `HeapExtend`.
+    fn heap_globals_fs(&mut self) -> (u64, u64) {
+        if let Some(g) = self.heap_fs_off {
+            return g;
+        }
+        let g = (self.alloc_bss_fs(8, 8), self.alloc_bss_fs(8, 8));
+        self.heap_fs_off = Some(g);
+        g
+    }
+
     fn emit_fs_malloc(&mut self) {
-        let hp = self.alloc_bss_fs(8, 8); // heap bump pointer
-        let he = self.alloc_bss_fs(8, 8); // heap end
+        let (hp, he) = self.heap_globals_fs(); // heap bump pointer, heap end
         let fits = self.asm.new_label();
         let sized = self.asm.new_label();
+        if self.uses_msize {
+            self.asm.push(0); // save the original n for the size header
+        }
         // x9 = (n + 15) & ~15
         self.asm.add_imm(9, 0, 15);
         self.asm.load_imm(10, -16);
         self.asm.and(9, 9, 10);
+        if self.uses_msize {
+            self.asm.add_imm(9, 9, 16); // reserve a 16-byte size header
+        }
         // x11 = *hp, x12 = *he
         self.asm.adr_global_fs(13, hp);
         self.asm.load_mem(11, 13, 8, false);
@@ -3730,7 +3767,65 @@ impl Cg {
         self.asm.add(15, 11, 9);
         self.asm.adr_global_fs(13, hp);
         self.asm.store_mem(15, 13, 8);
-        self.asm.mov_reg(0, 11);
+        if self.uses_msize {
+            self.asm.pop(10); // x10 = original n
+            self.asm.store_mem(10, 11, 8); // [base] = n (the size header)
+            self.asm.add_imm(0, 11, 16); // return base + 16 (past the header)
+        } else {
+            self.asm.mov_reg(0, 11);
+        }
+        self.asm.ret();
+    }
+
+    /// `HeapExtend(x0=ptr, x1=old, x2=new) -> x0`: extend `ptr` in place to `new`
+    /// bytes when it is the last bump-allocated block and still fits the chunk
+    /// (advance `*heap_ptr`, return `ptr`); else NULL. No copy/alloc — the move path
+    /// is the HolyC `ReAlloc`.
+    fn emit_fs_heapextend(&mut self) {
+        let (hp, he) = self.heap_globals_fs();
+        let null = self.asm.new_label();
+        self.asm.cbz(0, null); // NULL ptr never extends
+        // x9 = align16(old), x11 = align16(new)
+        self.asm.add_imm(9, 1, 15);
+        self.asm.load_imm(10, -16);
+        self.asm.and(9, 9, 10);
+        self.asm.add_imm(11, 2, 15);
+        self.asm.and(11, 11, 10);
+        // last block? ptr + align16(old) == *heap_ptr
+        self.asm.add(12, 0, 9); // x12 = block end
+        self.asm.adr_global_fs(13, hp);
+        self.asm.load_mem(14, 13, 8, false); // x14 = *heap_ptr
+        self.asm.cmp_reg(12, 14);
+        self.asm.b_cond(COND_NE, null);
+        // fits? ptr + align16(new) <= *heap_end
+        self.asm.add(12, 0, 11); // x12 = ptr + anew
+        self.asm.adr_global_fs(14, he);
+        self.asm.load_mem(15, 14, 8, false); // x15 = *heap_end
+        self.asm.cmp_reg(12, 15);
+        self.asm.b_cond(COND_HI, null); // ptr+anew > heap_end ⇒ doesn't fit
+        // extend in place: *heap_ptr = ptr + anew; return ptr (x0 unchanged)
+        self.asm.store_mem(12, 13, 8); // x13 still = &heap_ptr
+        if self.uses_msize {
+            self.asm.sub_imm(9, 0, 16); // x9 = ptr - 16 (header)
+            self.asm.store_mem(2, 9, 8); // keep MSize current: [ptr-16] = new size
+        }
+        self.asm.ret();
+        self.asm.place(null);
+        self.asm.load_imm(0, 0); // NULL
+        self.asm.ret();
+    }
+
+    /// `MSize(x0=ptr) -> x0`: the requested byte size from `ptr`'s header
+    /// (`*(ptr-16)`), or 0 for NULL. Emitted only when the program uses `MSize`, so
+    /// every block carries a header.
+    fn emit_fs_msize(&mut self) {
+        let null = self.asm.new_label();
+        self.asm.cbz(0, null);
+        self.asm.sub_imm(9, 0, 16);
+        self.asm.load_mem(0, 9, 8, false); // x0 = *(ptr - 16)
+        self.asm.ret();
+        self.asm.place(null);
+        self.asm.load_imm(0, 0); // MSize(NULL) == 0
         self.asm.ret();
     }
 
@@ -3746,103 +3841,6 @@ impl Cg {
         self.asm.b(l);
         self.asm.place(d);
         self.asm.sub(0, 9, 0); // cursor - ptr
-        self.asm.ret();
-    }
-
-    /// `StrCpy(x0=dst, x1=src) -> x0` — copy through the NUL; return dst.
-    fn emit_fs_strcpy(&mut self) {
-        let l = self.asm.new_label();
-        let d = self.asm.new_label();
-        self.asm.mov_reg(9, 0); // dst cursor (x0 kept for the return)
-        self.asm.place(l);
-        self.asm.load_mem(10, 1, 1, false);
-        self.asm.store_mem(10, 9, 1);
-        self.asm.cbz(10, d);
-        self.asm.add_imm(9, 9, 1);
-        self.asm.add_imm(1, 1, 1);
-        self.asm.b(l);
-        self.asm.place(d);
-        self.asm.ret();
-    }
-
-    /// `StrCmp(x0=a, x1=b) -> x0` — a sign in {-1, 0, 1} (matches the interpreter).
-    fn emit_fs_strcmp(&mut self) {
-        let l = self.asm.new_label();
-        let diff = self.asm.new_label();
-        let eq = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.place(l);
-        self.asm.load_mem(9, 0, 1, false);
-        self.asm.load_mem(10, 1, 1, false);
-        self.asm.cmp_reg(9, 10);
-        self.asm.b_cond(COND_NE, diff);
-        self.asm.cbz(9, eq); // both NUL -> equal
-        self.asm.add_imm(0, 0, 1);
-        self.asm.add_imm(1, 1, 1);
-        self.asm.b(l);
-        self.asm.place(diff);
-        self.asm.load_imm(0, 1);
-        self.asm.cmp_reg(9, 10);
-        self.asm.b_cond(COND_HI, done); // a > b (unsigned byte)
-        self.asm.load_imm(0, -1);
-        self.asm.place(done);
-        self.asm.ret();
-        self.asm.place(eq);
-        self.asm.load_imm(0, 0);
-        self.asm.ret();
-    }
-
-    /// `StrCat(x0=dst, x1=src) -> x0` — append src at dst's NUL; return dst.
-    fn emit_fs_strcat(&mut self) {
-        let fe = self.asm.new_label();
-        let cp = self.asm.new_label();
-        let d = self.asm.new_label();
-        self.asm.mov_reg(9, 0); // dst cursor
-        self.asm.place(fe);
-        self.asm.load_mem(10, 9, 1, false);
-        self.asm.cbz(10, cp);
-        self.asm.add_imm(9, 9, 1);
-        self.asm.b(fe);
-        self.asm.place(cp);
-        self.asm.load_mem(10, 1, 1, false);
-        self.asm.store_mem(10, 9, 1);
-        self.asm.cbz(10, d);
-        self.asm.add_imm(9, 9, 1);
-        self.asm.add_imm(1, 1, 1);
-        self.asm.b(cp);
-        self.asm.place(d);
-        self.asm.ret();
-    }
-
-    /// `MemCpy(x0=dst, x1=src, x2=n) -> x0` — copy n bytes; return dst.
-    fn emit_fs_memcpy(&mut self) {
-        let l = self.asm.new_label();
-        let d = self.asm.new_label();
-        self.asm.mov_reg(9, 0); // dst cursor
-        self.asm.place(l);
-        self.asm.cbz(2, d);
-        self.asm.load_mem(10, 1, 1, false);
-        self.asm.store_mem(10, 9, 1);
-        self.asm.add_imm(9, 9, 1);
-        self.asm.add_imm(1, 1, 1);
-        self.asm.sub_imm(2, 2, 1);
-        self.asm.b(l);
-        self.asm.place(d);
-        self.asm.ret();
-    }
-
-    /// `MemSet(x0=dst, x1=c, x2=n) -> x0` — set n bytes to c; return dst.
-    fn emit_fs_memset(&mut self) {
-        let l = self.asm.new_label();
-        let d = self.asm.new_label();
-        self.asm.mov_reg(9, 0); // dst cursor
-        self.asm.place(l);
-        self.asm.cbz(2, d);
-        self.asm.store_mem(1, 9, 1); // low byte of c
-        self.asm.add_imm(9, 9, 1);
-        self.asm.sub_imm(2, 2, 1);
-        self.asm.b(l);
-        self.asm.place(d);
         self.asm.ret();
     }
 
@@ -4035,44 +4033,6 @@ impl Cg {
         self.asm.cmp_imm(12, NLIMBS as u32);
         self.asm.b_cond(COND_LO, iloop);
         self.asm.place(rdone);
-        self.asm.ret();
-    }
-
-    /// `StrFind(x0=haystack, x1=needle) -> x0` — pointer to the first occurrence of
-    /// `needle` in `haystack`, or NULL (libc `strstr`). An empty needle matches at
-    /// the start.
-    fn emit_fs_strfind(&mut self) {
-        let outer = self.asm.new_label();
-        let inner = self.asm.new_label();
-        let next = self.asm.new_label();
-        let found = self.asm.new_label();
-        let notfound = self.asm.new_label();
-        let ret_h = self.asm.new_label();
-        // Empty needle -> return haystack.
-        self.asm.load_mem(9, 1, 1, false);
-        self.asm.cbz(9, ret_h);
-        self.asm.place(outer);
-        self.asm.load_mem(9, 0, 1, false);
-        self.asm.cbz(9, notfound); // end of haystack
-        self.asm.mov_reg(10, 0); // h cursor
-        self.asm.mov_reg(11, 1); // n cursor
-        self.asm.place(inner);
-        self.asm.load_mem(12, 11, 1, false); // *n
-        self.asm.cbz(12, found); // end of needle -> match
-        self.asm.load_mem(13, 10, 1, false); // *h
-        self.asm.cmp_reg(12, 13);
-        self.asm.b_cond(COND_NE, next);
-        self.asm.add_imm(10, 10, 1);
-        self.asm.add_imm(11, 11, 1);
-        self.asm.b(inner);
-        self.asm.place(next);
-        self.asm.add_imm(0, 0, 1);
-        self.asm.b(outer);
-        self.asm.place(found);
-        self.asm.ret(); // x0 = match start
-        self.asm.place(notfound);
-        self.asm.load_imm(0, 0);
-        self.asm.place(ret_h);
         self.asm.ret();
     }
 
@@ -4994,34 +4954,6 @@ impl Cg {
         self.asm.place(done);
     }
 
-    /// `MemCmp(x0=a, x1=b, x2=n) -> x0` — a sign in {-1, 0, 1}.
-    fn emit_fs_memcmp(&mut self) {
-        let l = self.asm.new_label();
-        let diff = self.asm.new_label();
-        let eq = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.place(l);
-        self.asm.cbz(2, eq);
-        self.asm.load_mem(9, 0, 1, false);
-        self.asm.load_mem(10, 1, 1, false);
-        self.asm.cmp_reg(9, 10);
-        self.asm.b_cond(COND_NE, diff);
-        self.asm.add_imm(0, 0, 1);
-        self.asm.add_imm(1, 1, 1);
-        self.asm.sub_imm(2, 2, 1);
-        self.asm.b(l);
-        self.asm.place(diff);
-        self.asm.load_imm(0, 1);
-        self.asm.cmp_reg(9, 10);
-        self.asm.b_cond(COND_HI, done);
-        self.asm.load_imm(0, -1);
-        self.asm.place(done);
-        self.asm.ret();
-        self.asm.place(eq);
-        self.asm.load_imm(0, 0);
-        self.asm.ret();
-    }
-
     /// `StrPrint(dst, fmt, ...)` / `CatPrint(dst, fmt, ...)` -> `sprintf` into
     /// `dst` (or `dst + strlen(dst)` when `append`), returning `dst`.
     fn gen_formatted_write(
@@ -5180,91 +5112,6 @@ impl Cg {
         self.asm.bl_extern("_sprintf");
         self.asm.add_sp_imm(16);
         self.load_local(RES, buf_off, &Type::I64); // return buf
-        Ok(())
-    }
-
-    /// An `Is*` ctype predicate: leave 1 in RES if the argument byte falls in any
-    /// of `ranges` (inclusive), else 0. Each range is the unsigned check
-    /// `(c - lo) <= (hi - lo)`; the first hit short-circuits.
-    fn gen_ctype(&mut self, arg: &Expr, ranges: &[(u8, u8)]) -> Result<(), CodegenError> {
-        self.gen_expr(arg)?; // RES = c
-        let done = self.asm.new_label();
-        for &(lo, hi) in ranges {
-            let skip = self.asm.new_label();
-            self.asm.sub_imm(T2, RES, lo as u32); // T2 = c - lo
-            self.asm.cmp_imm(T2, (hi - lo) as u32);
-            self.asm.b_cond(COND_HI, skip); // (c - lo) > (hi - lo) unsigned -> miss
-            self.asm.load_imm(RES, 1);
-            self.asm.b(done);
-            self.asm.place(skip);
-        }
-        self.asm.load_imm(RES, 0);
-        self.asm.place(done);
-        Ok(())
-    }
-
-    /// `StrToUpper(str)` / `StrToLower(str)` — walk `str` to its NUL, replacing
-    /// each byte with `toupper`/`tolower` of it; return `str`. The cursor lives in
-    /// a frame slot since the per-char libc call clobbers the temp registers.
-    fn gen_str_case(&mut self, arg: &Expr, upper: bool) -> Result<(), CodegenError> {
-        self.gen_expr(arg)?; // RES = str
-        let str_off = self.alloc(8, 8);
-        self.asm.sub_imm(T2, FP, str_off);
-        self.gen_store(RES, T2, &Type::I64); // save str (the result)
-        let cur_off = self.alloc(8, 8);
-        self.asm.sub_imm(T2, FP, cur_off);
-        self.gen_store(RES, T2, &Type::I64); // cursor = str
-
-        let l_loop = self.asm.new_label();
-        let l_end = self.asm.new_label();
-        self.asm.place(l_loop);
-        self.load_local(T2, cur_off, &Type::I64); // T2 = cursor
-        self.asm.load_mem(RES, T2, 1, false); // RES = *cursor
-        self.asm.cbz(RES, l_end); // NUL -> done
-        self.asm.mov_reg(0, RES); // x0 = char
-        self.asm
-            .bl_extern(if upper { "_toupper" } else { "_tolower" });
-        self.load_local(T2, cur_off, &Type::I64); // reload cursor (call clobbered it)
-        self.asm.store_mem(0, T2, 1); // *cursor = result byte
-        self.asm.add_imm(T2, T2, 1);
-        self.asm.sub_imm(SCRATCH, FP, cur_off);
-        self.gen_store(T2, SCRATCH, &Type::I64); // cursor++
-        self.asm.b(l_loop);
-        self.asm.place(l_end);
-        self.load_local(RES, str_off, &Type::I64); // return str
-        Ok(())
-    }
-
-    /// `StrRev(str)` — reverse `str` in place with two pointers converging from
-    /// the ends, swapping bytes until they meet; return `str`. No call inside the
-    /// loop, so the cursors stay in registers.
-    fn gen_str_rev(&mut self, arg: &Expr) -> Result<(), CodegenError> {
-        self.gen_expr(arg)?; // RES = str
-        let str_off = self.alloc(8, 8);
-        self.asm.sub_imm(T2, FP, str_off);
-        self.gen_store(RES, T2, &Type::I64); // save str (base + result)
-
-        // q = str + strlen(str) - 1 ; p stays in a register from the base.
-        self.load_local(0, str_off, &Type::I64);
-        self.asm.bl_extern("_strlen"); // x0 = len
-        self.load_local(RES, str_off, &Type::I64); // p = base
-        self.asm.add(T2, RES, 0); // T2 = base + len
-        self.asm.sub_imm(T2, T2, 1); // q = base + len - 1
-
-        let l_loop = self.asm.new_label();
-        let l_end = self.asm.new_label();
-        self.asm.place(l_loop);
-        self.asm.cmp_reg(RES, T2); // p - q
-        self.asm.b_cond(COND_HS, l_end); // p >= q (unsigned) -> done
-        self.asm.load_mem(SCRATCH, RES, 1, false); // SCRATCH = *p
-        self.asm.load_mem(0, T2, 1, false); // x0 = *q
-        self.asm.store_mem(SCRATCH, T2, 1); // *q = old *p
-        self.asm.store_mem(0, RES, 1); // *p = old *q
-        self.asm.add_imm(RES, RES, 1); // p++
-        self.asm.sub_imm(T2, T2, 1); // q--
-        self.asm.b(l_loop);
-        self.asm.place(l_end);
-        self.load_local(RES, str_off, &Type::I64); // return str
         Ok(())
     }
 

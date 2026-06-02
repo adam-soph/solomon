@@ -143,6 +143,100 @@ fn extreme_field_width_and_precision_do_not_overflow() {
 }
 
 #[test]
+fn realloc_extends_the_last_block_in_place() {
+    // The payoff of the `HeapExtend` builtin: growing the heap's *last* allocation
+    // extends it in place on the freestanding bump allocator (the pointer never
+    // moves, so no copy and no leak) — unlike the libc/interp heaps. Also checks the
+    // contents survive the grows.
+    let src = r#"
+        #include <string.hc>
+        U0 Main() {
+          U8 *q = MAlloc(16);
+          StrCpy(q, "keep");
+          I64 moves = 0, i;
+          for (i = 1; i <= 6; i++) {
+            U8 *prev = q;
+            q = ReAlloc(q, 16 * i, 16 * (i + 1));
+            if (q != prev) moves++;
+          }
+          "%s moves=%d\n", q, moves;
+        }
+        Main;
+    "#;
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "realloc".to_string();
+    Arm64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!(
+            "skipping aarch64 ReAlloc in-place conformance: needs a linux/aarch64 host or docker"
+        );
+        return;
+    };
+    // In place every time → the bump pointer is never abandoned.
+    assert_eq!(
+        got[0], "keep moves=0\n",
+        "freestanding ReAlloc did not extend in place"
+    );
+}
+
+#[test]
+fn dynamic_width_and_precision_match_the_interpreter() {
+    // `*` width/precision (taken from arguments) in the freestanding formatter —
+    // including a negative `*` width (left-justify) and a negative `*` precision
+    // (no precision) — must match the interpreter byte-for-byte, for ints, strings,
+    // and floats.
+    let cases: &[&str] = &[
+        r#"U0 Main(){ "[%*d][%-*d][%*d]\n", 5, 42, 5, 42, -5, 42; } Main;"#,
+        r#"U0 Main(){ "[%.*d][%*.*d]\n", 3, 7, 8, 4, 42; } Main;"#,
+        r#"U0 Main(){ "[%.*f][%*.*f]\n", 2, 3.14159, 10, 3, 2.5; } Main;"#,
+        r#"U0 Main(){ "[%.*e][%*g]\n", 3, 1234.5, 12, 1.5; } Main;"#,
+        r#"U0 Main(){ "[%.*s][%*s][%-*s]\n", 3, "hello", 8, "hi", 8, "hi"; } Main;"#,
+        r#"U0 Main(){ "[%.*d][%*c]\n", -1, 7, 4, 'x'; } Main;"#,
+    ];
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for (idx, src) in cases.iter().enumerate() {
+        let program = parse(src).unwrap_or_else(|e| panic!("parse failed for `{src}`: {e}"));
+        assert!(
+            check_program(&program).is_empty(),
+            "sema errors for `{src}`"
+        );
+        let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+        let name = format!("star{idx}");
+        Arm64Linux::new(dir.join(&name))
+            .run(&program)
+            .unwrap_or_else(|e| panic!("freestanding build failed for `{src}`: {e}"));
+        names.push(name);
+        expected.push(want);
+    }
+    let got = run_stdouts(&dir, &names);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!(
+            "skipping aarch64 dynamic width/precision conformance: needs a linux/aarch64 host or docker"
+        );
+        return;
+    };
+    for ((src, want), out) in cases.iter().zip(&expected).zip(&got) {
+        assert_eq!(
+            out, want,
+            "freestanding native != interp stdout for `{src}`"
+        );
+    }
+}
+
+#[test]
 fn stdlib_math_matches_the_interpreter() {
     // The HolyC standard library (`#include <math.hc>`) compiles freestanding and
     // prints exactly what the interpreter does — exercising angle includes through

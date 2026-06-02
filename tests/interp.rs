@@ -5,19 +5,23 @@ use solomon::parser::{parse, parse_with};
 use solomon::sema::check_program;
 
 /// Parse, semantically check, then interpret `src`, returning captured output. The
-/// moved string builtins (`StrLen`, `Abs`, …) live in `lib/string.hc` now, so the
-/// stdlib include is prepended when absent (resolved against the repo `lib/`); the
-/// extra unused defs don't change a program's output.
+/// reducible builtins live in the HolyC stdlib now (`lib/string.hc` for the string/
+/// memory/ctype ops, `lib/math.hc` for math + `RandU64`), so the includes are
+/// prepended when absent (resolved against the repo `lib/`); the extra unused defs
+/// don't change a program's output.
 fn run(src: &str) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let owned;
-    let s = if src.contains("#include <string.hc>") {
-        src
-    } else {
-        owned = format!("#include <string.hc>\n{src}");
-        &owned
-    };
-    let program = parse_with(s, std::path::Path::new("."), &[lib])
+    let mut s = String::new();
+    if !src.contains("#include <string.hc>") {
+        s.push_str("#include <string.hc>\n");
+    }
+    // `math.hc` only when the source uses the moved `RandU64` PRNG — see the note
+    // on `common::with_stdlib_prelude`.
+    if src.contains("RandU64") && !src.contains("#include <math.hc>") {
+        s.push_str("#include <math.hc>\n");
+    }
+    s.push_str(src);
+    let program = parse_with(&s, std::path::Path::new("."), &[lib])
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");

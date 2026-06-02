@@ -9,8 +9,8 @@
 //! standard library when it lands.
 //!
 //! Every intrinsic here has **backend-independent, solomon-defined semantics**
-//! (e.g. `StrCmp` normalized to a sign, `RandU64` a fixed splitmix64, formatting
-//! pinned by [`crate::fmt`]). That is deliberately why the **transcendental** math
+//! (e.g. `Sqrt` correctly-rounded, formatting pinned by [`crate::fmt`]). That is
+//! deliberately why the **transcendental** math
 //! functions (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…) are *not* here: their only meaning
 //! would be "whatever the host libm computes," which isn't reproducible across
 //! platforms (IEEE 754 doesn't require correctly-rounded transcendentals) and
@@ -46,7 +46,7 @@ pub fn all() -> Vec<BuiltinSig> {
         params,
         varargs,
     };
-    let mut sigs = vec![
+    let sigs = vec![
         // `Print(fmt, ...)` — printf-style output.
         sig("Print", Type::U0, vec![u8p()], true),
         // The printf-family string builders. Variadic — they consume `...`, which
@@ -62,27 +62,32 @@ pub fn all() -> Vec<BuiltinSig> {
         sig("UnixNS", i64(), vec![], false), // wall-clock ns (CLOCK_REALTIME)
         sig("NanoNS", i64(), vec![], false), // monotonic ns (CLOCK_MONOTONIC)
         sig("Sleep", Type::U0, vec![i64()], false),
-        // Memory ops (libc memcpy/memmove/memset/memcmp/memchr/memmem).
-        sig("MemCpy", u8p(), vec![u8p(), u8p(), i64()], false),
-        sig("MemMove", u8p(), vec![u8p(), u8p(), i64()], false),
-        sig("MemSet", u8p(), vec![u8p(), i64(), i64()], false),
-        sig("MemCmp", i64(), vec![u8p(), u8p(), i64()], false),
-        sig("MemFind", u8p(), vec![u8p(), i64(), i64()], false),
-        sig("MemSearch", u8p(), vec![u8p(), i64(), u8p(), i64()], false),
-        // Heap (mmap bump allocator freestanding, libc malloc/free hosted).
+        // Heap (mmap bump allocator freestanding, libc malloc/free hosted). The
+        // only irreducible memory primitives — the byte-loop ops (`MemCpy`/`MemMove`/
+        // `MemSet`/`MemCmp`/`MemFind`/`MemSearch`) are pure HolyC in `lib/string.hc`.
         sig("MAlloc", u8p(), vec![i64()], false),
         sig("Free", Type::U0, vec![u8p()], false),
-        // ASCII case conversion.
-        sig("ToUpper", i64(), vec![i64()], false),
-        sig("ToLower", i64(), vec![i64()], false),
+        // `HeapExtend(ptr, old, new)` grows the block at `ptr` (originally `old`
+        // bytes) to `new` bytes *in place*, returning `ptr` — but only when that's
+        // free (a bump allocator extending its last block); otherwise NULL. The one
+        // irreducible bit of a `realloc`: the move-and-copy fallback is pure HolyC
+        // (`ReAlloc` in `lib/string.hc`). NULL on the libc/interp heaps (no in-place
+        // API), so they always take the copy path — where `Free` actually reclaims.
+        sig("HeapExtend", u8p(), vec![u8p(), i64(), i64()], false),
+        // `MSize(ptr)` returns the byte size that was requested for the block at
+        // `ptr` (a TempleOS heap primitive). It needs the allocator to *track* sizes,
+        // so when a program uses it `MAlloc` prepends an 8-byte size header (gated on
+        // `MSize` usage, so size-agnostic programs keep the lean header-free heap);
+        // the interpreter tracks sizes in a side table.
+        sig("MSize", i64(), vec![u8p()], false),
         // The two irreducible algebraic float primitives: `Sqrt` (a correctly-
         // rounded hardware instruction) and `Fabs` (a sign-bit clear the interpreter
         // models specially — it can't byte-pun a local). The reducible rounding ops
-        // (`Floor`/`Ceil`/`Round`, exact via an I64 cast) live in `lib/math.hc`.
+        // (`Floor`/`Ceil`/`Round`, exact via an I64 cast) live in `lib/math.hc`, as
+        // does the splitmix64 `RandU64`; `ToUpper`/`ToLower` and the `Is*` ctype
+        // predicates (ASCII range checks) live in `lib/string.hc`.
         sig("Sqrt", f64(), vec![f64()], false),
         sig("Fabs", f64(), vec![f64()], false),
-        // Deterministic splitmix64 PRNG (fixed seed), mirrored by the backends.
-        sig("RandU64", Type::U64, vec![], false),
         // The captured command line.
         sig("ArgC", i64(), vec![], false),
         sig("ArgV", u8p(), vec![i64()], false),
@@ -94,64 +99,7 @@ pub fn all() -> Vec<BuiltinSig> {
         sig("VarArgF64", f64(), vec![i64()], false),
         sig("VarArg", u8p(), vec![i64()], false),
     ];
-    // The `Is*` ctype predicates — each `(I64) -> I64` returning 0/1.
-    sigs.extend(
-        CTYPE_NAMES
-            .iter()
-            .map(|&name| sig(name, i64(), vec![i64()], false)),
-    );
     sigs
-}
-
-/// The ASCII `Is*` character-classification builtins. Each class is a union of
-/// inclusive byte ranges (see [`ctype_ranges`]) — the **single source of truth**
-/// for classification: the interpreter tests membership and both native backends
-/// emit the same range checks, so the result is identical everywhere. Defined for
-/// the C/POSIX "C" locale (pure ASCII); a byte outside every range — including
-/// high bytes and negative/EOF-like values — classifies as false (`0`).
-pub const CTYPE_NAMES: &[&str] = &[
-    "IsDigit", "IsAlpha", "IsAlNum", "IsSpace", "IsUpper", "IsLower", "IsXDigit", "IsPunct",
-    "IsCntrl", "IsPrint", "IsGraph", "IsBlank",
-];
-
-/// The inclusive byte ranges defining each `Is*` predicate, or `None` for a name
-/// that isn't a ctype predicate.
-pub fn ctype_ranges(name: &str) -> Option<&'static [(u8, u8)]> {
-    Some(match name {
-        "IsDigit" => &[(b'0', b'9')],
-        "IsUpper" => &[(b'A', b'Z')],
-        "IsLower" => &[(b'a', b'z')],
-        "IsAlpha" => &[(b'A', b'Z'), (b'a', b'z')],
-        "IsAlNum" => &[(b'0', b'9'), (b'A', b'Z'), (b'a', b'z')],
-        "IsXDigit" => &[(b'0', b'9'), (b'A', b'F'), (b'a', b'f')],
-        "IsSpace" => &[(0x09, 0x0d), (b' ', b' ')], // \t \n \v \f \r and space
-        "IsBlank" => &[(b'\t', b'\t'), (b' ', b' ')],
-        "IsCntrl" => &[(0x00, 0x1f), (0x7f, 0x7f)],
-        "IsPrint" => &[(b' ', 0x7e)], // space..'~'
-        "IsGraph" => &[(0x21, 0x7e)], // '!'..'~'
-        "IsPunct" => &[(0x21, 0x2f), (0x3a, 0x40), (0x5b, 0x60), (0x7b, 0x7e)], // graphic, not alnum
-        _ => return None,
-    })
-}
-
-/// Evaluate an `Is*` predicate on `c` — the interpreter path. `false` for a
-/// non-predicate name or a byte outside `[0, 255]`.
-pub fn ctype_test(name: &str, c: i64) -> bool {
-    matches!(ctype_ranges(name), Some(ranges)
-        if (0..=0xff).contains(&c)
-            && ranges.iter().any(|&(lo, hi)| (lo as i64..=hi as i64).contains(&c)))
-}
-
-/// The hidden global holding the `RandU64` PRNG state in the native backend.
-pub const RNG_STATE_GLOBAL: &str = "__solomon_holyc_rng_state";
-
-/// splitmix64 step: advance `state` and return the next value.
-pub fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e3779b97f4a7c15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
 }
 
 /// The C library symbol a builtin lowers to in the native backend, if it is
@@ -161,21 +109,12 @@ pub fn libc_symbol(name: &str) -> Option<&'static str> {
         "Sqrt" => "_sqrt",
         "MAlloc" => "_malloc",
         "Free" => "_free",
-        "MemCpy" => "_memcpy",
-        "MemSet" => "_memset",
-        "ToUpper" => "_toupper",
-        "ToLower" => "_tolower",
-        "MemCmp" => "_memcmp",
         "Fabs" => "_fabs",
         "StrToF64" => "_atof",
-        "MemMove" => "_memmove",
-        "MemFind" => "_memchr",
-        "MemSearch" => "_memmem",
-        // `Sign`/`RandU64`/`ArgC`/`ArgV` and the `Is*` ctype predicates (computed
-        // inline — libc's `isdigit` etc. return an unspecified nonzero, which would
-        // diverge from the interpreter's 0/1), `StrToUpper`/`StrToLower`/`StrRev`
-        // (inline loops), and `Print`/`StrPrint`/`CatPrint`/`MStrPrint`/`I64ToStr`/
-        // `F64ToStr` (specially lowered) are not here.
+        // `ArgC`/`ArgV` (read hidden globals) and `Print`/`StrPrint`/`CatPrint`/
+        // `MStrPrint`/`F64ToStr` (specially lowered) are not here. The string,
+        // memory, ctype and PRNG ops are no longer builtins at all — they live in
+        // `lib/string.hc` / `lib/math.hc` as pure HolyC.
         _ => return None,
     })
 }

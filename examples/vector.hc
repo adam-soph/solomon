@@ -2,6 +2,8 @@
 // MAlloc, MemCpy to copy on growth, Free, pointer indexing, and a class threaded
 // through functions by pointer so mutations persist.
 
+#include <string.hc>   // MemCpy
+
 class Vec {
   I64 *data;
   I64 len;

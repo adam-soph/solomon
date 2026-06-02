@@ -1,3 +1,5 @@
+#ifndef _MATH_HC
+#define _MATH_HC
 // math.hc — the solomon standard math library.
 //
 // Pure HolyC built on F64 arithmetic and the two irreducible algebraic builtins
@@ -203,3 +205,18 @@ F64 Atan2(F64 y, F64 x)
 F64 Sinh(F64 x) { return (Exp(x) - Exp(-x)) / 2.0; }
 F64 Cosh(F64 x) { return (Exp(x) + Exp(-x)) / 2.0; }
 F64 Tanh(F64 x) { F64 a = Exp(x), b = Exp(-x); return (a - b) / (a + b); }
+
+// --- pseudo-random (deterministic splitmix64, fixed zero seed) ----------------
+
+U64 __rand_state = 0;
+
+U64 RandU64()
+{
+  __rand_state += 0x9e3779b97f4a7c15;
+  U64 z = __rand_state;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+  return z ^ (z >> 31);
+}
+
+#endif

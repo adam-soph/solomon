@@ -174,6 +174,22 @@ impl Asm {
     pub(super) fn call(&mut self, label: usize) {
         self.jcc(&[0xE8], label);
     }
+    /// `call <reg>` — an indirect call through a register (`FF /2`). Used for a
+    /// function-pointer call once the target address is in `reg`.
+    pub(super) fn call_reg(&mut self, reg: u8) {
+        if reg >= 8 {
+            self.emit(&[0x41]); // REX.B for r8..r15
+        }
+        self.emit(&[0xFF, 0xD0 | (reg & 7)]);
+    }
+    /// `lea rax, [rip + disp32]` to a code `label` — the address of a function (for
+    /// `&Func`). Reuses the rel32 code-label fixup (disp is relative to the end of
+    /// the displacement, exactly the RIP-relative semantics).
+    pub(super) fn lea_rax_label(&mut self, label: usize) {
+        self.emit(&[0x48, 0x8D, 0x05]); // lea rax, [rip+disp32]
+        self.fixups.push((self.code.len(), label));
+        self.emit(&[0, 0, 0, 0]);
+    }
     /// `lea rsi, [rip + disp32]` to an interned string (a RIP-relative fixup).
     pub(super) fn lea_rsi_string(&mut self, idx: usize) {
         self.emit(&[0x48, 0x8D, 0x35]); // lea rsi, [rip+disp32]
@@ -403,10 +419,6 @@ impl Asm {
     pub(super) fn shr_ri(&mut self, dst: u8, imm: u8) {
         self.emit(&[rex_b1(dst), 0xC1, 0xC0 | (5 << 3) | (dst & 7), imm]);
     }
-    /// `imul dst, src` (64-bit, two-operand).
-    pub(super) fn imul_rr(&mut self, dst: u8, src: u8) {
-        self.emit(&[rex_w(dst, src), 0x0F, 0xAF, modrm_rr(dst, src)]);
-    }
     /// `<op> dst, src` for an `r/m, r` ALU opcode (01 add, 29 sub, 09 or, 21 and,
     /// 31 xor, 39 cmp, 85 test) — i.e. `dst = dst <op> src` (cmp/test set flags).
     pub(super) fn alu_rr(&mut self, op: u8, dst: u8, src: u8) {
@@ -601,27 +613,6 @@ impl Asm {
             bytes.push(0x40 | if xd >= 8 { 0x04 } else { 0 } | if xs >= 8 { 0x01 } else { 0 });
         }
         bytes.extend_from_slice(&[0x0F, 0x54, modrm_rr(xd, xs)]);
-        self.emit(&bytes);
-    }
-    /// `orpd xmm_d, xmm_s` — bitwise OR of doubles (for `copysign`, injecting a sign).
-    pub(super) fn orpd(&mut self, xd: u8, xs: u8) {
-        // 66 0F 56 /r
-        let mut bytes = vec![0x66u8];
-        if xd >= 8 || xs >= 8 {
-            bytes.push(0x40 | if xd >= 8 { 0x04 } else { 0 } | if xs >= 8 { 0x01 } else { 0 });
-        }
-        bytes.extend_from_slice(&[0x0F, 0x56, modrm_rr(xd, xs)]);
-        self.emit(&bytes);
-    }
-    /// `roundsd xmm_d, xmm_s, imm8` (SSE4.1) — round a double per `mode`:
-    /// 0 nearest-even, 1 floor (−∞), 2 ceil (+∞), 3 trunc (toward zero).
-    pub(super) fn roundsd(&mut self, xd: u8, xs: u8, mode: u8) {
-        // 66 0F 3A 0B /r ib
-        let mut bytes = vec![0x66u8];
-        if xd >= 8 || xs >= 8 {
-            bytes.push(0x40 | if xd >= 8 { 0x04 } else { 0 } | if xs >= 8 { 0x01 } else { 0 });
-        }
-        bytes.extend_from_slice(&[0x0F, 0x3A, 0x0B, modrm_rr(xd, xs), mode]);
         self.emit(&bytes);
     }
 
