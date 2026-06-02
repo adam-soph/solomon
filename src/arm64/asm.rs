@@ -57,6 +57,10 @@ pub(super) struct Asm {
     strings: Vec<Vec<u8>>,
     string_dedup: HashMap<Vec<u8>, usize>,
     adr_fixups: Vec<(usize, usize)>,
+    /// Freestanding global-address ADRs: `(word index, BSS byte offset)`. Resolved
+    /// in `finish` to a PC-relative `ADR` pointing at the global's fixed address
+    /// (`text_len + offset`), since the BSS follows the code+strings in the image.
+    global_adr_fixups: Vec<(usize, u64)>,
     relocs: Vec<(usize, SymRef, RelKind)>,
     // Liveness tags, parallel to `words` (one entry per emitted instruction word).
     inst_def: Vec<i8>,    // GP register written (0..30), or -1 for none / multi-def
@@ -73,6 +77,7 @@ impl Asm {
             strings: Vec::new(),
             string_dedup: HashMap::new(),
             adr_fixups: Vec::new(),
+            global_adr_fixups: Vec::new(),
             relocs: Vec::new(),
             inst_def: Vec::new(),
             inst_use: Vec::new(),
@@ -280,6 +285,9 @@ impl Asm {
         for a in self.adr_fixups.iter_mut() {
             a.0 = remap(a.0);
         }
+        for a in self.global_adr_fixups.iter_mut() {
+            a.0 = remap(a.0);
+        }
         for r in self.relocs.iter_mut() {
             r.0 = remap(r.0);
         }
@@ -323,6 +331,18 @@ impl Asm {
             let imm = str_offsets[*sidx] as i64 - (*at * 4) as i64;
             if !(-(1 << 20)..(1 << 20)).contains(&imm) {
                 return Err(CodegenError::new("string too far for ADR (>1MB)", None));
+            }
+            let immlo = (imm as u32) & 0x3;
+            let immhi = ((imm as u32) >> 2) & 0x7_FFFF;
+            self.words[*at] |= (immlo << 29) | (immhi << 5);
+        }
+        // Freestanding globals live in the BSS that follows code+strings (`cursor`
+        // is the end of the file image, where the BSS begins). Resolve each to a
+        // PC-relative ADR pointing at `cursor + offset`.
+        for (at, off) in &self.global_adr_fixups {
+            let imm = (cursor as i64 + *off as i64) - (*at * 4) as i64;
+            if !(-(1 << 20)..(1 << 20)).contains(&imm) {
+                return Err(CodegenError::new("global too far for ADR (>1MB)", None));
             }
             let immlo = (imm as u32) & 0x3;
             let immhi = ((imm as u32) >> 2) & 0x7_FFFF;
@@ -401,6 +421,32 @@ impl Asm {
     pub(super) fn lslv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
+    /// UMULH Xd, Xn, Xm — the high 64 bits of the unsigned 64×64→128 product.
+    pub(super) fn umulh(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.e_rrr(0x9BC0_7C00 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
+    }
+    /// ADDS Xd, Xn, Xm — add, setting NZCV (so a following ADC sees the carry).
+    pub(super) fn adds(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.e_rrr(0xAB00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
+    }
+    /// ADC Xd, Xn, Xm — add with the carry flag.
+    pub(super) fn adc(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.e_rrr(0x9A00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
+    }
+    /// SUBS Xd, Xn, Xm — subtract, setting NZCV.
+    pub(super) fn subs(&mut self, rd: u32, rn: u32, rm: u32) {
+        self.e_rrr(0xEB00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
+    }
+    /// LDR Xt, [Xn, Xm, LSL #3] — load a 64-bit limb at `base + idx*8`.
+    pub(super) fn ldr_idx8(&mut self, rt: u32, base: u32, idx: u32) {
+        let w = 0xF860_7800 | (idx << 16) | (base << 5) | rt;
+        self.emit_du(w, rt as i32, gpb(base) | gpb(idx), B_NORMAL);
+    }
+    /// STR Xt, [Xn, Xm, LSL #3] — store a 64-bit limb at `base + idx*8`.
+    pub(super) fn str_idx8(&mut self, rt: u32, base: u32, idx: u32) {
+        let w = 0xF820_7800 | (idx << 16) | (base << 5) | rt;
+        self.emit_du(w, -1, gpb(rt) | gpb(base) | gpb(idx), B_NORMAL);
+    }
     pub(super) fn lsrv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
@@ -463,6 +509,23 @@ impl Asm {
     }
     pub(super) fn fneg(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E61_4000 | (dn << 5) | dd);
+    }
+    /// FABS / FSQRT / FRINTM (floor) / FRINTP (ceil) / FRINTA (round, ties away) —
+    /// scalar double-precision unary FP ops used by the algebraic math builtins.
+    pub(super) fn fabs(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E60_C000 | (dn << 5) | dd);
+    }
+    pub(super) fn fsqrt(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E61_C000 | (dn << 5) | dd);
+    }
+    pub(super) fn frintm(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E65_4000 | (dn << 5) | dd);
+    }
+    pub(super) fn frintp(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E64_C000 | (dn << 5) | dd);
+    }
+    pub(super) fn frinta(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E66_4000 | (dn << 5) | dd);
     }
     /// FCMP Dn, Dm — set NZCV for an ordered comparison.
     pub(super) fn fcmp(&mut self, dn: u32, dm: u32) {
@@ -670,6 +733,11 @@ impl Asm {
     pub(super) fn br(&mut self, rn: u32) {
         self.emit(0xD61F_0000 | (rn << 5)); // barrier (default tags)
     }
+    /// SVC #0 — a Linux syscall (number in `x8`, args in `x0..x5`, result in
+    /// `x0`). Only the freestanding Linux target uses it.
+    pub(super) fn svc(&mut self) {
+        self.emit(0xD400_0001); // barrier (default tags)
+    }
     /// LDRSW Xt, [Xn, Xm, LSL #2] — load a 32-bit word at `base + index*4`,
     /// sign-extended to 64 bits. Used to read a jump-table offset entry.
     pub(super) fn ldrsw_reg(&mut self, rt: u32, base: u32, index: u32) {
@@ -698,6 +766,13 @@ impl Asm {
         self.relocs
             .push((self.words.len(), SymRef::Extern(sym), RelKind::Branch26));
         self.emit_du(0x9400_0000, -1, 0, B_CALL);
+    }
+    /// ADR rd, <global> — load the PC-relative address of a freestanding global at
+    /// `bss_off` (its byte offset within the BSS that follows code+strings).
+    /// Resolved in `finish`; replaces the hosted `adrp_global`+`add_global` pair.
+    pub(super) fn adr_global_fs(&mut self, rd: u32, bss_off: u64) {
+        self.global_adr_fixups.push((self.words.len(), bss_off));
+        self.e_wr(0x1000_0000 | rd, rd);
     }
     pub(super) fn adr(&mut self, rd: u32, sidx: usize) {
         self.adr_fixups.push((self.words.len(), sidx));

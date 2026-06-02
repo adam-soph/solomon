@@ -1,0 +1,42 @@
+name: CI
+
+# Manual trigger only — run from the Actions tab (or `gh workflow run CI`).
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: fmt · build · test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # `cargo build` is the warning-free bar (clippy's stylistic lints are not
+      # enforced); -D warnings makes any new compiler warning fail the build.
+      - name: Build (warning-free)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --bins
+
+      # Register binfmt handlers so the freestanding aarch64 ELF can run under
+      # `docker run --platform linux/arm64` on this x86_64 runner — without it the
+      # arm64 conformance test self-skips. (The amd64 conformance runs natively.)
+      - name: Set up QEMU for linux/arm64
+        uses: docker/setup-qemu-action@v3
+
+      # The full suite — including the native-backend conformance tests that hold
+      # every code generator byte-for-byte to the interpreter (the oracle).
+      - name: Test
+        run: cargo test

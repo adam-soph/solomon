@@ -18,6 +18,26 @@ fn implicit_string_print() {
 }
 
 #[test]
+fn ctype_classification_predicates() {
+    // Each `Is*` predicate on a representative member and non-member: "10" per pair.
+    let src = r#"
+        "%d%d ", IsDigit('5'), IsDigit('x');
+        "%d%d ", IsAlpha('x'), IsAlpha('5');
+        "%d%d ", IsAlNum('5'), IsAlNum(' ');
+        "%d%d ", IsSpace('\t'), IsSpace('x');
+        "%d%d ", IsUpper('A'), IsUpper('a');
+        "%d%d ", IsLower('a'), IsLower('A');
+        "%d%d ", IsXDigit('F'), IsXDigit('g');
+        "%d%d ", IsPunct('@'), IsPunct('A');
+        "%d%d ", IsCntrl('\n'), IsCntrl('A');
+        "%d%d ", IsPrint(' '), IsPrint('\n');
+        "%d%d ", IsGraph('!'), IsGraph(' ');
+        "%d%d\n", IsBlank(' '), IsBlank('\n');
+    "#;
+    assert_eq!(run(src), "10 10 10 10 10 10 10 10 10 10 10 10\n");
+}
+
+#[test]
 fn formatted_print() {
     let src = r#"I64 x = 42; "x=%d\n", x;"#;
     assert_eq!(run(src), "x=42\n");
@@ -1457,6 +1477,48 @@ fn division_by_zero_is_a_runtime_error() {
     let mut interp = Interpreter::new(Vec::<u8>::new());
     let err = interp.run(&program).unwrap_err();
     assert!(err.message.contains("division by zero"), "got: {err}");
+}
+
+#[test]
+fn extreme_field_width_and_precision_are_clamped() {
+    // A pathological width/precision is clamped at the shared `fmt` layer
+    // (width ≤ 1024, precision ≤ 512) so the fixed-size native scratch buffers
+    // can never overflow. The interpreter clamps identically.
+    let w = run(r#""%2000d", 42;"#); // width 2000 -> 1024
+    assert_eq!(w.len(), 1024);
+    assert!(w.ends_with("   42")); // right-aligned in the clamped field
+    let p = run(r#""%.800f", 3.14;"#); // precision 800 -> 512; "3." + 512 digits
+    assert_eq!(p.len(), 2 + 512);
+    assert!(p.starts_with("3.14"));
+}
+
+#[test]
+fn float_division_by_zero_is_infinity() {
+    // Unlike integer `/0` (a runtime error), float division follows IEEE-754:
+    // it yields ±inf / nan rather than trapping, matching the native backends.
+    assert_eq!(run(r#""%f\n", 1.0 / 0.0;"#), "inf\n");
+    assert_eq!(run(r#""%f\n", -1.0 / 0.0;"#), "-inf\n");
+    assert_eq!(run(r#""%f\n", 0.0 / 0.0;"#), "NaN\n");
+}
+
+#[test]
+fn narrow_increment_truncates_to_width() {
+    // `++`/`--` on a narrow integer wraps at its declared width, like a store.
+    assert_eq!(run(r#"U8 x = 255; x++; "%d\n", x;"#), "0\n");
+    assert_eq!(run(r#"U8 x = 0; x--; "%d\n", x;"#), "255\n");
+    assert_eq!(run(r#"U16 x = 65535; x++; "%d\n", x;"#), "0\n");
+}
+
+#[test]
+fn identical_string_literals_share_one_address() {
+    // String literals are interned by content, so two decays of the same text
+    // address one buffer — pointer identity matches the native `__text` dedup.
+    assert_eq!(
+        run(r#"U8 *p = "hello"; U8 *q = "hello"; "%d %d\n", p == q, "x" == "x";"#),
+        "1 1\n"
+    );
+    // Distinct contents stay distinct.
+    assert_eq!(run(r#"U8 *p = "ab"; U8 *q = "cd"; "%d\n", p == q;"#), "0\n");
 }
 
 #[test]

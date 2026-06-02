@@ -9,10 +9,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::codegen::Codegen;
-use solomon::x86_64::X64Linux;
 use solomon::interp::run_to_string;
 use solomon::parser::parse;
 use solomon::sema::check_program;
+use solomon::x86_64::X64Linux;
 
 /// The ELF header (64) + one program header (56) precede the code.
 const CODE_OFFSET: usize = 120;
@@ -623,6 +623,15 @@ fn printing_matches_the_interpreter() {
         r#"U0 Main(){ U8 b[64]; StrCpy(b,"sum:"); I64 i; for(i=1;i<=4;i++) CatPrint(b," +%d", i); "%s\n", b; } Main;"#,
         r#"U0 Main(){ U8 a[32]; U8 b[32]; "%s|%s\n", I64ToStr(123456, a), I64ToStr(-7, b); } Main;"#,
         r#"U0 Main(){ U8 a[32]; U8 b[64]; StrPrint(a,"v%d",7); StrPrint(b,"[%s] then plain", a); "%s\n", b; "stdout still works\n"; } Main;"#,
+        // MStrPrint (asprintf into a fresh right-sized buffer) and F64ToStr (`%g`).
+        r#"U0 Main(){ U8 *s = MStrPrint("[%d:%s:%.2f]", 7, "hi", 3.14159); "%s\n", s; Free(s); } Main;"#,
+        // MStrPrint with output far past the 64-byte initial capacity: forces the
+        // growing sink through several reallocations in a single format pass.
+        r#"U0 Main(){ U8 *s = MStrPrint("%s/%s/%s", "0123456789ABCDEF0123456789ABCDEF", "0123456789ABCDEF0123456789ABCDEF", "0123456789ABCDEF0123456789ABCDEF"); "%s (%d)\n", s, StrLen(s); Free(s); } Main;"#,
+        r#"U0 Main(){ U8 b[64]; F64ToStr(2.71828,b); "%s ",b; F64ToStr(1000000.0,b); "%s ",b; F64ToStr(0.0001,b); "%s\n",b; } Main;"#,
+        // The `Is*` ctype predicates — classify each byte of a mixed string; the
+        // inline range-check routines must match the interpreter byte-for-byte.
+        r#"U0 Main(){ U8 *s = "a1 B!~\t"; I64 i; for(i=0;s[i];i++){ "%d%d%d%d%d ", IsAlpha(s[i]), IsDigit(s[i]), IsSpace(s[i]), IsPunct(s[i]), IsCntrl(s[i]); } "\n"; } Main;"#,
         // %f float printing — correctly rounded (bignum), matching the interpreter
         // (Rust `{:.P}`) byte-for-byte, incl. round-half-to-even ties.
         r#"U0 Main(){ "%f %f %f\n", 3.14159, 0.1, 39.566371; } Main;"#,
@@ -639,6 +648,14 @@ fn printing_matches_the_interpreter() {
         r#"U0 Main(){ "%g %g %g %g\n", 1.5, 1000000.0, 0.0001, 0.00001; } Main;"#,
         r#"U0 Main(){ "%g %.3g %#g %G\n", 1234567.0, 1234567.0, 1.5, 0.00001; } Main;"#,
         r#"U0 Main(){ "[%12.3e][%-12.3e][%+g][%015.2e]\n", 1.5, 1.5, 2.5, 42.0; } Main;"#,
+        // Pathological width/precision: clamped at the shared `fmt` layer (width
+        // ≤1024, precision ≤512) so the hand-emitted fixed scratch buffers never
+        // overflow. Pre-clamp these segfaulted; they must now match the interpreter.
+        r#"U0 Main(){ "%2000d\n", 42; } Main;"#,
+        r#"U0 Main(){ "%.800f\n", 3.14; } Main;"#,
+        r#"U0 Main(){ "%.100d\n", 7; } Main;"#,
+        r#"U0 Main(){ "[%2000s]\n", "tail"; } Main;"#,
+        r#"U0 Main(){ "%.700e\n", 1.5; } Main;"#,
     ];
 
     let dir = temp_out();

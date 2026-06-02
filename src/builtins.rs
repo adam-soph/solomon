@@ -31,7 +31,7 @@ pub struct BuiltinSig {
 
 /// Every builtin and its signature.
 pub fn all() -> Vec<BuiltinSig> {
-    vec![
+    let mut sigs = vec![
         // `Print(fmt, ...)` — printf-style output.
         BuiltinSig {
             name: "Print",
@@ -348,7 +348,55 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 1,
             varargs: false,
         },
-    ]
+    ];
+    // The `Is*` ctype classification predicates — each `(I64) -> I64` returning
+    // 0 or 1. Computed inline in both backends (see `ctype_ranges`).
+    sigs.extend(CTYPE_NAMES.iter().map(|&name| BuiltinSig {
+        name,
+        ret: Type::I64,
+        min_args: 1,
+        varargs: false,
+    }));
+    sigs
+}
+
+/// The ASCII `Is*` character-classification builtins. Each class is a union of
+/// inclusive byte ranges (see [`ctype_ranges`]) — the **single source of truth**
+/// for classification: the interpreter tests membership and both native backends
+/// emit the same range checks, so the result is identical everywhere. Defined for
+/// the C/POSIX "C" locale (pure ASCII); a byte outside every range — including
+/// high bytes and negative/EOF-like values — classifies as false (`0`).
+pub const CTYPE_NAMES: &[&str] = &[
+    "IsDigit", "IsAlpha", "IsAlNum", "IsSpace", "IsUpper", "IsLower", "IsXDigit", "IsPunct",
+    "IsCntrl", "IsPrint", "IsGraph", "IsBlank",
+];
+
+/// The inclusive byte ranges defining each `Is*` predicate, or `None` for a name
+/// that isn't a ctype predicate.
+pub fn ctype_ranges(name: &str) -> Option<&'static [(u8, u8)]> {
+    Some(match name {
+        "IsDigit" => &[(b'0', b'9')],
+        "IsUpper" => &[(b'A', b'Z')],
+        "IsLower" => &[(b'a', b'z')],
+        "IsAlpha" => &[(b'A', b'Z'), (b'a', b'z')],
+        "IsAlNum" => &[(b'0', b'9'), (b'A', b'Z'), (b'a', b'z')],
+        "IsXDigit" => &[(b'0', b'9'), (b'A', b'F'), (b'a', b'f')],
+        "IsSpace" => &[(0x09, 0x0d), (b' ', b' ')], // \t \n \v \f \r and space
+        "IsBlank" => &[(b'\t', b'\t'), (b' ', b' ')],
+        "IsCntrl" => &[(0x00, 0x1f), (0x7f, 0x7f)],
+        "IsPrint" => &[(b' ', 0x7e)], // space..'~'
+        "IsGraph" => &[(0x21, 0x7e)], // '!'..'~'
+        "IsPunct" => &[(0x21, 0x2f), (0x3a, 0x40), (0x5b, 0x60), (0x7b, 0x7e)], // graphic, not alnum
+        _ => return None,
+    })
+}
+
+/// Evaluate an `Is*` predicate on `c` — the interpreter path. `false` for a
+/// non-predicate name or a byte outside `[0, 255]`.
+pub fn ctype_test(name: &str, c: i64) -> bool {
+    matches!(ctype_ranges(name), Some(ranges)
+        if (0..=0xff).contains(&c)
+            && ranges.iter().any(|&(lo, hi)| (lo as i64..=hi as i64).contains(&c)))
 }
 
 /// The hidden global holding the `RandU64` PRNG state in the native backend.
@@ -396,14 +444,33 @@ pub fn libc_symbol(name: &str) -> Option<&'static str> {
         "StrLastChr" => "_strrchr",
         "StrSpn" => "_strspn",
         "StrCSpn" => "_strcspn",
-        // `Sign`/`RandU64`/`ArgC`/`ArgV` (computed inline), `StrToUpper`/
-        // `StrToLower`/`StrRev` (inline loops), and `Print`/`StrPrint`/`CatPrint`/
-        // `MStrPrint`/`I64ToStr`/`F64ToStr` (specially lowered) are not here.
+        // `Sign`/`RandU64`/`ArgC`/`ArgV` and the `Is*` ctype predicates (computed
+        // inline — libc's `isdigit` etc. return an unspecified nonzero, which would
+        // diverge from the interpreter's 0/1), `StrToUpper`/`StrToLower`/`StrRev`
+        // (inline loops), and `Print`/`StrPrint`/`CatPrint`/`MStrPrint`/`I64ToStr`/
+        // `F64ToStr` (specially lowered) are not here.
         _ => return None,
     })
 }
 
 /// Whether `name` is a builtin function.
+/// The builtin names, built once and cached. `all()` allocates a fresh registry
+/// `Vec` (it's used for one-shot signature seeding in sema), so `is_builtin` —
+/// which the interpreter calls on **every** builtin call — goes through this cache
+/// instead, avoiding a per-call allocation of the whole registry. (`BuiltinSig`'s
+/// `Type` isn't `Sync`, so only the `&'static str` names are cached.)
+fn names() -> &'static [&'static str] {
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| all().iter().map(|b| b.name).collect())
+}
+
 pub fn is_builtin(name: &str) -> bool {
-    all().iter().any(|b| b.name == name)
+    names().contains(&name)
+}
+
+/// The declared return type of a builtin (`None` if unknown). Compile-time only
+/// (per builtin call site lowered), so it rebuilds the registry rather than caching
+/// the non-`Sync` `Type`.
+pub fn ret_of(name: &str) -> Option<Type> {
+    all().into_iter().find(|b| b.name == name).map(|b| b.ret)
 }

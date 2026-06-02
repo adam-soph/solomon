@@ -1,17 +1,32 @@
+<div align="center">
+
 # Solomon
 
-A reimplementation of **HolyC** — the C-like language created by Terry A. Davis
-for [TempleOS](https://templeos.org) — written from scratch in Rust.
+**A from-scratch reimplementation of [HolyC](https://templeos.org) — Terry A. Davis's TempleOS language — in Rust.**
+
+A full compiler front end, a tree-walking interpreter, and three hand-rolled native code generators. No LLVM, no Cranelift, no assembler.
+
+[![CI](https://github.com/adam-soph/solomon/actions/workflows/ci.yml/badge.svg)](https://github.com/adam-soph/solomon/actions/workflows/ci.yml)
+![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-CE412B?logo=rust&logoColor=white)
+![Codegen](https://img.shields.io/badge/codegen-hand--rolled-success)
+![Native targets](https://img.shields.io/badge/native_targets-3-blue)
+![Linux](https://img.shields.io/badge/Linux-freestanding_static_ELF-orange)
+![Conformance](https://img.shields.io/badge/examples-18%2F18_byte--identical-brightgreen)
+
+</div>
+
+---
 
 solomon takes HolyC source through a full compiler front end (lexer →
 preprocessor → parser → semantic analysis → type layout) and either interprets it
-with a tree-walking **interpreter** or compiles it with one of two hand-rolled
+with a tree-walking **interpreter** or compiles it with one of several hand-rolled
 native code generators (behind a small `Codegen` trait) named for their target —
 **`aarch64-apple-darwin`** (emits a Mach-O object, no LLVM/Cranelift, links with
-`cc`) and **`x86_64-unknown-linux`** (writes a freestanding static ELF with raw
-syscalls — no linker, no libc). A codegen backend is an (architecture, OS) pair,
-since the object format, syscalls, and ABI depend on the OS, not just the CPU.
-The interpreter is the conformance oracle the native backends match byte-for-byte.
+`cc`) and the **`x86_64-unknown-linux`** / **`aarch64-unknown-linux`** Linux targets
+(each writes a **freestanding static ELF** with raw syscalls — no linker, no libc).
+A codegen backend is an (architecture, OS) pair, since the object format, syscalls,
+and ABI depend on the OS, not just the CPU. The interpreter is the conformance
+oracle the native backends match byte-for-byte (on all 18 example programs).
 
 ```holyc
 U0 Main()
@@ -23,15 +38,44 @@ U0 Main()
 Main;
 ```
 
-```
+```console
 $ hci hello.hc
 Hello, World!
 x=42 y=255
 ```
 
+## Contents
+
+- [The pipeline](#the-pipeline)
+- [Status](#status)
+- [Building](#building)
+- [Usage](#usage)
+- [Language notes](#language-notes)
+- [Examples](#examples)
+- [Project layout](#project-layout)
+
+## The pipeline
+
+Source flows one direction, each stage a separate module. The interpreter is the
+oracle; every native backend is held byte-for-byte to its output.
+
+```text
+  lexer → preprocessor → parser → sema → layout
+                                            │
+                                            ▼
+                          ┌─────────────────────────────────┐
+                          │     interpreter  (the oracle)    │
+                          └─────────────────────────────────┘
+                                            │  must match byte-for-byte
+                  ┌─────────────────────────┼─────────────────────────┐
+                  ▼                         ▼                         ▼
+        aarch64-apple-darwin       x86_64-unknown-linux      aarch64-unknown-linux
+           Mach-O + cc              freestanding ELF            freestanding ELF
+```
+
 ## Status
 
-Working today:
+### Front end
 
 - **Lexer** — numbers (decimal/hex/binary, `F64` floats), strings with escapes,
   multi-char `'AB'` character constants, `//` and `/* */` comments, full
@@ -51,25 +95,46 @@ Working today:
   functions are compile-time errors.
 - **Type layout** — `repr(C)`-style sizes, alignment, and field offsets, used by
   `sizeof` and available to backends.
-- **Interpreter backend** — executes the program, including recursion, all loop
+
+### Backends
+
+| Target | Output | Linker / libc | Default on |
+| ------ | ------ | ------------- | ---------- |
+| `aarch64-apple-darwin` | Mach-O relocatable object | links with `cc` | Apple silicon |
+| `x86_64-unknown-linux` | freestanding static ELF | none — raw syscalls | Linux x86-64 |
+| `aarch64-unknown-linux` | freestanding static ELF | none — raw syscalls¹ | Linux ARM64 |
+
+¹ The bare triple is freestanding; the `-gnu`/`-musl` suffixes opt into a gcc-linked libc instead.
+
+- **Interpreter** — executes the program, including recursion, all loop
   forms, `switch` with `case lo ... hi:` ranges, `goto`, real pointer semantics
   (arithmetic, indexing, comparison, `&`/`*`/`->`), arrays (including
   multidimensional and pass-by-reference), classes/unions, casts, function
   pointers, a byte-addressable `MAlloc` heap, and HolyC's implicit print.
-- **`aarch64-apple-darwin` native backend** (the default build on Apple silicon,
-  or `--target aarch64-apple-darwin`) — hand-emits machine code and a Mach-O
+- **`aarch64-apple-darwin`** (the default build on Apple silicon, or
+  `--target aarch64-apple-darwin`) — hand-emits machine code and a Mach-O
   relocatable object, then links with `cc`. Type-directed codegen covering the
   whole implemented subset: control flow (dense `switch`es lower to an O(1)
   jump table), functions (recursion, default and variadic args), classes by
   value (sret returns), F64, function pointers (`ADR`+`BLR` for indirect calls),
   brace/designated initializers, and calls into libc for the built-in library.
-- **`x86_64-unknown-linux` native backend** (`--target x86_64-unknown-linux`) —
+- **`x86_64-unknown-linux`** (`--target x86_64-unknown-linux`) —
   hand-writes a **freestanding static ELF** with raw Linux syscalls: no linker,
   no libc, no relocations. Its own `_start` runs the program and `exit`s. Covers
   the same subset (integers with C signedness, pointers/arrays, classes/unions
   incl. sret, globals, F64, `switch`/`goto`, and printf with correctly-rounded
   `%f`/`%e`/`%g`), with the core-library built-ins re-implemented from scratch
   (an `mmap` bump allocator, inline string/memory loops, splitmix64).
+- **`aarch64-unknown-linux`** (`--target aarch64-unknown-linux`) —
+  also a **freestanding static ELF**, sharing the entire AArch64 emitter with the
+  Darwin backend but emitting its own `_start`, raw syscalls, and runtime (no libc,
+  no linker — the `-gnu`/`-musl` suffixes opt into a gcc-linked libc instead).
+  Globals self-address to a fixed BSS slot; the runtime re-implements the printf
+  engine including the **correctly-rounded bignum `%f`/`%e`/`%g`**, the `mmap` bump
+  allocator, and the string/memory built-ins. All 18 examples run byte-for-byte
+  identical to the interpreter under `docker --platform linux/arm64`.
+
+### Core library
 
 A slice of the **core library** exists as built-ins, shared by all backends:
 `Print`, formatted-string builders `StrPrint`/`CatPrint`/`MStrPrint`, string ops
@@ -80,13 +145,13 @@ number conversion (`StrToI64`/`StrToF64`, `I64ToStr`/`F64ToStr`), memory (`MemCp
 (`ToUpper`, `ToLower`), the exactly-reproducible float ops (`Abs`/`Sign`/`Fabs`,
 `Sqrt`, `Floor`/`Ceil`/`Round`), and a deterministic PRNG (`RandU64`).
 
-The transcendental math functions (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…) are
-deliberately **not** built-ins: every built-in has a portable, solomon-defined
-meaning, whereas a transcendental's value would be only "whatever the host libm
-computes" (not reproducible across platforms, and impossible in a freestanding
-target). They belong in a future HolyC standard library with a defined algorithm.
+> **Why no `Sin`/`Cos`/`Pow`/`Exp`/`Ln`?** The transcendental math functions are
+> deliberately **not** built-ins: every built-in has a portable, solomon-defined
+> meaning, whereas a transcendental's value would be only "whatever the host libm
+> computes" (not reproducible across platforms, and impossible in a freestanding
+> target). They belong in a future HolyC standard library with a defined algorithm.
 
-Not yet implemented: most of the TempleOS core/standard library and DolDoc.
+**Not yet implemented:** most of the TempleOS core/standard library and DolDoc.
 
 ## Building
 
@@ -116,15 +181,15 @@ make help                  # list everything
 
 Default targets:
 
-| Platform            | Triple                        |
-| ------------------- | ----------------------------- |
-| macOS (Apple silicon) | `aarch64-apple-darwin`      |
-| macOS (Intel)       | `x86_64-apple-darwin`         |
-| Linux x86-64        | `x86_64-unknown-linux-gnu`    |
-| Linux ARM64         | `aarch64-unknown-linux-gnu`   |
-| Linux x86-64 (static) | `x86_64-unknown-linux-musl` |
-| Windows x86-64      | `x86_64-pc-windows-gnu`       |
-| Windows x86         | `i686-pc-windows-gnu`         |
+| Platform              | Triple                        |
+| --------------------- | ----------------------------- |
+| macOS (Apple silicon) | `aarch64-apple-darwin`        |
+| macOS (Intel)         | `x86_64-apple-darwin`         |
+| Linux x86-64          | `x86_64-unknown-linux-gnu`    |
+| Linux ARM64           | `aarch64-unknown-linux-gnu`   |
+| Linux x86-64 (static) | `x86_64-unknown-linux-musl`   |
+| Windows x86-64        | `x86_64-pc-windows-gnu`       |
+| Windows x86           | `i686-pc-windows-gnu`         |
 
 These triples are what the **`hcc`/`hci` binaries themselves** are compiled for —
 every one can interpret HolyC (`hci`). Native code *generation* (`hcc`) is a
@@ -157,7 +222,7 @@ target list with `make all TARGETS="x86_64-unknown-linux-gnu ..."`.
 There are two binaries: **`hci`** runs a HolyC program, **`hcc`** compiles one.
 Both read from `FILE`, or from stdin if no file is given.
 
-```
+```text
 hci [FILE] [ARGS...]                     run with the tree-walking interpreter
 hcc [--target TRIPLE] [-o OUT] [FILE]    compile a native binary (the default)
 hcc <subcommand> [FILE]
@@ -168,19 +233,19 @@ hcc <subcommand> [FILE]
 (`-o OUT`, default `a.out`); `--target TRIPLE` cross-compiles instead. Its
 subcommands are front-end tools:
 
-| Command         | Does                                                       |
-| --------------- | ---------------------------------------------------------- |
-| `hci FILE`      | type-check then execute with the tree-walking interpreter  |
-| `hcc FILE`      | compile a native binary for the host target (`-o OUT`)     |
-| `hcc check`     | parse + semantic analysis; report errors, run nothing      |
-| `hcc ast`       | parse and dump the AST                                      |
-| `hcc tokens`    | run the lexer only and dump the token stream               |
+| Command      | Does                                                       |
+| ------------ | ---------------------------------------------------------- |
+| `hci FILE`   | type-check then execute with the tree-walking interpreter  |
+| `hcc FILE`   | compile a native binary for the host target (`-o OUT`)     |
+| `hcc check`  | parse + semantic analysis; report errors, run nothing      |
+| `hcc ast`    | parse and dump the AST                                      |
+| `hcc tokens` | run the lexer only and dump the token stream               |
 
 `--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`,
-`x86_64-pc-windows`, and `aarch64-unknown-linux-gnu` — each with `-gnu`/`-musl`
+`x86_64-pc-windows`, and `aarch64-unknown-linux` — each with `-gnu`/`-musl`
 forms where applicable.
 
-```sh
+```console
 $ hcc check broken.hc
 semantic error at 2:3: call to undeclared function `DrawRect`
 1 error(s)
@@ -222,23 +287,36 @@ A few things specific to HolyC (and to this implementation):
   it). Because of this, `start` and `end` are **reserved words** — they cannot be
   used as identifiers (`I64 start;` is a parse error).
 
-See `examples/*.hc` for worked examples, from `hello.hc` up to a linked list,
-a stack-machine interpreter, shape-area dispatch via inheritance, a
-preprocessor-heavy math library, 3×3 matrix multiplication, a core-library tour
-(`builtin.hc`) exercising the string/memory/math built-ins, a heap-growing dynamic
-array (`vector.hc`), text processing with `StrFind` (`text.hc`), a string-keyed
-hash map with chaining (`hashmap.hc`), a `RandU64`-driven shuffle
-(`shuffle.hc`), and a recursive-descent JSON parser that builds a heap tree of
-tagged nodes — objects, arrays, strings (with escapes), F64 reals, integers,
-and `true`/`false`/`null` — then re-serializes it back to JSON with a `switch
-[tag]` pretty-printer (`json.hc`). Two `StrPrint`/`CatPrint` showcases round it
-out: a formatted sales report with aligned columns (`report.hc`) and a gallery
-rendering numbers in every conversion — decimal/hex/octal/fixed/`%e`/`%g`
-(`gallery.hc`).
+## Examples
+
+The `examples/` directory has 18 worked HolyC programs, from `hello.hc` up to a
+recursive-descent JSON parser. Every one runs under the interpreter and compiles
+on each native backend with byte-identical output.
+
+| File | What it shows |
+| ---- | ------------- |
+| `hello.hc` | the basics — prints, variable declarations, top-level statements |
+| `fib.hc` | functions, recursion, and loops |
+| `control.hc` | `switch`/`case` ranges, `do`-`while`, ternary, bit ops, casts, `sizeof` |
+| `classes.hc` | `class` and `union` definitions, pointers, member access |
+| `shapes.hc` | class inheritance, upcasting to a base pointer, tagged dispatch |
+| `linklist.hc` | an array-backed singly linked list with sorted insertion |
+| `vm.hc` | a tiny stack machine — bytecode `(opcode, argument)` interpreter |
+| `matrix.hc` | fixed-size 3×3 matrix math with nested arrays and loops |
+| `preproc.hc` | macros, conditionals, and a forward type reference (hoisting) |
+| `mathlib.hc` | a preprocessor-heavy macro math library |
+| `builtin.hc` | a tour of the core-library built-ins (string/memory/math) |
+| `vector.hc` | a growable heap dynamic array of `I64` |
+| `text.hc` | text processing — word counting and `StrFind` search |
+| `hashmap.hc` | a string→`I64` hash map with separate chaining |
+| `shuffle.hc` | a Fisher–Yates shuffle of `0..N-1` driven by `RandU64` |
+| `json.hc` | recursive-descent JSON parser → heap tree → re-serialize with `switch [tag]` |
+| `report.hc` | a formatted sales report with aligned columns (`StrPrint`/`CatPrint`) |
+| `gallery.hc` | numbers rendered in every conversion — decimal/hex/octal/fixed/`%e`/`%g` |
 
 ## Project layout
 
-```
+```text
 src/
   token.rs      token + keyword definitions
   lexer.rs      lexer (streaming) + TokenStream trait
@@ -254,8 +332,9 @@ src/
                 (Mach-O + cc), linux.rs (ELF + gcc; gnu/musl)
   x86_64/       x86-64 backend — asm.rs (encoder), mod.rs (codegen + OsTarget),
                 linux.rs (static ELF), windows.rs (self-contained PE)
-  main.rs       the `hcc` compiler CLI
-  bin/hci.rs    the `hci` interpreter CLI
+  bin/          the executables (auto-discovered by Cargo):
+    hcc.rs      the `hcc` compiler CLI
+    hci.rs      the `hci` interpreter CLI
 tests/          lexer, parser, sema, preproc, layout, interpreter, the native
                 backends, target registration, and whole-program tests
 ```

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use super::{Asm, OsTarget, R8, R9, R10, RAX, RCX, RDI, RDX};
+use super::{Asm, OsTarget, R8, R9, R10, RAX, RCX, RDI, RDX, RSI};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
@@ -75,10 +75,27 @@ impl OsTarget for LinuxTarget {
     }
 
     fn emit_write_stdout(&mut self, asm: &mut Asm) {
-        // write(1, rsi, rdx).
+        // write(1, rsi, rdx), looping until the whole buffer is written: `write`
+        // may return a short count, and `-EINTR` (-4) means retry. rsi=buf, rdx=remaining.
+        let wloop = asm.new_label();
+        let advance = asm.new_label();
+        let wdone = asm.new_label();
+        asm.place(wloop);
+        asm.test_rr(RDX, RDX);
+        asm.je(wdone); // nothing left
         asm.emit(&[0xB8, 1, 0, 0, 0]); // mov eax, 1 (SYS_write)
         asm.emit(&[0xBF, 1, 0, 0, 0]); // mov edi, 1 (stdout)
-        asm.syscall();
+        asm.syscall(); // rax = bytes written (or -errno)
+        asm.test_rr(RAX, RAX);
+        asm.jg(advance); // wrote >0 bytes
+        asm.cmp_ri(RAX, -4); // -EINTR?
+        asm.je(wloop); // EINTR: retry same buf/len
+        asm.jmp(wdone); // other error / 0: give up
+        asm.place(advance);
+        asm.add_rr(RSI, RAX); // buf += written
+        asm.sub_rr(RDX, RAX); // remaining -= written
+        asm.jmp(wloop);
+        asm.place(wdone);
     }
 
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {

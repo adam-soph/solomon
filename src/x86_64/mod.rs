@@ -44,8 +44,8 @@
 //! static ELF has no libm, and — like Rust's `core` (which omits them; they live
 //! in `std` for the platform libm) — we don't fake them with approximations,
 //! since libm results aren't bit-identical across platforms anyway (IEEE 754
-//! doesn't require correctly-rounded transcendentals). `MStrPrint`/`F64ToStr` are
-//! also not done. Anything unimplemented is a build-time error.
+//! doesn't require correctly-rounded transcendentals). Otherwise the core-library
+//! builtins are complete here. Anything unimplemented is a build-time error.
 //!
 //! Expression evaluation is a stack machine: a value lands in `rax` (or `xmm0`
 //! for an F64-typed expression), a binary op's left operand is spilled to the
@@ -56,7 +56,9 @@
 //! integers/strings into a BSS scratch buffer and hands them to a single output
 //! sink (`out_write`) — which goes to the `write` syscall when the `out_ptr`
 //! global is 0, or appends to a destination buffer otherwise, so the same format
-//! machinery serves both `Print` and `StrPrint`/`CatPrint`. String literals live
+//! machinery serves both `Print` and `StrPrint`/`CatPrint` — and `MStrPrint`,
+//! whose buffer the sink *grows* (reallocs) on overflow, like libc `vasprintf`.
+//! String literals live
 //! after the code (RIP-relative addressed). ELF layout:
 //! `[ELF header | one PT_LOAD | code | strings | BSS]`, mapped R+W+X at
 //! `0x400000` (`p_memsz > p_filesz` reserves the zero-filled BSS), `_start` first.
@@ -200,6 +202,10 @@ enum Helper {
     /// The output sink: `rsi`=buf, `rdx`=len. Writes to stdout when the `out_ptr`
     /// global is 0, else appends to `[out_ptr]` (advancing it) — the StrPrint path.
     OutWrite,
+    /// Grow the owned `MStrPrint` buffer so the pending `rdx`-byte write (plus a
+    /// trailing NUL) fits, reallocating + copying. Preserves `rsi`/`rdx`, returns
+    /// the new cursor in `rax`, and updates `out_base`/`out_ptr`/`out_limit`.
+    GrowSink,
     /// Format an F64 as `%f`. `xmm0`=value, `edi`=precision, `esi`=flags, `edx`=width.
     FmtFloat,
     /// Format an F64 as `%e`/`%g`. Same registers; `ecx`=conv (1 `e`, 2 `g`;
@@ -219,6 +225,12 @@ enum Helper {
 /// exact decimal expansion: the smallest subnormal's `m·5^1074` is ~767 digits ≈
 /// 2548 bits, so 48 limbs (3072 bits ≈ 925 digits) covers it with margin.
 const NLIMBS: i32 = 48;
+// Freestanding printf scratch sizes (≥ the clamped fmt::MAX_WIDTH/MAX_PRECISION),
+// so the formatters can never overflow their fixed buffers.
+const FS_INT_DIGBUF: i32 = 600;
+const FS_OUTBUF: i32 = 1152;
+const FS_FLOAT_DIGBUF: i32 = 1024;
+const FS_SIGBUF: i32 = 576;
 
 // Register numbers for the generic encoders.
 const RAX: u8 = 0;
@@ -275,6 +287,12 @@ struct Cg {
     helpers: HashMap<Helper, usize>, // print runtime routine -> code label (on first use)
     rt_routines: HashMap<&'static str, usize>, // builtin runtime routine -> label (on first use)
     out_ptr_off: Option<i32>, // BSS slot: the formatted-output sink pointer (0 = stdout)
+    // Growing-sink globals (set only when a program uses `MStrPrint`): the base of
+    // the owned, reallocating buffer and its current capacity end. `out_limit != 0`
+    // is what tells the sink it may grow rather than blindly append (the StrPrint
+    // path leaves it 0). `out_limit_off.is_some()` gates the grow branch in the sink.
+    out_base_off: Option<i32>,
+    out_limit_off: Option<i32>,
     bignum_off: Option<i32>, // BSS offset of the float-printing bignum (NLIMBS limbs)
     // Command-line args: BSS slots holding argc and the argv array pointer, set
     // when the program uses `ArgC`/`ArgV` (the entry captures them). `None`/false
@@ -308,6 +326,8 @@ impl Cg {
             helpers: HashMap::new(),
             rt_routines: HashMap::new(),
             out_ptr_off: None,
+            out_base_off: None,
+            out_limit_off: None,
             bignum_off: None,
             argc_off: None,
             argv_off: None,
@@ -369,7 +389,7 @@ impl Cg {
         if let Some(o) = self.digbuf {
             return o;
         }
-        let o = self.alloc_bss(80, 1);
+        let o = self.alloc_bss(FS_INT_DIGBUF, 1);
         self.digbuf = Some(o);
         o
     }
@@ -377,7 +397,7 @@ impl Cg {
         if let Some(o) = self.outbuf {
             return o;
         }
-        let o = self.alloc_bss(1024, 1);
+        let o = self.alloc_bss(FS_OUTBUF, 1);
         self.outbuf = Some(o);
         o
     }
@@ -387,6 +407,27 @@ impl Cg {
         }
         let o = self.alloc_bss(1, 1);
         self.charbuf = Some(o);
+        o
+    }
+    /// BSS slots for the growing sink (allocated together on first `MStrPrint`):
+    /// `out_base` is the start of the owned, reallocating output buffer (and the
+    /// value `MStrPrint` ultimately returns); `out_limit` is one past its last
+    /// usable byte. A nonzero `out_limit` is the sink's signal that it owns the
+    /// buffer and may grow it; `StrPrint` never sets it, so it keeps appending.
+    fn out_base_global(&mut self) -> i32 {
+        if let Some(o) = self.out_base_off {
+            return o;
+        }
+        let o = self.alloc_bss(8, 8);
+        self.out_base_off = Some(o);
+        o
+    }
+    fn out_limit_global(&mut self) -> i32 {
+        if let Some(o) = self.out_limit_off {
+            return o;
+        }
+        let o = self.alloc_bss(8, 8);
+        self.out_limit_off = Some(o);
         o
     }
 
@@ -1679,7 +1720,9 @@ impl Cg {
             // printf-into-a-buffer (the sprintf family)
             "StrPrint" => self.gen_strprint(args, false, pos),
             "CatPrint" => self.gen_strprint(args, true, pos),
+            "MStrPrint" => self.gen_mstrprint(args, pos),
             "I64ToStr" => self.gen_i64tostr(args, pos),
+            "F64ToStr" => self.gen_f64tostr(args, pos),
             // one integer/pointer argument
             "MAlloc" => self.call_rt("MAlloc", &[&args[0]]),
             "StrLen" => self.call_rt("StrLen", &[&args[0]]),
@@ -1709,6 +1752,15 @@ impl Cg {
             "MemFind" => self.call_rt("MemFind", &[&args[0], &args[1], &args[2]]),
             // four arguments
             "MemSearch" => self.call_rt("MemSearch", &[&args[0], &args[1], &args[2], &args[3]]),
+            // the `Is*` ctype predicates — each emitted as an inline range-check
+            // routine (see `emit_rt_ctype`).
+            n if crate::builtins::ctype_ranges(n).is_some() => {
+                let name = *crate::builtins::CTYPE_NAMES
+                    .iter()
+                    .find(|&&s| s == n)
+                    .unwrap();
+                self.call_rt(name, &[&args[0]])
+            }
             other => Err(CodegenError::at(
                 pos,
                 format!("x86_64 backend: builtin `{other}` is not supported yet"),
@@ -1771,6 +1823,69 @@ impl Cg {
         self.asm.call(l);
         self.finish_buffer_write(out);
         self.asm.load_local(dslot, 8, false); // return buf
+        Ok(())
+    }
+
+    /// `F64ToStr(f, buf)`: format `f` with `%g` into `buf`; return `buf`.
+    fn gen_f64tostr(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        let out = self.out_ptr_global();
+        self.gen_expr(&args[1])?; // buf
+        let dslot = self.alloc(8, 8);
+        self.asm.store_local(dslot, 8);
+        self.asm.load_local(dslot, 8, false);
+        self.asm.lea_global(R8, out);
+        self.asm.store_qword_at(R8, RAX); // out_ptr = buf
+        self.gen_print("%g", &args[0..1], pos)?; // format the value (matches the interpreter)
+        self.finish_buffer_write(out);
+        self.asm.load_local(dslot, 8, false); // return buf
+        Ok(())
+    }
+
+    /// `MStrPrint(fmt, ...)`: format into a fresh, right-sized buffer and return it
+    /// (asprintf-style). This is the **growing-sink** strategy real libcs use for
+    /// `vasprintf` (glibc/BSD's `open_memstream`): allocate a small owned buffer,
+    /// arm the sink to *grow* it (realloc + copy via [`Helper::GrowSink`]) whenever
+    /// a write would overflow, then format in a single pass. No measurement pass
+    /// and no fixed cap — the result pointer is just `out_base` when we finish.
+    fn gen_mstrprint(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        let ExprKind::Str(fmt) = &args[0].kind else {
+            return Err(CodegenError::at(
+                pos,
+                "x86_64 backend: MStrPrint's format must be a string literal",
+            ));
+        };
+        let fmt = fmt.clone();
+        const INIT_CAP: i32 = 64; // grown on demand; covers most results in one shot
+        let out = self.out_ptr_global();
+        let base = self.out_base_global();
+        let limit = self.out_limit_global();
+        self.helper(Helper::GrowSink); // ensure the grow routine is emitted
+        // buf = MAlloc(INIT_CAP); arm the sink at it (base = ptr = buf, limit = end).
+        self.asm.mov_ri(RDI, INIT_CAP);
+        let malloc = self.rt_routine("MAlloc");
+        self.asm.call(malloc); // rax = buf
+        self.asm.lea_global(R8, base);
+        self.asm.store_qword_at(R8, RAX); // out_base = buf
+        self.asm.lea_global(R8, out);
+        self.asm.store_qword_at(R8, RAX); // out_ptr = buf (write cursor)
+        self.asm.add_ri(RAX, INIT_CAP); // rax = buf + INIT_CAP
+        self.asm.lea_global(R8, limit);
+        self.asm.store_qword_at(R8, RAX); // out_limit = buf + INIT_CAP
+        // Format in one pass; the sink grows the buffer as needed.
+        self.gen_print(&fmt, &args[1..], pos)?;
+        // NUL-terminate at the cursor (GrowSink keeps cursor < limit, so this fits),
+        // then disarm: cursor = 0 (stdout), limit = 0 (StrPrint append mode).
+        self.asm.lea_global(R8, out);
+        self.asm.load_qword_at(RAX, R8); // rax = cursor
+        self.asm.store_byte_imm_at(RAX, 0); // *cursor = '\0'
+        self.asm.mov_ri(RAX, 0);
+        self.asm.lea_global(R8, out);
+        self.asm.store_qword_at(R8, RAX); // out_ptr = 0
+        self.asm.lea_global(R8, limit);
+        self.asm.store_qword_at(R8, RAX); // out_limit = 0
+        // Return the buffer base (it may have moved during a grow).
+        self.asm.lea_global(R8, base);
+        self.asm.load_qword_at(RAX, R8); // rax = out_base = result
         Ok(())
     }
 
@@ -1851,6 +1966,32 @@ impl Cg {
                 _ => {}
             }
         }
+        // The `Is*` ctype predicates (registered via `call_rt`), each an inline
+        // range-check routine driven by the shared `ctype_ranges` table.
+        for &name in crate::builtins::CTYPE_NAMES {
+            if let Some(&label) = self.rt_routines.get(name) {
+                self.asm.place(label);
+                self.emit_rt_ctype(crate::builtins::ctype_ranges(name).unwrap());
+            }
+        }
+    }
+
+    /// An `Is*` ctype predicate routine: `rdi` = the character, result `0`/`1` in
+    /// `rax`. Returns 1 on the first range `[lo, hi]` that contains the byte, else
+    /// 0 — matching `builtins::ctype_ranges` and the arm64 backend.
+    fn emit_rt_ctype(&mut self, ranges: &[(u8, u8)]) {
+        for &(lo, hi) in ranges {
+            let skip = self.asm.new_label();
+            self.asm.cmp_ri(RDI, lo as i32);
+            self.asm.jl(skip); // c < lo
+            self.asm.cmp_ri(RDI, hi as i32);
+            self.asm.jg(skip); // c > hi
+            self.asm.mov_ri(RAX, 1);
+            self.asm.emit(&[0xC3]); // ret (hit)
+            self.asm.place(skip);
+        }
+        self.asm.mov_ri(RAX, 0);
+        self.asm.emit(&[0xC3]); // ret (no range matched)
     }
 
     /// `MAlloc(rdi=n)`: a bump allocator over `mmap`'d chunks (1 MiB, page-aligned),
@@ -2841,6 +2982,10 @@ impl Cg {
             self.asm.place(label);
             self.emit_out_write();
         }
+        if let Some(&label) = self.helpers.get(&Helper::GrowSink) {
+            self.asm.place(label);
+            self.emit_grow_sink();
+        }
         // FmtFloat first: emitting it registers the bignum sub-routines it calls,
         // which are then emitted below (label references resolve at `finish`).
         for (h, emit) in [
@@ -2859,22 +3004,101 @@ impl Cg {
     }
 
     /// The output sink routine (`rsi`=buf, `rdx`=len). To stdout when `out_ptr` is
-    /// 0; otherwise it appends to the `StrPrint` buffer and advances `out_ptr`.
+    /// 0; otherwise it appends to the destination buffer and advances `out_ptr`.
+    /// When the buffer is an owned, growing `MStrPrint` one (`out_limit != 0`), it
+    /// first grows via [`Helper::GrowSink`] if the write would overflow.
     fn emit_out_write(&mut self) {
         let off = self.out_ptr_global();
         let stdout = self.asm.new_label();
+        let copy = self.asm.new_label();
         self.asm.lea_global(R8, off);
-        self.asm.load_qword_at(RAX, R8); // rax = out_ptr
+        self.asm.load_qword_at(RAX, R8); // rax = out_ptr (cursor)
         self.asm.test_rr(RAX, RAX);
         self.asm.je(stdout);
+        // Owned/growing buffer? Grow if cursor + len would leave no room for a NUL.
+        if self.out_limit_off.is_some() {
+            let limit = self.out_limit_global();
+            self.asm.lea_global(R9, limit);
+            self.asm.load_qword_at(R9, R9); // r9 = out_limit
+            self.asm.test_rr(R9, R9);
+            self.asm.je(copy); // limit == 0 → plain StrPrint append, no grow
+            self.asm.mov_rr(RCX, RAX);
+            self.asm.add_rr(RCX, RDX); // rcx = cursor + len
+            self.asm.cmp_rr(RCX, R9);
+            self.asm.jb(copy); // cursor + len < limit → fits (NUL has room)
+            let grow = self.helper(Helper::GrowSink);
+            self.asm.call(grow); // returns the (possibly new) cursor in rax
+        }
         // buffer mode: memcpy len bytes [rsi]->[rax]; out_ptr = rax + len
+        self.asm.place(copy);
         self.asm.mov_rr(RDI, RAX);
         self.asm.mov_rr(RCX, RDX);
         self.asm.rep_movsb(); // advances rdi by len
+        self.asm.lea_global(R8, off); // (GrowSink may have clobbered r8)
         self.asm.store_qword_at(R8, RDI); // out_ptr = new position
         self.asm.emit(&[0xC3]); // ret
         self.asm.place(stdout);
         self.os.emit_write_stdout(&mut self.asm); // write rdx bytes at rsi to stdout
+        self.asm.emit(&[0xC3]); // ret
+    }
+
+    /// [`Helper::GrowSink`]: reallocate the owned `MStrPrint` buffer so a pending
+    /// `rdx`-byte write (plus a trailing NUL) fits. New capacity is `max(2·old,
+    /// used + len + 1)`. Copies the live bytes, updates `out_base`/`out_ptr`/
+    /// `out_limit`, and returns the new cursor in `rax`. Preserves `rsi`/`rdx` (the
+    /// sink still needs the pending write); other volatiles are scratch. The bump
+    /// allocator never frees, so the old buffer is simply abandoned.
+    fn emit_grow_sink(&mut self) {
+        let out = self.out_ptr_global();
+        let base = self.out_base_global();
+        let limit = self.out_limit_global();
+        self.asm.emit(&[0x56]); // push rsi
+        self.asm.emit(&[0x52]); // push rdx
+        // new_cap (r9) = max(2·oldcap, used + len + 1)
+        self.asm.lea_global(R8, base);
+        self.asm.load_qword_at(R10, R8); // r10 = base
+        self.asm.lea_global(R8, out);
+        self.asm.load_qword_at(R11, R8); // r11 = cursor
+        self.asm.sub_rr(R11, R10); // r11 = used = cursor - base
+        self.asm.add_rr(R11, RDX); // r11 = used + len
+        self.asm.add_ri(R11, 1); // r11 = used + len + 1 (need)
+        self.asm.lea_global(R8, limit);
+        self.asm.load_qword_at(R9, R8); // r9 = limit
+        self.asm.sub_rr(R9, R10); // r9 = oldcap = limit - base
+        self.asm.add_rr(R9, R9); // r9 = 2·oldcap
+        let have = self.asm.new_label();
+        self.asm.cmp_rr(R9, R11);
+        self.asm.jae(have); // 2·oldcap >= need
+        self.asm.mov_rr(R9, R11); // else new_cap = need
+        self.asm.place(have);
+        // newbuf = MAlloc(new_cap)
+        self.asm.emit(&[0x41, 0x51]); // push r9 (new_cap)
+        self.asm.mov_rr(RDI, R9);
+        let malloc = self.rt_routine("MAlloc");
+        self.asm.call(malloc); // rax = newbuf
+        self.asm.emit(&[0x41, 0x59]); // pop r9 (new_cap)
+        self.asm.mov_rr(R11, RAX); // r11 = newbuf
+        // Copy the live bytes [base .. cursor) into newbuf (rep movsb leaves rdi at
+        // newbuf + used = the new cursor).
+        self.asm.lea_global(R8, base);
+        self.asm.load_qword_at(RSI, R8); // rsi = old base (src)
+        self.asm.lea_global(R8, out);
+        self.asm.load_qword_at(RCX, R8); // rcx = cursor
+        self.asm.sub_rr(RCX, RSI); // rcx = used
+        self.asm.mov_rr(RDI, R11); // rdi = newbuf (dst)
+        self.asm.rep_movsb(); // rdi = newbuf + used
+        // Publish the new buffer: base = newbuf, cursor = rdi, limit = newbuf + cap.
+        self.asm.lea_global(R8, base);
+        self.asm.store_qword_at(R8, R11);
+        self.asm.lea_global(R8, out);
+        self.asm.store_qword_at(R8, RDI);
+        self.asm.mov_rr(RAX, R11);
+        self.asm.add_rr(RAX, R9); // rax = newbuf + new_cap
+        self.asm.lea_global(R8, limit);
+        self.asm.store_qword_at(R8, RAX);
+        self.asm.mov_rr(RAX, RDI); // return the new cursor
+        self.asm.emit(&[0x5A]); // pop rdx
+        self.asm.emit(&[0x5E]); // pop rsi
         self.asm.emit(&[0xC3]); // ret
     }
 
@@ -2984,7 +3208,7 @@ impl Cg {
         let dloop = self.asm.new_label();
         let store = self.asm.new_label();
         let upper = self.asm.new_label();
-        self.asm.lea_global(R15, digbuf + 80); // one past the buffer end
+        self.asm.lea_global(R15, digbuf + FS_INT_DIGBUF); // one past the buffer end
         self.asm.mov_rr(RAX, RDI);
         self.asm.place(dloop);
         self.asm.xor_rr(RDX, RDX);
@@ -3003,7 +3227,7 @@ impl Cg {
         self.asm.store_byte_at(R15, RDX);
         self.asm.test_rr(RAX, RAX);
         self.asm.jne(dloop);
-        self.asm.lea_global(RBX, digbuf + 80);
+        self.asm.lea_global(RBX, digbuf + FS_INT_DIGBUF);
         self.asm.sub_rr(RBX, R15); // rbx = digit count
         // ---- octal `#`: ensure a leading 0 ----
         let nooct = self.asm.new_label();
@@ -3024,6 +3248,13 @@ impl Cg {
         self.asm.cmp_ri(R13, 0);
         self.asm.jl(precdone); // precision −1 ⇒ none
         self.asm.jne(precpad);
+        // octal `#` keeps a leading 0 even at precision 0 of value 0 (don't drop).
+        let not_octhash = self.asm.new_label();
+        self.asm.cmp_ri(R10, 8);
+        self.asm.jne(not_octhash);
+        self.asm.test_ri(R11, F_HASH);
+        self.asm.jne(precdone);
+        self.asm.place(not_octhash);
         self.asm.cmp_ri(RBX, 1);
         self.asm.jne(precpad);
         self.asm.cmp_byte_imm_at(R15, b'0');
@@ -3394,8 +3625,8 @@ impl Cg {
     /// esi=flags, edx=width. Mirrors Rust's `{:.P}` byte-for-byte.
     fn emit_fmt_float(&mut self) {
         let bn = self.bignum_global();
-        let digbuf = self.alloc_bss(768, 1);
-        let digend = digbuf + 768;
+        let digbuf = self.alloc_bss(FS_FLOAT_DIGBUF, 1);
+        let digend = digbuf + FS_FLOAT_DIGBUF;
         let outbuf = self.outbuf();
         self.asm
             .emit(&[0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]); // push rbx,r12-r15
@@ -3711,7 +3942,7 @@ impl Cg {
         let bn = self.bignum_global();
         let egdig = self.alloc_bss(1024, 1);
         let egend = egdig + 1024;
-        let sigbuf = self.alloc_bss(512, 1);
+        let sigbuf = self.alloc_bss(FS_SIGBUF, 1);
         let bodybuf = self.alloc_bss(1024, 1);
         let outbuf = self.outbuf();
         const CONV: i8 = 0;

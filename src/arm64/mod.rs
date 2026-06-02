@@ -64,6 +64,23 @@ const FT2: u32 = 17; // secondary F64 temporary (v17)
 const FP: u32 = 29;
 const LR: u32 = 30;
 const SP: u32 = 31;
+
+// printf flag bits for the freestanding formatter (mirror the x86-64 backend).
+const F_SIGNED: i64 = 1; // a signed conversion (`%d`/`%i`)
+const F_UPPER: i64 = 2; // uppercase hex (`%X`) / `0X`
+const F_MINUS: i64 = 4; // left-justify
+const F_ZERO: i64 = 8; // zero-pad
+const F_PLUS: i64 = 16; // always show a sign
+const F_SPACE: i64 = 32; // space before a non-negative
+const F_HASH: i64 = 64; // alternate form (`0x`/leading `0`)
+const NLIMBS: i64 = 48; // limbs in the float-formatting BIGNUM (matches x86-64)
+
+// Freestanding printf scratch buffer sizes, large enough for the clamped
+// `fmt::MAX_WIDTH`/`MAX_PRECISION` so the formatters can never overflow them.
+const FS_INT_DIGBUF: u64 = 600; // integer digit string (≥ MAX_PRECISION + sign/prefix)
+const FS_OUTBUF: u64 = 1152; // assembled field (≥ MAX_WIDTH)
+const FS_FLOAT_DIGBUF: u64 = 1024; // `%f` digits (J ≤ ~925, the bignum's capacity)
+const FS_SIGBUF: u64 = 576; // `%e`/`%g` significant digits (≥ MAX_PRECISION + 1)
 const XZR: u32 = 31;
 
 const COND_EQ: u32 = 0b0000;
@@ -119,6 +136,24 @@ trait ArmTarget {
     /// registers (standard AAPCS64 — `true`) or all on the stack (Apple's ARM64
     /// ABI — `false`). The only codegen difference between the two AArch64 OSes.
     fn variadic_in_registers(&self) -> bool;
+
+    /// `true` for a **freestanding** target — one that emits a self-contained
+    /// static executable with its own `_start` and raw syscalls, calling no libc
+    /// and needing no linker (`aarch64-unknown-linux` with no C toolchain). When
+    /// set, the driver emits a `_start` entry and `compile` returns the finished
+    /// executable from [`write_executable`](ArmTarget::write_executable) instead of
+    /// a relocatable object. Hosted targets (Darwin, gcc-linked Linux) leave this
+    /// `false` and use [`write_object`](ArmTarget::write_object) + `link`.
+    fn freestanding(&self) -> bool {
+        false
+    }
+
+    /// Wrap the freestanding `code` (entry at its first byte, BSS of `bss` zero
+    /// bytes trailing the image) into a runnable executable. Only called when
+    /// [`freestanding`](ArmTarget::freestanding) is `true`.
+    fn write_executable(&self, _code: &[u8], _bss: u64) -> Vec<u8> {
+        unreachable!("write_executable is only called for freestanding targets")
+    }
 }
 
 impl Arm64Darwin {
@@ -142,8 +177,10 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
     let (layouts, _) = crate::layout::compute(program);
     let mut cg = Cg::new(layouts);
     cg.variadic_regs = target.variadic_in_registers();
+    cg.freestanding = target.freestanding();
 
     let main_label = cg.asm.new_label();
+    let start_label = cg.asm.new_label();
     for item in &program.items {
         if let StmtKind::Func(f) = &item.kind {
             if f.body.is_some() {
@@ -202,6 +239,32 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
         }
     }
 
+    // Freestanding: lay out the globals in BSS (no linker to allocate commons), in
+    // declaration order with natural alignment, so `addr_global` can address each
+    // by a fixed offset.
+    if cg.freestanding {
+        for name in cg.global_order.clone() {
+            let g = &cg.globals[&name];
+            let (size, align) = (
+                cg.layouts.size_of(&g.ty).max(1) as u64,
+                cg.layouts.align_of(&g.ty).max(1) as u64,
+            );
+            let sym = g.sym;
+            let off = cg.alloc_bss_fs(size, align);
+            cg.global_bss.insert(sym, off);
+        }
+    }
+
+    // Freestanding: emit `_start` (the ELF entry, first byte of `__text`) — call
+    // `_main`, then exit_group with its return value. Hosted targets let the libc
+    // start-up code call `_main` and turn its return into the exit status.
+    if cg.freestanding {
+        cg.asm.place(start_label);
+        cg.asm.bl(main_label); // x0 = Main()
+        cg.asm.load_imm(8, 94); // x8 = SYS_exit_group
+        cg.asm.svc(); // exit(x0)
+    }
+
     let driver: Vec<&Stmt> = program
         .items
         .iter()
@@ -217,6 +280,28 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
                 cg.emit_function(label, &f.params, &f.ret, &body_refs, false)?;
             }
         }
+    }
+
+    // Freestanding runtime routines used by the program (emitted once, at the end
+    // of `__text`, so their forward `bl` references resolve in `finish`).
+    if cg.freestanding {
+        cg.emit_fs_runtime();
+    }
+
+    // Freestanding: no symbol table or linker — the image is the executable. For
+    // now (no globals/strings/libc lowered yet) any leftover relocation means the
+    // program uses a feature not ported to the freestanding backend.
+    if cg.freestanding {
+        let image = cg.asm.finish()?;
+        if !image.relocs.is_empty() {
+            return Err(CodegenError::new(
+                "freestanding aarch64-linux: this program uses a feature (libc call, \
+                 global, or formatted output) not yet supported on the freestanding \
+                 backend",
+                None,
+            ));
+        }
+        return Ok(target.write_executable(&image.text, cg.bss_size));
     }
 
     // Symbol table: defined (`_main` + funcs, in __text) then common globals.
@@ -246,10 +331,22 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
     Ok(target.write_object(&image, &defined, &commons, ndefined))
 }
 
-/// Compile `program`, write the object to a temp file, and link it into
-/// `out_path` with `target`'s linker.
+/// Compile `program` and produce the executable at `out_path`. For a freestanding
+/// target, `compile` already returns the finished executable, so this just writes
+/// it and marks it runnable. For a hosted target it writes the relocatable object
+/// to a temp file and links it.
 fn build(program: &Program, out_path: &Path, target: &dyn ArmTarget) -> Result<(), CodegenError> {
     let obj = compile(program, target)?;
+    if target.freestanding() {
+        fs::write(out_path, &obj)
+            .map_err(|e| CodegenError::new(format!("cannot write executable: {e}"), None))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(out_path, fs::Permissions::from_mode(0o755));
+        }
+        return Ok(());
+    }
     static OBJ_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = OBJ_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("solomon-{}-{seq}.o", std::process::id()));
@@ -328,6 +425,26 @@ struct Cg {
     uses_args: bool,
     /// Whether variadic args go in registers (AAPCS64) vs the stack (Apple).
     variadic_regs: bool,
+    /// Whether this is a freestanding target (own `_start`, raw syscalls, no
+    /// libc). Selects emitted runtime over libc calls throughout codegen.
+    freestanding: bool,
+    /// Freestanding print scratch (allocated once): BSS offsets of `digbuf`
+    /// (digit string), `outbuf` (the padded field), `charbuf` (`%c`), and `out_ptr`
+    /// (the sink: 0 = stdout, else the current `StrPrint` write cursor).
+    fs_scratch_off: Option<[u64; 4]>,
+    /// Float-formatter BSS: `(BIGNUM offset, digit-buffer offset)`, allocated once.
+    fs_float_off: Option<(u64, u64)>,
+    /// `%e`/`%g` scratch BSS: `(egdig, sigbuf, bodybuf)`, allocated once.
+    fs_eg_off: Option<(u64, u64, u64)>,
+    /// Freestanding BSS layout: each global symbol's byte offset within the BSS
+    /// region that follows code+strings, and the running total size. Globals are
+    /// addressed by a self-resolved `ADR` to `text_end + offset` (no relocations);
+    /// runtime scratch (allocator state, …) is bump-allocated here too.
+    global_bss: HashMap<u32, u64>,
+    bss_size: u64,
+    /// Freestanding builtin runtime routines (name -> label), emitted once at the
+    /// end of `__text` in place of the libc calls the hosted backends make.
+    fs_routines: HashMap<&'static str, usize>,
 }
 
 /// Hidden globals holding the command line, populated at the entry (only when the
@@ -354,6 +471,45 @@ impl Cg {
             cs_saves: Vec::new(),
             uses_args: false,
             variadic_regs: false,
+            freestanding: false,
+            fs_scratch_off: None,
+            fs_float_off: None,
+            fs_eg_off: None,
+            global_bss: HashMap::new(),
+            bss_size: 0,
+            fs_routines: HashMap::new(),
+        }
+    }
+
+    /// The label of a freestanding runtime routine, allocated on first use.
+    fn fs_routine(&mut self, name: &'static str) -> usize {
+        if let Some(&l) = self.fs_routines.get(name) {
+            return l;
+        }
+        let l = self.asm.new_label();
+        self.fs_routines.insert(name, l);
+        l
+    }
+
+    /// Reserve `size` bytes of freestanding BSS at `align`, returning the offset of
+    /// its first byte (relative to the BSS base = end of code+strings).
+    fn alloc_bss_fs(&mut self, size: u64, align: u64) -> u64 {
+        let a = align.max(1);
+        let off = self.bss_size.div_ceil(a) * a;
+        self.bss_size = off + size.max(1);
+        off
+    }
+
+    /// Load the address of global `sym` into `dst`. Freestanding: a single
+    /// self-resolved `ADR` to its fixed BSS address. Hosted: the relocated
+    /// `ADRP`+`ADD` pair the linker fills in.
+    fn addr_global(&mut self, dst: u32, sym: u32) {
+        if self.freestanding {
+            let off = self.global_bss[&sym];
+            self.asm.adr_global_fs(dst, off);
+        } else {
+            self.asm.adrp_global(dst, sym);
+            self.asm.add_global(dst, dst, sym);
         }
     }
 
@@ -420,8 +576,7 @@ impl Cg {
             Ok(())
         } else if let Some(g) = self.globals.get(name) {
             let sym = g.sym;
-            self.asm.adrp_global(RES, sym);
-            self.asm.add_global(RES, RES, sym);
+            self.addr_global(RES, sym);
             Ok(())
         } else {
             Err(CodegenError::at(
@@ -590,12 +745,10 @@ impl Cg {
         // callee-saved spills above don't touch x0/x1).
         if is_main && self.uses_args {
             let csym = self.globals[ARGC_GLOBAL].sym;
-            self.asm.adrp_global(SCRATCH, csym);
-            self.asm.add_global(SCRATCH, SCRATCH, csym);
+            self.addr_global(SCRATCH, csym);
             self.asm.store_mem(0, SCRATCH, 8); // __argc = x0
             let vsym = self.globals[ARGV_GLOBAL].sym;
-            self.asm.adrp_global(SCRATCH, vsym);
-            self.asm.add_global(SCRATCH, SCRATCH, vsym);
+            self.addr_global(SCRATCH, vsym);
             self.asm.store_mem(1, SCRATCH, 8); // __argv = x1
         }
 
@@ -1094,8 +1247,7 @@ impl Cg {
         if matches!(ty, Type::Named(_)) {
             // Copy-initialise a global class from another class value.
             self.gen_expr(init)?; // RES = source address
-            self.asm.adrp_global(T2, sym);
-            self.asm.add_global(T2, T2, sym);
+            self.addr_global(T2, sym);
             let n = self.type_size(&ty);
             self.gen_memcpy(T2, RES, n, SCRATCH);
             return Ok(());
@@ -1108,14 +1260,12 @@ impl Cg {
         }
         if is_f64(&ty) {
             self.gen_foperand(init)?; // value -> FRES
-            self.asm.adrp_global(T2, sym);
-            self.asm.add_global(T2, T2, sym);
+            self.addr_global(T2, sym);
             self.asm.fmov_to_gpr(RES, FRES);
             self.asm.store_mem(RES, T2, 8);
         } else {
             self.gen_int_expr(init, &ty)?; // value -> RES
-            self.asm.adrp_global(T2, sym);
-            self.asm.add_global(T2, T2, sym);
+            self.addr_global(T2, sym);
             self.gen_store(RES, T2, &ty);
         }
         Ok(())
@@ -1154,8 +1304,7 @@ impl Cg {
             // The slot starts at x29 - off; element `byte_off` in is x29 - (off - byte_off).
             Place::Local(off) => self.asm.sub_imm(dst, FP, off - byte_off),
             Place::Global(sym) => {
-                self.asm.adrp_global(dst, *sym);
-                self.asm.add_global(dst, dst, *sym);
+                self.addr_global(dst, *sym);
                 if byte_off > 0 {
                     self.asm.add_imm(dst, dst, byte_off);
                 }
@@ -2201,8 +2350,7 @@ impl Cg {
         // so its sequence matches the interpreter's `splitmix64`.
         if name == "RandU64" {
             let sym = self.globals[crate::builtins::RNG_STATE_GLOBAL].sym;
-            self.asm.adrp_global(T2, sym);
-            self.asm.add_global(T2, T2, sym); // T2 = &state
+            self.addr_global(T2, sym); // T2 = &state
             self.asm.load_mem(RES, T2, 8, false);
             self.asm.load_imm(SCRATCH, 0x9e3779b97f4a7c15u64 as i64);
             self.asm.add(RES, RES, SCRATCH); // state += golden
@@ -2228,8 +2376,7 @@ impl Cg {
         // `ArgC()` / `ArgV(i)` — read the command line captured at the entry.
         if name == "ArgC" {
             let sym = self.globals[ARGC_GLOBAL].sym;
-            self.asm.adrp_global(T2, sym);
-            self.asm.add_global(T2, T2, sym);
+            self.addr_global(T2, sym);
             self.asm.load_mem(RES, T2, 8, false); // RES = argc
             return Ok(());
         }
@@ -2240,15 +2387,13 @@ impl Cg {
             let l_done = self.asm.new_label();
             // Out of range (including negative i, via the unsigned compare) -> NULL.
             let csym = self.globals[ARGC_GLOBAL].sym;
-            self.asm.adrp_global(SCRATCH, csym);
-            self.asm.add_global(SCRATCH, SCRATCH, csym);
+            self.addr_global(SCRATCH, csym);
             self.asm.load_mem(SCRATCH, SCRATCH, 8, false); // SCRATCH = argc
             self.asm.cmp_reg(T2, SCRATCH);
             self.asm.b_cond(COND_HS, l_null); // unsigned i >= argc
             // RES = argv[i] = *(argv_base + i*8)
             let vsym = self.globals[ARGV_GLOBAL].sym;
-            self.asm.adrp_global(RES, vsym);
-            self.asm.add_global(RES, RES, vsym);
+            self.addr_global(RES, vsym);
             self.asm.load_mem(RES, RES, 8, false); // RES = argv base pointer
             self.asm.lsl_imm(SCRATCH, T2, 3); // SCRATCH = i*8
             self.asm.add(RES, RES, SCRATCH);
@@ -2267,6 +2412,17 @@ impl Cg {
         if name == "StrRev" {
             return self.gen_str_rev(&args[0]);
         }
+        // The `Is*` ctype predicates — emitted inline as ASCII range checks (libc's
+        // `isdigit` etc. return an unspecified nonzero, which wouldn't match the
+        // interpreter's 0/1), giving 0 or 1 in RES.
+        if let Some(ranges) = crate::builtins::ctype_ranges(name) {
+            return self.gen_ctype(&args[0], ranges);
+        }
+        // Freestanding: lower libc-backed builtins to emitted AArch64 routines (or
+        // inline sequences) instead of libc calls.
+        if self.freestanding && crate::builtins::libc_symbol(name).is_some() {
+            return self.gen_builtin_fs(name, args, pos);
+        }
         // A libc-backed builtin (e.g. `StrLen` -> `_strlen`) is an external call;
         // its argument classes come from the inferred call-site types and its
         // return type from the builtin registry.
@@ -2280,11 +2436,7 @@ impl Cg {
                     span: Span::dummy(),
                 })
                 .collect();
-            let ret = crate::builtins::all()
-                .into_iter()
-                .find(|b| b.name == name)
-                .map(|b| b.ret)
-                .unwrap_or(Type::I64);
+            let ret = crate::builtins::ret_of(name).unwrap_or(Type::I64);
             self.emit_call(CallTarget::Extern(sym), &params, args, &ret, name, pos)?;
             if name == "StrCmp" || name == "MemCmp" || name == "StrNCmp" {
                 // libc compare functions may return any (signed) magnitude; reduce
@@ -2652,6 +2804,9 @@ impl Cg {
     }
 
     fn gen_print(&mut self, fmt: &str, args: &[Expr]) -> Result<(), CodegenError> {
+        if self.freestanding {
+            return self.gen_print_fs(fmt, args);
+        }
         let c_fmt = translate_format(fmt)?;
         let fmt_idx = self.asm.intern_string(&c_fmt);
         let sz = self.pass_variadics(args, 1)?; // x0 = fmt, integer variadics from x1
@@ -2661,6 +2816,2070 @@ impl Cg {
             self.asm.add_sp_imm(sz);
         }
         Ok(())
+    }
+
+    /// Freestanding `StrPrint`/`CatPrint`: format into `dst` (or `dst + StrLen(dst)`
+    /// for an append) by redirecting the output sink (`out_ptr`) at the buffer, then
+    /// NUL-terminating and resetting the sink. Returns `dst`.
+    fn gen_formatted_write_fs(
+        &mut self,
+        dst: &Expr,
+        fmt: &str,
+        rest: &[Expr],
+        append: bool,
+    ) -> Result<(), CodegenError> {
+        self.fs_routine("OutWrite"); // ensure the sink is emitted
+        let out_ptr = self.fs_scratch()[3];
+        // dst -> frame slot (survives formatting; also the result).
+        self.gen_expr(dst)?;
+        let dst_off = self.alloc(8, 8);
+        self.asm.sub_imm(T2, FP, dst_off);
+        self.gen_store(RES, T2, &Type::I64);
+        // Compute the write start (T2): dst, or dst + StrLen(dst) for an append.
+        if append {
+            self.load_local(0, dst_off, &Type::I64);
+            let sl = self.fs_routine("StrLen");
+            self.asm.bl(sl); // x0 = StrLen(dst)
+            self.load_local(T2, dst_off, &Type::I64);
+            self.asm.add(T2, T2, 0); // T2 = dst + len
+        } else {
+            self.load_local(T2, dst_off, &Type::I64);
+        }
+        // out_ptr = write start.
+        self.asm.adr_global_fs(SCRATCH, out_ptr);
+        self.asm.store_mem(T2, SCRATCH, 8);
+        // Format through the sink (it appends to the buffer while out_ptr != 0).
+        self.gen_print_fs(fmt, rest)?;
+        // NUL-terminate at the cursor, then disarm the sink (out_ptr = 0).
+        self.asm.adr_global_fs(SCRATCH, out_ptr);
+        self.asm.load_mem(T2, SCRATCH, 8, false);
+        self.asm.load_imm(RES, 0);
+        self.asm.store_mem(RES, T2, 1); // *cursor = '\0'
+        self.asm.store_mem(RES, SCRATCH, 8); // out_ptr = 0
+        self.load_local(RES, dst_off, &Type::I64); // return dst
+        Ok(())
+    }
+
+    /// Freestanding `Print`: emit the formatting inline against raw `write`
+    /// syscalls instead of calling libc `printf`. Walks the format string (the same
+    /// [`crate::fmt`] spec the other backends use); literal runs and each `%`
+    /// conversion are rendered and written in turn. Integers go through the shared
+    /// [`emit_fmt_int_plain`](Self::emit_fmt_int_plain) routine; `%c`/`%s` are tiny
+    /// inline sequences. Flags/width/precision and floats aren't handled yet — an
+    /// unsupported spec is a clear error rather than wrong output.
+    fn gen_print_fs(&mut self, fmt: &str, args: &[Expr]) -> Result<(), CodegenError> {
+        let mut chars = fmt.chars().peekable();
+        let mut arg_i = 0usize;
+        let mut lit = String::new();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                lit.push(c);
+                continue;
+            }
+            let spec = crate::fmt::parse(&mut chars);
+            if spec.conv == '%' {
+                lit.push('%');
+                continue;
+            }
+            self.emit_literal_fs(&lit);
+            lit.clear();
+            if spec.width_star || spec.prec_star {
+                return Err(CodegenError::new(
+                    "freestanding aarch64-linux: `*` width/precision not supported yet",
+                    None,
+                ));
+            }
+            let i = arg_i;
+            if i >= args.len() {
+                return Err(CodegenError::new(
+                    "freestanding aarch64-linux: too few arguments for format string",
+                    None,
+                ));
+            }
+            arg_i += 1;
+            let mut flags: i64 = 0;
+            if spec.minus {
+                flags |= F_MINUS;
+            }
+            if spec.plus {
+                flags |= F_PLUS;
+            }
+            if spec.space {
+                flags |= F_SPACE;
+            }
+            if spec.zero {
+                flags |= F_ZERO;
+            }
+            if spec.hash {
+                flags |= F_HASH;
+            }
+            let width = spec.width.unwrap_or(0) as i64;
+            let prec = if spec.has_precision {
+                spec.precision as i64
+            } else {
+                -1
+            };
+            self.fs_routine("OutWrite"); // ensure the sink is emitted
+            match spec.conv {
+                'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
+                    let (radix, extra) = match spec.conv {
+                        'd' | 'i' => (10, F_SIGNED),
+                        'u' => (10, 0),
+                        'x' => (16, 0),
+                        'X' => (16, F_UPPER),
+                        _ => (8, 0), // 'o'
+                    };
+                    self.gen_expr(&args[i])?;
+                    self.asm.mov_reg(0, RES);
+                    self.asm.load_imm(1, radix);
+                    self.asm.load_imm(2, flags | extra);
+                    self.asm.load_imm(3, width);
+                    self.asm.load_imm(4, prec);
+                    let l = self.fs_routine("FmtInt");
+                    self.asm.bl(l);
+                }
+                'c' => {
+                    let charbuf = self.fs_scratch()[2];
+                    self.gen_expr(&args[i])?;
+                    self.asm.adr_global_fs(5, charbuf);
+                    self.asm.store_mem(RES, 5, 1);
+                    self.asm.adr_global_fs(0, charbuf);
+                    self.asm.load_imm(1, 1); // length 1
+                    self.asm.load_imm(2, flags);
+                    self.asm.load_imm(3, width);
+                    self.asm.load_imm(4, -1); // %c ignores precision
+                    let l = self.fs_routine("FmtStr");
+                    self.asm.bl(l);
+                }
+                's' => {
+                    self.gen_expr(&args[i])?;
+                    self.asm.mov_reg(0, RES);
+                    self.asm.load_imm(1, -1); // length -1 ⇒ strlen
+                    self.asm.load_imm(2, flags);
+                    self.asm.load_imm(3, width);
+                    self.asm.load_imm(4, prec);
+                    let l = self.fs_routine("FmtStr");
+                    self.asm.bl(l);
+                }
+                'f' => {
+                    self.gen_fexpr(&args[i])?; // FRES = value
+                    self.asm.fmov_reg(0, FRES); // d0 = value
+                    self.asm.load_imm(0, if prec < 0 { 6 } else { prec }); // %f default precision 6
+                    self.asm.load_imm(1, flags);
+                    self.asm.load_imm(2, width);
+                    let l = self.fs_routine("FmtFloat");
+                    self.asm.bl(l);
+                }
+                'e' | 'E' | 'g' | 'G' => {
+                    let conv = match spec.conv {
+                        'e' => 1,
+                        'E' => 1 | 4,
+                        'g' => 2,
+                        _ => 2 | 4, // 'G'
+                    };
+                    self.gen_fexpr(&args[i])?;
+                    self.asm.fmov_reg(0, FRES); // d0 = value
+                    self.asm.load_imm(0, if prec < 0 { 6 } else { prec });
+                    self.asm.load_imm(1, flags);
+                    self.asm.load_imm(2, width);
+                    self.asm.load_imm(3, conv);
+                    let l = self.fs_routine("FmtFloatEg");
+                    self.asm.bl(l);
+                }
+                other => {
+                    return Err(CodegenError::new(
+                        format!(
+                            "freestanding aarch64-linux: printf conversion %{other} is not \
+                             supported yet (%e/%g pending)"
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+        self.emit_literal_fs(&lit);
+        Ok(())
+    }
+
+    /// Write a literal run through the output sink (so it honours a `StrPrint`
+    /// redirect): intern it in `__text`, point `x1`/`x2` at it, call `OutWrite`.
+    fn emit_literal_fs(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let idx = self.asm.intern_string(s);
+        self.asm.adr(1, idx); // x1 = &string
+        self.asm.load_imm(2, s.len() as i64); // x2 = byte length
+        let l = self.fs_routine("OutWrite");
+        self.asm.bl(l);
+    }
+
+    /// The four print scratch buffers (`digbuf`, `outbuf`, `charbuf`, `out_ptr`),
+    /// allocated once in BSS.
+    fn fs_scratch(&mut self) -> [u64; 4] {
+        if let Some(s) = self.fs_scratch_off {
+            return s;
+        }
+        let s = [
+            self.alloc_bss_fs(FS_INT_DIGBUF, 8),
+            self.alloc_bss_fs(FS_OUTBUF, 8),
+            self.alloc_bss_fs(8, 8),
+            self.alloc_bss_fs(8, 8),
+        ];
+        self.fs_scratch_off = Some(s);
+        s
+    }
+
+    /// Test `flags & flag` (using `x7` as scratch) and branch to `label` when the
+    /// bit is set (`if_set`) or clear.
+    fn fs_tst(&mut self, flags_reg: u32, flag: i64, label: usize, if_set: bool) {
+        self.asm.load_imm(7, flag);
+        self.asm.and(7, flags_reg, 7);
+        if if_set {
+            self.asm.cbnz(7, label);
+        } else {
+            self.asm.cbz(7, label);
+        }
+    }
+
+    /// The output sink (`x1`=buf, `x2`=len): to stdout via `write` when the
+    /// `out_ptr` global is 0, else append to `[out_ptr]` and advance it (the
+    /// `StrPrint` path). A leaf — clobbers only `x0`/`x8..x12`.
+    fn emit_fs_out_write(&mut self) {
+        let out_ptr = self.fs_scratch()[3];
+        let stdout = self.asm.new_label();
+        let loop_ = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.adr_global_fs(9, out_ptr);
+        self.asm.load_mem(10, 9, 8, false); // x10 = out_ptr
+        self.asm.cbz(10, stdout);
+        self.asm.place(loop_);
+        self.asm.cbz(2, done);
+        self.asm.load_mem(12, 1, 1, false);
+        self.asm.store_mem(12, 10, 1);
+        self.asm.add_imm(1, 1, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.sub_imm(2, 2, 1);
+        self.asm.b(loop_);
+        self.asm.place(done);
+        self.asm.store_mem(10, 9, 8); // out_ptr = new cursor
+        self.asm.ret();
+        self.asm.place(stdout);
+        // Loop until the whole buffer is written: `write` may return a short
+        // count, and `-EINTR` (-4) means retry. x1=buf, x2=remaining.
+        let wloop = self.asm.new_label();
+        let advance = self.asm.new_label();
+        let wdone = self.asm.new_label();
+        self.asm.place(wloop);
+        self.asm.cbz(2, wdone); // nothing left
+        self.asm.load_imm(0, 1); // fd = stdout
+        self.asm.load_imm(8, 64); // SYS_write
+        self.asm.svc(); // x0 = bytes written (or -errno)
+        self.asm.cmp_imm0(0);
+        self.asm.b_cond(COND_GT, advance); // wrote >0 bytes
+        self.asm.add_imm(5, 0, 4); // x5 = x0 + 4 (==0 iff x0 == -EINTR)
+        self.asm.cbz(5, wloop); // EINTR: retry same buf/len
+        self.asm.b(wdone); // other error / 0: give up
+        self.asm.place(advance);
+        self.asm.add(1, 1, 0); // buf += written
+        self.asm.sub(2, 2, 0); // remaining -= written
+        self.asm.b(wloop);
+        self.asm.place(wdone);
+        self.asm.ret();
+    }
+
+    /// The integer formatter (mirrors `fmt::render_int`): `x0`=value, `x1`=radix,
+    /// `x2`=flags, `x3`=width, `x4`=precision. Builds the field in `outbuf` and
+    /// hands it to `OutWrite`. State lives in `x9..x17`; all of it is dead by the
+    /// single sink call, so only `lr` is preserved.
+    fn emit_fs_fmt_int(&mut self) {
+        let [digbuf, outbuf, _c, _o] = self.fs_scratch();
+        self.asm.push(LR);
+        self.asm.mov_reg(9, 1); // radix
+        self.asm.mov_reg(10, 2); // flags
+        self.asm.mov_reg(11, 3); // width
+        self.asm.mov_reg(12, 4); // precision
+        // ---- sign char (x13) + magnitude (x0; loop value in x8) ----
+        self.asm.load_imm(13, 0);
+        let unsigned = self.asm.new_label();
+        let havesign = self.asm.new_label();
+        let nonneg = self.asm.new_label();
+        let tryspace = self.asm.new_label();
+        self.fs_tst(10, F_SIGNED, unsigned, false);
+        self.asm.cmp_imm0(0);
+        self.asm.b_cond(COND_GE, nonneg);
+        self.asm.neg(0, 0);
+        self.asm.load_imm(13, b'-' as i64);
+        self.asm.b(havesign);
+        self.asm.place(nonneg);
+        self.fs_tst(10, F_PLUS, tryspace, false);
+        self.asm.load_imm(13, b'+' as i64);
+        self.asm.b(havesign);
+        self.asm.place(tryspace);
+        self.fs_tst(10, F_SPACE, havesign, false);
+        self.asm.load_imm(13, b' ' as i64);
+        self.asm.place(havesign);
+        self.asm.place(unsigned);
+        // ---- digits into digbuf, right-to-left (x14 = cursor) ----
+        self.asm.adr_global_fs(14, digbuf + FS_INT_DIGBUF);
+        self.asm.mov_reg(8, 0); // loop value (keep x0 = original magnitude)
+        let dloop = self.asm.new_label();
+        let store = self.asm.new_label();
+        let upper = self.asm.new_label();
+        self.asm.place(dloop);
+        self.asm.udiv(5, 8, 9); // q
+        self.asm.msub(6, 5, 9, 8); // rem
+        self.asm.add_imm(6, 6, b'0' as u32);
+        self.asm.cmp_imm(6, b'9' as u32);
+        self.asm.b_cond(COND_LS, store);
+        self.fs_tst(10, F_UPPER, upper, true);
+        self.asm.add_imm(6, 6, 0x27); // 'a'..'f'
+        self.asm.b(store);
+        self.asm.place(upper);
+        self.asm.add_imm(6, 6, 0x07); // 'A'..'F'
+        self.asm.place(store);
+        self.asm.sub_imm(14, 14, 1);
+        self.asm.store_mem(6, 14, 1);
+        self.asm.mov_reg(8, 5); // value = q
+        self.asm.cbnz(8, dloop);
+        // x15 = digit count = (digbuf+80) - x14
+        self.asm.adr_global_fs(15, digbuf + FS_INT_DIGBUF);
+        self.asm.sub(15, 15, 14);
+        // ---- octal `#`: ensure a leading 0 ----
+        let nooct = self.asm.new_label();
+        self.asm.cmp_imm(9, 8);
+        self.asm.b_cond(COND_NE, nooct);
+        self.fs_tst(10, F_HASH, nooct, false);
+        self.asm.load_mem(5, 14, 1, false);
+        self.asm.cmp_imm(5, b'0' as u32);
+        self.asm.b_cond(COND_EQ, nooct);
+        self.asm.sub_imm(14, 14, 1);
+        self.asm.load_imm(5, b'0' as i64);
+        self.asm.store_mem(5, 14, 1);
+        self.asm.add_imm(15, 15, 1);
+        self.asm.place(nooct);
+        // ---- precision (min digits); 0 value with precision 0 ⇒ no digits ----
+        let precdone = self.asm.new_label();
+        let precpad = self.asm.new_label();
+        let ploop = self.asm.new_label();
+        self.asm.cmp_imm0(12);
+        self.asm.b_cond(COND_LT, precdone); // precision −1 ⇒ none
+        self.asm.b_cond(COND_NE, precpad);
+        // octal `#` keeps a leading 0 even at precision 0 of value 0 (don't drop).
+        let not_octhash = self.asm.new_label();
+        self.asm.cmp_imm(9, 8);
+        self.asm.b_cond(COND_NE, not_octhash);
+        self.fs_tst(10, F_HASH, precdone, true);
+        self.asm.place(not_octhash);
+        self.asm.cmp_imm(15, 1);
+        self.asm.b_cond(COND_NE, precpad);
+        self.asm.load_mem(5, 14, 1, false);
+        self.asm.cmp_imm(5, b'0' as u32);
+        self.asm.b_cond(COND_NE, precpad);
+        self.asm.add_imm(14, 14, 1); // drop the single '0'
+        self.asm.load_imm(15, 0);
+        self.asm.b(precdone);
+        self.asm.place(precpad);
+        self.asm.place(ploop);
+        self.asm.cmp_reg(15, 12);
+        self.asm.b_cond(COND_GE, precdone);
+        self.asm.sub_imm(14, 14, 1);
+        self.asm.load_imm(5, b'0' as i64);
+        self.asm.store_mem(5, 14, 1);
+        self.asm.add_imm(15, 15, 1);
+        self.asm.b(ploop);
+        self.asm.place(precdone);
+        // ---- alt length (x16): `0x`/`0X` for `#` hex of a non-zero value ----
+        let noalt = self.asm.new_label();
+        self.asm.load_imm(16, 0);
+        self.fs_tst(10, F_HASH, noalt, false);
+        self.asm.cmp_imm(9, 16);
+        self.asm.b_cond(COND_NE, noalt);
+        self.asm.cbz(0, noalt); // original magnitude == 0
+        self.asm.load_imm(16, 2);
+        self.asm.place(noalt);
+        // ---- assemble into outbuf (x17 = cursor) ----
+        self.asm.adr_global_fs(17, outbuf);
+        // body_len (x5) = digits + alt + (sign ? 1 : 0)
+        self.asm.add(5, 15, 16);
+        let nosl = self.asm.new_label();
+        self.asm.cbz(13, nosl);
+        self.asm.add_imm(5, 5, 1);
+        self.asm.place(nosl);
+        // pad (x6) = max(0, width − body_len)
+        let padok = self.asm.new_label();
+        self.asm.sub(6, 11, 5);
+        self.asm.cmp_imm0(6);
+        self.asm.b_cond(COND_GE, padok);
+        self.asm.load_imm(6, 0);
+        self.asm.place(padok);
+        // choose justification
+        let do_minus = self.asm.new_label();
+        let do_right = self.asm.new_label();
+        let donebody = self.asm.new_label();
+        self.fs_tst(10, F_MINUS, do_minus, true);
+        self.fs_tst(10, F_ZERO, do_right, false);
+        self.asm.cmp_imm0(12); // zero flag ignored when precision is given
+        self.asm.b_cond(COND_GE, do_right);
+        // zero-justify: sign, alt, zeros, digits
+        self.fs_append_sign();
+        self.fs_append_alt();
+        self.fs_append_pad(b'0');
+        self.fs_append_digits();
+        self.asm.b(donebody);
+        // right-justify: spaces, sign, alt, digits
+        self.asm.place(do_right);
+        self.fs_append_pad(b' ');
+        self.fs_append_sign();
+        self.fs_append_alt();
+        self.fs_append_digits();
+        self.asm.b(donebody);
+        // left-justify: sign, alt, digits, spaces
+        self.asm.place(do_minus);
+        self.fs_append_sign();
+        self.fs_append_alt();
+        self.fs_append_digits();
+        self.fs_append_pad(b' ');
+        self.asm.place(donebody);
+        // OutWrite(outbuf, cursor − outbuf)
+        self.asm.adr_global_fs(1, outbuf);
+        self.asm.sub(2, 17, 1);
+        let ow = self.fs_routine("OutWrite");
+        self.asm.bl(ow);
+        self.asm.pop(LR);
+        self.asm.ret();
+    }
+
+    // Append helpers for `emit_fs_fmt_int`: the outbuf cursor is x17, the sign char
+    // x13, the alt length x16, the flags x10, the digit run [x14, x14+x15), and the
+    // pad count x6. (All fixed by the routine above.)
+    fn fs_append_sign(&mut self) {
+        let skip = self.asm.new_label();
+        self.asm.cbz(13, skip);
+        self.asm.store_mem(13, 17, 1);
+        self.asm.add_imm(17, 17, 1);
+        self.asm.place(skip);
+    }
+    fn fs_append_alt(&mut self) {
+        let skip = self.asm.new_label();
+        let wrote = self.asm.new_label();
+        self.asm.cbz(16, skip);
+        self.asm.load_imm(5, b'0' as i64);
+        self.asm.store_mem(5, 17, 1);
+        self.asm.add_imm(17, 17, 1);
+        self.asm.load_imm(5, b'x' as i64);
+        self.fs_tst(10, F_UPPER, wrote, false);
+        self.asm.load_imm(5, b'X' as i64);
+        self.asm.place(wrote);
+        self.asm.store_mem(5, 17, 1);
+        self.asm.add_imm(17, 17, 1);
+        self.asm.place(skip);
+    }
+    fn fs_append_pad(&mut self, fill: u8) {
+        let top = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.load_imm(5, fill as i64);
+        self.asm.place(top);
+        self.asm.cbz(6, done);
+        self.asm.store_mem(5, 17, 1);
+        self.asm.add_imm(17, 17, 1);
+        self.asm.sub_imm(6, 6, 1);
+        self.asm.b(top);
+        self.asm.place(done);
+    }
+    fn fs_append_digits(&mut self) {
+        let top = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.mov_reg(5, 15); // count (x6 holds the pad count for a later append)
+        self.asm.place(top);
+        self.asm.cbz(5, done);
+        self.asm.load_mem(7, 14, 1, false);
+        self.asm.store_mem(7, 17, 1);
+        self.asm.add_imm(14, 14, 1);
+        self.asm.add_imm(17, 17, 1);
+        self.asm.sub_imm(5, 5, 1);
+        self.asm.b(top);
+        self.asm.place(done);
+    }
+
+    /// The string/char formatter (mirrors `fmt::render_str`): `x0`=ptr,
+    /// `x1`=len (−1 ⇒ strlen), `x2`=flags, `x3`=width, `x4`=precision. Applies a
+    /// precision (truncate) then pads to width (left-justified with `-`). The
+    /// surviving state across the two sink calls (ptr/len/pad) lives in callee-saved
+    /// `x19..x21`.
+    fn emit_fs_fmt_str(&mut self) {
+        self.asm.push(19);
+        self.asm.push(20);
+        self.asm.push(21);
+        self.asm.push(LR);
+        self.asm.mov_reg(9, 0); // ptr
+        self.asm.mov_reg(10, 1); // len
+        self.asm.mov_reg(11, 2); // flags
+        self.asm.mov_reg(12, 3); // width
+        self.asm.mov_reg(13, 4); // precision
+        // len: strlen when negative
+        let havelen = self.asm.new_label();
+        let slloop = self.asm.new_label();
+        let sldone = self.asm.new_label();
+        self.asm.cmp_imm0(10);
+        self.asm.b_cond(COND_GE, havelen);
+        self.asm.mov_reg(5, 9); // cursor
+        self.asm.place(slloop);
+        self.asm.load_mem(6, 5, 1, false);
+        self.asm.cbz(6, sldone);
+        self.asm.add_imm(5, 5, 1);
+        self.asm.b(slloop);
+        self.asm.place(sldone);
+        self.asm.sub(10, 5, 9);
+        self.asm.place(havelen);
+        // precision: clamp len when 0 ≤ prec < len
+        let noprec = self.asm.new_label();
+        self.asm.cmp_imm0(13);
+        self.asm.b_cond(COND_LT, noprec);
+        self.asm.cmp_reg(13, 10);
+        self.asm.b_cond(COND_GE, noprec);
+        self.asm.mov_reg(10, 13);
+        self.asm.place(noprec);
+        // pad (x14) = max(0, width − len)
+        let padok = self.asm.new_label();
+        self.asm.sub(14, 12, 10);
+        self.asm.cmp_imm0(14);
+        self.asm.b_cond(COND_GE, padok);
+        self.asm.load_imm(14, 0);
+        self.asm.place(padok);
+        // survivors -> callee-saved (out_write clobbers x9..x12)
+        self.asm.mov_reg(19, 9); // ptr
+        self.asm.mov_reg(20, 10); // len
+        self.asm.mov_reg(21, 14); // pad
+        let do_minus = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.fs_tst(11, F_MINUS, do_minus, true);
+        self.fs_str_pad();
+        self.fs_str_body();
+        self.asm.b(done);
+        self.asm.place(do_minus);
+        self.fs_str_body();
+        self.fs_str_pad();
+        self.asm.place(done);
+        self.asm.pop(LR);
+        self.asm.pop(21);
+        self.asm.pop(20);
+        self.asm.pop(19);
+        self.asm.ret();
+    }
+    /// Output the body (`x19`=ptr, `x20`=len) through the sink.
+    fn fs_str_body(&mut self) {
+        self.asm.mov_reg(1, 19);
+        self.asm.mov_reg(2, 20);
+        let ow = self.fs_routine("OutWrite");
+        self.asm.bl(ow);
+    }
+    /// Output `x21` space padding through the sink, in `outbuf`-sized chunks.
+    fn fs_str_pad(&mut self) {
+        let outbuf = self.fs_scratch()[1];
+        let outer = self.asm.new_label();
+        let done = self.asm.new_label();
+        let noclamp = self.asm.new_label();
+        let fill = self.asm.new_label();
+        let filled = self.asm.new_label();
+        self.asm.place(outer);
+        self.asm.cbz(21, done);
+        // chunk x5 = min(x21, 1024)
+        self.asm.mov_reg(5, 21);
+        self.asm.cmp_imm(5, 1024);
+        self.asm.b_cond(COND_LS, noclamp);
+        self.asm.load_imm(5, 1024);
+        self.asm.place(noclamp);
+        self.asm.sub(21, 21, 5);
+        // fill outbuf[0..chunk] with spaces (cursor x6, counter x7, char x9)
+        self.asm.adr_global_fs(6, outbuf);
+        self.asm.mov_reg(7, 5);
+        self.asm.load_imm(9, b' ' as i64);
+        self.asm.place(fill);
+        self.asm.cbz(7, filled);
+        self.asm.store_mem(9, 6, 1);
+        self.asm.add_imm(6, 6, 1);
+        self.asm.sub_imm(7, 7, 1);
+        self.asm.b(fill);
+        self.asm.place(filled);
+        self.asm.adr_global_fs(1, outbuf);
+        self.asm.mov_reg(2, 5);
+        let ow = self.fs_routine("OutWrite");
+        self.asm.bl(ow);
+        self.asm.b(outer);
+        self.asm.place(done);
+    }
+
+    /// Freestanding lowering of a libc-backed builtin: inline scalar ops, or a call
+    /// to an emitted runtime routine (same ABI as the libc function it replaces).
+    fn gen_builtin_fs(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        match name {
+            // `Abs`: negate when negative.
+            "Abs" => {
+                self.gen_expr(&args[0])?;
+                let skip = self.asm.new_label();
+                self.asm.cmp_imm0(RES);
+                self.asm.b_cond(COND_GE, skip);
+                self.asm.neg(RES, RES);
+                self.asm.place(skip);
+                return Ok(());
+            }
+            // ASCII case conversion: shift a letter by 32.
+            "ToUpper" | "ToLower" => {
+                self.gen_expr(&args[0])?;
+                let upper = name == "ToUpper";
+                let lo = if upper { b'a' } else { b'A' } as u32;
+                let skip = self.asm.new_label();
+                self.asm.sub_imm(T2, RES, lo); // T2 = c - 'a'/'A'
+                self.asm.cmp_imm(T2, 25);
+                self.asm.b_cond(COND_HI, skip); // not a letter in range
+                if upper {
+                    self.asm.sub_imm(RES, RES, 32);
+                } else {
+                    self.asm.add_imm(RES, RES, 32);
+                }
+                self.asm.place(skip);
+                return Ok(());
+            }
+            // Algebraic F64 math — single AArch64 FP instructions.
+            "Sqrt" | "Fabs" | "Floor" | "Ceil" | "Round" => {
+                self.gen_fexpr(&args[0])?; // FRES = value
+                match name {
+                    "Sqrt" => self.asm.fsqrt(FRES, FRES),
+                    "Fabs" => self.asm.fabs(FRES, FRES),
+                    "Floor" => self.asm.frintm(FRES, FRES),
+                    "Ceil" => self.asm.frintp(FRES, FRES),
+                    _ => self.asm.frinta(FRES, FRES), // Round (ties away)
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        // Routine-backed builtins (standard ABI: args in x0.., result in x0).
+        let sname: &'static str = match name {
+            "MAlloc" => "MAlloc",
+            "Free" => "Free",
+            "StrLen" => "StrLen",
+            "StrCpy" => "StrCpy",
+            "StrCmp" => "StrCmp",
+            "StrCat" => "StrCat",
+            "StrFind" => "StrFind",
+            "MemCpy" => "MemCpy",
+            "MemSet" => "MemSet",
+            "MemCmp" => "MemCmp",
+            other => {
+                return Err(CodegenError::at(
+                    pos,
+                    format!("freestanding aarch64-linux: builtin `{other}` is not supported yet"),
+                ));
+            }
+        };
+        let params: Vec<Param> = args
+            .iter()
+            .map(|a| Param {
+                ty: self.expr_ty(a),
+                name: None,
+                default: None,
+                span: Span::dummy(),
+            })
+            .collect();
+        let ret = crate::builtins::ret_of(name).unwrap_or(Type::I64);
+        let label = self.fs_routine(sname);
+        self.emit_call(CallTarget::Label(label), &params, args, &ret, name, pos)
+    }
+
+    /// Emit the freestanding runtime routines the program uses, once, in a fixed
+    /// order. Each follows the internal ABI (args `x0..`, result `x0`) and clobbers
+    /// only caller-saved registers, so it is a safe `bl` target.
+    fn emit_fs_runtime(&mut self) {
+        const ORDER: &[&str] = &[
+            "OutWrite",
+            "FmtInt",
+            "FmtStr",
+            "FmtFloat",
+            "FmtFloatEg",
+            "BnMul",
+            "BnDiv10",
+            "BnShl",
+            "BnShr",
+            "MAlloc",
+            "Free",
+            "StrLen",
+            "StrCpy",
+            "StrCmp",
+            "StrCat",
+            "StrFind",
+            "MemCpy",
+            "MemSet",
+            "MemCmp",
+        ];
+        for &name in ORDER {
+            let Some(&l) = self.fs_routines.get(name) else {
+                continue;
+            };
+            self.asm.place(l);
+            match name {
+                "OutWrite" => self.emit_fs_out_write(),
+                "FmtInt" => self.emit_fs_fmt_int(),
+                "FmtStr" => self.emit_fs_fmt_str(),
+                "FmtFloat" => self.emit_fs_fmt_float(),
+                "FmtFloatEg" => self.emit_fs_fmt_float_eg(),
+                "BnMul" => self.emit_fs_bn_mul(),
+                "BnDiv10" => self.emit_fs_bn_div10(),
+                "BnShl" => self.emit_fs_bn_shl(),
+                "BnShr" => self.emit_fs_bn_shr(),
+                "MAlloc" => self.emit_fs_malloc(),
+                "Free" => self.asm.ret(), // a no-op bump allocator never frees
+                "StrLen" => self.emit_fs_strlen(),
+                "StrCpy" => self.emit_fs_strcpy(),
+                "StrCmp" => self.emit_fs_strcmp(),
+                "StrCat" => self.emit_fs_strcat(),
+                "StrFind" => self.emit_fs_strfind(),
+                "MemCpy" => self.emit_fs_memcpy(),
+                "MemSet" => self.emit_fs_memset(),
+                "MemCmp" => self.emit_fs_memcmp(),
+                _ => {}
+            }
+        }
+    }
+
+    /// `MAlloc(x0=n) -> x0`: a bump allocator over `mmap`'d chunks (≥1 MiB,
+    /// page-aligned), 16-byte-aligned allocations, state in two BSS words. `Free`
+    /// is a no-op, so chunks are never reused.
+    fn emit_fs_malloc(&mut self) {
+        let hp = self.alloc_bss_fs(8, 8); // heap bump pointer
+        let he = self.alloc_bss_fs(8, 8); // heap end
+        let fits = self.asm.new_label();
+        let sized = self.asm.new_label();
+        // x9 = (n + 15) & ~15
+        self.asm.add_imm(9, 0, 15);
+        self.asm.load_imm(10, -16);
+        self.asm.and(9, 9, 10);
+        // x11 = *hp, x12 = *he
+        self.asm.adr_global_fs(13, hp);
+        self.asm.load_mem(11, 13, 8, false);
+        self.asm.adr_global_fs(14, he);
+        self.asm.load_mem(12, 14, 8, false);
+        self.asm.add(15, 11, 9); // hp + n
+        self.asm.cmp_reg(15, 12);
+        self.asm.b_cond(COND_LS, fits); // fits in the current chunk
+        // chunk size x1 = max(n, 1 MiB), rounded up to a page
+        self.asm.mov_reg(1, 9);
+        self.asm.load_imm(10, 0x10_0000);
+        self.asm.cmp_reg(1, 10);
+        self.asm.b_cond(COND_HS, sized);
+        self.asm.mov_reg(1, 10);
+        self.asm.place(sized);
+        self.asm.add_imm(1, 1, 4095);
+        self.asm.load_imm(10, -4096);
+        self.asm.and(1, 1, 10);
+        // mmap(0, x1, PROT_READ|WRITE=3, MAP_PRIVATE|ANON=0x22, -1, 0), nr 222.
+        self.asm.load_imm(0, 0);
+        self.asm.load_imm(2, 3);
+        self.asm.load_imm(3, 0x22);
+        self.asm.load_imm(4, -1);
+        self.asm.load_imm(5, 0);
+        self.asm.load_imm(8, 222);
+        self.asm.svc();
+        self.asm.mov_reg(11, 0); // hp base = mmap base
+        self.asm.add(12, 0, 1); // he = base + chunk size
+        self.asm.adr_global_fs(14, he);
+        self.asm.store_mem(12, 14, 8);
+        self.asm.place(fits);
+        // result = x11 (base); *hp = base + n
+        self.asm.add(15, 11, 9);
+        self.asm.adr_global_fs(13, hp);
+        self.asm.store_mem(15, 13, 8);
+        self.asm.mov_reg(0, 11);
+        self.asm.ret();
+    }
+
+    /// `StrLen(x0=ptr) -> x0` — count bytes to the NUL.
+    fn emit_fs_strlen(&mut self) {
+        let l = self.asm.new_label();
+        let d = self.asm.new_label();
+        self.asm.mov_reg(9, 0); // cursor
+        self.asm.place(l);
+        self.asm.load_mem(10, 9, 1, false);
+        self.asm.cbz(10, d);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.b(l);
+        self.asm.place(d);
+        self.asm.sub(0, 9, 0); // cursor - ptr
+        self.asm.ret();
+    }
+
+    /// `StrCpy(x0=dst, x1=src) -> x0` — copy through the NUL; return dst.
+    fn emit_fs_strcpy(&mut self) {
+        let l = self.asm.new_label();
+        let d = self.asm.new_label();
+        self.asm.mov_reg(9, 0); // dst cursor (x0 kept for the return)
+        self.asm.place(l);
+        self.asm.load_mem(10, 1, 1, false);
+        self.asm.store_mem(10, 9, 1);
+        self.asm.cbz(10, d);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.add_imm(1, 1, 1);
+        self.asm.b(l);
+        self.asm.place(d);
+        self.asm.ret();
+    }
+
+    /// `StrCmp(x0=a, x1=b) -> x0` — a sign in {-1, 0, 1} (matches the interpreter).
+    fn emit_fs_strcmp(&mut self) {
+        let l = self.asm.new_label();
+        let diff = self.asm.new_label();
+        let eq = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.place(l);
+        self.asm.load_mem(9, 0, 1, false);
+        self.asm.load_mem(10, 1, 1, false);
+        self.asm.cmp_reg(9, 10);
+        self.asm.b_cond(COND_NE, diff);
+        self.asm.cbz(9, eq); // both NUL -> equal
+        self.asm.add_imm(0, 0, 1);
+        self.asm.add_imm(1, 1, 1);
+        self.asm.b(l);
+        self.asm.place(diff);
+        self.asm.load_imm(0, 1);
+        self.asm.cmp_reg(9, 10);
+        self.asm.b_cond(COND_HI, done); // a > b (unsigned byte)
+        self.asm.load_imm(0, -1);
+        self.asm.place(done);
+        self.asm.ret();
+        self.asm.place(eq);
+        self.asm.load_imm(0, 0);
+        self.asm.ret();
+    }
+
+    /// `StrCat(x0=dst, x1=src) -> x0` — append src at dst's NUL; return dst.
+    fn emit_fs_strcat(&mut self) {
+        let fe = self.asm.new_label();
+        let cp = self.asm.new_label();
+        let d = self.asm.new_label();
+        self.asm.mov_reg(9, 0); // dst cursor
+        self.asm.place(fe);
+        self.asm.load_mem(10, 9, 1, false);
+        self.asm.cbz(10, cp);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.b(fe);
+        self.asm.place(cp);
+        self.asm.load_mem(10, 1, 1, false);
+        self.asm.store_mem(10, 9, 1);
+        self.asm.cbz(10, d);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.add_imm(1, 1, 1);
+        self.asm.b(cp);
+        self.asm.place(d);
+        self.asm.ret();
+    }
+
+    /// `MemCpy(x0=dst, x1=src, x2=n) -> x0` — copy n bytes; return dst.
+    fn emit_fs_memcpy(&mut self) {
+        let l = self.asm.new_label();
+        let d = self.asm.new_label();
+        self.asm.mov_reg(9, 0); // dst cursor
+        self.asm.place(l);
+        self.asm.cbz(2, d);
+        self.asm.load_mem(10, 1, 1, false);
+        self.asm.store_mem(10, 9, 1);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.add_imm(1, 1, 1);
+        self.asm.sub_imm(2, 2, 1);
+        self.asm.b(l);
+        self.asm.place(d);
+        self.asm.ret();
+    }
+
+    /// `MemSet(x0=dst, x1=c, x2=n) -> x0` — set n bytes to c; return dst.
+    fn emit_fs_memset(&mut self) {
+        let l = self.asm.new_label();
+        let d = self.asm.new_label();
+        self.asm.mov_reg(9, 0); // dst cursor
+        self.asm.place(l);
+        self.asm.cbz(2, d);
+        self.asm.store_mem(1, 9, 1); // low byte of c
+        self.asm.add_imm(9, 9, 1);
+        self.asm.sub_imm(2, 2, 1);
+        self.asm.b(l);
+        self.asm.place(d);
+        self.asm.ret();
+    }
+
+    /// BSS for the float formatter: the 48-limb `BIGNUM` and the 768-byte digit
+    /// buffer, allocated once.
+    fn fs_float_scratch(&mut self) -> (u64, u64) {
+        if let Some(s) = self.fs_float_off {
+            return s;
+        }
+        let s = (
+            self.alloc_bss_fs(NLIMBS as u64 * 8, 8),
+            self.alloc_bss_fs(FS_FLOAT_DIGBUF, 1),
+        );
+        self.fs_float_off = Some(s);
+        s
+    }
+
+    /// `BIGNUM *= x0` (a small multiplier). Carry propagates low→high.
+    fn emit_fs_bn_mul(&mut self) {
+        let (bn, _) = self.fs_float_scratch();
+        let loop_l = self.asm.new_label();
+        self.asm.adr_global_fs(8, bn);
+        self.asm.load_imm(9, 0); // carry
+        self.asm.load_imm(10, 0); // index
+        self.asm.place(loop_l);
+        self.asm.ldr_idx8(11, 8, 10);
+        self.asm.mul(12, 11, 0); // lo = limb * k
+        self.asm.umulh(13, 11, 0); // hi
+        self.asm.adds(12, 12, 9); // lo += carry
+        self.asm.adc(13, 13, 31); // hi += C (x31 = XZR)
+        self.asm.str_idx8(12, 8, 10);
+        self.asm.mov_reg(9, 13); // new carry
+        self.asm.add_imm(10, 10, 1);
+        self.asm.cmp_imm(10, NLIMBS as u32);
+        self.asm.b_cond(COND_LO, loop_l);
+        self.asm.ret();
+    }
+
+    /// `BIGNUM /= 10`, returning the remainder digit in `x0`. Most-significant limb
+    /// first; each limb is divided by a 64-iteration shift/subtract (AArch64 has no
+    /// 128÷64), with the running remainder (< 10) carried down.
+    fn emit_fs_bn_div10(&mut self) {
+        let (bn, _) = self.fs_float_scratch();
+        let outer = self.asm.new_label();
+        let bits = self.asm.new_label();
+        let nosub = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.adr_global_fs(8, bn);
+        self.asm.load_imm(9, NLIMBS as i64 - 1); // index (MSB first)
+        self.asm.load_imm(10, 0); // running remainder
+        self.asm.place(outer);
+        self.asm.ldr_idx8(11, 8, 9); // limb
+        self.asm.load_imm(12, 0); // quotient
+        self.asm.load_imm(13, 64); // bit counter
+        self.asm.place(bits);
+        self.asm.lsl_imm(10, 10, 1); // rem <<= 1
+        self.asm.lsr_imm(14, 11, 63); // top bit of limb
+        self.asm.orr(10, 10, 14);
+        self.asm.lsl_imm(11, 11, 1); // consume top bit
+        self.asm.lsl_imm(12, 12, 1); // quot <<= 1
+        self.asm.cmp_imm(10, 10);
+        self.asm.b_cond(COND_LO, nosub); // rem < 10
+        self.asm.sub_imm(10, 10, 10); // rem -= 10
+        self.asm.add_imm(12, 12, 1); // quot |= 1
+        self.asm.place(nosub);
+        self.asm.sub_imm(13, 13, 1);
+        self.asm.cbnz(13, bits);
+        self.asm.str_idx8(12, 8, 9); // store quotient
+        self.asm.cbz(9, done); // processed limb 0 → finished
+        self.asm.sub_imm(9, 9, 1);
+        self.asm.b(outer);
+        self.asm.place(done);
+        self.asm.mov_reg(0, 10); // remainder
+        self.asm.ret();
+    }
+
+    /// `BIGNUM <<= x0` bits.
+    fn emit_fs_bn_shl(&mut self) {
+        let (bn, _) = self.fs_float_scratch();
+        let loop_l = self.asm.new_label();
+        let zero = self.asm.new_label();
+        let store = self.asm.new_label();
+        self.asm.lsr_imm(9, 0, 6); // word = bits/64
+        self.asm.and_imm_lowbits(10, 0, 6); // bit = bits%64
+        self.asm.adr_global_fs(8, bn);
+        self.asm.load_imm(11, NLIMBS as i64 - 1); // i (high → low)
+        self.asm.place(loop_l);
+        self.asm.subs(12, 11, 9); // src = i - word
+        self.asm.b_cond(COND_LT, zero);
+        self.asm.ldr_idx8(13, 8, 12); // lo
+        self.asm.cbz(10, store); // bit == 0 → just lo
+        self.asm.lslv(13, 13, 10); // lo << bit
+        self.asm.sub_imm(12, 12, 1); // src - 1
+        self.asm.cmp_imm0(12);
+        self.asm.b_cond(COND_LT, store);
+        self.asm.ldr_idx8(14, 8, 12); // hi
+        self.asm.load_imm(15, 64);
+        self.asm.sub(15, 15, 10); // 64 - bit
+        self.asm.lsrv(14, 14, 15); // hi >> (64-bit)
+        self.asm.orr(13, 13, 14);
+        self.asm.b(store);
+        self.asm.place(zero);
+        self.asm.load_imm(13, 0);
+        self.asm.place(store);
+        self.asm.str_idx8(13, 8, 11);
+        self.asm.sub_imm(11, 11, 1);
+        self.asm.cmp_imm0(11);
+        self.asm.b_cond(COND_GE, loop_l);
+        self.asm.ret();
+    }
+
+    /// `BIGNUM >>= x0` bits, rounding the dropped bits to nearest, ties to even.
+    fn emit_fs_bn_shr(&mut self) {
+        let (bn, _) = self.fs_float_scratch();
+        self.asm.adr_global_fs(8, bn); // base
+        self.asm.mov_reg(9, 0); // bits
+        // ---- round bit (x15) + sticky (x16) of the dropped low `bits` bits ----
+        self.asm.sub_imm(12, 9, 1); // m = bits - 1
+        self.asm.lsr_imm(13, 12, 6); // mword
+        self.asm.and_imm_lowbits(14, 12, 6); // mbit
+        self.asm.ldr_idx8(15, 8, 13); // limb[mword]
+        self.asm.mov_reg(16, 15); // copy for sticky
+        self.asm.lsrv(15, 15, 14);
+        self.asm.and_imm_lowbits(15, 15, 1); // round bit
+        self.asm.load_imm(17, 1);
+        self.asm.lslv(17, 17, 14);
+        self.asm.sub_imm(17, 17, 1); // mask = (1<<mbit)-1
+        self.asm.and(16, 16, 17); // partial low bits
+        let sloop = self.asm.new_label();
+        let sdone = self.asm.new_label();
+        self.asm.load_imm(18, 0); // j
+        self.asm.place(sloop);
+        self.asm.cmp_reg(18, 13);
+        self.asm.b_cond(COND_HS, sdone);
+        self.asm.ldr_idx8(0, 8, 18);
+        self.asm.orr(16, 16, 0);
+        self.asm.add_imm(18, 18, 1);
+        self.asm.b(sloop);
+        self.asm.place(sdone);
+        // ---- shift right by `bits` (word, bit) ----
+        let shloop = self.asm.new_label();
+        let lozero = self.asm.new_label();
+        let havelo = self.asm.new_label();
+        let store2 = self.asm.new_label();
+        self.asm.lsr_imm(10, 9, 6); // word
+        self.asm.and_imm_lowbits(11, 9, 6); // bit
+        self.asm.load_imm(12, 0); // i (low → high)
+        self.asm.place(shloop);
+        self.asm.add(13, 12, 10); // src = i + word
+        self.asm.cmp_imm(13, NLIMBS as u32);
+        self.asm.b_cond(COND_HS, lozero);
+        self.asm.ldr_idx8(14, 8, 13);
+        self.asm.b(havelo);
+        self.asm.place(lozero);
+        self.asm.load_imm(14, 0);
+        self.asm.place(havelo);
+        self.asm.cbz(11, store2); // bit == 0
+        self.asm.lsrv(14, 14, 11); // lo >> bit
+        self.asm.add_imm(13, 13, 1); // src + 1
+        self.asm.cmp_imm(13, NLIMBS as u32);
+        self.asm.b_cond(COND_HS, store2);
+        self.asm.ldr_idx8(0, 8, 13); // hi
+        self.asm.load_imm(1, 64);
+        self.asm.sub(1, 1, 11);
+        self.asm.lslv(0, 0, 1); // hi << (64-bit)
+        self.asm.orr(14, 14, 0);
+        self.asm.place(store2);
+        self.asm.str_idx8(14, 8, 12);
+        self.asm.add_imm(12, 12, 1);
+        self.asm.cmp_imm(12, NLIMBS as u32);
+        self.asm.b_cond(COND_LO, shloop);
+        // ---- round up if round_bit && (sticky || quotient is odd) ----
+        let rdone = self.asm.new_label();
+        let roundup = self.asm.new_label();
+        let iloop = self.asm.new_label();
+        self.asm.cbz(15, rdone); // round bit clear
+        self.asm.cbnz(16, roundup); // sticky set
+        self.asm.load_imm(12, 0);
+        self.asm.ldr_idx8(0, 8, 12); // BIGNUM[0]
+        self.asm.and_imm_lowbits(0, 0, 1);
+        self.asm.cbz(0, rdone); // quotient even
+        self.asm.place(roundup);
+        self.asm.load_imm(12, 0); // i
+        self.asm.place(iloop);
+        self.asm.ldr_idx8(0, 8, 12);
+        self.asm.add_imm(0, 0, 1);
+        self.asm.str_idx8(0, 8, 12);
+        self.asm.cbnz(0, rdone); // no wrap to 0 → no carry out
+        self.asm.add_imm(12, 12, 1);
+        self.asm.cmp_imm(12, NLIMBS as u32);
+        self.asm.b_cond(COND_LO, iloop);
+        self.asm.place(rdone);
+        self.asm.ret();
+    }
+
+    /// `StrFind(x0=haystack, x1=needle) -> x0` — pointer to the first occurrence of
+    /// `needle` in `haystack`, or NULL (libc `strstr`). An empty needle matches at
+    /// the start.
+    fn emit_fs_strfind(&mut self) {
+        let outer = self.asm.new_label();
+        let inner = self.asm.new_label();
+        let next = self.asm.new_label();
+        let found = self.asm.new_label();
+        let notfound = self.asm.new_label();
+        let ret_h = self.asm.new_label();
+        // Empty needle -> return haystack.
+        self.asm.load_mem(9, 1, 1, false);
+        self.asm.cbz(9, ret_h);
+        self.asm.place(outer);
+        self.asm.load_mem(9, 0, 1, false);
+        self.asm.cbz(9, notfound); // end of haystack
+        self.asm.mov_reg(10, 0); // h cursor
+        self.asm.mov_reg(11, 1); // n cursor
+        self.asm.place(inner);
+        self.asm.load_mem(12, 11, 1, false); // *n
+        self.asm.cbz(12, found); // end of needle -> match
+        self.asm.load_mem(13, 10, 1, false); // *h
+        self.asm.cmp_reg(12, 13);
+        self.asm.b_cond(COND_NE, next);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.add_imm(11, 11, 1);
+        self.asm.b(inner);
+        self.asm.place(next);
+        self.asm.add_imm(0, 0, 1);
+        self.asm.b(outer);
+        self.asm.place(found);
+        self.asm.ret(); // x0 = match start
+        self.asm.place(notfound);
+        self.asm.load_imm(0, 0);
+        self.asm.place(ret_h);
+        self.asm.ret();
+    }
+
+    /// `%f` formatter (mirrors Rust's `{:.P}` byte-for-byte): `d0`=value, `x0`=P,
+    /// `x1`=flags, `x2`=width. Builds `J = round(m·2^e·10^P)` in the BIGNUM, extracts
+    /// its decimal digits, and places the point. Persistent state across the bignum
+    /// calls lives in callee-saved `x19..x28`.
+    fn emit_fs_fmt_float(&mut self) {
+        let (bn, digbuf) = self.fs_float_scratch();
+        let digend = digbuf + FS_FLOAT_DIGBUF;
+        let outbuf = self.fs_scratch()[1];
+        for r in [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, LR] {
+            self.asm.push(r);
+        }
+        self.asm.mov_reg(19, 0); // P
+        self.asm.mov_reg(20, 1); // flags
+        self.asm.mov_reg(21, 2); // width
+        self.asm.fmov_to_gpr(23, 0); // value bits
+        // ---- sign char (x22) + magnitude bits (x23) ----
+        let signpos = self.asm.new_label();
+        let havesign = self.asm.new_label();
+        let nospace = self.asm.new_label();
+        self.asm.load_imm(8, 0x7FFF_FFFF_FFFF_FFFF);
+        self.asm.and(9, 23, 8); // magnitude bits
+        self.asm.load_imm(22, 0); // sign = none
+        self.asm.cbz(9, signpos); // ±0 is non-negative
+        self.asm.lsr_imm(10, 23, 63);
+        self.asm.cbz(10, signpos);
+        self.asm.load_imm(22, b'-' as i64);
+        self.asm.b(havesign);
+        self.asm.place(signpos);
+        self.fs_tst(20, F_PLUS, havesign, false);
+        self.asm.load_imm(22, b'+' as i64);
+        self.asm.place(havesign);
+        self.asm.cbnz(22, nospace);
+        self.fs_tst(20, F_SPACE, nospace, false);
+        self.asm.load_imm(22, b' ' as i64);
+        self.asm.place(nospace);
+        self.asm.mov_reg(23, 9); // x23 = magnitude bits
+        // ---- decompose into exp field (x10) + fraction (x9 → mantissa) ----
+        let infnan = self.asm.new_label();
+        let subnormal = self.asm.new_label();
+        let havem = self.asm.new_label();
+        self.asm.lsr_imm(10, 23, 52);
+        self.asm.load_imm(8, 0x7FF);
+        self.asm.and(10, 10, 8); // exp field
+        self.asm.load_imm(8, 0x000F_FFFF_FFFF_FFFF);
+        self.asm.and(9, 23, 8); // fraction
+        self.asm.cmp_imm(10, 0x7FF);
+        self.asm.b_cond(COND_EQ, infnan);
+        self.asm.cbz(10, subnormal);
+        // normal: m = frac | 2^52, e2 = exp - 1075
+        self.asm.load_imm(8, 0x0010_0000_0000_0000);
+        self.asm.orr(9, 9, 8);
+        self.asm.sub_imm(10, 10, 1075); // careful: 1075 < 4096, sub_imm ok
+        self.asm.b(havem);
+        self.asm.place(subnormal);
+        self.asm.load_imm(10, -1074); // e2 (m = frac)
+        self.asm.place(havem);
+        // s = e2 + P (kept in callee-saved x28 across the bignum calls)
+        self.asm.add(28, 10, 19);
+        // BIGNUM = m
+        let zloop = self.asm.new_label();
+        self.asm.adr_global_fs(8, bn);
+        self.asm.load_imm(11, 0); // index
+        self.asm.load_imm(12, 0); // zero
+        self.asm.place(zloop);
+        self.asm.str_idx8(12, 8, 11);
+        self.asm.add_imm(11, 11, 1);
+        self.asm.cmp_imm(11, NLIMBS as u32);
+        self.asm.b_cond(COND_LO, zloop);
+        self.asm.store_mem(9, 8, 8); // BIGNUM[0] = m
+        // × 5^P
+        let mulloop = self.asm.new_label();
+        let muldone = self.asm.new_label();
+        self.asm.mov_reg(24, 19); // counter = P (x24 free until ndig)
+        self.asm.place(mulloop);
+        self.asm.cbz(24, muldone);
+        self.asm.load_imm(0, 5);
+        let bm = self.fs_routine("BnMul");
+        self.asm.bl(bm);
+        self.asm.sub_imm(24, 24, 1);
+        self.asm.b(mulloop);
+        self.asm.place(muldone);
+        // × 2^s
+        let shifted = self.asm.new_label();
+        let shrpath = self.asm.new_label();
+        self.asm.cmp_imm0(28);
+        self.asm.b_cond(COND_LT, shrpath);
+        self.asm.mov_reg(0, 28);
+        let sl = self.fs_routine("BnShl");
+        self.asm.bl(sl);
+        self.asm.b(shifted);
+        self.asm.place(shrpath);
+        self.asm.neg(0, 28);
+        let sr = self.fs_routine("BnShr");
+        self.asm.bl(sr);
+        self.asm.place(shifted);
+        // extract decimal digits into digbuf (downward from digend)
+        let dloop = self.asm.new_label();
+        let zchk = self.asm.new_label();
+        let notzero = self.asm.new_label();
+        let extracted = self.asm.new_label();
+        self.asm.adr_global_fs(23, digend); // digit cursor
+        self.asm.place(dloop);
+        let bd = self.fs_routine("BnDiv10");
+        self.asm.bl(bd); // x0 = digit
+        self.asm.add_imm(0, 0, b'0' as u32);
+        self.asm.sub_imm(23, 23, 1);
+        self.asm.store_mem(0, 23, 1);
+        self.asm.adr_global_fs(8, bn);
+        self.asm.load_imm(9, 0);
+        self.asm.place(zchk);
+        self.asm.ldr_idx8(10, 8, 9);
+        self.asm.cbnz(10, notzero);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.cmp_imm(9, NLIMBS as u32);
+        self.asm.b_cond(COND_LO, zchk);
+        self.asm.b(extracted);
+        self.asm.place(notzero);
+        self.asm.b(dloop);
+        self.asm.place(extracted);
+        // ndig (x24) = digend - x23
+        self.asm.adr_global_fs(8, digend);
+        self.asm.sub(24, 8, 23);
+        // bodylen (x25): P==0 ⇒ ndig; ndig>P ⇒ ndig+1; else P+2
+        let pnz = self.asm.new_label();
+        let bsmall = self.asm.new_label();
+        let haveblen = self.asm.new_label();
+        self.asm.cbnz(19, pnz);
+        self.asm.mov_reg(25, 24);
+        self.asm.b(haveblen);
+        self.asm.place(pnz);
+        self.asm.cmp_reg(24, 19);
+        self.asm.b_cond(COND_LS, bsmall);
+        self.asm.add_imm(25, 24, 1);
+        self.asm.b(haveblen);
+        self.asm.place(bsmall);
+        self.asm.add_imm(25, 19, 2);
+        self.asm.place(haveblen);
+        // pad (x27) = max(0, width - (bodylen + signlen))
+        let nosl = self.asm.new_label();
+        let padok = self.asm.new_label();
+        self.asm.mov_reg(8, 25);
+        self.asm.cbz(22, nosl);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.place(nosl);
+        self.asm.sub(27, 21, 8);
+        self.asm.cmp_imm0(27);
+        self.asm.b_cond(COND_GE, padok);
+        self.asm.load_imm(27, 0);
+        self.asm.place(padok);
+        // assemble into outbuf (cursor x26)
+        self.asm.adr_global_fs(26, outbuf);
+        let do_minus = self.asm.new_label();
+        let do_right = self.asm.new_label();
+        let fielddone = self.asm.new_label();
+        self.fs_tst(20, F_MINUS, do_minus, true);
+        self.fs_tst(20, F_ZERO, do_right, false);
+        self.fs_float_sign();
+        self.fs_float_pad(b'0');
+        self.fs_float_body();
+        self.asm.b(fielddone);
+        self.asm.place(do_right);
+        self.fs_float_pad(b' ');
+        self.fs_float_sign();
+        self.fs_float_body();
+        self.asm.b(fielddone);
+        self.asm.place(do_minus);
+        self.fs_float_sign();
+        self.fs_float_body();
+        self.fs_float_pad(b' ');
+        self.asm.place(fielddone);
+        // OutWrite(outbuf, cursor - outbuf)
+        let epilogue = self.asm.new_label();
+        self.asm.adr_global_fs(1, outbuf);
+        self.asm.sub(2, 26, 1);
+        let ow = self.fs_routine("OutWrite");
+        self.asm.bl(ow);
+        self.asm.b(epilogue);
+        // inf / NaN: sign then "inf"/"NaN" (Rust's spelling), unpadded. x9=fraction.
+        self.asm.place(infnan);
+        self.asm.adr_global_fs(26, outbuf);
+        self.fs_float_sign();
+        let is_nan = self.asm.new_label();
+        let wrote = self.asm.new_label();
+        self.asm.cbnz(9, is_nan); // fraction nonzero ⇒ NaN
+        for ch in [b'i', b'n', b'f'] {
+            self.asm.load_imm(8, ch as i64);
+            self.asm.store_mem(8, 26, 1);
+            self.asm.add_imm(26, 26, 1);
+        }
+        self.asm.b(wrote);
+        self.asm.place(is_nan);
+        for ch in [b'N', b'a', b'N'] {
+            self.asm.load_imm(8, ch as i64);
+            self.asm.store_mem(8, 26, 1);
+            self.asm.add_imm(26, 26, 1);
+        }
+        self.asm.place(wrote);
+        self.asm.adr_global_fs(1, outbuf);
+        self.asm.sub(2, 26, 1);
+        let ow = self.fs_routine("OutWrite");
+        self.asm.bl(ow);
+        self.asm.place(epilogue);
+        for r in [LR, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19] {
+            self.asm.pop(r);
+        }
+        self.asm.ret();
+    }
+
+    // Field helpers for `emit_fs_fmt_float`: outbuf cursor x26, sign x22, pad x27,
+    // P x19, digit cursor x23, ndig x24.
+    fn fs_float_sign(&mut self) {
+        let skip = self.asm.new_label();
+        self.asm.cbz(22, skip);
+        self.asm.store_mem(22, 26, 1);
+        self.asm.add_imm(26, 26, 1);
+        self.asm.place(skip);
+    }
+    fn fs_float_pad(&mut self, fill: u8) {
+        let top = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.load_imm(8, fill as i64);
+        self.asm.place(top);
+        self.asm.cbz(27, done);
+        self.asm.store_mem(8, 26, 1);
+        self.asm.add_imm(26, 26, 1);
+        self.asm.sub_imm(27, 27, 1);
+        self.asm.b(top);
+        self.asm.place(done);
+    }
+    /// Copy `x10` digit bytes from `x9` to the cursor `x26`.
+    fn fs_float_copy_digits(&mut self) {
+        let top = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.place(top);
+        self.asm.cbz(10, done);
+        self.asm.load_mem(11, 9, 1, false);
+        self.asm.store_mem(11, 26, 1);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.add_imm(26, 26, 1);
+        self.asm.sub_imm(10, 10, 1);
+        self.asm.b(top);
+        self.asm.place(done);
+    }
+    fn fs_float_body(&mut self) {
+        let p_zero = self.asm.new_label();
+        let big = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.cbz(19, p_zero);
+        self.asm.cmp_reg(24, 19);
+        self.asm.b_cond(COND_HI, big); // ndig > P
+        // ndig <= P: "0", '.', (P-ndig) zeros, ndig digits
+        self.asm.load_imm(8, b'0' as i64);
+        self.asm.store_mem(8, 26, 1);
+        self.asm.add_imm(26, 26, 1);
+        self.asm.load_imm(8, b'.' as i64);
+        self.asm.store_mem(8, 26, 1);
+        self.asm.add_imm(26, 26, 1);
+        let zloop = self.asm.new_label();
+        let zdone = self.asm.new_label();
+        self.asm.sub(12, 19, 24); // P - ndig
+        self.asm.place(zloop);
+        self.asm.cbz(12, zdone);
+        self.asm.load_imm(8, b'0' as i64);
+        self.asm.store_mem(8, 26, 1);
+        self.asm.add_imm(26, 26, 1);
+        self.asm.sub_imm(12, 12, 1);
+        self.asm.b(zloop);
+        self.asm.place(zdone);
+        self.asm.mov_reg(9, 23);
+        self.asm.mov_reg(10, 24);
+        self.fs_float_copy_digits();
+        self.asm.b(done);
+        self.asm.place(big); // ndig > P: (ndig-P) ints, '.', P fracs
+        self.asm.mov_reg(9, 23);
+        self.asm.sub(10, 24, 19);
+        self.fs_float_copy_digits();
+        self.asm.load_imm(8, b'.' as i64);
+        self.asm.store_mem(8, 26, 1);
+        self.asm.add_imm(26, 26, 1);
+        self.asm.mov_reg(10, 19); // x9 already advanced
+        self.fs_float_copy_digits();
+        self.asm.b(done);
+        self.asm.place(p_zero); // P == 0: all ndig digits
+        self.asm.mov_reg(9, 23);
+        self.asm.mov_reg(10, 24);
+        self.fs_float_copy_digits();
+        self.asm.place(done);
+    }
+
+    /// `%e`/`%g` scratch BSS (egdig, sigbuf, bodybuf), allocated once.
+    fn fs_eg_scratch(&mut self) -> (u64, u64, u64) {
+        if let Some(s) = self.fs_eg_off {
+            return s;
+        }
+        let s = (
+            self.alloc_bss_fs(1024, 1),
+            self.alloc_bss_fs(FS_SIGBUF, 1),
+            self.alloc_bss_fs(1024, 1),
+        );
+        self.fs_eg_off = Some(s);
+        s
+    }
+
+    /// `%e`/`%g` formatter: `d0`=value, `x0`=P, `x1`=flags, `x2`=width, `x3`=conv
+    /// (low 2 bits: 1=`e`, 2=`g`; bit 2 = uppercase). Works from the value's exact
+    /// finite decimal expansion (`Dint = m·5^(−e)`), rounds to N significant
+    /// figures, then renders `e`-style or `f`-style. Persistent state in x19..x28.
+    fn emit_fs_fmt_float_eg(&mut self) {
+        let (bn, _) = self.fs_float_scratch();
+        let (egdig, sigbuf, bodybuf) = self.fs_eg_scratch();
+        let egend = egdig + 1024;
+        let outbuf = self.fs_scratch()[1];
+        for r in [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, LR] {
+            self.asm.push(r);
+        }
+        self.asm.mov_reg(19, 0); // P
+        self.asm.mov_reg(20, 1); // flags
+        self.asm.mov_reg(21, 2); // width
+        self.asm.mov_reg(24, 3); // conv
+        self.asm.fmov_to_gpr(23, 0); // value bits
+        // sign (x22) + magnitude bits (x23)
+        let sgpos = self.asm.new_label();
+        let shavesign = self.asm.new_label();
+        let snospace = self.asm.new_label();
+        self.asm.load_imm(8, 0x7FFF_FFFF_FFFF_FFFF);
+        self.asm.and(9, 23, 8);
+        self.asm.load_imm(22, 0);
+        self.asm.cbz(9, sgpos);
+        self.asm.lsr_imm(10, 23, 63);
+        self.asm.cbz(10, sgpos);
+        self.asm.load_imm(22, b'-' as i64);
+        self.asm.b(shavesign);
+        self.asm.place(sgpos);
+        self.fs_tst(20, F_PLUS, shavesign, false);
+        self.asm.load_imm(22, b'+' as i64);
+        self.asm.place(shavesign);
+        self.asm.cbnz(22, snospace);
+        self.fs_tst(20, F_SPACE, snospace, false);
+        self.asm.load_imm(22, b' ' as i64);
+        self.asm.place(snospace);
+        self.asm.mov_reg(23, 9); // magnitude bits
+        // decompose → exp (x12), frac/mantissa (x9), e2 (x12)
+        let eg_infnan = self.asm.new_label();
+        let eg_zero = self.asm.new_label();
+        let eg_subn = self.asm.new_label();
+        let eg_havem = self.asm.new_label();
+        self.asm.lsr_imm(12, 23, 52);
+        self.asm.load_imm(8, 0x7FF);
+        self.asm.and(12, 12, 8);
+        self.asm.load_imm(8, 0x000F_FFFF_FFFF_FFFF);
+        self.asm.and(9, 23, 8); // frac
+        self.asm.cmp_imm(12, 0x7FF);
+        self.asm.b_cond(COND_EQ, eg_infnan);
+        self.asm.cbz(23, eg_zero); // value == 0
+        self.asm.cbz(12, eg_subn);
+        self.asm.load_imm(8, 0x0010_0000_0000_0000);
+        self.asm.orr(9, 9, 8);
+        self.asm.sub_imm(12, 12, 1075);
+        self.asm.b(eg_havem);
+        self.asm.place(eg_subn);
+        self.asm.load_imm(12, -1074);
+        self.asm.place(eg_havem);
+        // BIGNUM = m
+        let ezloop = self.asm.new_label();
+        self.asm.adr_global_fs(8, bn);
+        self.asm.load_imm(13, 0);
+        self.asm.load_imm(14, 0);
+        self.asm.place(ezloop);
+        self.asm.str_idx8(14, 8, 13);
+        self.asm.add_imm(13, 13, 1);
+        self.asm.cmp_imm(13, NLIMBS as u32);
+        self.asm.b_cond(COND_LO, ezloop);
+        self.asm.store_mem(9, 8, 8); // BIGNUM[0] = m
+        // pe = min(e2,0); Dint = m·2^e2 (e2≥0) or m·5^(−e2) (e2<0).
+        let eg_neg = self.asm.new_label();
+        let eg_mulloop = self.asm.new_label();
+        let eg_built = self.asm.new_label();
+        self.asm.cmp_imm0(12);
+        self.asm.b_cond(COND_LT, eg_neg);
+        self.asm.load_imm(25, 0); // pe = 0
+        self.asm.mov_reg(0, 12);
+        let sl = self.fs_routine("BnShl");
+        self.asm.bl(sl);
+        self.asm.b(eg_built);
+        self.asm.place(eg_neg);
+        self.asm.mov_reg(25, 12); // pe = e2
+        self.asm.neg(26, 12); // count = -e2 (x26, becomes X later)
+        self.asm.place(eg_mulloop);
+        self.asm.cbz(26, eg_built);
+        self.asm.load_imm(0, 5);
+        let bm = self.fs_routine("BnMul");
+        self.asm.bl(bm);
+        self.asm.sub_imm(26, 26, 1);
+        self.asm.b(eg_mulloop);
+        self.asm.place(eg_built);
+        // extract all digits of Dint into egdig (downward); x23 = MSB ptr
+        let eg_dloop = self.asm.new_label();
+        let eg_zchk = self.asm.new_label();
+        let eg_notz = self.asm.new_label();
+        let eg_done = self.asm.new_label();
+        self.asm.adr_global_fs(23, egend);
+        self.asm.place(eg_dloop);
+        let bd = self.fs_routine("BnDiv10");
+        self.asm.bl(bd);
+        self.asm.add_imm(0, 0, b'0' as u32);
+        self.asm.sub_imm(23, 23, 1);
+        self.asm.store_mem(0, 23, 1);
+        self.asm.adr_global_fs(8, bn);
+        self.asm.load_imm(9, 0);
+        self.asm.place(eg_zchk);
+        self.asm.ldr_idx8(10, 8, 9);
+        self.asm.cbnz(10, eg_notz);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.cmp_imm(9, NLIMBS as u32);
+        self.asm.b_cond(COND_LO, eg_zchk);
+        self.asm.b(eg_done);
+        self.asm.place(eg_notz);
+        self.asm.b(eg_dloop);
+        self.asm.place(eg_done);
+        // ndig (x28) = egend − x23; X (x26) = ndig − 1 + pe
+        self.asm.adr_global_fs(8, egend);
+        self.asm.sub(28, 8, 23);
+        self.asm.add(26, 28, 25);
+        self.asm.sub_imm(26, 26, 1);
+        self.eg_nsig(); // nsig → x27 from conv (x24) and P (x19)
+        // round to nsig significant figures (real → x11)
+        let eg_noround = self.asm.new_label();
+        let eg_haveround = self.asm.new_label();
+        self.asm.cmp_reg(28, 27);
+        self.asm.b_cond(COND_LS, eg_noround);
+        self.eg_round();
+        self.asm.mov_reg(11, 27); // real = nsig
+        self.asm.b(eg_haveround);
+        self.asm.place(eg_noround);
+        self.asm.mov_reg(11, 28); // real = ndig
+        self.asm.place(eg_haveround);
+        self.eg_copy_to_sigbuf(sigbuf); // real digits + '0' pad → sigbuf; x23 = base
+        self.eg_format(bodybuf);
+        self.eg_field(bodybuf, outbuf);
+        let eg_epilogue = self.asm.new_label();
+        self.asm.b(eg_epilogue);
+        // value == 0
+        self.asm.place(eg_zero);
+        self.asm.load_imm(26, 0); // X = 0
+        self.eg_nsig();
+        let z2 = self.asm.new_label();
+        let z2d = self.asm.new_label();
+        self.asm.adr_global_fs(8, sigbuf);
+        self.asm.load_imm(9, 0);
+        self.asm.place(z2);
+        self.asm.cmp_reg(9, 27);
+        self.asm.b_cond(COND_HS, z2d);
+        self.asm.load_imm(10, b'0' as i64);
+        self.asm.store_mem(10, 8, 1);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.b(z2);
+        self.asm.place(z2d);
+        self.asm.adr_global_fs(23, sigbuf);
+        self.eg_format(bodybuf);
+        self.eg_field(bodybuf, outbuf);
+        self.asm.b(eg_epilogue);
+        // inf / NaN (x9 = fraction)
+        self.asm.place(eg_infnan);
+        self.asm.adr_global_fs(26, outbuf); // cursor
+        self.fs_float_sign();
+        let eg_nan = self.asm.new_label();
+        let eg_wrote = self.asm.new_label();
+        self.asm.cbnz(9, eg_nan);
+        for ch in [b'i', b'n', b'f'] {
+            self.asm.load_imm(8, ch as i64);
+            self.asm.store_mem(8, 26, 1);
+            self.asm.add_imm(26, 26, 1);
+        }
+        self.asm.b(eg_wrote);
+        self.asm.place(eg_nan);
+        for ch in [b'N', b'a', b'N'] {
+            self.asm.load_imm(8, ch as i64);
+            self.asm.store_mem(8, 26, 1);
+            self.asm.add_imm(26, 26, 1);
+        }
+        self.asm.place(eg_wrote);
+        self.asm.adr_global_fs(1, outbuf);
+        self.asm.sub(2, 26, 1);
+        let ow = self.fs_routine("OutWrite");
+        self.asm.bl(ow);
+        self.asm.place(eg_epilogue);
+        for r in [LR, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19] {
+            self.asm.pop(r);
+        }
+        self.asm.ret();
+    }
+
+    /// nsig (x27): `e` → P+1; `g` → max(P,1). Reads conv (x24), P (x19).
+    fn eg_nsig(&mut self) {
+        let isg = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.and_imm_lowbits(8, 24, 2); // conv & 3
+        self.asm.cmp_imm(8, 2);
+        self.asm.b_cond(COND_EQ, isg);
+        self.asm.add_imm(27, 19, 1); // P+1
+        self.asm.b(done);
+        self.asm.place(isg);
+        self.asm.mov_reg(27, 19); // max(P,1)
+        self.asm.cbnz(27, done);
+        self.asm.load_imm(27, 1);
+        self.asm.place(done);
+    }
+
+    /// Round egdig[x23..] (ndig=x28) to nsig (x27) significant figures, half-even;
+    /// may bump X (x26).
+    fn eg_round(&mut self) {
+        let sloop = self.asm.new_label();
+        let nstick = self.asm.new_label();
+        let sdone = self.asm.new_label();
+        let roundup = self.asm.new_label();
+        let noup = self.asm.new_label();
+        let iloop = self.asm.new_label();
+        let carry = self.asm.new_label();
+        let overflow = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.add(8, 23, 27); // &cursor[nsig]
+        self.asm.load_mem(9, 8, 1, false); // round digit
+        self.asm.load_imm(11, 0); // sticky
+        self.asm.add_imm(12, 8, 1);
+        self.asm.add(13, 23, 28); // end = cursor + ndig
+        self.asm.place(sloop);
+        self.asm.cmp_reg(12, 13);
+        self.asm.b_cond(COND_HS, sdone);
+        self.asm.load_mem(14, 12, 1, false);
+        self.asm.cmp_imm(14, b'0' as u32);
+        self.asm.b_cond(COND_EQ, nstick);
+        self.asm.load_imm(11, 1);
+        self.asm.b(sdone);
+        self.asm.place(nstick);
+        self.asm.add_imm(12, 12, 1);
+        self.asm.b(sloop);
+        self.asm.place(sdone);
+        self.asm.cmp_imm(9, b'5' as u32);
+        self.asm.b_cond(COND_GT, roundup);
+        self.asm.b_cond(COND_LT, noup);
+        self.asm.cbnz(11, roundup); // sticky
+        self.asm.add(8, 23, 27);
+        self.asm.sub_imm(8, 8, 1);
+        self.asm.load_mem(12, 8, 1, false);
+        self.asm.and_imm_lowbits(12, 12, 1);
+        self.asm.cbz(12, noup); // last-kept even
+        self.asm.place(roundup);
+        self.asm.sub_imm(12, 27, 1); // index = nsig-1
+        self.asm.place(iloop);
+        self.asm.add(8, 23, 12);
+        self.asm.load_mem(9, 8, 1, false);
+        self.asm.cmp_imm(9, b'9' as u32);
+        self.asm.b_cond(COND_EQ, carry);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.store_mem(9, 8, 1);
+        self.asm.b(done);
+        self.asm.place(carry);
+        self.asm.load_imm(9, b'0' as i64);
+        self.asm.store_mem(9, 8, 1);
+        self.asm.sub_imm(12, 12, 1);
+        self.asm.cmp_imm0(12);
+        self.asm.b_cond(COND_LT, overflow);
+        self.asm.b(iloop);
+        self.asm.place(overflow);
+        self.asm.load_imm(9, b'1' as i64);
+        self.asm.store_mem(9, 23, 1);
+        self.asm.add_imm(26, 26, 1); // X += 1
+        self.asm.place(noup);
+        self.asm.place(done);
+    }
+
+    /// Copy `real` (x11) digits from x23, then '0'-pad to nsig (x27), into sigbuf;
+    /// leaves x23 = sigbuf base.
+    fn eg_copy_to_sigbuf(&mut self, sigbuf: u64) {
+        let loop_l = self.asm.new_label();
+        let zfill = self.asm.new_label();
+        let put = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.adr_global_fs(8, sigbuf); // dst
+        self.asm.mov_reg(9, 23); // src
+        self.asm.load_imm(12, 0); // i
+        self.asm.place(loop_l);
+        self.asm.cmp_reg(12, 27);
+        self.asm.b_cond(COND_HS, done);
+        self.asm.cmp_reg(12, 11);
+        self.asm.b_cond(COND_HS, zfill);
+        self.asm.load_mem(13, 9, 1, false);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.b(put);
+        self.asm.place(zfill);
+        self.asm.load_imm(13, b'0' as i64);
+        self.asm.place(put);
+        self.asm.store_mem(13, 8, 1);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.add_imm(12, 12, 1);
+        self.asm.b(loop_l);
+        self.asm.place(done);
+        self.asm.adr_global_fs(23, sigbuf);
+    }
+
+    /// Build the body into bodybuf (body cursor → x10), choosing `e`-style or
+    /// `f`-style and trimming trailing zeros (unless `#`). x23=sigbuf, X=x26,
+    /// nsig=x27, P=x19, conv=x24.
+    fn eg_format(&mut self, bodybuf: u64) {
+        let kind_g = self.asm.new_label();
+        let use_e = self.asm.new_label();
+        let trim = self.asm.new_label();
+        let no_trim = self.asm.new_label();
+        self.asm.adr_global_fs(10, bodybuf);
+        self.asm.and_imm_lowbits(8, 24, 2);
+        self.asm.cmp_imm(8, 2);
+        self.asm.b_cond(COND_EQ, kind_g);
+        self.eg_body_sci(19); // %e: precision P
+        self.asm.b(no_trim);
+        self.asm.place(kind_g);
+        self.asm.load_imm(8, -4);
+        self.asm.cmp_reg(26, 8);
+        self.asm.b_cond(COND_LT, use_e); // X < -4
+        self.asm.cmp_reg(26, 27);
+        self.asm.b_cond(COND_GE, use_e); // X >= p
+        self.eg_body_fixed();
+        self.asm.b(trim);
+        self.asm.place(use_e);
+        self.asm.sub_imm(15, 27, 1); // p-1
+        self.eg_body_sci(15);
+        self.asm.place(trim);
+        self.fs_tst(20, F_HASH, no_trim, true);
+        self.eg_trim(bodybuf);
+        self.asm.place(no_trim);
+    }
+
+    /// `e`-style body: `d.ddde±XX` with `prec_reg` fractional digits.
+    fn eg_body_sci(&mut self, prec_reg: u32) {
+        self.asm.mov_reg(14, prec_reg); // precision (stable)
+        self.asm.load_mem(8, 23, 1, false); // first digit
+        self.asm.store_mem(8, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        let nofrac = self.asm.new_label();
+        let floop = self.asm.new_label();
+        let fdone = self.asm.new_label();
+        self.asm.cbz(14, nofrac);
+        self.asm.load_imm(8, b'.' as i64);
+        self.asm.store_mem(8, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.add_imm(9, 23, 1); // &sigbuf[1]
+        self.asm.place(floop);
+        self.asm.cbz(14, fdone);
+        self.asm.load_mem(8, 9, 1, false);
+        self.asm.store_mem(8, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.sub_imm(14, 14, 1);
+        self.asm.b(floop);
+        self.asm.place(fdone);
+        self.asm.place(nofrac);
+        // 'e' / 'E'
+        let lower = self.asm.new_label();
+        let wrote = self.asm.new_label();
+        self.fs_tst(24, 4, lower, false);
+        self.asm.load_imm(8, b'E' as i64);
+        self.asm.b(wrote);
+        self.asm.place(lower);
+        self.asm.load_imm(8, b'e' as i64);
+        self.asm.place(wrote);
+        self.asm.store_mem(8, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        // exponent sign + |X| (≥ 2 digits)
+        let xneg = self.asm.new_label();
+        let haveabs = self.asm.new_label();
+        self.asm.cmp_imm0(26);
+        self.asm.b_cond(COND_GE, xneg); // reuse label name; ≥0 path
+        self.asm.load_imm(8, b'-' as i64);
+        self.asm.store_mem(8, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.neg(9, 26);
+        self.asm.b(haveabs);
+        self.asm.place(xneg);
+        self.asm.load_imm(8, b'+' as i64);
+        self.asm.store_mem(8, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.mov_reg(9, 26);
+        self.asm.place(haveabs);
+        // x9 = |X|; hundreds (if any), tens, ones
+        let nohund = self.asm.new_label();
+        self.asm.load_imm(12, 100);
+        self.asm.udiv(13, 9, 12);
+        self.asm.msub(9, 13, 12, 9); // |X| % 100
+        self.asm.cbz(13, nohund);
+        self.asm.add_imm(13, 13, b'0' as u32);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.place(nohund);
+        self.asm.load_imm(12, 10);
+        self.asm.udiv(13, 9, 12);
+        self.asm.msub(14, 13, 12, 9);
+        self.asm.add_imm(13, 13, b'0' as u32);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.add_imm(14, 14, b'0' as u32);
+        self.asm.store_mem(14, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+    }
+
+    /// `f`-style body from the sigbuf digits, point placed by X (x26), nsig (x27).
+    fn eg_body_fixed(&mut self) {
+        let xneg = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.cmp_imm0(26);
+        self.asm.b_cond(COND_LT, xneg);
+        // X ≥ 0: int = sigbuf[0..X+1]
+        let iloop = self.asm.new_label();
+        let idone = self.asm.new_label();
+        self.asm.mov_reg(8, 23); // src
+        self.asm.add_imm(9, 26, 1); // X+1
+        self.asm.place(iloop);
+        self.asm.cbz(9, idone);
+        self.asm.load_mem(13, 8, 1, false);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.sub_imm(9, 9, 1);
+        self.asm.b(iloop);
+        self.asm.place(idone);
+        // frac: nsig - X - 1 digits, if any
+        let nofrac = self.asm.new_label();
+        let floop = self.asm.new_label();
+        let fdone = self.asm.new_label();
+        self.asm.sub(9, 27, 26);
+        self.asm.sub_imm(9, 9, 1); // nsig - X - 1
+        self.asm.cmp_imm0(9);
+        self.asm.b_cond(COND_LE, nofrac);
+        self.asm.load_imm(13, b'.' as i64);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.place(floop);
+        self.asm.cbz(9, fdone);
+        self.asm.load_mem(13, 8, 1, false);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.sub_imm(9, 9, 1);
+        self.asm.b(floop);
+        self.asm.place(fdone);
+        self.asm.place(nofrac);
+        self.asm.b(done);
+        // X < 0: "0." then (−X−1) zeros then all nsig digits
+        self.asm.place(xneg);
+        self.asm.load_imm(13, b'0' as i64);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.load_imm(13, b'.' as i64);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        let zloop = self.asm.new_label();
+        let zdone = self.asm.new_label();
+        self.asm.neg(9, 26);
+        self.asm.sub_imm(9, 9, 1); // -X-1
+        self.asm.place(zloop);
+        self.asm.cbz(9, zdone);
+        self.asm.load_imm(13, b'0' as i64);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.sub_imm(9, 9, 1);
+        self.asm.b(zloop);
+        self.asm.place(zdone);
+        let dloop = self.asm.new_label();
+        let ddone = self.asm.new_label();
+        self.asm.mov_reg(8, 23);
+        self.asm.mov_reg(9, 27); // nsig
+        self.asm.place(dloop);
+        self.asm.cbz(9, ddone);
+        self.asm.load_mem(13, 8, 1, false);
+        self.asm.store_mem(13, 10, 1);
+        self.asm.add_imm(10, 10, 1);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.sub_imm(9, 9, 1);
+        self.asm.b(dloop);
+        self.asm.place(ddone);
+        self.asm.place(done);
+    }
+
+    /// Trim trailing zeros (and a bare `.`) from the mantissa of the body in
+    /// bodybuf, preserving any `e±XX` exponent. Body end is x10.
+    fn eg_trim(&mut self, bodybuf: u64) {
+        let scan = self.asm.new_label();
+        let found_e = self.asm.new_label();
+        let no_e = self.asm.new_label();
+        let have_split = self.asm.new_label();
+        self.asm.adr_global_fs(8, bodybuf); // p
+        self.asm.place(scan);
+        self.asm.cmp_reg(8, 10);
+        self.asm.b_cond(COND_HS, no_e);
+        self.asm.load_mem(12, 8, 1, false);
+        self.asm.cmp_imm(12, b'e' as u32);
+        self.asm.b_cond(COND_EQ, found_e);
+        self.asm.cmp_imm(12, b'E' as u32);
+        self.asm.b_cond(COND_EQ, found_e);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.b(scan);
+        self.asm.place(no_e);
+        self.asm.mov_reg(13, 10); // mantissa end = body end
+        self.asm.load_imm(14, 0); // no exponent
+        self.asm.b(have_split);
+        self.asm.place(found_e);
+        self.asm.mov_reg(13, 8); // mantissa end = 'e'
+        self.asm.sub(14, 10, 8); // exponent length
+        self.asm.place(have_split);
+        // only trim if the mantissa contains '.'
+        let mscan = self.asm.new_label();
+        let has_dot = self.asm.new_label();
+        let nodot = self.asm.new_label();
+        self.asm.adr_global_fs(8, bodybuf);
+        self.asm.place(mscan);
+        self.asm.cmp_reg(8, 13);
+        self.asm.b_cond(COND_HS, nodot);
+        self.asm.load_mem(12, 8, 1, false);
+        self.asm.cmp_imm(12, b'.' as u32);
+        self.asm.b_cond(COND_EQ, has_dot);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.b(mscan);
+        self.asm.place(has_dot);
+        // strip trailing '0', then a trailing '.', from [bodybuf .. x13)
+        let tloop = self.asm.new_label();
+        let tdone = self.asm.new_label();
+        let nodot2 = self.asm.new_label();
+        self.asm.place(tloop);
+        self.asm.sub_imm(8, 13, 1);
+        self.asm.load_mem(12, 8, 1, false);
+        self.asm.cmp_imm(12, b'0' as u32);
+        self.asm.b_cond(COND_NE, tdone);
+        self.asm.sub_imm(13, 13, 1);
+        self.asm.b(tloop);
+        self.asm.place(tdone);
+        self.asm.sub_imm(8, 13, 1);
+        self.asm.load_mem(12, 8, 1, false);
+        self.asm.cmp_imm(12, b'.' as u32);
+        self.asm.b_cond(COND_NE, nodot2);
+        self.asm.sub_imm(13, 13, 1);
+        self.asm.place(nodot2);
+        // move the exponent suffix down to x13, set x10 = new end
+        let eloop = self.asm.new_label();
+        let edone = self.asm.new_label();
+        self.asm.sub(9, 10, 14); // exponent source start = old end - explen
+        self.asm.place(eloop);
+        self.asm.cbz(14, edone);
+        self.asm.load_mem(12, 9, 1, false);
+        self.asm.store_mem(12, 13, 1);
+        self.asm.add_imm(13, 13, 1);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.sub_imm(14, 14, 1);
+        self.asm.b(eloop);
+        self.asm.place(edone);
+        self.asm.mov_reg(10, 13); // new body end
+        self.asm.place(nodot);
+    }
+
+    /// Render the body field (sign + pad + bodybuf) into outbuf and write it. Body
+    /// end is x10; reuses the `%f` field helpers (cursor x26, sign x22, pad x27).
+    fn eg_field(&mut self, bodybuf: u64, outbuf: u64) {
+        // bodylen (x11) = x10 − bodybuf
+        self.asm.adr_global_fs(8, bodybuf);
+        self.asm.sub(11, 10, 8);
+        // pad (x27) = max(0, width − (bodylen + signlen))
+        let nosl = self.asm.new_label();
+        let padok = self.asm.new_label();
+        self.asm.mov_reg(8, 11);
+        self.asm.cbz(22, nosl);
+        self.asm.add_imm(8, 8, 1);
+        self.asm.place(nosl);
+        self.asm.sub(27, 21, 8);
+        self.asm.cmp_imm0(27);
+        self.asm.b_cond(COND_GE, padok);
+        self.asm.load_imm(27, 0);
+        self.asm.place(padok);
+        // assemble into outbuf (cursor x26)
+        self.asm.adr_global_fs(26, outbuf);
+        let do_minus = self.asm.new_label();
+        let do_right = self.asm.new_label();
+        let fielddone = self.asm.new_label();
+        self.fs_tst(20, F_MINUS, do_minus, true);
+        self.fs_tst(20, F_ZERO, do_right, false);
+        self.fs_float_sign();
+        self.fs_float_pad(b'0');
+        self.eg_copy_body(bodybuf);
+        self.asm.b(fielddone);
+        self.asm.place(do_right);
+        self.fs_float_pad(b' ');
+        self.fs_float_sign();
+        self.eg_copy_body(bodybuf);
+        self.asm.b(fielddone);
+        self.asm.place(do_minus);
+        self.fs_float_sign();
+        self.eg_copy_body(bodybuf);
+        self.fs_float_pad(b' ');
+        self.asm.place(fielddone);
+        self.asm.adr_global_fs(1, outbuf);
+        self.asm.sub(2, 26, 1);
+        let ow = self.fs_routine("OutWrite");
+        self.asm.bl(ow);
+    }
+    /// Copy `x11` body bytes from bodybuf to the cursor x26.
+    fn eg_copy_body(&mut self, bodybuf: u64) {
+        let top = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.adr_global_fs(9, bodybuf); // src
+        self.asm.mov_reg(12, 11); // count
+        self.asm.place(top);
+        self.asm.cbz(12, done);
+        self.asm.load_mem(13, 9, 1, false);
+        self.asm.store_mem(13, 26, 1);
+        self.asm.add_imm(9, 9, 1);
+        self.asm.add_imm(26, 26, 1);
+        self.asm.sub_imm(12, 12, 1);
+        self.asm.b(top);
+        self.asm.place(done);
+    }
+
+    /// `MemCmp(x0=a, x1=b, x2=n) -> x0` — a sign in {-1, 0, 1}.
+    fn emit_fs_memcmp(&mut self) {
+        let l = self.asm.new_label();
+        let diff = self.asm.new_label();
+        let eq = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.place(l);
+        self.asm.cbz(2, eq);
+        self.asm.load_mem(9, 0, 1, false);
+        self.asm.load_mem(10, 1, 1, false);
+        self.asm.cmp_reg(9, 10);
+        self.asm.b_cond(COND_NE, diff);
+        self.asm.add_imm(0, 0, 1);
+        self.asm.add_imm(1, 1, 1);
+        self.asm.sub_imm(2, 2, 1);
+        self.asm.b(l);
+        self.asm.place(diff);
+        self.asm.load_imm(0, 1);
+        self.asm.cmp_reg(9, 10);
+        self.asm.b_cond(COND_HI, done);
+        self.asm.load_imm(0, -1);
+        self.asm.place(done);
+        self.asm.ret();
+        self.asm.place(eq);
+        self.asm.load_imm(0, 0);
+        self.asm.ret();
     }
 
     /// `StrPrint(dst, fmt, ...)` / `CatPrint(dst, fmt, ...)` -> `sprintf` into
@@ -2692,6 +4911,10 @@ impl Cg {
                 ));
             }
         };
+
+        if self.freestanding {
+            return self.gen_formatted_write_fs(dst, &fmt, rest, append);
+        }
 
         // Evaluate dst and stash it in a frame slot (it survives the SP-relative
         // variadic area and becomes the result).
@@ -2817,6 +5040,26 @@ impl Cg {
         self.asm.bl_extern("_sprintf");
         self.asm.add_sp_imm(16);
         self.load_local(RES, buf_off, &Type::I64); // return buf
+        Ok(())
+    }
+
+    /// An `Is*` ctype predicate: leave 1 in RES if the argument byte falls in any
+    /// of `ranges` (inclusive), else 0. Each range is the unsigned check
+    /// `(c - lo) <= (hi - lo)`; the first hit short-circuits.
+    fn gen_ctype(&mut self, arg: &Expr, ranges: &[(u8, u8)]) -> Result<(), CodegenError> {
+        self.gen_expr(arg)?; // RES = c
+        let done = self.asm.new_label();
+        for &(lo, hi) in ranges {
+            let skip = self.asm.new_label();
+            self.asm.sub_imm(T2, RES, lo as u32); // T2 = c - lo
+            self.asm.cmp_imm(T2, (hi - lo) as u32);
+            self.asm.b_cond(COND_HI, skip); // (c - lo) > (hi - lo) unsigned -> miss
+            self.asm.load_imm(RES, 1);
+            self.asm.b(done);
+            self.asm.place(skip);
+        }
+        self.asm.load_imm(RES, 0);
+        self.asm.place(done);
         Ok(())
     }
 

@@ -3,12 +3,6 @@ name = "solomon"
 version = "0.1.0"
 edition = "2024"
 
-# The library crate stays `solomon`; the CLIs are `hcc` (the compiler) and `hci`
-# (the interpreter).
-[[bin]]
-name = "hcc"
-path = "src/hcc.rs"
-
-[[bin]]
-name = "hci"
-path = "src/hci.rs"
+# The library crate stays `solomon`. The binaries live in `src/bin/` and are
+# auto-discovered by Cargo (filename = binary name): `hcc` (the compiler) and
+# `hci` (the interpreter).

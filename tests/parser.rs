@@ -438,3 +438,26 @@ fn errors_carry_position() {
     // Garbage expression.
     assert!(parse("1 + ;").is_err());
 }
+
+#[test]
+fn deeply_nested_input_is_an_error_not_a_stack_overflow() {
+    // Pathologically deep nesting must surface as a recoverable parse error
+    // rather than overflowing the native stack and aborting the process. Run on
+    // an 8 MiB stack (matching the real main-thread entry point, the `hcc`/`hci`
+    // CLIs) — the Rust test harness's smaller per-test thread would itself blow
+    // the stack reaching the depth cap, which is exactly the case the guard
+    // converts into a clean error on the production path.
+    let handle = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let src = format!("I64 x = {}1{};", "(".repeat(5000), ")".repeat(5000));
+            let e = parse(&src).unwrap_err();
+            assert!(
+                e.message.contains("nested too deeply"),
+                "msg was: {}",
+                e.message
+            );
+        })
+        .unwrap();
+    handle.join().unwrap();
+}

@@ -76,8 +76,22 @@ pub fn parse(chars: &mut Peekable<Chars>) -> Spec {
         chars.next();
     }
     s.conv = chars.next().unwrap_or('\0');
+    // Clamp the literal width/precision so the native backends' fixed scratch
+    // buffers (sized to these caps) can't overflow. `*` width/precision is rejected
+    // by the freestanding backends, and the interpreter/libc paths are unbounded, so
+    // only the literal forms need clamping. The caps are far beyond any real use, and
+    // `MAX_PRECISION` keeps `%f`'s digit count within the 48-limb bignum.
+    if let Some(w) = s.width {
+        s.width = Some(w.min(MAX_WIDTH));
+    }
+    s.precision = s.precision.min(MAX_PRECISION);
     s
 }
+
+/// Caps on literal field width / precision (see [`parse`]). The native formatters
+/// size their digit/field buffers to hold these.
+pub const MAX_WIDTH: usize = 1024;
+pub const MAX_PRECISION: usize = 512;
 
 /// Reconstruct a libc format string from `s`, injecting the `ll` length modifier
 /// on integer conversions so a 64-bit argument is read in full.
@@ -206,14 +220,24 @@ pub fn render_g(mag: f64, precision: usize, upper: bool, alt: bool) -> String {
 /// Lay out a string/char conversion: truncate to `precision` chars, then pad to
 /// `width` (left-justified with `-`).
 pub fn render_str(s: &Spec, width: Option<usize>, precision: Option<usize>, body: &str) -> String {
-    let body: String = match precision {
-        Some(p) => body.chars().take(p).collect(),
-        None => body.to_string(),
+    // C `%.Ns` truncates and `%Ns` pads by **bytes** (as the native backends do).
+    // Truncate to ≤ `p` bytes, flooring to a char boundary so the result stays valid
+    // UTF-8 (identical to the native byte truncation except when a precision splits a
+    // multibyte char — vanishingly rare, and only for non-ASCII).
+    let body: &str = match precision {
+        Some(p) => {
+            let mut end = p.min(body.len());
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            &body[..end]
+        }
+        None => body,
     };
-    let len = body.chars().count();
+    let len = body.len(); // byte length, so width padding matches the native backend
     let w = width.unwrap_or(0);
     if len >= w {
-        body
+        body.to_string()
     } else if s.minus {
         format!("{body}{}", " ".repeat(w - len))
     } else {

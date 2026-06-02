@@ -406,6 +406,9 @@ impl<W: Write> Interpreter<W> {
     /// Run an (already semantically-checked) program, writing to the output sink.
     /// Use [`run_to_string`] or call [`crate::sema::check_program`] first.
     pub fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
+        // Reset the per-run string-literal intern cache so buffers never bleed
+        // between programs run on the same thread (e.g. across tests).
+        STR_INTERN.with(|m| m.borrow_mut().clear());
         // Compute type layouts up front so `sizeof` reports real sizes.
         self.layouts = crate::layout::compute(program).0;
 
@@ -847,6 +850,12 @@ impl<W: Write> Interpreter<W> {
                 let delta = if matches!(op, UnOp::PreInc) { 1 } else { -1 };
                 let place = self.eval_place(expr, env)?;
                 let nv = self.step_value(&place.load(pos)?, delta, expr, env, pos)?;
+                // Truncate to the lvalue's width, like `+=`/assignment (and the
+                // native backends, which narrow `++`/`--` to the declared width).
+                let nv = match expr.ty() {
+                    Some(t) => coerce_to(&t, nv),
+                    None => nv,
+                };
                 place.store(nv.clone(), pos)?;
                 Ok(nv)
             }
@@ -864,6 +873,10 @@ impl<W: Write> Interpreter<W> {
         let place = self.eval_place(expr, env)?;
         let old = place.load(pos)?;
         let nv = self.step_value(&old, delta, expr, env, pos)?;
+        let nv = match expr.ty() {
+            Some(t) => coerce_to(&t, nv),
+            None => nv,
+        };
         place.store(nv, pos)?;
         Ok(old)
     }
@@ -978,12 +991,9 @@ impl<W: Write> Interpreter<W> {
                         Add => a + b,
                         Sub => a - b,
                         Mul => a * b,
-                        Div => {
-                            if b == 0.0 {
-                                return Err(CodegenError::at(pos, "division by zero"));
-                            }
-                            a / b
-                        }
+                        // Float `/0` is IEEE-defined (`±inf`/`nan`), matching the
+                        // native backends' hardware divide — not a runtime error.
+                        Div => a / b,
                         Mod => a % b,
                         _ => unreachable!(),
                     };
@@ -1506,6 +1516,12 @@ impl<W: Write> Interpreter<W> {
             "ToLower" => {
                 let c = self.to_i64(args[0].clone(), pos)?;
                 Ok(Value::Int(if (65..=90).contains(&c) { c + 32 } else { c }))
+            }
+            // The `Is*` ctype classification predicates — ASCII membership tests,
+            // shared with both backends via `builtins::ctype_ranges`.
+            _ if crate::builtins::ctype_ranges(name).is_some() => {
+                let c = self.to_i64(args[0].clone(), pos)?;
+                Ok(Value::Int(crate::builtins::ctype_test(name, c) as i64))
             }
             // Algebraic F64 math — exactly reproducible in every backend (hardware
             // `sqrt`, rounding, sign-bit clear), so it has well-defined, backend-
@@ -2375,8 +2391,16 @@ impl<W: Write> Interpreter<W> {
                 'o' => {
                     let u = value_as_i64(&take(&mut ai)?) as u64;
                     let mut digits = format!("{u:o}");
-                    if spec.hash && !digits.starts_with('0') {
-                        digits.insert(0, '0');
+                    let mut precision = precision;
+                    if spec.hash {
+                        if !digits.starts_with('0') {
+                            digits.insert(0, '0');
+                        }
+                        // `#` octal keeps a leading `0` even for `%#.0o` of 0, where
+                        // precision 0 would otherwise drop the digit (C semantics).
+                        if precision == Some(0) && digits == "0" {
+                            precision = Some(1);
+                        }
                     }
                     out.push_str(&render_int(&spec, width, precision, "", "", &digits));
                 }
@@ -2492,8 +2516,34 @@ fn step_number(v: &Value, delta: i64, pos: Pos) -> Result<Value, CodegenError> {
     }
 }
 
+// Per-run cache mapping a string literal's content to the single byte buffer its
+// decayed pointer addresses. The native backend dedups identical literals into one
+// `__text` copy (`Asm::string_dedup`), so interning here makes pointer identity
+// over literals — `p == s`, `p - s`, `"x" == "x"` — agree with native instead of
+// minting a fresh buffer per decay. Cleared each `run`.
+thread_local! {
+    static STR_INTERN: RefCell<HashMap<Vec<u8>, Rc<RefCell<Vec<u8>>>>> =
+        RefCell::new(HashMap::new());
+}
+
 /// View a value as a pointer, decaying an array to a pointer at index 0.
 /// `None` => not pointer-like; `Some(None)` => null; `Some(Some(pv))` => pointer.
+
+/// The shared (interned) NUL-terminated byte buffer for a string literal.
+fn intern_str_buf(s: &str) -> Rc<RefCell<Vec<u8>>> {
+    STR_INTERN.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(rc) = m.get(s.as_bytes()) {
+            return rc.clone();
+        }
+        let mut bytes = s.as_bytes().to_vec();
+        bytes.push(0);
+        let rc = Rc::new(RefCell::new(bytes));
+        m.insert(s.as_bytes().to_vec(), rc.clone());
+        rc
+    })
+}
+
 fn as_pointer(v: &Value) -> Option<Option<PtrVal>> {
     match v {
         Value::Ptr(p) => Some(p.clone()),
@@ -2502,15 +2552,13 @@ fn as_pointer(v: &Value) -> Option<Option<PtrVal>> {
             index: 0,
         })),
         // A string literal decays to a pointer to its bytes (NUL-terminated), so
-        // `s[i]`, `*s`, and `s + n` work as they would on a `U8*` natively.
-        Value::Str(s) => {
-            let mut bytes = s.as_bytes().to_vec();
-            bytes.push(0);
-            Some(Some(PtrVal {
-                region: Region::Heap(Rc::new(RefCell::new(bytes))),
-                index: 0,
-            }))
-        }
+        // `s[i]`, `*s`, and `s + n` work as they would on a `U8*` natively. The
+        // buffer is interned by content, so two decays of the same literal share
+        // one object (matching the native `__text` dedup).
+        Value::Str(s) => Some(Some(PtrVal {
+            region: Region::Heap(intern_str_buf(s)),
+            index: 0,
+        })),
         _ => None,
     }
 }
@@ -2732,14 +2780,10 @@ fn coerce_to(ty: &Type, v: Value) -> Value {
         // this, each `as_pointer` of a `Value::Str` would mint a fresh buffer and
         // two pointers into "the same" literal would compare as different objects.
         Type::Ptr(_) => match v {
-            Value::Str(s) => {
-                let mut bytes = s.as_bytes().to_vec();
-                bytes.push(0);
-                Value::Ptr(Some(PtrVal {
-                    region: Region::Heap(Rc::new(RefCell::new(bytes))),
-                    index: 0,
-                }))
-            }
+            Value::Str(s) => Value::Ptr(Some(PtrVal {
+                region: Region::Heap(intern_str_buf(&s)),
+                index: 0,
+            })),
             other => other,
         },
         _ => v,

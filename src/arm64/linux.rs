@@ -42,6 +42,16 @@ impl Arm64Linux {
         }
     }
 
+    /// `aarch64-unknown-linux` **freestanding** — a self-contained static ELF with
+    /// its own `_start` and raw syscalls, no libc and no linker (the AArch64
+    /// analogue of the freestanding `x86_64-unknown-linux` backend).
+    pub fn new_freestanding(out_path: impl Into<PathBuf>) -> Self {
+        Arm64Linux {
+            out_path: out_path.into(),
+            target: Linux::FREESTANDING,
+        }
+    }
+
     /// Emit the ELF relocatable object for `program` as raw bytes (no link).
     /// Exposed so structural tests can byte-check the object on any host.
     pub fn object(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
@@ -66,6 +76,8 @@ struct Linux {
     triple: &'static str,
     default_cc: &'static str,
     static_link: bool,
+    /// Freestanding: emit a self-contained executable, no libc, no linker.
+    freestanding: bool,
 }
 
 impl Linux {
@@ -73,11 +85,19 @@ impl Linux {
         triple: "aarch64-unknown-linux-gnu",
         default_cc: "aarch64-linux-gnu-gcc",
         static_link: false,
+        freestanding: false,
     };
     const MUSL: Linux = Linux {
         triple: "aarch64-unknown-linux-musl",
         default_cc: "aarch64-linux-musl-gcc",
         static_link: true,
+        freestanding: false,
+    };
+    const FREESTANDING: Linux = Linux {
+        triple: "aarch64-unknown-linux",
+        default_cc: "",
+        static_link: true,
+        freestanding: true,
     };
 }
 
@@ -156,6 +176,65 @@ impl ArmTarget for Linux {
     fn variadic_in_registers(&self) -> bool {
         true // standard AAPCS64 passes variadic args in registers
     }
+
+    fn freestanding(&self) -> bool {
+        self.freestanding
+    }
+
+    fn write_executable(&self, code: &[u8], bss: u64) -> Vec<u8> {
+        write_elf_exec(code, bss)
+    }
+}
+
+// ---- freestanding ELF executable writer ----
+
+const VADDR: u64 = 0x40_0000;
+const EHSIZE: u64 = 64;
+const PHENTSIZE: u64 = 56;
+
+/// Wrap freestanding `code` in a minimal static ELF64 executable: an ELF header,
+/// one `PT_LOAD` (R+W+X) covering the whole file plus a trailing zero-filled BSS
+/// region of `bss` bytes, with the entry at the first code byte (the emitted
+/// `_start`). Mirrors the `x86_64-unknown-linux` writer, with `e_machine =
+/// EM_AARCH64`.
+fn write_elf_exec(code: &[u8], bss: u64) -> Vec<u8> {
+    let entry = VADDR + EHSIZE + PHENTSIZE;
+    let filesz = EHSIZE + PHENTSIZE + code.len() as u64;
+    let memsz = filesz + bss;
+    let mut out = Vec::with_capacity(filesz as usize);
+
+    out.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
+    out.push(2); // ELFCLASS64
+    out.push(1); // ELFDATA2LSB
+    out.push(1); // EI_VERSION
+    out.push(0); // ELFOSABI_SYSV
+    out.extend_from_slice(&[0u8; 8]);
+    put_u16(&mut out, 2); // e_type = ET_EXEC
+    put_u16(&mut out, 183); // e_machine = EM_AARCH64
+    put_u32(&mut out, 1); // e_version
+    put_u64(&mut out, entry); // e_entry
+    put_u64(&mut out, EHSIZE); // e_phoff
+    put_u64(&mut out, 0); // e_shoff
+    put_u32(&mut out, 0); // e_flags
+    put_u16(&mut out, EHSIZE as u16); // e_ehsize
+    put_u16(&mut out, PHENTSIZE as u16); // e_phentsize
+    put_u16(&mut out, 1); // e_phnum
+    put_u16(&mut out, 0); // e_shentsize
+    put_u16(&mut out, 0); // e_shnum
+    put_u16(&mut out, 0); // e_shstrndx
+
+    put_u32(&mut out, 1); // p_type = PT_LOAD
+    put_u32(&mut out, 7); // p_flags = R | W | X
+    put_u64(&mut out, 0); // p_offset
+    put_u64(&mut out, VADDR); // p_vaddr
+    put_u64(&mut out, VADDR); // p_paddr
+    put_u64(&mut out, filesz); // p_filesz
+    put_u64(&mut out, memsz); // p_memsz (file image + BSS)
+    put_u64(&mut out, 0x1000); // p_align
+
+    out.extend_from_slice(code);
+    debug_assert_eq!(out.len() as u64, filesz);
+    out
 }
 
 /// Strip the Mach-O-style leading underscore the code generator adds; ELF symbols

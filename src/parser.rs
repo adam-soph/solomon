@@ -76,7 +76,14 @@ pub struct Parser<S: TokenStream> {
     pending_types: Vec<Stmt>,
     /// Counter for naming anonymous embedded unions (`$anonN`).
     anon_counter: u32,
+    /// Current recursion depth through `parse_unary`/`parse_stmt` (the funnels every
+    /// nested expression/statement passes through), so pathologically deep input
+    /// fails with a `ParseError` instead of overflowing the stack and aborting.
+    depth: u32,
 }
+
+/// Maximum expression/statement nesting depth before the parser bails out.
+const MAX_PARSE_DEPTH: u32 = 256;
 
 impl<S: TokenStream> Parser<S> {
     /// Build a parser that draws tokens from `stream` (a [`Lexer`] or a
@@ -96,7 +103,19 @@ impl<S: TokenStream> Parser<S> {
             type_aliases: HashMap::new(),
             pending_types: Vec::new(),
             anon_counter: 0,
+            depth: 0,
         }
+    }
+
+    /// Enter a recursive parse frame, erroring if nesting is too deep. Paired with a
+    /// `self.depth -= 1` on the success path (an error aborts the whole parse, so a
+    /// leftover count is harmless).
+    fn enter_recursion(&mut self) -> PResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return self.err("input nested too deeply");
+        }
+        Ok(())
     }
 
     /// Parse a whole translation unit.
@@ -361,6 +380,12 @@ impl<S: TokenStream> Parser<S> {
     // ---- statements ----
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        self.enter_recursion()?;
+        let r = self.parse_stmt_inner();
+        self.depth -= 1;
+        r
+    }
+    fn parse_stmt_inner(&mut self) -> PResult<Stmt> {
         let m = self.mark()?;
 
         // Label: `name:` (but not `name::`, which is a scope operator).
@@ -1021,6 +1046,12 @@ impl<S: TokenStream> Parser<S> {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        self.enter_recursion()?;
+        let r = self.parse_unary_inner();
+        self.depth -= 1;
+        r
+    }
+    fn parse_unary_inner(&mut self) -> PResult<Expr> {
         let m = self.mark()?;
         let kind = self.peek_kind()?;
 

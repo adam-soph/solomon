@@ -21,9 +21,8 @@ pub mod sema;
 pub mod token;
 pub mod x86_64;
 
-pub use ast::{Expr, ExprKind, Program, Stmt, StmtKind, Type};
 pub use arm64::{Arm64Darwin, Arm64Linux};
-pub use x86_64::{X64Linux, X64Windows};
+pub use ast::{Expr, ExprKind, Program, Stmt, StmtKind, Type};
 pub use codegen::{Codegen, CodegenError};
 pub use interp::Interpreter;
 pub use layout::{Layout, Layouts};
@@ -32,3 +31,4 @@ pub use parser::{ParseError, Parser, parse};
 pub use preproc::Preprocessor;
 pub use sema::{SemaError, analyze, check_program};
 pub use token::{Keyword, Pos, Span, Token, TokenKind};
+pub use x86_64::{X64Linux, X64Windows};

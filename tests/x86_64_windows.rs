@@ -10,9 +10,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::codegen::Codegen;
-use solomon::x86_64::X64Windows;
 use solomon::parser::parse;
 use solomon::sema::check_program;
+use solomon::x86_64::X64Windows;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 

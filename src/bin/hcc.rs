@@ -32,6 +32,7 @@ enum Target {
     X64Windows,
     Arm64Linux,
     Arm64LinuxMusl,
+    Arm64LinuxFree,
 }
 
 impl Target {
@@ -41,6 +42,10 @@ impl Target {
             Some(Target::Arm64Darwin)
         } else if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
             Some(Target::X64Linux)
+        } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+            // The bare aarch64-linux target is freestanding, matching the
+            // bare-triple default from `from_triple`.
+            Some(Target::Arm64LinuxFree)
         } else {
             None
         }
@@ -59,10 +64,13 @@ impl Target {
             | "x86_64-pc-windows-gnu"
             | "x86_64-pc-windows-msvc"
             | "x86_64-windows" => Some(Target::X64Windows),
-            "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux" | "aarch64-linux" => {
-                Some(Target::Arm64Linux)
-            }
+            "aarch64-unknown-linux-gnu" => Some(Target::Arm64Linux),
             "aarch64-unknown-linux-musl" => Some(Target::Arm64LinuxMusl),
+            // The bare triple is freestanding (no libc, no linker); the `-gnu`/`-musl`
+            // suffixes opt into a libc via gcc.
+            "aarch64-unknown-linux" | "aarch64-linux" | "aarch64-unknown-linux-none" => {
+                Some(Target::Arm64LinuxFree)
+            }
             _ => None,
         }
     }
@@ -78,6 +86,7 @@ impl Target {
             Target::X64Windows => Box::new(X64Windows::new(out)),
             Target::Arm64Linux => Box::new(Arm64Linux::new(out)),
             Target::Arm64LinuxMusl => Box::new(Arm64Linux::new_musl(out)),
+            Target::Arm64LinuxFree => Box::new(Arm64Linux::new_freestanding(out)),
         }
     }
 }
@@ -137,7 +146,7 @@ fn main() -> ExitCode {
                         eprintln!(
                             "hcc: unknown target `{t}` (known: aarch64-apple-darwin, \
                              x86_64-unknown-linux{{,-gnu,-musl}}, x86_64-pc-windows, \
-                             aarch64-unknown-linux-gnu)"
+                             aarch64-unknown-linux{{,-gnu,-musl}})"
                         );
                         return ExitCode::FAILURE;
                     }
