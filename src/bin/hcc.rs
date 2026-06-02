@@ -11,8 +11,8 @@
 //!
 //! With no subcommand `hcc` builds for the host target (`-o OUT`, default
 //! `a.out`); `--target TRIPLE` cross-compiles instead (`aarch64-apple-darwin` →
-//! Mach-O via `cc`, `x86_64-unknown-linux` → a freestanding static ELF,
-//! `x86_64-pc-windows` → a self-contained PE).
+//! Mach-O via `cc`, `x86_64-unknown-linux` / `aarch64-unknown-linux` → a
+//! freestanding static ELF, `x86_64-pc-windows` → a self-contained PE).
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -28,11 +28,8 @@ use solomon::{lexer, parser, sema};
 enum Target {
     Arm64Darwin,
     X64Linux,
-    X64LinuxMusl,
     X64Windows,
     Arm64Linux,
-    Arm64LinuxMusl,
-    Arm64LinuxFree,
 }
 
 impl Target {
@@ -43,33 +40,26 @@ impl Target {
         } else if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
             Some(Target::X64Linux)
         } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
-            // The bare aarch64-linux target is freestanding, matching the
-            // bare-triple default from `from_triple`.
-            Some(Target::Arm64LinuxFree)
+            Some(Target::Arm64Linux)
         } else {
             None
         }
     }
-    /// Parse a target triple (canonical, plus a couple of common short forms).
+    /// Parse a target triple (canonical, plus a couple of common short forms). The
+    /// Linux targets are **freestanding** (no libc, no linker), so the `-gnu`/
+    /// `-musl` libc suffixes are deliberately not accepted — use the bare triple.
     fn from_triple(s: &str) -> Option<Self> {
         match s {
             "aarch64-apple-darwin" | "arm64-apple-darwin" | "aarch64-darwin" | "arm64-darwin" => {
                 Some(Target::Arm64Darwin)
             }
-            "x86_64-unknown-linux" | "x86_64-unknown-linux-gnu" | "x86_64-linux" => {
-                Some(Target::X64Linux)
-            }
-            "x86_64-unknown-linux-musl" => Some(Target::X64LinuxMusl),
+            "x86_64-unknown-linux" | "x86_64-linux" => Some(Target::X64Linux),
             "x86_64-pc-windows"
             | "x86_64-pc-windows-gnu"
             | "x86_64-pc-windows-msvc"
             | "x86_64-windows" => Some(Target::X64Windows),
-            "aarch64-unknown-linux-gnu" => Some(Target::Arm64Linux),
-            "aarch64-unknown-linux-musl" => Some(Target::Arm64LinuxMusl),
-            // The bare triple is freestanding (no libc, no linker); the `-gnu`/`-musl`
-            // suffixes opt into a libc via gcc.
             "aarch64-unknown-linux" | "aarch64-linux" | "aarch64-unknown-linux-none" => {
-                Some(Target::Arm64LinuxFree)
+                Some(Target::Arm64Linux)
             }
             _ => None,
         }
@@ -78,15 +68,8 @@ impl Target {
         match self {
             Target::Arm64Darwin => Box::new(Arm64Darwin::new(out)),
             Target::X64Linux => Box::new(X64Linux::new(out)),
-            // The freestanding static ELF is libc-independent, so `-musl` reuses
-            // the same backend — only its reported triple differs.
-            Target::X64LinuxMusl => {
-                Box::new(X64Linux::with_triple(out, "x86_64-unknown-linux-musl"))
-            }
             Target::X64Windows => Box::new(X64Windows::new(out)),
             Target::Arm64Linux => Box::new(Arm64Linux::new(out)),
-            Target::Arm64LinuxMusl => Box::new(Arm64Linux::new_musl(out)),
-            Target::Arm64LinuxFree => Box::new(Arm64Linux::new_freestanding(out)),
         }
     }
 }
@@ -145,8 +128,10 @@ fn main() -> ExitCode {
                     None => {
                         eprintln!(
                             "hcc: unknown target `{t}` (known: aarch64-apple-darwin, \
-                             x86_64-unknown-linux{{,-gnu,-musl}}, x86_64-pc-windows, \
-                             aarch64-unknown-linux{{,-gnu,-musl}})"
+                             x86_64-unknown-linux, x86_64-pc-windows, \
+                             aarch64-unknown-linux). The Linux targets are \
+                             freestanding; the `-gnu`/`-musl` libc suffixes are not \
+                             accepted — use the bare triple."
                         );
                         return ExitCode::FAILURE;
                     }
@@ -304,11 +289,10 @@ read from stdin when omitted. To run a program, use `hci`.
 Options:
   -o OUT            output path for the compiled binary (default: a.out)
   --target TRIPLE   cross-compile for a specific target:
-                      aarch64-apple-darwin         Mach-O, linked with cc
-                      x86_64-unknown-linux[-musl]  freestanding static ELF
-                      x86_64-pc-windows            self-contained PE
-                      aarch64-unknown-linux-gnu    ELF, glibc, via aarch64 gcc
-                      aarch64-unknown-linux-musl   ELF, static musl
+                      aarch64-apple-darwin    Mach-O, linked with cc
+                      x86_64-unknown-linux    freestanding static ELF
+                      aarch64-unknown-linux   freestanding static ELF
+                      x86_64-pc-windows       self-contained PE
   -h, --help        show this help
 "
     );

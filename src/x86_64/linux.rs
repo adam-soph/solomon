@@ -9,32 +9,23 @@ use super::{Asm, OsTarget, R8, R9, R10, RAX, RCX, RDI, RDX, RSI};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
-/// Compiles a HolyC program to a freestanding static ELF for `x86_64-unknown-linux`.
+/// Compiles a HolyC program to a freestanding static ELF for `x86_64-unknown-linux`
+/// (no libc, no linker — its own `_start` makes raw syscalls).
 pub struct X64Linux {
     out_path: PathBuf,
-    triple: &'static str,
 }
 
 impl X64Linux {
     pub fn new(out_path: impl Into<PathBuf>) -> Self {
-        Self::with_triple(out_path, "x86_64-unknown-linux")
-    }
-
-    /// The same freestanding static ELF, reported under a specific triple. The
-    /// output is libc-independent (it links no libc and makes raw syscalls), so
-    /// the `-gnu` and `-musl` variants are byte-for-byte identical — `-musl`
-    /// just builds through here with its own triple name.
-    pub fn with_triple(out_path: impl Into<PathBuf>, triple: &'static str) -> Self {
         X64Linux {
             out_path: out_path.into(),
-            triple,
         }
     }
 }
 
 impl Codegen for X64Linux {
     fn name(&self) -> &'static str {
-        self.triple
+        "x86_64-unknown-linux"
     }
 
     fn run(&mut self, program: &Program) -> Result<(), CodegenError> {

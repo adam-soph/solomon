@@ -1,7 +1,7 @@
 //! The [`Codegen`] trait and [`CodegenError`] — the shared interface every native
 //! code generator implements. The generators themselves are per-architecture
 //! sibling modules: [`crate::arm64`] (AArch64 — `aarch64-apple-darwin` Mach-O via
-//! `cc`, and `aarch64-unknown-linux-{gnu,musl}` ELF via gcc) and [`crate::x86_64`]
+//! `cc`, and `aarch64-unknown-linux` freestanding ELF) and [`crate::x86_64`]
 //! (`x86_64-unknown-linux` freestanding ELF, `x86_64-pc-windows` PE). A backend is
 //! a **target** — an (architecture, OS) pair — since the object format, syscalls,
 //! and ABI depend on the OS, not just the CPU. (The tree-walking

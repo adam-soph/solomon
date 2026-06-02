@@ -120,17 +120,25 @@ trait ArmTarget {
     /// Package the machine code + symbolic relocations into a relocatable object.
     /// `defined` are the `_main` + function symbols (with their `__text` byte
     /// offsets), `commons` the BSS-allocated globals, `ndefined` the count of
-    /// defined symbols. The Linux writer drops the Mach-O leading underscore.
+    /// defined symbols. Only hosted targets (Darwin) implement this; a
+    /// [`freestanding`](ArmTarget::freestanding) target emits an executable
+    /// directly via [`write_executable`](ArmTarget::write_executable).
     fn write_object(
         &self,
-        image: &CodeImage,
-        defined: &[(String, u64)],
-        commons: &[(String, u64, u32)],
-        ndefined: u32,
-    ) -> Vec<u8>;
+        _image: &CodeImage,
+        _defined: &[(String, u64)],
+        _commons: &[(String, u64, u32)],
+        _ndefined: u32,
+    ) -> Vec<u8> {
+        unreachable!("write_object is only called for hosted (non-freestanding) targets")
+    }
 
-    /// Link the relocatable object `obj` into the executable `out`.
-    fn link(&self, obj: &Path, out: &Path) -> Result<(), CodegenError>;
+    /// Link the relocatable object `obj` into the executable `out`. Only hosted
+    /// targets (Darwin, via `cc`) implement this; freestanding targets need no
+    /// linker.
+    fn link(&self, _obj: &Path, _out: &Path) -> Result<(), CodegenError> {
+        unreachable!("link is only called for hosted (non-freestanding) targets")
+    }
 
     /// Whether variadic arguments (to `printf`/`sprintf`/…) are passed in
     /// registers (standard AAPCS64 — `true`) or all on the stack (Apple's ARM64
@@ -142,8 +150,8 @@ trait ArmTarget {
     /// and needing no linker (`aarch64-unknown-linux` with no C toolchain). When
     /// set, the driver emits a `_start` entry and `compile` returns the finished
     /// executable from [`write_executable`](ArmTarget::write_executable) instead of
-    /// a relocatable object. Hosted targets (Darwin, gcc-linked Linux) leave this
-    /// `false` and use [`write_object`](ArmTarget::write_object) + `link`.
+    /// a relocatable object. The hosted Darwin target leaves this `false` and uses
+    /// [`write_object`](ArmTarget::write_object) + `link` (via `cc`).
     fn freestanding(&self) -> bool {
         false
     }

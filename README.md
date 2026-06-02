@@ -54,25 +54,6 @@ x=42 y=255
 - [Examples](#examples)
 - [Project layout](#project-layout)
 
-## The pipeline
-
-Source flows one direction, each stage a separate module. The interpreter is the
-oracle; every native backend is held byte-for-byte to its output.
-
-```text
-  lexer → preprocessor → parser → sema → layout
-                                            │
-                                            ▼
-                          ┌─────────────────────────────────┐
-                          │     interpreter  (the oracle)    │
-                          └─────────────────────────────────┘
-                                            │  must match byte-for-byte
-                  ┌─────────────────────────┼─────────────────────────┐
-                  ▼                         ▼                         ▼
-        aarch64-apple-darwin       x86_64-unknown-linux      aarch64-unknown-linux
-           Mach-O + cc              freestanding ELF            freestanding ELF
-```
-
 ## Status
 
 ### Front end
@@ -102,9 +83,9 @@ oracle; every native backend is held byte-for-byte to its output.
 | ------ | ------ | ------------- | ---------- |
 | `aarch64-apple-darwin` | Mach-O relocatable object | links with `cc` | Apple silicon |
 | `x86_64-unknown-linux` | freestanding static ELF | none — raw syscalls | Linux x86-64 |
-| `aarch64-unknown-linux` | freestanding static ELF | none — raw syscalls¹ | Linux ARM64 |
+| `aarch64-unknown-linux` | freestanding static ELF | none — raw syscalls | Linux ARM64 |
 
-¹ The bare triple is freestanding; the `-gnu`/`-musl` suffixes opt into a gcc-linked libc instead.
+Both Linux targets are **freestanding** — no libc, no linker, raw syscalls. (Darwin is the one hosted target: macOS has no stable syscall ABI, so it links libSystem via `cc`.)
 
 - **Interpreter** — executes the program, including recursion, all loop
   forms, `switch` with `case lo ... hi:` ranges, `goto`, real pointer semantics
@@ -128,8 +109,7 @@ oracle; every native backend is held byte-for-byte to its output.
 - **`aarch64-unknown-linux`** (`--target aarch64-unknown-linux`) —
   also a **freestanding static ELF**, sharing the entire AArch64 emitter with the
   Darwin backend but emitting its own `_start`, raw syscalls, and runtime (no libc,
-  no linker — the `-gnu`/`-musl` suffixes opt into a gcc-linked libc instead).
-  Globals self-address to a fixed BSS slot; the runtime re-implements the printf
+  no linker). Globals self-address to a fixed BSS slot; the runtime re-implements the printf
   engine including the **correctly-rounded bignum `%f`/`%e`/`%g`**, the `mmap` bump
   allocator, and the string/memory built-ins. All 18 examples run byte-for-byte
   identical to the interpreter under `docker --platform linux/arm64`.
@@ -193,12 +173,12 @@ Default targets:
 
 These triples are what the **`hcc`/`hci` binaries themselves** are compiled for —
 every one can interpret HolyC (`hci`). Native code *generation* (`hcc`) is a
-separate axis: `aarch64-apple-darwin`, `x86_64-unknown-linux` (its `-gnu` and
-`-musl` triples are the same freestanding static ELF), `x86_64-pc-windows`, and
-`aarch64-unknown-linux-gnu`/`-musl` (an ELF linked with an aarch64 gcc —
-dynamically against glibc, or statically against musl) have a backend. On any
-other platform `hci` interprets HolyC but `hcc` cannot emit a native executable
-yet.
+separate axis, and only four targets have a backend: `aarch64-apple-darwin`,
+`x86_64-unknown-linux`, `aarch64-unknown-linux` (both freestanding static ELFs),
+and `x86_64-pc-windows`. The Linux targets link no libc, so there are no `-gnu`/
+`-musl` codegen variants — those suffixes are only meaningful as the *Rust* build
+triples above (how `hcc` itself is compiled). On any other platform `hci`
+interprets HolyC but `hcc` cannot emit a native executable yet.
 
 Building for an OS other than the host needs a cross linker/toolchain. The
 Makefile uses the [`cross`](https://github.com/cross-rs/cross) tool (Docker-based)
@@ -242,8 +222,9 @@ subcommands are front-end tools:
 | `hcc tokens` | run the lexer only and dump the token stream               |
 
 `--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`,
-`x86_64-pc-windows`, and `aarch64-unknown-linux` — each with `-gnu`/`-musl`
-forms where applicable.
+`aarch64-unknown-linux`, and `x86_64-pc-windows`. The Linux targets are
+freestanding (no libc), so the `-gnu`/`-musl` libc suffixes are not accepted —
+use the bare triple.
 
 ```console
 $ hcc check broken.hc
@@ -329,7 +310,7 @@ src/
   interp.rs     tree-walking interpreter (the conformance oracle)
   codegen.rs    the Codegen trait + CodegenError (the shared backend interface)
   arm64/        AArch64 backend — asm.rs (encoder), mod.rs (codegen), darwin.rs
-                (Mach-O + cc), linux.rs (ELF + gcc; gnu/musl)
+                (Mach-O + cc), linux.rs (freestanding static ELF)
   x86_64/       x86-64 backend — asm.rs (encoder), mod.rs (codegen + OsTarget),
                 linux.rs (static ELF), windows.rs (self-contained PE)
   bin/          the executables (auto-discovered by Cargo):

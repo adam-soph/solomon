@@ -7,11 +7,12 @@ language) in Rust. It is a real compiler front end plus a tree-walking
 **interpreter** (`src/interp.rs`, the conformance oracle) and two hand-rolled
 native code generators behind the **`Codegen`** trait (`src/codegen.rs`), each
 named for its target — `arm64` (`aarch64-apple-darwin`, Mach-O via `cc`; and
-`aarch64-unknown-linux`, a **freestanding** static ELF, with `-gnu`/`-musl`
-variants that link a libc via gcc instead) and `x86_64` (`x86_64-unknown-linux`, a
-freestanding static ELF; `x86_64-pc-windows`, a PE). A codegen backend is an (arch,
-OS) pair, not just a CPU. **Both Linux targets are freestanding by default — no
-libc, no linker, raw syscalls** — and match the interpreter byte-for-byte on all 18
+`aarch64-unknown-linux`, a **freestanding** static ELF) and `x86_64`
+(`x86_64-unknown-linux`, a freestanding static ELF; `x86_64-pc-windows`, a PE). A
+codegen backend is an (arch, OS) pair, not just a CPU. **Both Linux targets are
+freestanding — no libc, no linker, raw syscalls** (there are no gcc-linked
+`-gnu`/`-musl` codegen variants; Darwin is the one hosted target, linking
+libSystem via `cc`) — and match the interpreter byte-for-byte on all 18
 examples.
 
 ## Commands
@@ -201,10 +202,12 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   Promoted locals survive calls (incl. recursion) precisely because x19–x28 /
   d8–d15 are callee-saved.
 
-- **`arm64/linux.rs` — freestanding `aarch64-unknown-linux`** (the default for the
-  bare triple; `-gnu`/`-musl` opt into a gcc-linked libc instead). Shares the entire
+- **`arm64/linux.rs` — freestanding `aarch64-unknown-linux`** (the only aarch64
+  Linux codegen target; there is no gcc-linked libc variant). Shares the entire
   AArch64 emitter and `compile`/`build` drivers with Darwin via the `ArmTarget` seam
-  (`freestanding()` + `write_executable()`); when set, `Cg.freestanding` flips the
+  (`freestanding()` + `write_executable()`; Darwin keeps the `write_object()` +
+  `link()` path, which now have `unreachable!` trait defaults the freestanding
+  target inherits); when set, `Cg.freestanding` flips the
   builtin/printf lowering from libc calls to **emitted AArch64 runtime**, and the
   driver writes a self-contained static ELF (own `_start`, raw syscalls `write`/
   `mmap`/`exit_group`, no linker) — the AArch64 analogue of the `x86_64` freestanding

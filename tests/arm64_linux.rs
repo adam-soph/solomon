@@ -74,7 +74,7 @@ fn freestanding_matches_the_interpreter_for_every_example() {
         let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         assert!(check_program(&program).is_empty(), "{name}: sema errors");
         let want = run_to_string(&program).unwrap_or_else(|e| panic!("{name}: interp error: {e}"));
-        Arm64Linux::new_freestanding(dir.join(&name))
+        Arm64Linux::new(dir.join(&name))
             .run(&program)
             .unwrap_or_else(|e| panic!("{name}: freestanding build failed: {e}"));
         names.push(name);
@@ -121,7 +121,7 @@ fn extreme_field_width_and_precision_do_not_overflow() {
         );
         let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
         let name = format!("w{idx}");
-        Arm64Linux::new_freestanding(dir.join(&name))
+        Arm64Linux::new(dir.join(&name))
             .run(&program)
             .unwrap_or_else(|e| panic!("freestanding build failed for `{src}`: {e}"));
         names.push(name);
