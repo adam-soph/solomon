@@ -1505,6 +1505,20 @@ fn extreme_field_width_and_precision_are_clamped() {
 }
 
 #[test]
+fn clock_builtins_have_sane_properties() {
+    // Time is impure, so it can't be value-tested against a fixed expectation —
+    // assert properties instead: the wall clock is positive (well past 1970),
+    // and the monotonic clock does not go backwards across a Sleep.
+    let out = run(r#"
+        I64 a = NanoNS();
+        Sleep(2000000); // 2ms
+        I64 b = NanoNS();
+        "%d %d\n", UnixNS() > 1000000000000000000, b >= a;
+    "#);
+    assert_eq!(out, "1 1\n");
+}
+
+#[test]
 fn float_division_by_zero_is_infinity() {
     // Unlike integer `/0` (a runtime error), float division follows IEEE-754:
     // it yields ±inf / nan rather than trapping, matching the native backends.

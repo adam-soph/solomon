@@ -77,6 +77,30 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 2,
             varargs: false,
         },
+        // Clock/time primitives — impure (they read the OS clock or sleep), so
+        // unlike every other builtin they are *not* reproducible across backends:
+        // the byte-for-byte conformance is relaxed for these (tested by property,
+        // not value). `UnixNS()` is wall-clock ns since the Unix epoch
+        // (CLOCK_REALTIME), `NanoNS()` monotonic ns (CLOCK_MONOTONIC, for
+        // durations), `Sleep(ns)` suspends the thread.
+        BuiltinSig {
+            name: "UnixNS",
+            ret: Type::I64,
+            min_args: 0,
+            varargs: false,
+        },
+        BuiltinSig {
+            name: "NanoNS",
+            ret: Type::I64,
+            min_args: 0,
+            varargs: false,
+        },
+        BuiltinSig {
+            name: "Sleep",
+            ret: Type::U0,
+            min_args: 1,
+            varargs: false,
+        },
         // Memory ops (libc memcpy/memmove/memset/memcmp/memchr/memmem).
         BuiltinSig {
             name: "MemCpy",

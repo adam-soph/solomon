@@ -1475,6 +1475,24 @@ impl<W: Write> Interpreter<W> {
             "RandU64" => Ok(Value::Int(
                 crate::builtins::splitmix64(&mut self.rng_state) as i64
             )),
+            // Clock/time primitives — impure (read the host clock or sleep).
+            "UnixNS" => Ok(Value::Int(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0),
+            )),
+            "NanoNS" => {
+                // Monotonic ns from an unspecified, process-fixed origin.
+                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                let start = START.get_or_init(std::time::Instant::now);
+                Ok(Value::Int(start.elapsed().as_nanos() as i64))
+            }
+            "Sleep" => {
+                let ns = self.to_i64(args[0].clone(), pos)?.max(0) as u64;
+                std::thread::sleep(std::time::Duration::from_nanos(ns));
+                Ok(Value::Void)
+            }
             "ArgC" => Ok(Value::Int(self.args.len() as i64)),
             "ArgV" => {
                 let i = self.to_i64(args[0].clone(), pos)?;
