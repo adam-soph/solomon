@@ -394,7 +394,9 @@ clock past 1970), never by interp-vs-native value comparison. The interpreter us
 `std::time`; the freestanding backends emit `clock_gettime`/`nanosleep` syscalls
 (arm64 113/101, x86_64 228/35) over a 16-byte BSS timespec, folding `sec·1e9+nsec`;
 Darwin calls libc `clock_gettime`/`nanosleep` over a stack timespec (macOS
-`CLOCK_MONOTONIC`=6, not Linux's 1). Windows has no clock yet (`has_posix_clock`). The arm64 backend reaches libc
+`CLOCK_MONOTONIC`=6, not Linux's 1); Windows lowers them via kernel32
+(`GetSystemTimePreciseAsFileTime` → ns since 1970, `GetTickCount64`×1e6, `Sleep`)
+through the `OsTarget::emit_unix_ns`/`emit_mono_ns`/`emit_sleep` seam. The arm64 backend reaches libc
 through a generic
 external-symbol mechanism (`SymRef::Extern("_sym")` + `Asm::bl_extern`); the
 Mach-O writer emits one undefined symbol per referenced libc function, so adding
