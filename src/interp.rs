@@ -343,6 +343,10 @@ pub struct Interpreter<W: Write> {
     /// Command-line arguments exposed via `ArgC`/`ArgV`. `args[0]` is the program
     /// (or script) name, mirroring a native binary's argv, so the count is ≥ 1.
     args: Vec<String>,
+    /// A stack of variadic-argument lists, one frame per active `...` function
+    /// call. `VarArgCnt`/`VarArg{I64,F64,Ptr}` read the top frame (sema restricts
+    /// them to `...` bodies, so the top is always the current function's varargs).
+    va_stack: Vec<Vec<Value>>,
 }
 
 impl<W: Write> Interpreter<W> {
@@ -360,6 +364,7 @@ impl<W: Write> Interpreter<W> {
             layouts: Layouts::empty(),
             rng_state: 0,
             args: vec!["hcc".to_string()],
+            va_stack: Vec::new(),
         }
     }
 
@@ -1217,10 +1222,19 @@ impl<W: Write> Interpreter<W> {
             let body = f.body.as_ref().ok_or_else(|| {
                 CodegenError::at(pos, format!("call to `{name}`, which has no body"))
             })?;
+            // A `...` function exposes the trailing arguments (those past the named
+            // params) to `VarArg*` for the duration of its body.
+            if f.varargs {
+                let varargs = args.get(f.params.len()..).unwrap_or(&[]).to_vec();
+                self.va_stack.push(varargs);
+            }
             // Narrow the result to the declared return width (C truncates the
             // return value to the return type), matching the native backend.
-            let result = self.exec_func_body(body, &mut env)?;
-            return Ok(coerce_to(&f.ret, result));
+            let result = self.exec_func_body(body, &mut env);
+            if f.varargs {
+                self.va_stack.pop();
+            }
+            return Ok(coerce_to(&f.ret, result?));
         }
 
         // Intrinsics (signatures are registered for type-checking in
@@ -1500,6 +1514,26 @@ impl<W: Write> Interpreter<W> {
                     Some(s) => Ok(Value::Str(Rc::new(s.clone()))),
                     None => Ok(Value::Ptr(None)), // out of range -> NULL
                 }
+            }
+            // Variadic-argument access (current `...` frame on the va stack). An
+            // out-of-range index yields 0 / 0.0 / NULL.
+            "VarArgCnt" => Ok(Value::Int(
+                self.va_stack.last().map(|v| v.len()).unwrap_or(0) as i64,
+            )),
+            "VarArgI64" | "VarArgF64" | "VarArgPtr" => {
+                let i = self.to_i64(args[0].clone(), pos)?;
+                let slot = usize::try_from(i)
+                    .ok()
+                    .and_then(|i| self.va_stack.last().and_then(|v| v.get(i)))
+                    .cloned();
+                Ok(match (name, slot) {
+                    ("VarArgF64", Some(v)) => Value::Float(value_as_f64(&v)),
+                    ("VarArgF64", None) => Value::Float(0.0),
+                    ("VarArgPtr", Some(v)) => v,
+                    ("VarArgPtr", None) => Value::Ptr(None),
+                    (_, Some(v)) => Value::Int(value_as_i64(&v)),
+                    (_, None) => Value::Int(0),
+                })
             }
             "StrFind" => {
                 // A pointer to the first occurrence of needle in haystack, or NULL.

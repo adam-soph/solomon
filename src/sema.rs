@@ -85,6 +85,9 @@ struct Analyzer {
     scopes: Vec<HashMap<String, Type>>,
     /// Return type of the function currently being checked, if any.
     cur_ret: Option<Type>,
+    /// Whether the function currently being checked is variadic (`...`) — gates
+    /// the `VarArg*` accessors, which are meaningless outside a `...` body.
+    cur_varargs: bool,
     loop_depth: u32,
     switch_depth: u32,
     /// Stack of label scopes: the labels declared directly in the current block
@@ -101,6 +104,7 @@ impl Analyzer {
             funcs: HashMap::new(),
             scopes: Vec::new(),
             cur_ret: None,
+            cur_varargs: false,
             loop_depth: 0,
             switch_depth: 0,
             label_scopes: Vec::new(),
@@ -325,6 +329,7 @@ impl Analyzer {
         };
         self.resolve_type(&f.ret, Pos::new(0, 0));
         self.cur_ret = Some(f.ret.clone());
+        self.cur_varargs = f.varargs;
 
         self.label_scopes.push(direct_labels(body));
         self.push_scope();
@@ -346,6 +351,7 @@ impl Analyzer {
         self.pop_scope();
         self.label_scopes.pop();
         self.cur_ret = None;
+        self.cur_varargs = false;
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
@@ -907,6 +913,19 @@ impl Analyzer {
         // of the same name shadows it (then it's a function-pointer call).
         if let ExprKind::Ident(name) = &callee.kind {
             if self.lookup_var(name).is_none() {
+                // The `VarArg*` accessors only make sense inside a `...` function
+                // (there are no variadic arguments otherwise, and the native
+                // backends have no va frame to read).
+                if matches!(
+                    name.as_str(),
+                    "VarArgCnt" | "VarArgI64" | "VarArgF64" | "VarArgPtr"
+                ) && !self.cur_varargs
+                {
+                    self.error(
+                        callee.span.pos,
+                        format!("`{name}` is only valid inside a variadic (`...`) function"),
+                    );
+                }
                 if let Some(sig) = self.funcs.get(name) {
                     let (required, total, varargs, ret) =
                         (sig.required, sig.total, sig.varargs, sig.ret.clone());

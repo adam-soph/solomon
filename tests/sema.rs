@@ -561,3 +561,9 @@ fn errors_carry_positions() {
         .expect("expected an undeclared-identifier error");
     assert_eq!(undeclared.pos.line, 2);
 }
+
+#[test]
+fn vararg_accessors_require_a_variadic_function() {
+    has("U0 F() { VarArgI64(0); }", "only valid inside a variadic");
+    ok("I64 F(...) { return VarArgCnt() + VarArgI64(0); }");
+}

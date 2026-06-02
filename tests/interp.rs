@@ -1505,6 +1505,36 @@ fn extreme_field_width_and_precision_are_clamped() {
 }
 
 #[test]
+fn variadic_functions_read_their_varargs() {
+    // VarArgCnt + the typed accessors (I64/F64/Ptr) read the trailing `...` args.
+    let out = run(r#"
+        I64 SumI(...) {
+          I64 s = 0, i = 0, n = VarArgCnt();
+          while (i < n) { s += VarArgI64(i); i++; }
+          return s;
+        }
+        F64 AvgF(...) {
+          F64 s = 0.0; I64 i = 0, n = VarArgCnt();
+          while (i < n) { s += VarArgF64(i); i++; }
+          return s / n;
+        }
+        U0 Join(U8 *sep, ...) {
+          I64 i = 0, n = VarArgCnt();
+          while (i < n) { if (i) "%s", sep; "%s", VarArgPtr(i); i++; }
+          "\n";
+        }
+        U0 Main() {
+          "%d %d %d\n", SumI(10, 20, 30), SumI(5), VarArgCntZero();
+          "%.2f\n", AvgF(1.0, 2.0, 3.0, 4.0);
+          Join(", ", "a", "b", "c");
+        }
+        I64 VarArgCntZero(...) { return VarArgCnt(); }
+        Main;
+    "#);
+    assert_eq!(out, "60 5 0\n2.50\na, b, c\n");
+}
+
+#[test]
 fn clock_builtins_have_sane_properties() {
     // Time is impure, so it can't be value-tested against a fixed expectation —
     // assert properties instead: the wall clock is positive (well past 1970),

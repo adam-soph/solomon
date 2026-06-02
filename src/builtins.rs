@@ -84,6 +84,13 @@ pub fn all() -> Vec<BuiltinSig> {
         // The captured command line.
         sig("ArgC", i64(), vec![], false),
         sig("ArgV", u8p(), vec![i64()], false),
+        // Variadic-argument access, valid only inside a `...` function. Varargs are
+        // raw 64-bit slots; the accessor picks the type (as in C's `va_arg` — read
+        // back the type you passed). `VarArgCnt()` is the number passed.
+        sig("VarArgCnt", i64(), vec![], false),
+        sig("VarArgI64", i64(), vec![i64()], false),
+        sig("VarArgF64", f64(), vec![i64()], false),
+        sig("VarArgPtr", u8p(), vec![i64()], false),
     ];
     // The `Is*` ctype predicates — each `(I64) -> I64` returning 0/1.
     sigs.extend(
