@@ -45,9 +45,44 @@ impl Codegen for X64Linux {
 /// The Linux OS policy: Linux/x86-64 syscalls and a static-ELF container.
 struct LinuxTarget;
 
+impl LinuxTarget {
+    /// `clock_gettime(clockid, &ts)` (nr 228) over the 16-byte `ts` BSS slot, then
+    /// fold `tv_sec*1e9 + tv_nsec` into rax.
+    fn emit_clock(asm: &mut Asm, ts: i32, clockid: i32) {
+        asm.mov_ri(RDI, clockid);
+        asm.lea_global(RSI, ts); // &ts
+        asm.mov_ri(RAX, 228); // SYS_clock_gettime
+        asm.syscall();
+        asm.lea_global(RCX, ts);
+        asm.load_qword_at(RAX, RCX); // tv_sec
+        asm.imul_rax_imm32(1_000_000_000);
+        asm.add_ri(RCX, 8);
+        asm.load_qword_at(RDX, RCX); // tv_nsec
+        asm.add_rr(RAX, RDX); // rax = sec*1e9 + nsec
+    }
+}
+
 impl OsTarget for LinuxTarget {
-    fn has_posix_clock(&self) -> bool {
-        true
+    fn emit_unix_ns(&mut self, asm: &mut Asm, scratch: i32) {
+        Self::emit_clock(asm, scratch, 0); // CLOCK_REALTIME
+    }
+
+    fn emit_mono_ns(&mut self, asm: &mut Asm, scratch: i32) {
+        Self::emit_clock(asm, scratch, 1); // CLOCK_MONOTONIC
+    }
+
+    fn emit_sleep(&mut self, asm: &mut Asm, ts: i32) {
+        // rax = ns -> timespec(ns/1e9, ns%1e9); nanosleep(&ts, NULL) (nr 35).
+        asm.mov_ri(RCX, 1_000_000_000);
+        asm.div_rcx(); // rax = sec, rdx = nsec
+        asm.lea_global(R8, ts);
+        asm.store_qword_at(R8, RAX); // tv_sec
+        asm.add_ri(R8, 8);
+        asm.store_qword_at(R8, RDX); // tv_nsec
+        asm.lea_global(RDI, ts); // &ts
+        asm.xor_rr(RSI, RSI); // rem = NULL
+        asm.mov_ri(RAX, 35); // SYS_nanosleep
+        asm.syscall();
     }
 
     fn emit_exit(&mut self, asm: &mut Asm) {

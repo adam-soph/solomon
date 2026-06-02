@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use super::{Asm, OsTarget, R8, R9, RAX, RCX, RDI, RDX, RSI};
+use super::{Asm, OsTarget, R8, R9, R15, RAX, RCX, RDI, RDX, RSI};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
@@ -72,6 +72,19 @@ impl WindowsTarget {
         self.externs.push(name);
         self.externs.len() - 1
     }
+
+    /// Call a kernel32 import with rsp 16-aligned and a 32-byte shadow area (the
+    /// MS x64 ABI), preserving the caller's rsp in r15 (non-volatile, so it
+    /// survives the call) since the call site's alignment is unknown. Arguments
+    /// must already be in `rcx`/`rdx`/`r8`/`r9`.
+    fn call_aligned(&mut self, asm: &mut Asm, name: &'static str) {
+        let i = self.extern_idx(name);
+        asm.mov_rr(R15, super::RSP); // save rsp
+        asm.and_ri(super::RSP, -16); // 16-align
+        asm.emit(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32 (shadow)
+        asm.call_extern(i);
+        asm.mov_rr(super::RSP, R15); // restore rsp
+    }
 }
 
 impl OsTarget for WindowsTarget {
@@ -117,6 +130,32 @@ impl OsTarget for WindowsTarget {
         asm.emit(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp+32], 0
         asm.call_extern(wf); // call [WriteFile]
         asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+    }
+
+    fn emit_unix_ns(&mut self, asm: &mut Asm, ft: i32) {
+        // GetSystemTimePreciseAsFileTime(&filetime): 100 ns ticks since 1601-01-01.
+        // Convert to ns since the Unix epoch: (ticks - 1601→1970 offset) * 100.
+        asm.lea_global(RCX, ft); // arg1 = &filetime
+        self.call_aligned(asm, "GetSystemTimePreciseAsFileTime");
+        asm.lea_global(RCX, ft);
+        asm.load_qword_at(RAX, RCX); // rax = filetime ticks
+        asm.mov_ri64(RCX, 116_444_736_000_000_000); // 1601→1970 in 100 ns units
+        asm.sub_rr(RAX, RCX);
+        asm.imul_rax_imm32(100); // ticks → ns
+    }
+
+    fn emit_mono_ns(&mut self, asm: &mut Asm, _scratch: i32) {
+        // GetTickCount64() -> ms since boot (monotonic); *1e6 = ns.
+        self.call_aligned(asm, "GetTickCount64");
+        asm.imul_rax_imm32(1_000_000);
+    }
+
+    fn emit_sleep(&mut self, asm: &mut Asm, _scratch: i32) {
+        // rax = ns; Sleep(DWORD ms = ns / 1e6).
+        asm.mov_ri(RCX, 1_000_000);
+        asm.div_rcx(); // rax = ms
+        asm.mov_rr(RCX, RAX); // arg1 = ms
+        self.call_aligned(asm, "Sleep");
     }
 
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {

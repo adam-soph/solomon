@@ -221,3 +221,26 @@ fn malloc_lowers_to_virtualalloc() {
         "add rsp, 32"
     );
 }
+
+#[test]
+fn time_builtins_lower_to_kernel32() {
+    // Each time builtin marshals its args, then calls a kernel32 import behind the
+    // `call_aligned` shim (save rsp in r15, 16-align, 32-byte shadow, call [rip]).
+    // We can't execute the PE here, so byte-scan for the shim and resolve the import.
+    let shim: &[u8] = &[
+        0x49, 0x89, 0xE7, // mov r15, rsp
+        0x48, 0x81, 0xE4, 0xF0, 0xFF, 0xFF, 0xFF, // and rsp, -16
+        0x48, 0x83, 0xEC, 0x20, // sub rsp, 32 (shadow)
+        0xFF, 0x15, // call [rip] (the import)
+    ];
+    for (src, fname) in [
+        ("I64 t = UnixNS();", "GetSystemTimePreciseAsFileTime"),
+        ("I64 t = NanoNS();", "GetTickCount64"),
+        ("Sleep(1000000);", "Sleep"),
+    ] {
+        let pe = build_pe(src);
+        let at = find_code(&pe, shim);
+        let call = at + shim.len() - 2;
+        assert_eq!(call_target(&pe, call), fname, "for `{src}`");
+    }
+}
