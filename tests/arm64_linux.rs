@@ -181,3 +181,31 @@ fn stdlib_math_matches_the_interpreter() {
         "freestanding native != interp stdout for the math stdlib"
     );
 }
+
+#[test]
+fn time_builtins_run_natively() {
+    // Time is impure (non-reproducible), so assert *properties* of the native run
+    // rather than byte-comparing to the interpreter: wall clock past 1970, and a
+    // monotonic clock that doesn't go backwards across a Sleep.
+    let src = r#"U0 Main() {
+        I64 a = NanoNS();
+        Sleep(2000000);
+        I64 b = NanoNS();
+        "%d %d\n", UnixNS() > 1000000000000000000, b >= a;
+    } Main;"#;
+    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "timeprog".to_string();
+    Arm64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping aarch64 time conformance: needs a linux/aarch64 host or docker");
+        return;
+    };
+    assert_eq!(got[0], "1 1\n", "time builtin properties hold natively");
+}

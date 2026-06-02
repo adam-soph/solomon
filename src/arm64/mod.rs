@@ -2419,6 +2419,13 @@ impl Cg {
             self.asm.place(l_done);
             return Ok(());
         }
+        // Clock/time primitives. UnixNS = CLOCK_REALTIME, NanoNS = CLOCK_MONOTONIC.
+        if name == "UnixNS" || name == "NanoNS" {
+            return self.gen_clock(name == "NanoNS", pos);
+        }
+        if name == "Sleep" {
+            return self.gen_sleep(&args[0], pos);
+        }
         // `StrToUpper`/`StrToLower` — ASCII-case a string in place via an inline
         // loop calling libc `toupper`/`tolower`; return the string.
         if name == "StrToUpper" || name == "StrToLower" {
@@ -5140,6 +5147,66 @@ impl Cg {
         self.asm.b(l_loop);
         self.asm.place(l_end);
         self.load_local(RES, str_off, &Type::I64); // return str
+        Ok(())
+    }
+
+    /// `UnixNS()`/`NanoNS()` — read the clock into RES as nanoseconds since the
+    /// epoch (`mono=false`, CLOCK_REALTIME) or a monotonic origin (`mono=true`).
+    /// Freestanding emits a `clock_gettime` syscall over a BSS timespec; the hosted
+    /// (Darwin) target calls libc `clock_gettime` over a stack timespec. The two
+    /// OSes disagree on the monotonic clock id (Linux 1, macOS 6).
+    fn gen_clock(&mut self, mono: bool, _pos: Pos) -> Result<(), CodegenError> {
+        if self.freestanding {
+            let ts = self.alloc_bss_fs(16, 8);
+            self.asm.load_imm(0, i64::from(mono)); // clockid: 0 realtime / 1 monotonic
+            self.asm.adr_global_fs(1, ts);
+            self.asm.load_imm(8, 113); // SYS_clock_gettime
+            self.asm.svc();
+            self.asm.adr_global_fs(9, ts);
+            self.asm.load_mem(10, 9, 8, false); // tv_sec  @ +0
+            self.asm.ldur(11, 9, 8); // tv_nsec @ +8
+        } else {
+            self.asm.sub_sp_imm(16); // 16-byte stack timespec (keeps 16-alignment)
+            self.asm.load_imm(0, if mono { 6 } else { 0 }); // macOS clock ids
+            self.asm.add_imm(1, SP, 0); // x1 = &ts = sp
+            self.asm.bl_extern("_clock_gettime");
+            self.asm.load_mem(10, SP, 8, false); // tv_sec
+            self.asm.ldur(11, SP, 8); // tv_nsec
+            self.asm.add_sp_imm(16);
+        }
+        // RES = tv_sec * 1e9 + tv_nsec
+        self.asm.load_imm(12, 1_000_000_000);
+        self.asm.mul(10, 10, 12);
+        self.asm.add(RES, 10, 11);
+        Ok(())
+    }
+
+    /// `Sleep(ns)` — suspend the thread for `ns` nanoseconds. Builds a timespec
+    /// (`ns / 1e9`, `ns % 1e9`) and issues `nanosleep` (freestanding) or libc
+    /// `nanosleep` (hosted).
+    fn gen_sleep(&mut self, arg: &Expr, _pos: Pos) -> Result<(), CodegenError> {
+        self.gen_expr(arg)?; // RES = ns
+        self.asm.load_imm(10, 1_000_000_000);
+        self.asm.udiv(11, RES, 10); // tv_sec  = ns / 1e9
+        self.asm.msub(12, 11, 10, RES); // tv_nsec = ns - sec*1e9
+        if self.freestanding {
+            let ts = self.alloc_bss_fs(16, 8);
+            self.asm.adr_global_fs(9, ts);
+            self.asm.store_mem(11, 9, 8); // tv_sec  @ +0
+            self.asm.stur(12, 9, 8); // tv_nsec @ +8
+            self.asm.adr_global_fs(0, ts); // &ts
+            self.asm.load_imm(1, 0); // rem = NULL
+            self.asm.load_imm(8, 101); // SYS_nanosleep
+            self.asm.svc();
+        } else {
+            self.asm.sub_sp_imm(16);
+            self.asm.store_mem(11, SP, 8); // tv_sec
+            self.asm.stur(12, SP, 8); // tv_nsec
+            self.asm.add_imm(0, SP, 0); // x0 = &ts
+            self.asm.load_imm(1, 0); // rem = NULL
+            self.asm.bl_extern("_nanosleep");
+            self.asm.add_sp_imm(16);
+        }
         Ok(())
     }
 }

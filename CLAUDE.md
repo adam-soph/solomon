@@ -385,7 +385,16 @@ whose unspecified nonzero return wouldn't match the interpreter's 0/1); and
 `RandU64` — a deterministic splitmix64 (`builtins::splitmix64`, fixed zero seed) so
 its sequence is identical in both backends; the native backend keeps the state in a
 hidden `RNG_STATE_GLOBAL` common symbol the interpreter mirrors with
-`Interpreter::rng_state`. The arm64 backend reaches libc
+`Interpreter::rng_state`. The **clock/time primitives** `UnixNS` (wall-clock ns,
+CLOCK_REALTIME), `NanoNS` (monotonic ns, CLOCK_MONOTONIC) and `Sleep(ns)` are the
+one **impure, non-reproducible** group: the clock differs between an interpreter
+run and a native run, so the byte-for-byte conformance is *relaxed* for them —
+they're tested by **property** (monotonic non-decreasing across a `Sleep`; wall
+clock past 1970), never by interp-vs-native value comparison. The interpreter uses
+`std::time`; the freestanding backends emit `clock_gettime`/`nanosleep` syscalls
+(arm64 113/101, x86_64 228/35) over a 16-byte BSS timespec, folding `sec·1e9+nsec`;
+Darwin calls libc `clock_gettime`/`nanosleep` over a stack timespec (macOS
+`CLOCK_MONOTONIC`=6, not Linux's 1). Windows has no clock yet (`has_posix_clock`). The arm64 backend reaches libc
 through a generic
 external-symbol mechanism (`SymRef::Extern("_sym")` + `Asm::bl_extern`); the
 Mach-O writer emits one undefined symbol per referenced libc function, so adding

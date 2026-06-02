@@ -791,3 +791,31 @@ fn stdlib_math_matches_the_interpreter() {
     };
     assert_eq!(got[0], want, "native != interp stdout for the math stdlib");
 }
+
+#[test]
+fn time_builtins_run_natively() {
+    // Time is impure (non-reproducible), so it can't be byte-compared to the
+    // interpreter — run the native binary and assert *properties*: the wall clock
+    // is past 1970 and the monotonic clock doesn't go backwards across a Sleep.
+    let src = r#"U0 Main() {
+        I64 a = NanoNS();
+        Sleep(2000000);
+        I64 b = NanoNS();
+        "%d %d\n", UnixNS() > 1000000000000000000, b >= a;
+    } Main;"#;
+    let program = parse_src(src);
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "timeprog".to_string();
+    X64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("native build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping x86-64 time conformance: needs a linux/x86_64 host or docker");
+        return;
+    };
+    assert_eq!(got[0], "1 1\n", "time builtin properties hold natively");
+}

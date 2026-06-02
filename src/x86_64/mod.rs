@@ -97,6 +97,13 @@ trait OsTarget {
     /// case of the formatted-output sink.
     fn emit_write_stdout(&mut self, asm: &mut Asm);
 
+    /// Whether the Linux `clock_gettime`/`nanosleep` syscalls back the time
+    /// builtins. Windows would need kernel32 (QueryPerformanceCounter / Sleep),
+    /// not yet wired, so it leaves this `false`.
+    fn has_posix_clock(&self) -> bool {
+        false
+    }
+
     /// Emit the entry preamble that captures the command line into the BSS slots
     /// at `argc_off` / `argv_off` (argv there is a pointer to the argv array).
     /// Runs just after the entry's frame is set up, so the frame pointer `rbp` is
@@ -1725,6 +1732,49 @@ impl Cg {
             "RandU64" => {
                 let l = self.rt_routine("RandU64");
                 self.asm.call(l);
+                Ok(())
+            }
+            // Clock/time primitives via the Linux syscalls (clock_gettime nr 228,
+            // nanosleep nr 35) over a BSS timespec. CLOCK_REALTIME=0, MONOTONIC=1.
+            "UnixNS" | "NanoNS" => {
+                if !self.os.has_posix_clock() {
+                    return Err(CodegenError::at(
+                        pos,
+                        "x86_64 backend: the time builtins need a Linux target",
+                    ));
+                }
+                let ts = self.alloc_bss(16, 8);
+                self.asm.mov_ri(RDI, i32::from(name == "NanoNS")); // clockid
+                self.asm.lea_global(RSI, ts); // &ts
+                self.asm.mov_ri(RAX, 228); // SYS_clock_gettime
+                self.asm.syscall();
+                self.asm.lea_global(RCX, ts);
+                self.asm.load_qword_at(RAX, RCX); // tv_sec
+                self.asm.imul_rax_imm32(1_000_000_000);
+                self.asm.add_ri(RCX, 8);
+                self.asm.load_qword_at(RDX, RCX); // tv_nsec
+                self.asm.add_rr(RAX, RDX); // rax = sec*1e9 + nsec
+                Ok(())
+            }
+            "Sleep" => {
+                if !self.os.has_posix_clock() {
+                    return Err(CodegenError::at(
+                        pos,
+                        "x86_64 backend: Sleep needs a Linux target",
+                    ));
+                }
+                self.gen_expr(&args[0])?; // rax = ns
+                let ts = self.alloc_bss(16, 8);
+                self.asm.mov_ri(RCX, 1_000_000_000);
+                self.asm.div_rcx(); // rax = sec, rdx = nsec
+                self.asm.lea_global(R8, ts);
+                self.asm.store_qword_at(R8, RAX); // tv_sec
+                self.asm.add_ri(R8, 8);
+                self.asm.store_qword_at(R8, RDX); // tv_nsec
+                self.asm.lea_global(RDI, ts); // &ts
+                self.asm.xor_rr(RSI, RSI); // rem = NULL
+                self.asm.mov_ri(RAX, 35); // SYS_nanosleep
+                self.asm.syscall();
                 Ok(())
             }
             // `ArgC()` / `ArgV(i)` — read the command line captured at the entry

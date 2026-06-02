@@ -46,6 +46,10 @@ impl Codegen for X64Linux {
 struct LinuxTarget;
 
 impl OsTarget for LinuxTarget {
+    fn has_posix_clock(&self) -> bool {
+        true
+    }
+
     fn emit_exit(&mut self, asm: &mut Asm) {
         // exit(status in rax): mov rdi, rax; mov rax, 60; syscall.
         asm.mov_rdi_rax();
