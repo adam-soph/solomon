@@ -63,8 +63,9 @@ x=42 y=255
   operator set. Streams tokens on demand.
 - **Preprocessor** — object-like and function-like `#define`, `#undef`, nested
   macro expansion (with a hide-set guard against runaway recursion),
-  `#ifdef` / `#ifndef` / `#else` / `#endif` conditionals, and `#include "file"`
-  (resolved relative to the including file, with cycle/depth guards).
+  `#ifdef` / `#ifndef` / `#else` / `#endif` conditionals, `#include "file"`
+  (relative to the including file) and `#include <name>` (resolved against the
+  standard-library search path), both with cycle/depth guards.
 - **Parser** — recursive descent with precedence-climbing expressions. A
   two-pass design hoists `class`/`union` names first, so a type can be used
   before it is defined. Handles function-pointer declarators
@@ -295,7 +296,35 @@ on each native backend with byte-identical output.
 | `report.hc` | a formatted sales report with aligned columns (`StrPrint`/`CatPrint`) |
 | `gallery.hc` | numbers rendered in every conversion — decimal/hex/octal/fixed/`%e`/`%g` |
 
+## Standard library
+
+The standard library is written **in HolyC** and lives in `lib/`. Because it's
+ordinary HolyC built on the deterministic `F64` ops and the algebraic builtins, it
+computes identically on the interpreter and every native backend — the same
+byte-for-byte reproducibility the transcendentals were kept out of the builtin set
+to guarantee (a builtin needs a portable, solomon-defined value; a host libm's
+`Sin` doesn't have one, but a HolyC `Sin` with a *defined algorithm* does).
+
+Pull a module in with an **angle include**:
+
+```holyc
+#include <math.hc>
+U0 Main() { "%.6f\n", Exp(1.0); }   // 2.718282
+Main;
+```
+
+`#include <name>` resolves against the library search path (vs `#include "file"`,
+which is relative to the including file): the `SOLOMON_STDLIB` environment variable
+(`:`-separated), then `lib/` relative to the `hcc`/`hci` executable, then `./lib`.
+`hcc -I DIR` prepends extra directories. `lib/math.hc` provides `Exp`/`Ln`/`Pow`,
+`Sin`/`Cos`/`Tan` (range reduction + series), exact `PowI`, and `Gcd`/`Factorial`/
+`Min`/`Max`/`Clamp`.
+
 ## Project layout
+
+```text
+lib/            the HolyC standard library (angle-included: `#include <math.hc>`)
+
 
 ```text
 src/

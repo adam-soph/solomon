@@ -92,9 +92,15 @@ Preserve this: do not add code that collects the full token stream up front.
 `#include "file"` keeps this property: the preprocessor maintains a *stack* of
 `Lexer`s (one per open file) and pulls from the innermost, so included files
 stream in without buffering. The `Lexer` owns its source bytes (so an included
-file's lexer can outlive the `&str` it was built from). Paths resolve relative
-to the including file's directory; `parser::parse(src)` defaults that to the CWD,
-`parse_in_dir(src, dir)` sets it (the CLI passes the input file's parent).
+file's lexer can outlive the `&str` it was built from). `#include "file"` paths
+resolve relative to the including file's directory; **angle** includes
+`#include <name>` (the standard library) resolve against a *search path* instead
+(the angle path is reassembled from its lexed tokens by `angle_path`, since unlike
+the quoted form it isn't a single `Str` token). `parser::parse(src)` defaults the
+base dir to the CWD with no search path; `parse_in_dir(src, dir)` sets the base
+dir; `parse_with(src, dir, search)` sets both (the CLIs pass the input file's
+parent and `solomon::stdlib_dirs()` — `SOLOMON_STDLIB`, then exe-relative `lib/`,
+then `./lib`; `hcc -I DIR` prepends more). The library itself is HolyC in `lib/`.
 
 ### Typed AST
 
@@ -312,7 +318,11 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   sink; `CatPrint` appends at `dst + StrLen(dst)`). The transcendentals aren't
   builtins at all (see the `builtins.rs` note — they're excluded project-wide, not
   just here), so nothing math-related is missing from this backend; the algebraic
-  ops `Sqrt`/`Fabs` are done and `Floor`/`Ceil`/`Round` would be `roundsd` away.
+  ops `Sqrt`/`Fabs`/`Floor`/`Ceil`/`Round` are all done — `Floor`/`Ceil` are a
+  single `roundsd` (modes 1/2), and `Round` is `trunc` (`roundsd` mode 3) plus a
+  `copysign` bump so it rounds **half away from zero** like the interpreter's
+  `f64::round` and arm64's `frinta` (`roundsd`'s nearest mode is half-to-even, which
+  would diverge).
   `MStrPrint` (a **growing sink** like libc's `vasprintf`: `MAlloc` a small owned
   buffer, then format in one pass while the sink reallocs-and-copies on overflow —
   `Helper::GrowSink`, doubling capacity — so the result is just `out_base` when
@@ -351,8 +361,12 @@ shared range table (`builtins::ctype_ranges`), **not** libc-backed, since libc's
 deliberately *not* builtins: an intrinsic must have a portable, solomon-defined
 value, but a transcendental's would be only "whatever the host libm computes,"
 which isn't reproducible across platforms and can't exist in a freestanding
-target. They belong in a future HolyC standard library with a defined algorithm —
-see the `builtins.rs` module doc.) `NULL`/`TRUE`/`FALSE` are
+target. They instead live in the **HolyC standard library** (`lib/*.hc`, e.g.
+`lib/math.hc`'s `Exp`/`Ln`/`Pow`/`Sin`/`Cos`) — ordinary HolyC built on the
+deterministic F64 ops + these algebraic builtins, so each function's *defined
+algorithm* computes identically on the interpreter and every backend; pull it in
+with an angle include, `#include <math.hc>`. See the `builtins.rs` module doc.)
+`NULL`/`TRUE`/`FALSE` are
 const builtins seeded in each. `Print`/`StrPrint`/`CatPrint`/`MStrPrint` are
 *not* in `libc_symbol`: all are special-cased in the arm64 backend
 (`gen_print`/`gen_formatted_write`/`gen_mstrprint`) to translate the format

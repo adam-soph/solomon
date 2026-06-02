@@ -34,6 +34,21 @@ fn id(s: &str) -> TokenKind {
 /// Preprocess `src` with `#include` resolved against `dir`.
 fn pp_in_dir(src: &str, dir: &std::path::Path) -> Vec<TokenKind> {
     let mut p = Preprocessor::with_base_dir(Lexer::new(src), dir.to_path_buf());
+    drain(&mut p)
+}
+
+/// Preprocess `src`, resolving angle includes (`#include <name>`) against the
+/// `search` directories.
+fn pp_search(src: &str, search: Vec<std::path::PathBuf>) -> Vec<TokenKind> {
+    let mut p = Preprocessor::with_base_dir_and_search(
+        Lexer::new(src),
+        std::path::PathBuf::from("."),
+        search,
+    );
+    drain(&mut p)
+}
+
+fn drain<S: solomon::lexer::TokenStream>(p: &mut Preprocessor<S>) -> Vec<TokenKind> {
     let mut out = Vec::new();
     loop {
         let t = p
@@ -239,6 +254,43 @@ fn missing_include_errors() {
     let dir = make_files("missing", &[]);
     let err = pp_err("#include \"nope.hc\"\n1", &dir).expect("expected an error");
     assert!(err.contains("cannot open #include"), "got: {err}");
+}
+
+#[test]
+fn angle_include_resolves_from_the_search_path() {
+    // `#include <name>` ignores the including file's directory and resolves
+    // against the standard-library search path instead.
+    let dir = make_files("angle", &[("math.hc", "#define N 7\nN 8")]);
+    assert_eq!(
+        pp_search("#include <math.hc>\n9", vec![dir]),
+        vec![int(7), int(8), int(9)]
+    );
+}
+
+#[test]
+fn angle_include_tries_search_dirs_in_order() {
+    // The first search directory that holds the file wins.
+    let a = make_files("angle-a", &[]); // no math.hc here
+    let b = make_files("angle-b", &[("math.hc", "5")]);
+    assert_eq!(pp_search("#include <math.hc>", vec![a, b]), vec![int(5)]);
+}
+
+#[test]
+fn angle_include_not_found_errors() {
+    let dir = make_files("angle-missing", &[]);
+    let mut p = Preprocessor::with_base_dir_and_search(
+        Lexer::new("#include <nope.hc>"),
+        std::path::PathBuf::from("."),
+        vec![dir],
+    );
+    let err = loop {
+        match p.next_token() {
+            Ok(t) if t.kind == TokenKind::Eof => panic!("expected an error"),
+            Ok(_) => {}
+            Err(e) => break e.to_string(),
+        }
+    };
+    assert!(err.contains("cannot find #include <nope.hc>"), "got: {err}");
 }
 
 #[test]

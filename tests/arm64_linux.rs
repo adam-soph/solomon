@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use solomon::arm64::Arm64Linux;
 use solomon::codegen::Codegen;
 use solomon::interp::run_to_string;
-use solomon::parser::parse;
+use solomon::parser::{parse, parse_with};
 use solomon::sema::check_program;
 
 mod common;
@@ -139,4 +139,44 @@ fn extreme_field_width_and_precision_do_not_overflow() {
             "freestanding native != interp stdout for `{src}`"
         );
     }
+}
+
+#[test]
+fn stdlib_math_matches_the_interpreter() {
+    // The HolyC standard library (`#include <math.hc>`) compiles freestanding and
+    // prints exactly what the interpreter does — exercising angle includes through
+    // the native pipeline and the F64 algebraic builtins (`Floor`/`Ceil`/`Round`).
+    let src = r#"
+        #include <math.hc>
+        U0 Main() {
+          "%.6f %.6f %.6f\n", Exp(1.0), Ln(E), Pow(2.0, 10.0);
+          "%.6f %.6f %.6f\n", Sin(PI / 2.0), Cos(0.0), Tan(PI / 4.0);
+          "%.1f %.1f %.1f %.1f\n", Round(2.5), Round(-2.5), Round(0.5), Round(-3.5);
+          "%.1f %.1f %.1f %.1f\n", Floor(2.7), Floor(-2.3), Ceil(2.1), Ceil(-2.9);
+          "%d %d %d\n", Gcd(48, 36), Factorial(6), IMax(3, 9);
+        }
+        Main;
+    "#;
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "stdmath".to_string();
+    Arm64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping aarch64 stdlib conformance: needs a linux/aarch64 host or docker");
+        return;
+    };
+    assert_eq!(
+        got[0], want,
+        "freestanding native != interp stdout for the math stdlib"
+    );
 }

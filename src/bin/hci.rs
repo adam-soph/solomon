@@ -63,7 +63,8 @@ fn main() -> ExitCode {
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    let program = match parser::parse_in_dir(&src, &base_dir) {
+    // Angle includes (`#include <name>`) resolve against the standard library.
+    let program = match parser::parse_with(&src, &base_dir, &solomon::stdlib_dirs()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");

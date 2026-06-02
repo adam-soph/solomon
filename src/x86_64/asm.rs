@@ -603,6 +603,27 @@ impl Asm {
         bytes.extend_from_slice(&[0x0F, 0x54, modrm_rr(xd, xs)]);
         self.emit(&bytes);
     }
+    /// `orpd xmm_d, xmm_s` — bitwise OR of doubles (for `copysign`, injecting a sign).
+    pub(super) fn orpd(&mut self, xd: u8, xs: u8) {
+        // 66 0F 56 /r
+        let mut bytes = vec![0x66u8];
+        if xd >= 8 || xs >= 8 {
+            bytes.push(0x40 | if xd >= 8 { 0x04 } else { 0 } | if xs >= 8 { 0x01 } else { 0 });
+        }
+        bytes.extend_from_slice(&[0x0F, 0x56, modrm_rr(xd, xs)]);
+        self.emit(&bytes);
+    }
+    /// `roundsd xmm_d, xmm_s, imm8` (SSE4.1) — round a double per `mode`:
+    /// 0 nearest-even, 1 floor (−∞), 2 ceil (+∞), 3 trunc (toward zero).
+    pub(super) fn roundsd(&mut self, xd: u8, xs: u8, mode: u8) {
+        // 66 0F 3A 0B /r ib
+        let mut bytes = vec![0x66u8];
+        if xd >= 8 || xs >= 8 {
+            bytes.push(0x40 | if xd >= 8 { 0x04 } else { 0 } | if xs >= 8 { 0x01 } else { 0 });
+        }
+        bytes.extend_from_slice(&[0x0F, 0x3A, 0x0B, modrm_rr(xd, xs), mode]);
+        self.emit(&bytes);
+    }
 
     // ---- SSE2 (F64) encoders. The expression evaluator uses xmm0 as the float
     // result and xmm1 as the temp; argument passing reaches xmm0..xmm7. ----

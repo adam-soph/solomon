@@ -1,0 +1,63 @@
+//! Standard-library tests: the `lib/*.hc` HolyC modules, resolved via angle
+//! includes (`#include <math.hc>`) and run through the interpreter (the oracle).
+//! Host-independent — the native backends are held to this output byte-for-byte by
+//! the `stdlib_math_matches_the_interpreter` conformance tests.
+
+use solomon::interp::run_to_string;
+use solomon::parser::parse_with;
+use solomon::sema::check_program;
+
+/// Parse `src` with the repository's `lib/` on the angle-include search path, then
+/// type-check and run it, returning captured output.
+fn run_with_stdlib(src: &str) -> String {
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = check_program(&program);
+    assert!(errs.is_empty(), "semantic errors: {errs:?}");
+    run_to_string(&program).unwrap_or_else(|e| panic!("runtime error: {e}"))
+}
+
+#[test]
+fn math_transcendentals_are_accurate() {
+    let out = run_with_stdlib(
+        r#"
+        #include <math.hc>
+        U0 Main() {
+          "%.5f %.5f %.5f\n", Exp(1.0), Ln(E), Pow(2.0, 10.0);
+          "%.5f %.5f %.5f\n", Sin(PI / 2.0), Cos(0.0), Tan(PI / 4.0);
+          "%.5f %.5f\n", Sin(0.0), Cos(PI);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "2.71828 1.00000 1024.00000\n\
+         1.00000 1.00000 1.00000\n\
+         0.00000 -1.00000\n"
+    );
+}
+
+#[test]
+fn math_rounding_and_integer_helpers() {
+    let out = run_with_stdlib(
+        r#"
+        #include <math.hc>
+        U0 Main() {
+          "%.1f %.1f %.1f %.1f\n", Round(2.5), Round(-2.5), Round(0.5), Round(-3.5);
+          "%.1f %.1f %.1f %.1f\n", Floor(2.7), Floor(-2.3), Ceil(2.1), Ceil(-2.9);
+          "%.1f\n", PowI(2.0, 10);
+          "%d %d %d %d\n", Gcd(48, 36), Factorial(6), IMin(3, 9), IMax(3, 9);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "3.0 -3.0 1.0 -4.0\n\
+         2.0 -3.0 3.0 -2.0\n\
+         1024.0\n\
+         12 720 3 9\n"
+    );
+}

@@ -32,3 +32,26 @@ pub use preproc::Preprocessor;
 pub use sema::{SemaError, analyze, check_program};
 pub use token::{Keyword, Pos, Span, Token, TokenKind};
 pub use x86_64::{X64Linux, X64Windows};
+
+/// The default standard-library search directories for **angle** includes
+/// (`#include <math.hc>`), tried in order: the `SOLOMON_STDLIB` environment
+/// variable (`:`-separated) if set, then `lib/` resolved relative to the running
+/// executable (covering both an installed `<prefix>/bin/hcc` → `<prefix>/lib`
+/// layout and the dev `target/<profile>/hcc` → repo `lib/` layout), then `./lib`.
+/// Non-existent entries are simply skipped at resolution time.
+pub fn stdlib_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut dirs = Vec::new();
+    if let Ok(env) = std::env::var("SOLOMON_STDLIB") {
+        dirs.extend(env.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.join("lib"));
+            dirs.push(d.join("../lib"));
+            dirs.push(d.join("../../lib"));
+        }
+    }
+    dirs.push(PathBuf::from("lib"));
+    dirs
+}

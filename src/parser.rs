@@ -1362,15 +1362,33 @@ pub fn parse(src: &str) -> PResult<Program> {
 /// the source file). The CLI passes the input file's parent directory; `parse`
 /// defaults it to the current directory.
 pub fn parse_in_dir(src: &str, dir: &std::path::Path) -> PResult<Program> {
-    let known_types = hoist_type_names(src, dir)?;
-    let pp = Preprocessor::with_base_dir(Lexer::new(src), dir.to_path_buf());
+    parse_with(src, dir, &[])
+}
+
+/// Parse `src`, resolving `#include "..."` relative to `dir` and angle includes
+/// (`#include <name>`) against `search` (the standard-library directories, tried
+/// in order). The CLIs pass the input file's parent as `dir` and the stdlib
+/// directories as `search`.
+pub fn parse_with(
+    src: &str,
+    dir: &std::path::Path,
+    search: &[std::path::PathBuf],
+) -> PResult<Program> {
+    let known_types = hoist_type_names(src, dir, search)?;
+    let pp =
+        Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     Parser::with_known_types(pp, known_types).parse_program()
 }
 
 /// Stream the preprocessed tokens and collect every `class`/`union` name,
 /// descending into `#include`d files (so a type defined there can be used).
-fn hoist_type_names(src: &str, dir: &std::path::Path) -> PResult<HashSet<String>> {
-    let mut pp = Preprocessor::with_base_dir(Lexer::new(src), dir.to_path_buf());
+fn hoist_type_names(
+    src: &str,
+    dir: &std::path::Path,
+    search: &[std::path::PathBuf],
+) -> PResult<HashSet<String>> {
+    let mut pp =
+        Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     let mut names = HashSet::new();
     loop {
         let t = pp.next_token()?;

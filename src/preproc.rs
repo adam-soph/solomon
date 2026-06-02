@@ -91,8 +91,11 @@ pub struct Preprocessor<S: TokenStream> {
     /// repeating it on every subsequent Eof read.
     eof_reported: bool,
     /// Directory the top-level source was read from, for resolving its relative
-    /// `#include` paths.
+    /// `#include "..."` paths.
     base_dir: PathBuf,
+    /// Standard-library search directories for **angle** includes
+    /// (`#include <math.hc>`), tried in order. Quote includes ignore these.
+    search: Vec<PathBuf>,
     /// The stack of currently-open `#include`d files (innermost last). Tokens are
     /// pulled from the top of this stack before the base `inner` stream.
     includes: Vec<IncludeFrame>,
@@ -103,9 +106,16 @@ impl<S: TokenStream> Preprocessor<S> {
         Self::with_base_dir(inner, PathBuf::from("."))
     }
 
-    /// Build a preprocessor that resolves relative `#include` paths against
+    /// Build a preprocessor that resolves relative `#include "..."` paths against
     /// `base_dir` (the directory of the top-level source file).
     pub fn with_base_dir(inner: S, base_dir: PathBuf) -> Self {
+        Self::with_base_dir_and_search(inner, base_dir, Vec::new())
+    }
+
+    /// As [`with_base_dir`](Self::with_base_dir), plus a list of search
+    /// directories for **angle** includes (`#include <name>`) — the standard
+    /// library. Each is tried in order; the first that holds the file wins.
+    pub fn with_base_dir_and_search(inner: S, base_dir: PathBuf, search: Vec<PathBuf>) -> Self {
         Preprocessor {
             inner,
             lookahead: None,
@@ -114,6 +124,7 @@ impl<S: TokenStream> Preprocessor<S> {
             conds: Vec::new(),
             eof_reported: false,
             base_dir,
+            search,
             includes: Vec::new(),
         }
     }
@@ -285,28 +296,57 @@ impl<S: TokenStream> Preprocessor<S> {
     /// nesting are rejected.
     fn do_include(&mut self, toks: &[Token]) -> LResult<()> {
         let pos = toks[0].span.pos;
-        let path_str = match toks.get(1).map(|t| &t.kind) {
-            Some(TokenKind::Str(p)) => p.clone(),
-            _ => return Err(self.err(pos, "#include expects a quoted file path")),
-        };
-        // Relative to the directory of the file doing the including.
-        let cur_dir = self
-            .includes
-            .last()
-            .map(|f| f.dir.clone())
-            .unwrap_or_else(|| self.base_dir.clone());
-        let canon = cur_dir
-            .join(&path_str)
-            .canonicalize()
-            .map_err(|e| self.err(pos, format!("cannot open #include \"{path_str}\": {e}")))?;
+        // Two forms: `#include "file"` (a single string token, resolved relative
+        // to the including file) and `#include <name>` (an angle path spelled as
+        // separate tokens, resolved against the standard-library search path).
+        match toks.get(1).map(|t| &t.kind) {
+            Some(TokenKind::Str(p)) => {
+                let path_str = p.clone();
+                let cur_dir = self
+                    .includes
+                    .last()
+                    .map(|f| f.dir.clone())
+                    .unwrap_or_else(|| self.base_dir.clone());
+                let canon = cur_dir.join(&path_str).canonicalize().map_err(|e| {
+                    self.err(pos, format!("cannot open #include \"{path_str}\": {e}"))
+                })?;
+                self.open_include(canon, &format!("\"{path_str}\""), pos)
+            }
+            Some(TokenKind::Lt) => {
+                let path_str = angle_path(&toks[1..])
+                    .ok_or_else(|| self.err(pos, "malformed #include <...> path"))?;
+                // First search directory that holds the file wins.
+                let canon = self
+                    .search
+                    .iter()
+                    .find_map(|d| d.join(&path_str).canonicalize().ok())
+                    .ok_or_else(|| {
+                        self.err(
+                            pos,
+                            format!(
+                                "cannot find #include <{path_str}> in the standard-library \
+                                 search path (set SOLOMON_STDLIB or pass -I)"
+                            ),
+                        )
+                    })?;
+                self.open_include(canon, &format!("<{path_str}>"), pos)
+            }
+            _ => Err(self.err(pos, "#include expects \"file\" or <name>")),
+        }
+    }
+
+    /// Push the already-resolved canonical include path onto the source stack
+    /// (after the cycle and depth checks). `display` is the original spelling, for
+    /// error messages.
+    fn open_include(&mut self, canon: PathBuf, display: &str, pos: Pos) -> LResult<()> {
         if self.includes.iter().any(|f| f.path == canon) {
-            return Err(self.err(pos, format!("recursive #include of \"{path_str}\"")));
+            return Err(self.err(pos, format!("recursive #include of {display}")));
         }
         if self.includes.len() >= MAX_INCLUDE_DEPTH {
             return Err(self.err(pos, "#include nested too deeply"));
         }
         let contents = std::fs::read_to_string(&canon)
-            .map_err(|e| self.err(pos, format!("cannot read #include \"{path_str}\": {e}")))?;
+            .map_err(|e| self.err(pos, format!("cannot read #include {display}: {e}")))?;
         let dir = canon
             .parent()
             .map(|p| p.to_path_buf())
@@ -521,4 +561,35 @@ fn directive_name(tok: &Token) -> Option<String> {
         TokenKind::Keyword(Keyword::Else) => Some("else".to_string()),
         _ => None,
     }
+}
+
+/// Reconstruct an angle-include path from the tokens of `#include <name>` (passed
+/// starting at the opening `<`). A path has no embedded whitespace and is spelled
+/// with the limited filename charset — identifiers, `.`, `/`, `-`, digits — so the
+/// tokens between `<` and the first `>` must be adjacent and map to that text.
+/// Returns `None` on any gap or unexpected token.
+fn angle_path(toks: &[Token]) -> Option<String> {
+    if !matches!(toks.first().map(|t| &t.kind), Some(TokenKind::Lt)) {
+        return None;
+    }
+    let close = toks.iter().position(|t| matches!(t.kind, TokenKind::Gt))?;
+    let inner = &toks[1..close];
+    if inner.is_empty() {
+        return None;
+    }
+    let mut s = String::new();
+    for (i, t) in inner.iter().enumerate() {
+        if i > 0 && inner[i - 1].span.end != t.span.start {
+            return None; // a gap means embedded whitespace — not a path
+        }
+        match &t.kind {
+            TokenKind::Ident(x) => s.push_str(x),
+            TokenKind::Int(n) => s.push_str(&n.to_string()),
+            TokenKind::Dot => s.push('.'),
+            TokenKind::Slash => s.push('/'),
+            TokenKind::Minus => s.push('-'),
+            _ => return None,
+        }
+    }
+    Some(s)
 }

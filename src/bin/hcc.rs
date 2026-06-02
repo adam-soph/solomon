@@ -86,6 +86,9 @@ fn main() -> ExitCode {
     let mut mode = Mode::Build;
     let mut out: Option<String> = None;
     let mut target: Option<Target> = None;
+    // Extra include directories for angle includes (`#include <name>`), searched
+    // before the default standard-library directories.
+    let mut include_dirs: Vec<std::path::PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1).peekable();
 
@@ -148,6 +151,16 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "-I" => match args.next() {
+                Some(d) => include_dirs.push(std::path::PathBuf::from(d)),
+                None => {
+                    eprintln!("hcc: -I requires a directory");
+                    return ExitCode::FAILURE;
+                }
+            },
+            other if other.starts_with("-I") => {
+                include_dirs.push(std::path::PathBuf::from(&other[2..]));
+            }
             "-h" | "--help" => {
                 print_usage();
                 return ExitCode::SUCCESS;
@@ -187,6 +200,11 @@ fn main() -> ExitCode {
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+    // Angle includes (`#include <name>`) search `-I` dirs first, then the default
+    // standard-library directories.
+    let mut search = include_dirs;
+    search.extend(solomon::stdlib_dirs());
+
     match mode {
         Mode::Tokens => match lexer::tokenize(&src) {
             Ok(tokens) => {
@@ -200,7 +218,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Ast => match parser::parse_in_dir(&src, &base_dir) {
+        Mode::Ast => match parser::parse_with(&src, &base_dir, &search) {
             Ok(program) => {
                 println!("{program:#?}");
                 ExitCode::SUCCESS
@@ -210,7 +228,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Check => match parser::parse_in_dir(&src, &base_dir) {
+        Mode::Check => match parser::parse_with(&src, &base_dir, &search) {
             Ok(program) => {
                 let errors = sema::check_program(&program);
                 if errors.is_empty() {
@@ -241,7 +259,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let program = match parser::parse_in_dir(&src, &base_dir) {
+            let program = match parser::parse_with(&src, &base_dir, &search) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{e}");
@@ -293,6 +311,7 @@ Options:
                       x86_64-unknown-linux    freestanding static ELF
                       aarch64-unknown-linux   freestanding static ELF
                       x86_64-pc-windows       self-contained PE
+  -I DIR            add DIR to the angle-include (`#include <name>`) search path
   -h, --help        show this help
 "
     );

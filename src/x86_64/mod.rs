@@ -1674,6 +1674,45 @@ impl Cg {
                 self.asm.andpd(0, 1);
                 return Ok(());
             }
+            "Floor" => {
+                self.gen_foperand(&args[0])?;
+                self.asm.roundsd(0, 0, 1); // toward −∞
+                return Ok(());
+            }
+            "Ceil" => {
+                self.gen_foperand(&args[0])?;
+                self.asm.roundsd(0, 0, 2); // toward +∞
+                return Ok(());
+            }
+            "Round" => {
+                // Round half *away from zero* (matching `f64::round` / arm64
+                // `frinta`), which `roundsd`'s nearest-*even* mode does not do.
+                // Take t = trunc(x), the exact fractional part d = x − t, and bump
+                // t by copysign(1, x) when |d| ≥ 0.5. Scratch: xmm1..xmm5.
+                self.gen_foperand(&args[0])?; // xmm0 = x
+                self.asm.roundsd(1, 0, 3); // xmm1 = t = trunc(x)
+                self.asm.movsd_rr(2, 0); // xmm2 = x
+                self.asm.subsd(2, 1); // xmm2 = d = x − t
+                self.asm.mov_ri64(RAX, 0x7FFF_FFFF_FFFF_FFFF);
+                self.asm.movq_xmm_from_r(3, RAX);
+                self.asm.andpd(2, 3); // xmm2 = |d|
+                self.asm.mov_ri64(RAX, 0x3FE0_0000_0000_0000); // 0.5
+                self.asm.movq_xmm_from_r(3, RAX);
+                let skip = self.asm.new_label();
+                self.asm.ucomisd(2, 3); // |d| vs 0.5
+                self.asm.jb(skip); // |d| < 0.5 → no bump
+                // bump = copysign(1.0, x) = 1.0 | (x & signbit)
+                self.asm.mov_ri64(RAX, 0x3FF0_0000_0000_0000); // 1.0
+                self.asm.movq_xmm_from_r(4, RAX);
+                self.asm.mov_ri64(RAX, 0x8000_0000_0000_0000u64); // sign mask
+                self.asm.movq_xmm_from_r(5, RAX);
+                self.asm.andpd(5, 0); // xmm5 = x & signbit
+                self.asm.orpd(4, 5); // xmm4 = copysign(1.0, x)
+                self.asm.addsd(1, 4); // t += bump
+                self.asm.place(skip);
+                self.asm.movsd_rr(0, 1); // result in xmm0
+                return Ok(());
+            }
             _ => {}
         }
         match name {
