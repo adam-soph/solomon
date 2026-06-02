@@ -1107,6 +1107,7 @@ fn string_memory_and_math_builtins() {
 #[test]
 fn memcmp_and_more_math_builtins() {
     let src = r#"
+        #include <math.hc>
         U0 Main() {
             "%d %d %d\n", MemCmp("abc", "abc", 3), MemCmp("abc", "abd", 3), MemCmp("abd", "abc", 3);
             "%d %d %d\n", (I64)Floor(3.7), (I64)Ceil(3.2), (I64)Round(3.5);

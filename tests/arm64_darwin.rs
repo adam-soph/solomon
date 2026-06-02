@@ -2064,10 +2064,7 @@ fn compiles_string_memory_and_math_builtins() {
         // MemCmp normalized to a sign (offset to stay >= 0)
         ("return MemCmp(\"abc\", \"abd\", 3) + 5;", 4),
         ("return MemCmp(\"abd\", \"abc\", 3) + 5;", 6),
-        // Floor / Ceil / Round (algebraic, exactly reproducible)
-        ("return (I64)Floor(9.9) + (I64)Ceil(0.1);", 10),
-        ("return (I64)Round(2.5) + (I64)Round(2.4);", 5), // half away from zero
-        ("return (I64)Floor(-1.5) + 10;", 8),
+        // (Floor/Ceil/Round moved to lib/math.hc — covered by the stdlib conformance.)
         // StrFind(haystack, needle) returns a pointer into the haystack (or NULL).
         (
             "U8 *s = MAlloc(16); StrCpy(s, \"abcdef\"); return StrFind(s, \"cd\") - s;",

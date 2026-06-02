@@ -356,8 +356,11 @@ in-place `StrToUpper`/`StrToLower`/`StrRev` (inline loops); `Abs` (→
 `IsPrint`/`IsGraph`/`IsBlank`) — these are *computed inline* in both backends from a
 shared range table (`builtins::ctype_ranges`), **not** libc-backed, since libc's
 `isdigit` etc. return an unspecified nonzero that wouldn't match the interpreter's
-0/1; and the exactly-reproducible float ops
-`Sqrt`/`Floor`/`Ceil`/`Round`/`Fabs`/`Sign`; plus `RandU64`. (The **transcendentals** — `Sin`/`Cos`/`Pow`/`Exp`/`Ln`/… — are
+0/1; and the two **irreducible** float primitives `Sqrt` (a correctly-rounded
+hardware instruction) and `Fabs` (a sign-bit clear the interpreter models
+specially); plus `RandU64`. (`Floor`/`Ceil`/`Round` are reducible — an exact I64
+cast + adjust — so they live in `lib/math.hc`, not here. The **transcendentals** —
+`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/… — are
 deliberately *not* builtins: an intrinsic must have a portable, solomon-defined
 value, but a transcendental's would be only "whatever the host libm computes,"
 which isn't reproducible across platforms and can't exist in a freestanding

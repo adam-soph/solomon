@@ -765,6 +765,8 @@ fn stdlib_math_matches_the_interpreter() {
         U0 Main() {
           "%.6f %.6f %.6f\n", Exp(1.0), Ln(E), Pow(2.0, 10.0);
           "%.6f %.6f %.6f\n", Sin(PI / 2.0), Cos(0.0), Tan(PI / 4.0);
+          "%.6f %.6f %.6f\n", Atan(1.0), Log10(1000.0), Hypot(3.0, 4.0);
+          "%.6f %.6f %.6f\n", Sinh(1.0), Asin(0.5), Atan2(1.0, -1.0);
           "%.1f %.1f %.1f %.1f\n", Round(2.5), Round(-2.5), Round(0.5), Round(-3.5);
           "%.1f %.1f %.1f %.1f\n", Floor(2.7), Floor(-2.3), Ceil(2.1), Ceil(-2.9);
           "%d %d %d\n", Gcd(48, 36), Factorial(6), IMax(3, 9);

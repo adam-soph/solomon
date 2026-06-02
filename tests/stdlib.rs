@@ -61,3 +61,28 @@ fn math_rounding_and_integer_helpers() {
          12 720 3 9\n"
     );
 }
+
+#[test]
+fn math_extended_functions() {
+    let out = run_with_stdlib(
+        r#"
+        #include <math.hc>
+        U0 Main() {
+          "%.1f %.1f %.1f %.1f\n", Floor(2.7), Ceil(2.1), Round(2.5), Trunc(-2.9);
+          "%.4f %.4f %.1f\n", Log10(1000.0), Log2(8.0), Exp2(10.0);
+          "%.6f %.6f %.6f\n", Atan(1.0), Asin(0.5), Acos(0.5);
+          "%.6f %.6f\n", Atan2(1.0, 1.0), Atan2(1.0, -1.0);
+          "%.1f %.1f\n", Hypot(3.0, 4.0), Fmod(7.0, 3.0);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "2.0 3.0 3.0 -2.0\n\
+         3.0000 3.0000 1024.0\n\
+         0.785398 0.523599 1.047198\n\
+         0.785398 2.356194\n\
+         5.0 1.0\n"
+    );
+}

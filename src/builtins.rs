@@ -15,8 +15,10 @@
 //! would be "whatever the host libm computes," which isn't reproducible across
 //! platforms (IEEE 754 doesn't require correctly-rounded transcendentals) and
 //! can't exist in a freestanding target. They belong in a future HolyC standard
-//! library with a defined algorithm. The algebraic float ops that *are* exactly
-//! reproducible (`Sqrt`/`Floor`/`Ceil`/`Round`/`Fabs`) stay.
+//! library with a defined algorithm. Only the *irreducible* algebraic float ops
+//! stay: `Sqrt` (a correctly-rounded hardware instruction) and `Fabs` (a sign-bit
+//! clear the interpreter models specially). `Floor`/`Ceil`/`Round` are reducible
+//! (an exact I64 cast + adjust), so they moved to `lib/math.hc`.
 
 use crate::ast::Type;
 
@@ -73,12 +75,12 @@ pub fn all() -> Vec<BuiltinSig> {
         // ASCII case conversion.
         sig("ToUpper", i64(), vec![i64()], false),
         sig("ToLower", i64(), vec![i64()], false),
-        // Exactly-reproducible algebraic float ops (single hardware instructions).
+        // The two irreducible algebraic float primitives: `Sqrt` (a correctly-
+        // rounded hardware instruction) and `Fabs` (a sign-bit clear the interpreter
+        // models specially — it can't byte-pun a local). The reducible rounding ops
+        // (`Floor`/`Ceil`/`Round`, exact via an I64 cast) live in `lib/math.hc`.
         sig("Sqrt", f64(), vec![f64()], false),
         sig("Fabs", f64(), vec![f64()], false),
-        sig("Floor", f64(), vec![f64()], false),
-        sig("Ceil", f64(), vec![f64()], false),
-        sig("Round", f64(), vec![f64()], false),
         // Deterministic splitmix64 PRNG (fixed seed), mirrored by the backends.
         sig("RandU64", Type::U64, vec![], false),
         // The captured command line.
@@ -164,9 +166,6 @@ pub fn libc_symbol(name: &str) -> Option<&'static str> {
         "ToUpper" => "_toupper",
         "ToLower" => "_tolower",
         "MemCmp" => "_memcmp",
-        "Floor" => "_floor",
-        "Ceil" => "_ceil",
-        "Round" => "_round",
         "Fabs" => "_fabs",
         "StrToF64" => "_atof",
         "MemMove" => "_memmove",

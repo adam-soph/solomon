@@ -316,9 +316,13 @@ Main;
 `#include <name>` resolves against the library search path (vs `#include "file"`,
 which is relative to the including file): the `SOLOMON_STDLIB` environment variable
 (`:`-separated), then `lib/` relative to the `hcc`/`hci` executable, then `./lib`.
-`hcc -I DIR` prepends extra directories. `lib/math.hc` provides `Exp`/`Ln`/`Pow`,
-`Sin`/`Cos`/`Tan` (range reduction + series), exact `PowI`, and `Gcd`/`Factorial`/
-`Min`/`Max`/`Clamp`.
+`hcc -I DIR` prepends extra directories. `lib/math.hc` provides the rounding ops
+`Floor`/`Ceil`/`Round`/`Trunc`/`Fmod`, `Exp`/`Ln`/`Log2`/`Log10`/`Exp2`/`Pow`,
+the trig and inverse-trig `Sin`/`Cos`/`Tan`/`Atan`/`Asin`/`Acos`/`Atan2`, the
+hyperbolics `Sinh`/`Cosh`/`Tanh`, plus `Hypot`, exact `PowI`, and
+`Gcd`/`Factorial`/`Min`/`Max`/`Clamp` — all range-reduced + series, reproducible
+by construction. Only the *irreducible* float ops stay as builtins: `Sqrt`
+(correctly-rounded) and `Fabs` (a sign-bit clear).
 
 ## Project layout
 

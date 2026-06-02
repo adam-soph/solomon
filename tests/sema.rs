@@ -108,7 +108,7 @@ fn stdlib_builtins_are_known() {
           MemCpy(p, p, 1); MemSet(p, 0, 1); MemMove(p, p, 1); \
           I64 u = ToUpper('a'); I64 l = ToLower('A'); \
           I64 m = MemCmp(p, p, 1); \
-          F64 fl = Floor(1.5); F64 ce = Ceil(1.5); F64 rd = Round(1.5); \
+          F64 sq = Sqrt(2.0); F64 fa = Fabs(-1.0); \
           U64 r = RandU64(); \
           U8 *sp = StrPrint(p, \"%d\", 1); U8 *cp = CatPrint(p, \"%d\", 2); \
           U8 *mp = MStrPrint(\"%d\", 3); \
@@ -124,7 +124,7 @@ fn stdlib_builtin_arity_is_checked() {
     has("U0 F() { MAlloc(); }", "expects 1 argument(s), got 0");
     has("U0 F() { MemCpy(0, 0); }", "expects 3 argument(s), got 2");
     has("U0 F() { MemCmp(0, 0); }", "expects 3 argument(s), got 2");
-    has("U0 F() { Floor(); }", "expects 1 argument(s), got 0");
+    has("U0 F() { Sqrt(); }", "expects 1 argument(s), got 0");
     has("U0 F() { RandU64(7); }", "got 1");
     has("U0 F() { StrPrint(0); }", "at least 2 argument(s), got 1");
     has("U0 F() { CatPrint(0); }", "at least 2 argument(s), got 1");
