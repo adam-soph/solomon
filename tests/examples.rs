@@ -7,7 +7,6 @@
 
 use solomon::interp::run_to_string;
 use solomon::lexer::tokenize;
-use solomon::parser::parse;
 use solomon::sema::check_program;
 use solomon::token::TokenKind;
 
@@ -52,7 +51,8 @@ fn samples_tokenize_cleanly() {
 #[test]
 fn samples_parse_cleanly() {
     for (name, src) in EXAMPLES {
-        let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program =
+            common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         assert!(
             !program.items.is_empty(),
             "{name}: expected at least one top-level item"
@@ -65,7 +65,8 @@ fn samples_parse_cleanly() {
 #[test]
 fn samples_pass_semantic_analysis() {
     for (name, src) in EXAMPLES {
-        let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program =
+            common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let errors = check_program(&program);
         assert!(
             errors.is_empty(),
@@ -79,7 +80,8 @@ fn samples_run_without_error() {
     // Every sample should execute to completion. Most define library functions
     // and produce no output; hello.hc calls Main and prints.
     for (name, src) in EXAMPLES {
-        let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program =
+            common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let out = run_to_string(&program).unwrap_or_else(|e| panic!("{name}: runtime error: {e}"));
         if *name == "hello.hc" {
             assert!(

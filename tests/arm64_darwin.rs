@@ -152,7 +152,7 @@ fn main_is_framed_and_returns() {
 
 /// Compile `src`, run the resulting binary, and return its exit status.
 fn build_and_run(src: &str) -> i32 {
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let program = common::parse_example(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
 
@@ -173,7 +173,7 @@ fn build_and_run(src: &str) -> i32 {
 
 /// Compile `src`, run the resulting binary, and return its captured stdout.
 fn build_and_capture(src: &str) -> String {
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let program = common::parse_example(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
 
@@ -193,7 +193,7 @@ fn build_and_capture(src: &str) -> String {
 /// interpreter (the conformance oracle) for `src` — the strongest check, since
 /// it needs no hand-computed expected value.
 fn assert_native_matches_interp(src: &str) {
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let program = common::parse_example(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
     let interp = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
@@ -2200,7 +2200,8 @@ fn native_matches_interp_for_every_example() {
         return;
     }
     for (name, src) in common::EXAMPLES {
-        let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program =
+            common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let errs = check_program(&program);
         assert!(errs.is_empty(), "{name}: semantic errors: {errs:?}");
         let interp_out =

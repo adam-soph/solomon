@@ -100,63 +100,42 @@ fn print_intrinsic_is_known() {
 fn stdlib_builtins_are_known() {
     // The core-library intrinsics are registered, so calls type-check and yield
     // their declared return types.
-    ok("U0 F() { I64 n = Abs(-1); F64 r = Sqrt(2.0); I64 m = StrLen(\"hi\"); }");
+    // The remaining intrinsics (after the string/integer helpers moved to the
+    // `lib/string.hc` stdlib). The moved ones are now ordinary library calls.
+    ok("U0 F() { F64 r = Sqrt(2.0); F64 fa = Fabs(-1.0); }");
     ok("U0 F() { \
           U8 *p = MAlloc(16); \
-          StrCpy(p, \"x\"); StrCat(p, \"y\"); \
-          MemCpy(p, p, 1); MemSet(p, 0, 1); \
-          I64 c = StrCmp(p, \"x\"); I64 u = ToUpper('a'); I64 l = ToLower('A'); \
+          MemCpy(p, p, 1); MemSet(p, 0, 1); MemMove(p, p, 1); \
+          I64 u = ToUpper('a'); I64 l = ToLower('A'); \
           I64 m = MemCmp(p, p, 1); \
           F64 fl = Floor(1.5); F64 ce = Ceil(1.5); F64 rd = Round(1.5); \
-          U8 *f = StrFind(p, \"a\"); \
-          I64 nc = StrNCmp(p, \"x\", 1); StrNCpy(p, \"y\", 1); \
-          I64 sg = Sign(-1); F64 fa = Fabs(-1.0); U64 r = RandU64(); \
+          U64 r = RandU64(); \
           U8 *sp = StrPrint(p, \"%d\", 1); U8 *cp = CatPrint(p, \"%d\", 2); \
-          U8 *mp = MStrPrint(\"%d\", 3); I64 pv = StrToI64(\"7\"); \
-          F64 fv = StrToF64(\"1.5\"); U8 *up = StrToUpper(p); U8 *lo = StrToLower(p); \
-          U8 *mm = MemMove(p, p, 1); U8 *rv = StrRev(p); U8 *mf = MemFind(p, 65, 1); \
-          U8 *sc = StrChr(p, 47); U8 *sl = StrLastChr(p, 47); \
-          I64 spn = StrSpn(p, \"x\"); I64 csp = StrCSpn(p, \"x\"); \
-          U8 *ml = MemSearch(p, 1, \"x\", 1); \
-          U8 *is = I64ToStr(7, p); U8 *fs = F64ToStr(1.5, p); \
+          U8 *mp = MStrPrint(\"%d\", 3); \
+          F64 fv = StrToF64(\"1.5\"); U8 *fs = F64ToStr(1.5, p); \
+          U8 *mf = MemFind(p, 65, 1); U8 *ml = MemSearch(p, 1, \"x\", 1); \
           Free(p); \
         }");
 }
 
 #[test]
 fn stdlib_builtin_arity_is_checked() {
-    has("U0 F() { Abs(); }", "expects 1 argument(s), got 0");
     has("U0 F() { Sqrt(1.0, 2.0); }", "got 2");
-    has("U0 F() { StrCmp(\"a\"); }", "expects 2 argument(s), got 1");
     has("U0 F() { MAlloc(); }", "expects 1 argument(s), got 0");
     has("U0 F() { MemCpy(0, 0); }", "expects 3 argument(s), got 2");
     has("U0 F() { MemCmp(0, 0); }", "expects 3 argument(s), got 2");
     has("U0 F() { Floor(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { StrFind(\"a\"); }", "expects 2 argument(s), got 1");
-    has(
-        "U0 F() { StrNCmp(\"a\", \"b\"); }",
-        "expects 3 argument(s), got 2",
-    );
-    has("U0 F() { Sign(); }", "expects 1 argument(s), got 0");
     has("U0 F() { RandU64(7); }", "got 1");
     has("U0 F() { StrPrint(0); }", "at least 2 argument(s), got 1");
     has("U0 F() { CatPrint(0); }", "at least 2 argument(s), got 1");
     has("U0 F() { MStrPrint(); }", "at least 1 argument(s), got 0");
-    has("U0 F() { StrToI64(\"1\", \"2\"); }", "got 2");
     has("U0 F() { StrToF64(); }", "expects 1 argument(s), got 0");
     has("U0 F() { MemMove(0, 0); }", "expects 3 argument(s), got 2");
-    has("U0 F() { StrToUpper(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { StrRev(); }", "expects 1 argument(s), got 0");
     has("U0 F() { MemFind(0, 0); }", "expects 3 argument(s), got 2");
-    has("U0 F() { StrChr(0); }", "expects 2 argument(s), got 1");
-    has("U0 F() { StrLastChr(0); }", "expects 2 argument(s), got 1");
-    has("U0 F() { StrSpn(0); }", "expects 2 argument(s), got 1");
-    has("U0 F() { StrCSpn(0); }", "expects 2 argument(s), got 1");
     has(
         "U0 F() { MemSearch(0, 1, 0); }",
         "expects 4 argument(s), got 3",
     );
-    has("U0 F() { I64ToStr(7); }", "expects 2 argument(s), got 1");
     has("U0 F() { F64ToStr(1.5); }", "expects 2 argument(s), got 1");
 }
 

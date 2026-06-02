@@ -1,12 +1,24 @@
 //! Tests for the tree-walking interpreter.
 
 use solomon::interp::{Interpreter, run_to_string};
-use solomon::parser::parse;
+use solomon::parser::{parse, parse_with};
 use solomon::sema::check_program;
 
-/// Parse, semantically check, then interpret `src`, returning captured output.
+/// Parse, semantically check, then interpret `src`, returning captured output. The
+/// moved string builtins (`StrLen`, `Abs`, …) live in `lib/string.hc` now, so the
+/// stdlib include is prepended when absent (resolved against the repo `lib/`); the
+/// extra unused defs don't change a program's output.
 fn run(src: &str) -> String {
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let owned;
+    let s = if src.contains("#include <string.hc>") {
+        src
+    } else {
+        owned = format!("#include <string.hc>\n{src}");
+        &owned
+    };
+    let program = parse_with(s, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
     run_to_string(&program).unwrap_or_else(|e| panic!("runtime error: {e}"))

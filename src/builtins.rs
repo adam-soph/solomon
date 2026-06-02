@@ -39,99 +39,36 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 1,
             varargs: true,
         },
-        // `StrPrint(U8 *dst, U8 *fmt, ...) -> U8*` — printf-style formatting into
-        // `dst` (libc `sprintf`); returns `dst`. Specially lowered like `Print`.
+        // The printf-family string builders. Variadic — they consume `...`, which
+        // HolyC has no `va_arg` for, so they cannot (yet) be ordinary library code.
+        // `StrPrint(dst, fmt, ...) -> dst` (sprintf into dst).
         BuiltinSig {
             name: "StrPrint",
             ret: Type::Ptr(Box::new(Type::U8)),
             min_args: 2,
             varargs: true,
         },
-        // `CatPrint(U8 *dst, U8 *fmt, ...) -> U8*` — like `StrPrint` but *appends*
-        // to `dst` (formats into `dst + StrLen(dst)`); returns `dst`.
+        // `CatPrint(dst, fmt, ...) -> dst` (sprintf-append at dst + StrLen(dst)).
         BuiltinSig {
             name: "CatPrint",
             ret: Type::Ptr(Box::new(Type::U8)),
             min_args: 2,
             varargs: true,
         },
-        // `MStrPrint(U8 *fmt, ...) -> U8*` — format into a freshly `MAlloc`d,
-        // right-sized buffer (asprintf-style); returns the new buffer. Specially
-        // lowered (measure with `snprintf`, `malloc`, then `sprintf`).
+        // `MStrPrint(fmt, ...) -> U8*` (asprintf into a fresh right-sized buffer).
         BuiltinSig {
             name: "MStrPrint",
             ret: Type::Ptr(Box::new(Type::U8)),
             min_args: 1,
             varargs: true,
         },
-        // `StrToI64(U8 *str) -> I64` — parse a base-10 integer (libc `atoll`).
-        BuiltinSig {
-            name: "StrToI64",
-            ret: Type::I64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `StrToF64(U8 *str) -> F64` — parse a floating value (libc `atof`).
+        // `StrToF64(U8*) -> F64` / `F64ToStr(F64, U8*) -> U8*` — float parse/format;
+        // need the correctly-rounded bignum machinery (shared with `Print`'s %g), so
+        // they stay builtins for now.
         BuiltinSig {
             name: "StrToF64",
             ret: Type::F64,
             min_args: 1,
-            varargs: false,
-        },
-        // `MemMove(U8* dst, U8* src, I64 n) -> U8*` — copy `n` bytes, overlap-safe
-        // (libc `memmove`).
-        BuiltinSig {
-            name: "MemMove",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 3,
-            varargs: false,
-        },
-        // `StrToUpper(U8*)` / `StrToLower(U8*) -> U8*` — ASCII-case a string in
-        // place; return it. No libc equivalent — emitted as an inline loop.
-        BuiltinSig {
-            name: "StrToUpper",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "StrToLower",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 1,
-            varargs: false,
-        },
-        // `StrRev(U8*) -> U8*` — reverse a string in place; return it. No libc
-        // equivalent — emitted as an inline two-pointer loop.
-        BuiltinSig {
-            name: "StrRev",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 1,
-            varargs: false,
-        },
-        // `MemFind(U8* buf, I64 c, I64 n) -> U8*` — pointer to the first byte
-        // equal to `c` in `buf[0..n]`, or `NULL` (libc `memchr`).
-        BuiltinSig {
-            name: "MemFind",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 3,
-            varargs: false,
-        },
-        // `MemSearch(U8* hay, I64 hlen, U8* needle, I64 nlen) -> U8*` — pointer to
-        // the first occurrence of the `needle` byte sequence in `hay`, or `NULL`
-        // (libc `memmem`).
-        BuiltinSig {
-            name: "MemSearch",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 4,
-            varargs: false,
-        },
-        // `I64ToStr(I64 n, U8* buf) -> U8*` / `F64ToStr(F64 f, U8* buf) -> U8*` —
-        // format a number into `buf` (decimal / `%g`); return `buf`. Specially
-        // lowered to `sprintf` with a fixed format.
-        BuiltinSig {
-            name: "I64ToStr",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
             varargs: false,
         },
         BuiltinSig {
@@ -140,106 +77,54 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 2,
             varargs: false,
         },
-        // `StrChr(U8* str, I64 c) -> U8*` / `StrLastChr(...) -> U8*` — pointer to
-        // the first / last `c` in the NUL-terminated `str`, or `NULL` (libc
-        // `strchr` / `strrchr`; the terminating NUL counts, so `c == 0` finds it).
-        BuiltinSig {
-            name: "StrChr",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "StrLastChr",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: false,
-        },
-        // `StrSpn(U8* str, U8* set) -> I64` / `StrCSpn(...) -> I64` — length of the
-        // initial run of `str` made of chars that are in / not in `set` (libc
-        // `strspn` / `strcspn`).
-        BuiltinSig {
-            name: "StrSpn",
-            ret: Type::I64,
-            min_args: 2,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "StrCSpn",
-            ret: Type::I64,
-            min_args: 2,
-            varargs: false,
-        },
-        // `Abs(I64) -> I64` — integer absolute value (libc `llabs`).
-        BuiltinSig {
-            name: "Abs",
-            ret: Type::I64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `Sqrt(F64) -> F64` — square root (libc `sqrt`).
-        BuiltinSig {
-            name: "Sqrt",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `StrLen(U8*) -> I64` — length of a NUL-terminated string (libc `strlen`).
-        BuiltinSig {
-            name: "StrLen",
-            ret: Type::I64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `StrCmp(U8*, U8*) -> I64` — string comparison, normalized to the sign
-        // of the difference (-1, 0, 1) so both backends agree (libc `strcmp`).
-        BuiltinSig {
-            name: "StrCmp",
-            ret: Type::I64,
-            min_args: 2,
-            varargs: false,
-        },
-        // `StrCpy(U8* dst, U8* src) -> U8*` — copy a string, returns `dst` (libc
-        // `strcpy`).
-        BuiltinSig {
-            name: "StrCpy",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: false,
-        },
-        // `MAlloc(I64) -> U8*` — allocate a byte buffer (libc `malloc`).
-        BuiltinSig {
-            name: "MAlloc",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 1,
-            varargs: false,
-        },
-        // `Free(U8*) -> U0` — release a `MAlloc`d buffer (libc `free`).
-        BuiltinSig {
-            name: "Free",
-            ret: Type::U0,
-            min_args: 1,
-            varargs: false,
-        },
-        // `StrCat(U8* dst, U8* src) -> U8*` — append `src` to `dst` (libc `strcat`).
-        BuiltinSig {
-            name: "StrCat",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: false,
-        },
-        // `MemCpy(U8* dst, U8* src, I64 n) -> U8*` — copy `n` bytes (libc `memcpy`).
+        // Memory ops (libc memcpy/memmove/memset/memcmp/memchr/memmem).
         BuiltinSig {
             name: "MemCpy",
             ret: Type::Ptr(Box::new(Type::U8)),
             min_args: 3,
             varargs: false,
         },
-        // `MemSet(U8* dst, I64 c, I64 n) -> U8*` — set `n` bytes to `c` (libc `memset`).
+        BuiltinSig {
+            name: "MemMove",
+            ret: Type::Ptr(Box::new(Type::U8)),
+            min_args: 3,
+            varargs: false,
+        },
         BuiltinSig {
             name: "MemSet",
             ret: Type::Ptr(Box::new(Type::U8)),
             min_args: 3,
+            varargs: false,
+        },
+        BuiltinSig {
+            name: "MemCmp",
+            ret: Type::I64,
+            min_args: 3,
+            varargs: false,
+        },
+        BuiltinSig {
+            name: "MemFind",
+            ret: Type::Ptr(Box::new(Type::U8)),
+            min_args: 3,
+            varargs: false,
+        },
+        BuiltinSig {
+            name: "MemSearch",
+            ret: Type::Ptr(Box::new(Type::U8)),
+            min_args: 4,
+            varargs: false,
+        },
+        // Heap (mmap bump allocator on the freestanding targets, libc malloc/free else).
+        BuiltinSig {
+            name: "MAlloc",
+            ret: Type::Ptr(Box::new(Type::U8)),
+            min_args: 1,
+            varargs: false,
+        },
+        BuiltinSig {
+            name: "Free",
+            ret: Type::U0,
+            min_args: 1,
             varargs: false,
         },
         // `ToUpper(I64) -> I64` / `ToLower(I64) -> I64` — ASCII case conversion.
@@ -255,16 +140,21 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 1,
             varargs: false,
         },
-        // `MemCmp(U8*, U8*, I64 n) -> I64` — compare `n` bytes, normalized to a
-        // sign in `{-1, 0, 1}` (libc `memcmp`).
+        // The exactly-reproducible algebraic float ops — backed by single hardware
+        // instructions (FSQRT/FRINT*, sqrtsd/roundsd), so unlike pure library code
+        // they stay builtins to keep the correctly-rounded IEEE result.
         BuiltinSig {
-            name: "MemCmp",
-            ret: Type::I64,
-            min_args: 3,
+            name: "Sqrt",
+            ret: Type::F64,
+            min_args: 1,
             varargs: false,
         },
-        // Rounding (`F64 -> F64`). Exactly reproducible (hardware/`roundsd`), so
-        // unlike the transcendentals these stay as builtins.
+        BuiltinSig {
+            name: "Fabs",
+            ret: Type::F64,
+            min_args: 1,
+            varargs: false,
+        },
         BuiltinSig {
             name: "Floor",
             ret: Type::F64,
@@ -283,65 +173,21 @@ pub fn all() -> Vec<BuiltinSig> {
             min_args: 1,
             varargs: false,
         },
-        // `StrFind(U8* haystack, U8* needle) -> U8*` — a pointer to the first
-        // occurrence of `needle` in `haystack`, or `NULL`. Argument order matches
-        // libc `strstr` 1:1.
-        BuiltinSig {
-            name: "StrFind",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: false,
-        },
-        // `StrNCmp(U8*, U8*, I64 n) -> I64` — compare up to `n` chars, normalized
-        // to a sign in `{-1, 0, 1}` (libc `strncmp`).
-        BuiltinSig {
-            name: "StrNCmp",
-            ret: Type::I64,
-            min_args: 3,
-            varargs: false,
-        },
-        // `StrNCpy(U8* dst, U8* src, I64 n) -> U8*` — copy up to `n` chars,
-        // NUL-padding (libc `strncpy`).
-        BuiltinSig {
-            name: "StrNCpy",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 3,
-            varargs: false,
-        },
-        // `Fabs(F64) -> F64` — floating absolute value (libc `fabs`).
-        BuiltinSig {
-            name: "Fabs",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `Sign(I64) -> I64` — `-1`, `0`, or `1`. A computed builtin (no libc
-        // equivalent): the arm64 backend emits it inline.
-        BuiltinSig {
-            name: "Sign",
-            ret: Type::I64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `RandU64() -> U64` — a deterministic splitmix64 PRNG (fixed seed), so
-        // its sequence is identical in both backends. A computed builtin (the
-        // arm64 backend emits it inline against a hidden global state word).
+        // `RandU64() -> U64` — deterministic splitmix64 (fixed seed), mirrored by the
+        // native backends so the sequence is identical everywhere.
         BuiltinSig {
             name: "RandU64",
             ret: Type::U64,
             min_args: 0,
             varargs: false,
         },
-        // `ArgC() -> I64` — the number of command-line arguments (argv[0] is the
-        // program/script name, so the count is ≥ 1). Computed, not libc-backed.
+        // `ArgC() -> I64` / `ArgV(I64) -> U8*` — the captured command line.
         BuiltinSig {
             name: "ArgC",
             ret: Type::I64,
             min_args: 0,
             varargs: false,
         },
-        // `ArgV(I64 i) -> U8*` — the i-th command-line argument as a NUL-terminated
-        // string (argv[0] is the program name). Out-of-range indices yield NULL.
         BuiltinSig {
             name: "ArgV",
             ret: Type::Ptr(Box::new(Type::U8)),
@@ -415,14 +261,9 @@ pub fn splitmix64(state: &mut u64) -> u64 {
 /// implemented by calling into libc (rather than inline or via `printf`).
 pub fn libc_symbol(name: &str) -> Option<&'static str> {
     Some(match name {
-        "Abs" => "_llabs",
         "Sqrt" => "_sqrt",
-        "StrLen" => "_strlen",
-        "StrCmp" => "_strcmp",
-        "StrCpy" => "_strcpy",
         "MAlloc" => "_malloc",
         "Free" => "_free",
-        "StrCat" => "_strcat",
         "MemCpy" => "_memcpy",
         "MemSet" => "_memset",
         "ToUpper" => "_toupper",
@@ -431,19 +272,11 @@ pub fn libc_symbol(name: &str) -> Option<&'static str> {
         "Floor" => "_floor",
         "Ceil" => "_ceil",
         "Round" => "_round",
-        "StrFind" => "_strstr",
-        "StrNCmp" => "_strncmp",
-        "StrNCpy" => "_strncpy",
         "Fabs" => "_fabs",
-        "StrToI64" => "_atoll",
         "StrToF64" => "_atof",
         "MemMove" => "_memmove",
         "MemFind" => "_memchr",
         "MemSearch" => "_memmem",
-        "StrChr" => "_strchr",
-        "StrLastChr" => "_strrchr",
-        "StrSpn" => "_strspn",
-        "StrCSpn" => "_strcspn",
         // `Sign`/`RandU64`/`ArgC`/`ArgV` and the `Is*` ctype predicates (computed
         // inline — libc's `isdigit` etc. return an unspecified nonzero, which would
         // diverge from the interpreter's 0/1), `StrToUpper`/`StrToLower`/`StrRev`

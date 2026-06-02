@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::arm64::Arm64Linux;
 use solomon::codegen::Codegen;
-use solomon::parser::parse;
 use solomon::sema::check_program;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -16,7 +15,11 @@ fn temp() -> std::path::PathBuf {
 }
 
 fn checked(src: &str) -> solomon::Program {
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    // Resolve any `#include <string.hc>` against the repo `lib/` (identical to a
+    // plain parse for sources without angle includes).
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = solomon::parser::parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(check_program(&program).is_empty(), "semantic errors");
     program
 }
@@ -86,7 +89,8 @@ fn aarch64_freestanding_globals_and_runtime_need_no_libc() {
     // string/memory builtins are all emitted — no libc reference and no leftover
     // relocation. Behaviour is checked against the interpreter under docker.
     let program = checked(
-        r#"I64 g = 5; U0 Main(){ U8 *b = MAlloc(32); StrCpy(b, "hi"); StrCat(b, "!");
+        r#"#include <string.hc>
+           I64 g = 5; U0 Main(){ U8 *b = MAlloc(32); StrCpy(b, "hi"); StrCat(b, "!");
            "%s %d %d\n", b, StrLen(b), g; } Main;"#,
     );
     let elf = Arm64Linux::new(temp()).object(&program).unwrap();

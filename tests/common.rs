@@ -26,3 +26,22 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("report.hc", include_str!("../examples/report.hc")),
     ("gallery.hc", include_str!("../examples/gallery.hc")),
 ];
+
+/// Parse an example/source with the standard library on the angle-include search
+/// path (so `#include <string.hc>` resolves to the repo `lib/`). The moved string
+/// builtins (`StrLen`, `Abs`, …) now live in `lib/string.hc`; example files carry
+/// their own `#include <string.hc>`, while the many inline test sources do not, so
+/// this prepends the include when it's absent (never double-including, which would
+/// be a redefinition error). The extra unused defs don't affect a program's output.
+#[allow(dead_code)]
+pub fn parse_example(src: &str) -> Result<solomon::Program, solomon::ParseError> {
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let owned;
+    let src = if src.contains("#include <string.hc>") {
+        src
+    } else {
+        owned = format!("#include <string.hc>\n{src}");
+        &owned
+    };
+    solomon::parser::parse_with(src, std::path::Path::new("."), &[lib])
+}

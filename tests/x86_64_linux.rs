@@ -26,6 +26,22 @@ fn temp_out() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("solomon-x64-{}-{id}", std::process::id()))
 }
 
+/// Parse a program/source with the standard library available (so `#include
+/// <string.hc>` resolves). Examples carry the include; inline sources don't, so it
+/// is prepended when absent (the moved string builtins now live in `lib/string.hc`;
+/// the extra unused defs don't change a program's output).
+fn parse_src(src: &str) -> solomon::Program {
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let owned;
+    let s = if src.contains("#include <string.hc>") {
+        src
+    } else {
+        owned = format!("#include <string.hc>\n{src}");
+        &owned
+    };
+    parse_with(s, std::path::Path::new("."), &[lib]).unwrap_or_else(|e| panic!("parse failed: {e}"))
+}
+
 /// Compile `src` to the ELF image (written to a temp file, then read back).
 fn build_elf(src: &str) -> Vec<u8> {
     let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
@@ -504,7 +520,7 @@ fn programs_run_with_the_expected_exit_code() {
         .iter()
         .enumerate()
         .map(|(idx, (src, _))| {
-            let program = parse(src).unwrap_or_else(|e| panic!("parse failed for `{src}`: {e}"));
+            let program = parse_src(src);
             let errs = check_program(&program);
             assert!(errs.is_empty(), "sema errors for `{src}`: {errs:?}");
             let name = format!("c{idx}");
@@ -663,7 +679,7 @@ fn printing_matches_the_interpreter() {
     let mut names = Vec::new();
     let mut expected = Vec::new();
     for (idx, src) in cases.iter().enumerate() {
-        let program = parse(src).unwrap_or_else(|e| panic!("parse failed for `{src}`: {e}"));
+        let program = parse_src(src);
         let errs = check_program(&program);
         assert!(errs.is_empty(), "sema errors for `{src}`: {errs:?}");
         let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
@@ -717,7 +733,7 @@ fn buildable_examples_match_the_interpreter() {
     let mut names = Vec::new();
     let mut expected = Vec::new();
     for (name, src) in examples {
-        let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program = parse_src(src);
         assert!(check_program(&program).is_empty(), "{name}: sema errors");
         let want = run_to_string(&program).unwrap_or_else(|e| panic!("{name}: interp error: {e}"));
         X64Linux::new(dir.join(name))

@@ -2,11 +2,14 @@
 //! cleanly, they compute the right answers.
 
 use solomon::interp::run_to_string;
-use solomon::parser::parse;
+use solomon::parser::parse_with;
 
-/// Parse and run a sample, returning everything it printed.
+/// Parse and run a sample, returning everything it printed. Examples carry their
+/// own `#include <string.hc>`, resolved against the repo `lib/`.
 fn run(name: &str, src: &str) -> String {
-    let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
     run_to_string(&program).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 

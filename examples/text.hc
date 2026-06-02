@@ -3,6 +3,8 @@
 // uppercase a string in place. Output is integer/string only, so it is identical
 // under the interpreter and the native backend.
 
+#include <string.hc>
+
 I64 WordCount(U8 *s) {
   I64 words = 0;
   I64 in_word = 0;

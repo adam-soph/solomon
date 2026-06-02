@@ -71,7 +71,8 @@ fn freestanding_matches_the_interpreter_for_every_example() {
     let mut expected = Vec::new();
     for (file, src) in common::EXAMPLES {
         let name = file.trim_end_matches(".hc").to_string();
-        let program = parse(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program =
+            common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         assert!(check_program(&program).is_empty(), "{name}: sema errors");
         let want = run_to_string(&program).unwrap_or_else(|e| panic!("{name}: interp error: {e}"));
         Arm64Linux::new(dir.join(&name))

@@ -2344,6 +2344,13 @@ impl Cg {
     // ---- calls & printing ----
 
     fn gen_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        // A name that isn't a registered builtin is an ordinary function call —
+        // even if it shares a name with a former builtin now living in the stdlib
+        // (`Sign`, `StrToUpper`, `StrRev`, `StrLen`, …). Skip the builtin lowering
+        // and call the compiled body.
+        if !crate::builtins::is_builtin(name) {
+            return self.emit_user_call(name, args, pos);
+        }
         // `Sign(x)` = `(x > 0) - (x < 0)` — a computed builtin with no libc
         // counterpart, emitted inline.
         if name == "Sign" {
@@ -2457,6 +2464,11 @@ impl Cg {
             }
             return Ok(());
         }
+        self.emit_user_call(name, args, pos)
+    }
+
+    /// Emit a direct call to a user-defined function's compiled body.
+    fn emit_user_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         let (label, params, ret) = match self.funcs.get(name) {
             Some(info) => (info.label, info.params.clone(), info.ret.clone()),
             None => {
@@ -2507,23 +2519,18 @@ impl Cg {
     fn gen_call_expr(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), CodegenError> {
         let pos = callee.span.pos;
         if let ExprKind::Ident(name) = &callee.kind {
-            if name == "Print" {
-                return self.gen_print_call(args, pos);
-            }
-            if name == "StrPrint" {
-                return self.gen_formatted_write(args, pos, false);
-            }
-            if name == "CatPrint" {
-                return self.gen_formatted_write(args, pos, true);
-            }
-            if name == "MStrPrint" {
-                return self.gen_mstrprint(args, pos);
-            }
-            if name == "I64ToStr" {
-                return self.gen_tostr(&args[0], &args[1], "%d", false, pos);
-            }
-            if name == "F64ToStr" {
-                return self.gen_tostr(&args[0], &args[1], "%g", true, pos);
+            // Builtins with bespoke lowering. Gated on `is_builtin` so a user
+            // function sharing one of these names (e.g. a stdlib `I64ToStr`) is an
+            // ordinary call, not a mis-lowered builtin.
+            if crate::builtins::is_builtin(name) {
+                match name.as_str() {
+                    "Print" => return self.gen_print_call(args, pos),
+                    "StrPrint" => return self.gen_formatted_write(args, pos, false),
+                    "CatPrint" => return self.gen_formatted_write(args, pos, true),
+                    "MStrPrint" => return self.gen_mstrprint(args, pos),
+                    "F64ToStr" => return self.gen_tostr(&args[0], &args[1], "%g", true, pos),
+                    _ => return self.gen_call(name, args, pos),
+                }
             }
             if !self.is_variable(name) {
                 return self.gen_call(name, args, pos);

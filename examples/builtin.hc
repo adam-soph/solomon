@@ -7,6 +7,8 @@
 // would be only "whatever the host libm does," with no portable solomon
 // semantics, so they're left to a future HolyC standard library.)
 
+#include <string.hc>
+
 // Uppercase a NUL-terminated string in place; returns its new length.
 I64 Upcase(U8 *s) {
   I64 i = 0;
