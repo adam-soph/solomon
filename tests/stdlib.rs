@@ -86,3 +86,27 @@ fn math_extended_functions() {
          5.0 1.0\n"
     );
 }
+
+#[test]
+fn time_calendar_math() {
+    // FromUnix/FmtISO/ToUnix over fixed epochs (pure → reproducible). Covers the
+    // epoch, a leap year, and a pre-1970 negative timestamp.
+    let out = run_with_stdlib(
+        r#"
+        #include <time.hc>
+        U0 Show(I64 s) {
+          U8 b[32]; DateTime dt = FromUnix(s);
+          "%s w%d L%d r%d\n", FmtISO(b, dt), dt.wday, IsLeap(dt.year), ToUnix(dt) == s;
+        }
+        U0 Main() { Show(0); Show(1717200000); Show(1000000000); Show(-86400); }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "1970-01-01 00:00:00 w4 L0 r1\n\
+         2024-06-01 00:00:00 w6 L1 r1\n\
+         2001-09-09 01:46:40 w0 L0 r1\n\
+         1969-12-31 00:00:00 w3 L0 r1\n"
+    );
+}

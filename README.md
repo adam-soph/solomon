@@ -322,7 +322,9 @@ the trig and inverse-trig `Sin`/`Cos`/`Tan`/`Atan`/`Asin`/`Acos`/`Atan2`, the
 hyperbolics `Sinh`/`Cosh`/`Tanh`, plus `Hypot`, exact `PowI`, and
 `Gcd`/`Factorial`/`Min`/`Max`/`Clamp` — all range-reduced + series, reproducible
 by construction. Only the *irreducible* float ops stay as builtins: `Sqrt`
-(correctly-rounded) and `Fabs` (a sign-bit clear).
+(correctly-rounded) and `Fabs` (a sign-bit clear). `lib/time.hc` adds calendar math
+on the `UnixNS` clock: `FromUnix`/`ToUnix` (Hinnant's civil↔days, exact for any
+date), `FmtISO` (`YYYY-MM-DD HH:MM:SS`), `IsLeap`, and an impure `Now`.
 
 ## Project layout
 

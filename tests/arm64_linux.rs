@@ -243,3 +243,38 @@ fn variadic_functions_match_the_interpreter() {
     };
     assert_eq!(got[0], want, "freestanding native != interp for varargs");
 }
+
+#[test]
+fn time_calendar_math_matches_the_interpreter() {
+    // The pure calendar math in lib/time.hc held byte-for-byte to the interpreter.
+    let src = r#"
+        #include <time.hc>
+        U0 Show(I64 s) {
+          U8 b[32]; DateTime dt = FromUnix(s);
+          "%s w%d r%d\n", FmtISO(b, dt), dt.wday, ToUnix(dt) == s;
+        }
+        U0 Main() { Show(0); Show(1717200000); Show(1000000000); Show(-86400); }
+        Main;
+    "#;
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "timecal".to_string();
+    Arm64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping aarch64 time.hc conformance: needs a linux/aarch64 host or docker");
+        return;
+    };
+    assert_eq!(
+        got[0], want,
+        "freestanding native != interp for lib/time.hc"
+    );
+}

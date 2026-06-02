@@ -854,3 +854,34 @@ fn variadic_functions_match_the_interpreter() {
     };
     assert_eq!(got[0], want, "native != interp for varargs");
 }
+
+#[test]
+fn time_calendar_math_matches_the_interpreter() {
+    // The pure calendar math in lib/time.hc (class-by-value return + StrPrint with
+    // class fields) is held byte-for-byte to the interpreter.
+    let src = r#"
+        #include <time.hc>
+        U0 Show(I64 s) {
+          U8 b[32]; DateTime dt = FromUnix(s);
+          "%s w%d r%d\n", FmtISO(b, dt), dt.wday, ToUnix(dt) == s;
+        }
+        U0 Main() { Show(0); Show(1717200000); Show(1000000000); Show(-86400); }
+        Main;
+    "#;
+    let program = parse_src(src);
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "timecal".to_string();
+    X64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("native build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping x86-64 time.hc conformance: needs a linux/x86_64 host or docker");
+        return;
+    };
+    assert_eq!(got[0], want, "native != interp for lib/time.hc");
+}
