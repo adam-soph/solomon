@@ -137,11 +137,12 @@ impl Analyzer {
     /// name win (hence `or_insert`).
     fn seed_builtin_funcs(&mut self) {
         for b in crate::builtins::all() {
+            let n = b.params.len();
             self.funcs.entry(b.name.to_string()).or_insert(FuncSig {
                 ret: b.ret,
-                params: Vec::new(),
-                required: b.min_args,
-                total: b.min_args,
+                params: b.params,
+                required: n,
+                total: n,
                 varargs: b.varargs,
                 defined: true,
             });

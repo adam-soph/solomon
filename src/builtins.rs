@@ -24,209 +24,73 @@ use crate::ast::Type;
 pub struct BuiltinSig {
     pub name: &'static str,
     pub ret: Type,
-    /// Minimum number of arguments required.
-    pub min_args: usize,
+    /// Declared parameter types — the required prefix; the count is the minimum
+    /// arity, and `varargs` adds a trailing `...`. (Argument *types* aren't strictly
+    /// enforced — HolyC is weakly typed — but they give each builtin a real
+    /// signature for `&Func`, error messages, and future checks.)
+    pub params: Vec<Type>,
     pub varargs: bool,
 }
 
 /// Every builtin and its signature.
 pub fn all() -> Vec<BuiltinSig> {
+    let u8p = || Type::Ptr(Box::new(Type::U8));
+    let i64 = || Type::I64;
+    let f64 = || Type::F64;
+    // (name, ret, params, varargs)
+    let sig = |name, ret, params: Vec<Type>, varargs| BuiltinSig {
+        name,
+        ret,
+        params,
+        varargs,
+    };
     let mut sigs = vec![
         // `Print(fmt, ...)` — printf-style output.
-        BuiltinSig {
-            name: "Print",
-            ret: Type::U0,
-            min_args: 1,
-            varargs: true,
-        },
+        sig("Print", Type::U0, vec![u8p()], true),
         // The printf-family string builders. Variadic — they consume `...`, which
-        // HolyC has no `va_arg` for, so they cannot (yet) be ordinary library code.
-        // `StrPrint(dst, fmt, ...) -> dst` (sprintf into dst).
-        BuiltinSig {
-            name: "StrPrint",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: true,
-        },
-        // `CatPrint(dst, fmt, ...) -> dst` (sprintf-append at dst + StrLen(dst)).
-        BuiltinSig {
-            name: "CatPrint",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: true,
-        },
-        // `MStrPrint(fmt, ...) -> U8*` (asprintf into a fresh right-sized buffer).
-        BuiltinSig {
-            name: "MStrPrint",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 1,
-            varargs: true,
-        },
-        // `StrToF64(U8*) -> F64` / `F64ToStr(F64, U8*) -> U8*` — float parse/format;
-        // need the correctly-rounded bignum machinery (shared with `Print`'s %g), so
-        // they stay builtins for now.
-        BuiltinSig {
-            name: "StrToF64",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "F64ToStr",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 2,
-            varargs: false,
-        },
-        // Clock/time primitives — impure (they read the OS clock or sleep), so
-        // unlike every other builtin they are *not* reproducible across backends:
-        // the byte-for-byte conformance is relaxed for these (tested by property,
-        // not value). `UnixNS()` is wall-clock ns since the Unix epoch
-        // (CLOCK_REALTIME), `NanoNS()` monotonic ns (CLOCK_MONOTONIC, for
-        // durations), `Sleep(ns)` suspends the thread.
-        BuiltinSig {
-            name: "UnixNS",
-            ret: Type::I64,
-            min_args: 0,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "NanoNS",
-            ret: Type::I64,
-            min_args: 0,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Sleep",
-            ret: Type::U0,
-            min_args: 1,
-            varargs: false,
-        },
+        // HolyC has no `va_arg` for, so they can't yet be ordinary library code.
+        sig("StrPrint", u8p(), vec![u8p(), u8p()], true), // (dst, fmt, ...) -> dst
+        sig("CatPrint", u8p(), vec![u8p(), u8p()], true), // sprintf-append
+        sig("MStrPrint", u8p(), vec![u8p()], true),       // asprintf into a fresh buffer
+        // Float parse/format (correctly-rounded bignum, shared with `Print`'s %g).
+        sig("StrToF64", f64(), vec![u8p()], false),
+        sig("F64ToStr", u8p(), vec![f64(), u8p()], false),
+        // Clock/time primitives — impure (read the OS clock or sleep), so
+        // non-reproducible: conformance is by property, not value.
+        sig("UnixNS", i64(), vec![], false), // wall-clock ns (CLOCK_REALTIME)
+        sig("NanoNS", i64(), vec![], false), // monotonic ns (CLOCK_MONOTONIC)
+        sig("Sleep", Type::U0, vec![i64()], false),
         // Memory ops (libc memcpy/memmove/memset/memcmp/memchr/memmem).
-        BuiltinSig {
-            name: "MemCpy",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 3,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "MemMove",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 3,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "MemSet",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 3,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "MemCmp",
-            ret: Type::I64,
-            min_args: 3,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "MemFind",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 3,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "MemSearch",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 4,
-            varargs: false,
-        },
-        // Heap (mmap bump allocator on the freestanding targets, libc malloc/free else).
-        BuiltinSig {
-            name: "MAlloc",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Free",
-            ret: Type::U0,
-            min_args: 1,
-            varargs: false,
-        },
-        // `ToUpper(I64) -> I64` / `ToLower(I64) -> I64` — ASCII case conversion.
-        BuiltinSig {
-            name: "ToUpper",
-            ret: Type::I64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "ToLower",
-            ret: Type::I64,
-            min_args: 1,
-            varargs: false,
-        },
-        // The exactly-reproducible algebraic float ops — backed by single hardware
-        // instructions (FSQRT/FRINT*, sqrtsd/roundsd), so unlike pure library code
-        // they stay builtins to keep the correctly-rounded IEEE result.
-        BuiltinSig {
-            name: "Sqrt",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Fabs",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Floor",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Ceil",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "Round",
-            ret: Type::F64,
-            min_args: 1,
-            varargs: false,
-        },
-        // `RandU64() -> U64` — deterministic splitmix64 (fixed seed), mirrored by the
-        // native backends so the sequence is identical everywhere.
-        BuiltinSig {
-            name: "RandU64",
-            ret: Type::U64,
-            min_args: 0,
-            varargs: false,
-        },
-        // `ArgC() -> I64` / `ArgV(I64) -> U8*` — the captured command line.
-        BuiltinSig {
-            name: "ArgC",
-            ret: Type::I64,
-            min_args: 0,
-            varargs: false,
-        },
-        BuiltinSig {
-            name: "ArgV",
-            ret: Type::Ptr(Box::new(Type::U8)),
-            min_args: 1,
-            varargs: false,
-        },
+        sig("MemCpy", u8p(), vec![u8p(), u8p(), i64()], false),
+        sig("MemMove", u8p(), vec![u8p(), u8p(), i64()], false),
+        sig("MemSet", u8p(), vec![u8p(), i64(), i64()], false),
+        sig("MemCmp", i64(), vec![u8p(), u8p(), i64()], false),
+        sig("MemFind", u8p(), vec![u8p(), i64(), i64()], false),
+        sig("MemSearch", u8p(), vec![u8p(), i64(), u8p(), i64()], false),
+        // Heap (mmap bump allocator freestanding, libc malloc/free hosted).
+        sig("MAlloc", u8p(), vec![i64()], false),
+        sig("Free", Type::U0, vec![u8p()], false),
+        // ASCII case conversion.
+        sig("ToUpper", i64(), vec![i64()], false),
+        sig("ToLower", i64(), vec![i64()], false),
+        // Exactly-reproducible algebraic float ops (single hardware instructions).
+        sig("Sqrt", f64(), vec![f64()], false),
+        sig("Fabs", f64(), vec![f64()], false),
+        sig("Floor", f64(), vec![f64()], false),
+        sig("Ceil", f64(), vec![f64()], false),
+        sig("Round", f64(), vec![f64()], false),
+        // Deterministic splitmix64 PRNG (fixed seed), mirrored by the backends.
+        sig("RandU64", Type::U64, vec![], false),
+        // The captured command line.
+        sig("ArgC", i64(), vec![], false),
+        sig("ArgV", u8p(), vec![i64()], false),
     ];
-    // The `Is*` ctype classification predicates — each `(I64) -> I64` returning
-    // 0 or 1. Computed inline in both backends (see `ctype_ranges`).
-    sigs.extend(CTYPE_NAMES.iter().map(|&name| BuiltinSig {
-        name,
-        ret: Type::I64,
-        min_args: 1,
-        varargs: false,
-    }));
+    // The `Is*` ctype predicates — each `(I64) -> I64` returning 0/1.
+    sigs.extend(
+        CTYPE_NAMES
+            .iter()
+            .map(|&name| sig(name, i64(), vec![i64()], false)),
+    );
     sigs
 }
 
