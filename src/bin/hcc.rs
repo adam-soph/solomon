@@ -45,22 +45,17 @@ impl Target {
             None
         }
     }
-    /// Parse a target triple (canonical, plus a couple of common short forms). The
-    /// Linux targets are **freestanding** (no libc, no linker), so the `-gnu`/
-    /// `-musl` libc suffixes are deliberately not accepted — use the bare triple.
+    /// Parse a target triple. Exactly the four supported (arch, OS) triples are
+    /// accepted — one per backend, no aliases. The two Linux targets are
+    /// **freestanding** (no libc, no linker), so the `-gnu`/`-musl` libc suffixes
+    /// are deliberately not accepted; and Darwin is the one libc-linked (hosted)
+    /// target, while Windows imports `kernel32` (neither freestanding nor libc).
     fn from_triple(s: &str) -> Option<Self> {
         match s {
-            "aarch64-apple-darwin" | "arm64-apple-darwin" | "aarch64-darwin" | "arm64-darwin" => {
-                Some(Target::Arm64Darwin)
-            }
-            "x86_64-unknown-linux" | "x86_64-linux" => Some(Target::X64Linux),
-            "x86_64-pc-windows"
-            | "x86_64-pc-windows-gnu"
-            | "x86_64-pc-windows-msvc"
-            | "x86_64-windows" => Some(Target::X64Windows),
-            "aarch64-unknown-linux" | "aarch64-linux" | "aarch64-unknown-linux-none" => {
-                Some(Target::Arm64Linux)
-            }
+            "aarch64-apple-darwin" => Some(Target::Arm64Darwin),
+            "x86_64-unknown-linux" => Some(Target::X64Linux),
+            "aarch64-unknown-linux" => Some(Target::Arm64Linux),
+            "x86_64-pc-windows" => Some(Target::X64Windows),
             _ => None,
         }
     }

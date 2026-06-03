@@ -3,7 +3,8 @@
 // uppercase a string in place. Output is integer/string only, so it is identical
 // under the interpreter and the native backend.
 
-#include <string.hc>
+#include <cstr.hc>    // StrLen/StrCpy/StrFind
+#include <ctype.hc>   // ToUpper
 
 I64 WordCount(U8 *s) {
   I64 words = 0;

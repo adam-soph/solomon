@@ -84,7 +84,9 @@ targets:
 	rustup target add $(TARGETS)
 
 # Collect built binaries into dist/, named per target (.exe on Windows).
-# Targets that haven't been built yet are skipped with a note.
+# Targets that haven't been built yet are skipped with a note. The standard library
+# is embedded in each binary at build time (`include_str!`), so the binaries are
+# self-contained — there is no `lib/` to ship alongside them.
 dist: all
 	@mkdir -p $(DIST)
 	@for t in $(TARGETS); do \

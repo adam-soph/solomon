@@ -7,7 +7,9 @@
 // would be only "whatever the host libm does," with no portable solomon
 // semantics, so they're left to a future HolyC standard library.)
 
-#include <string.hc>
+#include <cstr.hc>    // StrLen/StrCmp/StrCpy/StrCat
+#include <mem.hc>     // MemCpy/MemSet/MemCmp
+#include <ctype.hc>   // ToUpper
 
 // Uppercase a NUL-terminated string in place; returns its new length.
 I64 Upcase(U8 *s) {

@@ -94,13 +94,19 @@ Preserve this: do not add code that collects the full token stream up front.
 stream in without buffering. The `Lexer` owns its source bytes (so an included
 file's lexer can outlive the `&str` it was built from). `#include "file"` paths
 resolve relative to the including file's directory; **angle** includes
-`#include <name>` (the standard library) resolve against a *search path* instead
-(the angle path is reassembled from its lexed tokens by `angle_path`, since unlike
-the quoted form it isn't a single `Str` token). `parser::parse(src)` defaults the
-base dir to the CWD with no search path; `parse_in_dir(src, dir)` sets the base
-dir; `parse_with(src, dir, search)` sets both (the CLIs pass the input file's
-parent and `solomon::stdlib_dirs()` — `SOLOMON_STDLIB`, then exe-relative `lib/`,
-then `./lib`; `hcc -I DIR` prepends more). The library itself is HolyC in `lib/`.
+`#include <name>` (the standard library) resolve first against a *search path* and
+then, if not found there, against the **stdlib embedded in the compiler at build
+time** (`EMBEDDED_STDLIB` in `lib.rs` — each `lib/*.hc` baked in via `include_str!`,
+so the compiler is self-contained and needs no `lib/` on disk; editing a `lib/*.hc`
+triggers a recompile). The angle path is reassembled from its lexed tokens by
+`angle_path` (unlike the quoted form it isn't a single `Str` token), and both disk
+and embedded sources go through the shared `Preprocessor::push_frame`.
+`parser::parse(src)` defaults the base dir to the CWD with no search path (so it
+uses the embedded stdlib); `parse_in_dir(src, dir)` sets the base dir;
+`parse_with(src, dir, search)` sets both (the CLIs pass the input file's parent and
+`solomon::stdlib_dirs()` — just the `SOLOMON_STDLIB` override dirs now, searched
+before the embedded copy; `hcc -I DIR` prepends more). The library source lives in
+`lib/` and is what gets embedded.
 
 ### Typed AST
 
@@ -139,9 +145,17 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   indexing, and comparison work. `MAlloc` of a scalar type and every `union`
   instance are instead **raw byte buffers** (`Region::Heap` / `Value::Union`)
   accessed through `Place::Bytes`, so type punning and overlapping union fields
-  match the native byte layout. `run_to_string` is the safe "check then run"
-  entry. **This interpreter is the conformance oracle for the native backends** —
-  when adding native-backend features, match its observable output.
+  match the native byte layout. A pointer (or a class value containing one) stored
+  into a byte buffer is **serialised** as an 8-byte handle into the interpreter's
+  `PtrTable` — since a `PtrVal` is a region+offset, not an address — and read back
+  through it (`serialize_ptr`/`deserialize_ptr`); the handle bytes copy verbatim, so
+  a byte-wise `MemCpy` still names the same pointer. And `obj->field` through a
+  pointer into a byte heap buffer resolves the field as a `Place::Bytes` at its
+  layout offset (via `union_field`), so a class laid out in raw bytes — e.g. a `Pt`
+  element of a `Vec`'s data — behaves like the native byte layout. `run_to_string`
+  is the safe "check then run" entry. **This interpreter is the conformance oracle
+  for the native backends** — when adding native-backend features, match its
+  observable output.
 - **`backend/arm64_darwin.rs`** — hand-emits AArch64 machine code (no LLVM/Cranelift/C),
   writes a Mach-O relocatable object by hand, and links with the system `cc`.
   Codegen is type-directed (uses `Expr::ty()` + the layout pass). It targets
@@ -311,7 +325,7 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   are lowered inline or to emitted runtime routines (`gen_builtin` +
   `emit_rt_routines`): `MAlloc`/`Free` (a bump allocator over `mmap`'d 1 MiB
   chunks; `Free` is a no-op), SSE `Sqrt`/`Fabs`, and the **sprintf family**
-  `StrPrint`/`CatPrint`/`F64ToStr` (printf into a buffer via the output sink;
+  `StrPrint`/`CatPrint` (printf into a buffer via the output sink;
   `CatPrint` appends at `dst + StrLen(dst)`, so `StrLen` is the one string runtime
   routine still emitted). The reducible string/memory/ctype/PRNG ops are pure HolyC
   in `lib/*.hc` now and compile as ordinary functions — the per-op `emit_rt_*`
@@ -322,8 +336,13 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   `MStrPrint` (a **growing sink** like libc's `vasprintf`: `MAlloc` a small owned
   buffer, then format in one pass while the sink reallocs-and-copies on overflow —
   `Helper::GrowSink`, doubling capacity — so the result is just `out_base` when
-  done; no measure pass, no fixed cap) and `F64ToStr` (`%g` via the shared sink)
-  are implemented too, so the whole core-library builtin set is covered. (**All 18 examples compile and run
+  done; no measure pass, no fixed cap) is implemented too, so the whole
+  core-library builtin set is covered. `F64ToStr` is **not** a builtin — it's the
+  one-line HolyC wrapper `StrPrint(buf, "%g", v)` in `lib/cstr.hc`, so it reuses
+  this same formatter rather than carrying its own. The print-runtime helpers are
+  emitted by a deterministic fixpoint (`emit_helpers`) so a float formatter pulled
+  in only by a compiled-but-not-top-level function — like that `F64ToStr` wrapper —
+  still gets its transitive `OutWrite`/bignum sub-routines placed. (**All 18 examples compile and run
   natively**, matching the interpreter.) Tests in
   `tests/x86_64_linux.rs` verify the ELF structure
   on any host and **execute** the produced binary — directly on a `linux`/`x86_64`
@@ -342,12 +361,18 @@ backends stay in sync. The set has been **pared down to the irreducible
 primitives** — anything expressible as reproducible HolyC has moved to the
 standard library (`lib/*.hc`). Current set: the printf family `Print` (→
 `printf`), `StrPrint` (→ `sprintf`, returns dst), `CatPrint` (sprintf-append, into
-`dst+strlen(dst)`) and `MStrPrint` (asprintf-style) — variadic, so they can't yet
-be ordinary library code; float parse/format `StrToF64` (→ `atof`) / `F64ToStr`
-(correctly-rounded `%g`); heap `MAlloc`/`Free` (a syscall/libc primitive),
+`dst+strlen(dst)`) and `MStrPrint` (asprintf-style) — they could read `...` in HolyC
+now (the `VarArg*` accessors exist), but stay builtins because they bundle the
+format-rendering machinery (the shared `fmt` spec + correctly-rounded bignum floats
+the backends emit), not practical as byte-identical HolyC. **Float conversion is no
+longer here at all**: `StrToF64` (`atof`) is a correctly-rounded bignum parser in
+`lib/strconv.hc` (over the `Bn` big integer in `lib/bignum.hc`) — pure HolyC, so it
+works on the freestanding targets too (no host libc), and its inverse `F64ToStr` is
+a `StrPrint(buf, "%g", v)` wrapper in `lib/cstr.hc`. Heap `MAlloc`/`Free` (a
+syscall/libc primitive),
 `HeapExtend(ptr, old, new)` (the one irreducible bit of `realloc` — grow a bump
 allocator's last block in place, else NULL; the move+copy `ReAlloc` is HolyC in
-`lib/string.hc`) and `MSize(ptr)` (the requested size of a block — when a program
+`lib/mem.hc`) and `MSize(ptr)` (the requested size of a block — when a program
 uses it, `MAlloc` prepends an 8-byte size header, **gated** so size-agnostic
 programs keep the lean header-free heap byte-for-byte; the interpreter keeps a side
 table, Darwin wraps libc `malloc`/`free` with the header); the two
@@ -359,24 +384,42 @@ clock primitives `UnixNS`/`NanoNS`/`Sleep` (below). `NULL`/`TRUE`/`FALSE` are co
 builtins. **Everything reducible now lives in `lib/*.hc`** as pure HolyC built on
 the deterministic F64/integer ops + these primitives, so each function's *defined
 algorithm* computes identically on the interpreter and every backend; pull it in
-with an angle include (`#include <string.hc>` / `#include <math.hc>`). Each lib
+with an angle include (`#include <cstr.hc>` / `#include <vec.hc>` / `#include <math.hc>`). Each lib
 file is wrapped in an `#ifndef _NAME_HC` include guard, so a module can include
 another (or a program can include the same one twice) without a redefinition error.
 
-- `lib/string.hc` — two layers. **(1)** the C-style `U8 *` primitives: the string
-  ops (`StrLen`/`StrCmp`/`StrCpy`/`StrCat`/`StrFind`/`StrChr`/`StrSpn`/`StrToUpper`/
-  `StrRev`/…), number conversion (`I64ToStr`/`StrToI64`), `Abs`/`Sign`, the memory
-  ops (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`, plus `ReAlloc`
-  over the `HeapExtend` builtin), ASCII case
-  (`ToUpper`/`ToLower`) and the `Is*` ctype predicates (`IsDigit`/`IsAlpha`/
-  `IsSpace`/…, inline ASCII range checks returning 0/1 — deliberately not libc's
-  `isdigit`, whose unspecified nonzero would diverge). **(2)** `class Str` — an
-  owning, growable string built on layer 1: the caller owns the struct, methods
-  take `Str *`, the heap buffer (`MAlloc`/`Free`) stays NUL-terminated, and a
-  zero-filled `Str` is already a valid empty string. `StrInit`/`StrFree`/`StrClear`/
-  `StrReserve`, `StrPushChar`/`StrPushCStr`/`StrPushStr`/`StrSet`, `StrCStr`/`StrEq`/
-  `StrClone`, and in-place `StrMakeUpper`/`StrMakeLower`/`StrReverse`/`StrTrim`. It
-  owns its buffer — duplicate with `StrClone`, not `=`.
+The string/memory library is split along the C-header lines so each module is
+includable on its own:
+
+- `lib/cstr.hc` — C-style `U8 *` NUL-terminated string primitives (the `<string.h>`
+  `str*` family): `StrLen`/`StrCmp`/`StrNCmp`/`StrCpy`/`StrNCpy`/`StrCat`/`StrFind`/
+  `StrChr`/`StrLastChr`/`StrSpn`/`StrCSpn`/`StrToUpper`/`StrToLower`/`StrRev`, number
+  conversion (`StrToI64`/`I64ToStr`, and `F64ToStr` = `StrPrint("%g")`), and the
+  `Abs`/`Sign` integer helpers.
+- `lib/mem.hc` — raw memory + heap (the `mem*` family): `MemCpy`/`MemMove`/`MemSet`/
+  `MemCmp`/`MemFind`/`MemSearch`, plus `ReAlloc` over the `HeapExtend` builtin.
+- `lib/bignum.hc` — `class Bn`, a minimal arbitrary-precision **nonnegative** integer
+  (little-endian base-2^32 limbs, fixed `d[72]`): build-from-digits, scale by powers
+  of two, compare, subtract. No division/general multiply — only what decimal→binary
+  conversion needs.
+- `lib/strconv.hc` — `StrToF64`, a **correctly-rounded** `atof` over `<bignum.hc>`: a
+  Clinger fast path (one exact F64 op for ≤15-digit significands with `|k|≤22`) and an
+  exact bignum slow path (build the value as an integer ratio, normalise into
+  `[2^52,2^53)` with powers of two, extract the 53-bit mantissa by shift/compare/
+  subtract — no bignum divide — and round half-to-even). Pure HolyC, so it runs on the
+  freestanding targets (no libc `atof`) and is bit-identical to a reference `strtod`.
+- `lib/ctype.hc` — ASCII character classification (`<ctype.h>`): `ToUpper`/`ToLower`
+  and the `Is*` predicates (`IsDigit`/`IsAlpha`/`IsSpace`/…, returning 0/1 —
+  deliberately not libc's `isdigit`, whose unspecified nonzero would diverge).
+- `lib/vec.hc` — `class Vec`, an owning, growable array of fixed-size elements (a
+  generic dynamic array on `<mem.hc>`'s `ReAlloc`). One `Vec` type holds elements of
+  **any** type — scalars, pointers, or class values — the size chosen at
+  `VecInit(&v, esize)`, with emplace-style pointer access: `*(I64 *)VecPush(&v) = x`,
+  `Pt *p = VecPush(&v); p->x = 1`, `*(F64 *)VecAt(&v, i)`. Working through the heap
+  buffer pointer (never copying a local's bytes) keeps it conformant; pointer and
+  class-value elements work because the interpreter byte-serialises pointers through
+  its `PtrTable` (see below).
+  `VecInit`/`VecFree`/`VecClear`/`VecReserve`/`VecPush`/`VecPop`/`VecAt`/`VecClone`.
 - `lib/math.hc` — rounding (`Floor`/`Ceil`/`Round`/`Trunc`/`Fmod`, exact via an I64
   cast + adjust), the transcendentals (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…, each with a
   *defined* series so it's reproducible — unlike a libm call), and the deterministic
@@ -391,7 +434,7 @@ special-cased in the arm64 backend
 (`gen_print`/`gen_formatted_write`/`gen_mstrprint`) to translate the format
 string (`translate_format`) and pass variadic args on the stack (Apple ABI); the
 interpreter renders them with the shared `fmt` module. The remaining libc-backed
-builtins (`Sqrt`/`Fabs`/`MAlloc`/`Free`/`StrToF64`) keep their HolyC signature 1:1
+builtins (`Sqrt`/`Fabs`/`MAlloc`/`Free`) keep their HolyC signature 1:1
 with the libc one, so they lower through the generic path with no special-casing.
 (The string/memory/ctype/PRNG lowering machinery the backends used to carry —
 `gen_str_case`, the `ctype_ranges` emitter, the `RNG_STATE_GLOBAL` splitmix, the

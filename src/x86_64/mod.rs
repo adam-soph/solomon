@@ -43,7 +43,7 @@
 //! including round-half-to-even ties) — and the irreducible **core-library
 //! builtins**, lowered with no libc: `MAlloc`/`Free` (an `mmap`-backed bump
 //! allocator), SSE `Sqrt`/`Fabs`, and the **sprintf family**
-//! (`StrPrint`/`CatPrint`/`MStrPrint`/`F64ToStr` — printf into a buffer via an
+//! (`StrPrint`/`CatPrint`/`MStrPrint` — printf into a buffer via an
 //! output sink, see below; the lone string routine still emitted is `StrLen`, used
 //! internally by `CatPrint`'s append). The reducible string/memory/ctype/PRNG ops
 //! are pure HolyC in `lib/*.hc` now and compile as ordinary functions. The
@@ -2083,7 +2083,6 @@ impl Cg {
             "StrPrint" => self.gen_strprint(args, false, pos),
             "CatPrint" => self.gen_strprint(args, true, pos),
             "MStrPrint" => self.gen_mstrprint(args, pos),
-            "F64ToStr" => self.gen_f64tostr(args, pos),
             "MAlloc" => self.call_rt("MAlloc", &[&args[0]]),
             "HeapExtend" => self.call_rt("HeapExtend", &[&args[0], &args[1], &args[2]]),
             "MSize" => self.call_rt("MSize", &[&args[0]]),
@@ -2127,21 +2126,6 @@ impl Cg {
         self.gen_print(&fmt, &args[2..], pos)?; // appends to the buffer
         self.finish_buffer_write(out);
         self.asm.load_local(dslot, 8, false); // return dst
-        Ok(())
-    }
-
-    /// `F64ToStr(f, buf)`: format `f` with `%g` into `buf`; return `buf`.
-    fn gen_f64tostr(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        let out = self.out_ptr_global();
-        self.gen_expr(&args[1])?; // buf
-        let dslot = self.alloc(8, 8);
-        self.asm.store_local(dslot, 8);
-        self.asm.load_local(dslot, 8, false);
-        self.asm.lea_global(R8, out);
-        self.asm.store_qword_at(R8, RAX); // out_ptr = buf
-        self.gen_print("%g", &args[0..1], pos)?; // format the value (matches the interpreter)
-        self.finish_buffer_write(out);
-        self.asm.load_local(dslot, 8, false); // return buf
         Ok(())
     }
 
@@ -2758,36 +2742,41 @@ impl Cg {
     }
 
     /// Emit the bodies of the print-runtime helpers actually used.
+    ///
+    /// Helpers request other helpers *during* their own emission: the float
+    /// formatters call `OutWrite` and register the bignum sub-routines, and
+    /// `OutWrite` calls `GrowSink`. So a single ordered pass can miss a helper first
+    /// requested by another helper's body (e.g. a compiled-but-not-top-level
+    /// `F64ToStr` that uses `%g` pulls in `OutWrite` only when `FmtFloatEg` is
+    /// emitted). Emit in a fixed order, looping until a full pass adds nothing new —
+    /// the fixed order keeps the emitted layout deterministic, the loop guarantees
+    /// every transitively-requested routine is placed.
     fn emit_helpers(&mut self) {
-        if let Some(&label) = self.helpers.get(&Helper::FmtInt) {
-            self.asm.place(label);
-            self.emit_fmt_int();
-        }
-        if let Some(&label) = self.helpers.get(&Helper::FmtStr) {
-            self.asm.place(label);
-            self.emit_fmt_str();
-        }
-        if let Some(&label) = self.helpers.get(&Helper::OutWrite) {
-            self.asm.place(label);
-            self.emit_out_write();
-        }
-        if let Some(&label) = self.helpers.get(&Helper::GrowSink) {
-            self.asm.place(label);
-            self.emit_grow_sink();
-        }
-        // FmtFloat first: emitting it registers the bignum sub-routines it calls,
-        // which are then emitted below (label references resolve at `finish`).
-        for (h, emit) in [
-            (Helper::FmtFloat, Self::emit_fmt_float as fn(&mut Self)),
+        let order: [(Helper, fn(&mut Self)); 10] = [
+            (Helper::FmtInt, Self::emit_fmt_int),
+            (Helper::FmtStr, Self::emit_fmt_str),
+            (Helper::FmtFloat, Self::emit_fmt_float),
             (Helper::FmtFloatEg, Self::emit_fmt_float_eg),
             (Helper::BnMul, Self::emit_bn_mul),
             (Helper::BnShr, Self::emit_bn_shr),
             (Helper::BnShl, Self::emit_bn_shl),
             (Helper::BnDiv10, Self::emit_bn_div10),
-        ] {
-            if let Some(&label) = self.helpers.get(&h) {
-                self.asm.place(label);
-                emit(self);
+            (Helper::OutWrite, Self::emit_out_write),
+            (Helper::GrowSink, Self::emit_grow_sink),
+        ];
+        let mut emitted: std::collections::HashSet<Helper> = std::collections::HashSet::new();
+        loop {
+            let mut progressed = false;
+            for &(h, emit) in &order {
+                if self.helpers.contains_key(&h) && emitted.insert(h) {
+                    let label = self.helpers[&h];
+                    self.asm.place(label);
+                    emit(self);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
             }
         }
     }

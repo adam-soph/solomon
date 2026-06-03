@@ -27,21 +27,20 @@ fn temp_out() -> std::path::PathBuf {
 }
 
 /// Parse a program/source with the standard library available (so `#include
-/// <string.hc>`/`<math.hc>` resolve). Examples carry their own includes; inline
-/// sources don't, so each is prepended when absent (the reducible builtins now live
-/// in `lib/string.hc` and `lib/math.hc`; the extra unused defs don't change a
-/// program's output).
+/// <cstr.hc>` etc. resolve). Examples carry their own includes; inline sources don't,
+/// so the primitive modules (`cstr`/`mem`/`ctype`, plus `math.hc` for `RandU64`) are
+/// prepended; the extra unused defs don't change a program's output.
 fn parse_src(src: &str) -> solomon::Program {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let mut s = String::new();
-    if !src.contains("#include <string.hc>") {
-        s.push_str("#include <string.hc>\n");
-    }
+    let mut s = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
     // `math.hc` only when the source uses the moved `RandU64` PRNG — see the note
     // on `common::with_stdlib_prelude` (prepending the rest collides with the
     // examples that define their own `Pow`/`Floor`/…).
     if src.contains("RandU64") && !src.contains("#include <math.hc>") {
         s.push_str("#include <math.hc>\n");
+    }
+    if src.contains("StrToF64") && !src.contains("#include <strconv.hc>") {
+        s.push_str("#include <strconv.hc>\n");
     }
     s.push_str(src);
     parse_with(&s, std::path::Path::new("."), &[lib])
@@ -828,6 +827,45 @@ fn stdlib_math_matches_the_interpreter() {
 }
 
 #[test]
+fn strtof64_matches_the_interpreter() {
+    // The correctly-rounded `atof` (`#include <strconv.hc>`, over `<bignum.hc>`)
+    // compiles and runs **freestanding** — previously `StrToF64` lowered to a libc
+    // `_atof` the static ELF couldn't resolve. Both the Clinger fast path and the
+    // exact bignum slow path (long significands, large/small exponents, the
+    // smallest normal double) must print byte-for-byte what the interpreter does.
+    let src = r#"
+        #include <strconv.hc>
+        U0 Main() {
+          "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
+          "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");
+          "%.17g %.17g\n", StrToF64("2.2250738585072014e-308"), StrToF64("6.022e23");
+          "%.3f %.3f %.3f\n", StrToF64("3.14"), StrToF64("-2.5e2"), StrToF64("  6.0x");
+          "%g %g %g\n", StrToF64("xyz"), StrToF64("1e309"), StrToF64("1e-330");
+        }
+        Main;
+    "#;
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "strtof64".to_string();
+    X64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("native build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping x86-64 StrToF64 conformance: needs a linux/x86_64 host or docker");
+        return;
+    };
+    assert_eq!(got[0], want, "native != interp stdout for StrToF64");
+}
+
+#[test]
 fn time_builtins_run_natively() {
     // Time is impure (non-reproducible), so it can't be byte-compared to the
     // interpreter — run the native binary and assert *properties*: the wall clock
@@ -976,24 +1014,39 @@ fn msize_matches_the_interpreter() {
 }
 
 #[test]
-fn string_object_matches_the_interpreter() {
-    // The owning, growable `Str` from lib/string.hc (heap buffer via MAlloc, class
-    // by pointer, reallocation on growth) is held byte-for-byte to the interpreter.
+fn vec_object_matches_the_interpreter() {
+    // The owning, growable generic `Vec` from lib/vec.hc (heap buffer via ReAlloc,
+    // reallocation on growth) over I64, pointer, and class-value elements — held
+    // byte-for-byte to the interpreter, including the interp's pointer serialisation.
     let src = r#"
+        #include <vec.hc>
+        class Pt { I64 x; I64 y; }
         U0 Main() {
-          Str s;
-          StrPushCStr(&s, "Hello, ");
-          StrPushStr(&s, &s);          // append self
-          StrPushChar(&s, '!');
-          "%s | len=%d\n", StrCStr(&s), s.len;
-          StrMakeUpper(&s);
-          "%s\n", StrCStr(&s);
-          Str t; StrSet(&t, "   padded   "); StrTrim(&t);
-          "[%s]\n", StrCStr(&t);
-          Str g; I64 i;
-          for (i = 0; i < 200; i++) StrPushChar(&g, 'a' + i % 26);
-          "grow=%d head=%c tail=%c\n", g.len, g.ptr[0], g.ptr[g.len - 1];
-          StrFree(&s); StrFree(&t); StrFree(&g);
+          Vec v; VecInit(&v, sizeof(I64));
+          I64 i;
+          for (i = 0; i < 200; i++) *(I64 *)VecPush(&v) = i * 3 - 7;
+          "len=%d head=%d tail=%d\n", v.len, *(I64 *)VecAt(&v, 0), *(I64 *)VecAt(&v, v.len - 1);
+          I64 sum = 0;
+          while (v.len > 0) sum += *(I64 *)VecPop(&v);
+          "sum=%d empty=%d\n", sum, v.len;
+
+          Vec a; VecInit(&a, sizeof(I64));
+          *(I64 *)VecPush(&a) = 1; *(I64 *)VecPush(&a) = 2;
+          Vec b; VecClone(&b, &a); *(I64 *)VecAt(&b, 0) = 9;
+          "a0=%d b0=%d\n", *(I64 *)VecAt(&a, 0), *(I64 *)VecAt(&b, 0);
+
+          Vec s; VecInit(&s, sizeof(U8 *));
+          *(U8 **)VecPush(&s) = "x"; *(U8 **)VecPush(&s) = "yz";
+          Vec sc; VecClone(&sc, &s);
+          "%s %s\n", *(U8 **)VecAt(&sc, 0), *(U8 **)VecAt(&sc, 1);
+
+          Vec p; VecInit(&p, sizeof(Pt));
+          I64 k;
+          for (k = 0; k < 50; k++) { Pt *e = VecPush(&p); e->x = k; e->y = k * k; }
+          Pt *g = VecAt(&p, 49);
+          "class %d %d len=%d\n", g->x, g->y, p.len;
+
+          VecFree(&v); VecFree(&a); VecFree(&b); VecFree(&s); VecFree(&sc); VecFree(&p);
         }
         Main;
     "#;
@@ -1002,17 +1055,17 @@ fn string_object_matches_the_interpreter() {
     let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
     let dir = temp_out();
     std::fs::create_dir_all(&dir).unwrap();
-    let name = "strobj".to_string();
+    let name = "vecobj".to_string();
     X64Linux::new(dir.join(&name))
         .run(&program)
         .unwrap_or_else(|e| panic!("native build failed: {e}"));
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 Str conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 Vec conformance: needs a linux/x86_64 host or docker");
         return;
     };
-    assert_eq!(got[0], want, "native != interp for the Str object");
+    assert_eq!(got[0], want, "native != interp for the Vec object");
 }
 
 #[test]

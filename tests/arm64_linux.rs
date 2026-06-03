@@ -149,7 +149,8 @@ fn realloc_extends_the_last_block_in_place() {
     // moves, so no copy and no leak) — unlike the libc/interp heaps. Also checks the
     // contents survive the grows.
     let src = r#"
-        #include <string.hc>
+        #include <cstr.hc>
+        #include <mem.hc>
         U0 Main() {
           U8 *q = MAlloc(16);
           StrCpy(q, "keep");
@@ -275,6 +276,47 @@ fn stdlib_math_matches_the_interpreter() {
     assert_eq!(
         got[0], want,
         "freestanding native != interp stdout for the math stdlib"
+    );
+}
+
+#[test]
+fn strtof64_matches_the_interpreter() {
+    // The correctly-rounded `atof` (`#include <strconv.hc>`, over `<bignum.hc>`)
+    // compiles and runs **freestanding** — previously `StrToF64` lowered to a libc
+    // `_atof` the static ELF couldn't resolve. Both paths (Clinger fast + exact
+    // bignum slow) must print byte-for-byte what the interpreter does.
+    let src = r#"
+        #include <strconv.hc>
+        U0 Main() {
+          "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
+          "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");
+          "%.17g %.17g\n", StrToF64("2.2250738585072014e-308"), StrToF64("6.022e23");
+          "%.3f %.3f %.3f\n", StrToF64("3.14"), StrToF64("-2.5e2"), StrToF64("  6.0x");
+          "%g %g %g\n", StrToF64("xyz"), StrToF64("1e309"), StrToF64("1e-330");
+        }
+        Main;
+    "#;
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, std::path::Path::new("."), &[lib])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(check_program(&program).is_empty(), "sema errors");
+    let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "strtof64".to_string();
+    Arm64Linux::new(dir.join(&name))
+        .run(&program)
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = run_stdouts(&dir, &[name]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping aarch64 StrToF64 conformance: needs a linux/aarch64 host or docker");
+        return;
+    };
+    assert_eq!(
+        got[0], want,
+        "freestanding native != interp stdout for StrToF64"
     );
 }
 

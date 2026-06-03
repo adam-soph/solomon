@@ -108,7 +108,6 @@ fn stdlib_builtins_are_known() {
           F64 sq = Sqrt(2.0); F64 fa = Fabs(-1.0); \
           U8 *sp = StrPrint(p, \"%d\", 1); U8 *cp = CatPrint(p, \"%d\", 2); \
           U8 *mp = MStrPrint(\"%d\", 3); \
-          F64 fv = StrToF64(\"1.5\"); U8 *fs = F64ToStr(1.5, p); \
           I64 ns = UnixNS(); I64 mn = NanoNS(); Sleep(0); \
           Free(p); \
         }");
@@ -122,8 +121,6 @@ fn stdlib_builtin_arity_is_checked() {
     has("U0 F() { StrPrint(0); }", "at least 2 argument(s), got 1");
     has("U0 F() { CatPrint(0); }", "at least 2 argument(s), got 1");
     has("U0 F() { MStrPrint(); }", "at least 1 argument(s), got 0");
-    has("U0 F() { StrToF64(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { F64ToStr(1.5); }", "expects 2 argument(s), got 1");
 }
 
 // ---- name resolution ----

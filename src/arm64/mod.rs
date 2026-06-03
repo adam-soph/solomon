@@ -2495,7 +2495,7 @@ impl Cg {
         if self.freestanding && crate::builtins::libc_symbol(name).is_some() {
             return self.gen_builtin_fs(name, args, pos);
         }
-        // A libc-backed builtin (`Sqrt`/`Fabs`/`MAlloc`/`Free`/`StrToF64` →
+        // A libc-backed builtin (`Sqrt`/`Fabs`/`MAlloc`/`Free` →
         // `_sqrt`/`_fabs`/…) is an external call; its argument classes come from the
         // inferred call-site types and its return type from the builtin registry.
         if let Some(sym) = crate::builtins::libc_symbol(name) {
@@ -2597,7 +2597,6 @@ impl Cg {
                     "StrPrint" => return self.gen_formatted_write(args, pos, false),
                     "CatPrint" => return self.gen_formatted_write(args, pos, true),
                     "MStrPrint" => return self.gen_mstrprint(args, pos),
-                    "F64ToStr" => return self.gen_tostr(&args[0], &args[1], "%g", true, pos),
                     _ => return self.gen_call(name, args, pos),
                 }
             }
@@ -3676,7 +3675,7 @@ impl Cg {
             "Free",
             // `StrLen` is the lone string routine still emitted — the freestanding
             // `CatPrint` append uses it internally. The rest of the string/memory
-            // ops are pure HolyC in `lib/string.hc` now.
+            // ops are pure HolyC in `lib/mem.hc`/`cstr.hc` now.
             "StrLen",
         ];
         for &name in ORDER {
@@ -5077,40 +5076,6 @@ impl Cg {
         if varsize > 0 {
             self.asm.add_sp_imm(varsize);
         }
-        self.load_local(RES, buf_off, &Type::I64); // return buf
-        Ok(())
-    }
-
-    /// `I64ToStr(n, buf)` / `F64ToStr(f, buf)` -> `sprintf(buf, fmt, value)`,
-    /// returning `buf`. `fmt` is a fixed single-conversion format.
-    fn gen_tostr(
-        &mut self,
-        value: &Expr,
-        buf: &Expr,
-        fmt: &str,
-        is_float: bool,
-        _pos: Pos,
-    ) -> Result<(), CodegenError> {
-        self.gen_expr(buf)?; // RES = buf
-        let buf_off = self.alloc(8, 8);
-        self.asm.sub_imm(T2, FP, buf_off);
-        self.gen_store(RES, T2, &Type::I64);
-
-        let c_fmt = translate_format(fmt)?;
-        let fmt_idx = self.asm.intern_string(&c_fmt);
-        self.asm.sub_sp_imm(16); // one 16-aligned variadic slot
-        if is_float {
-            self.gen_fexpr(value)?;
-            self.asm.fmov_to_gpr(RES, FRES);
-        } else {
-            self.gen_expr(value)?;
-        }
-        self.asm.str_sp(RES, 0);
-        self.load_local(0, buf_off, &Type::I64); // x0 = buf
-        self.asm.adr(1, fmt_idx); // x1 = format
-        self.load_variadic_regs(std::slice::from_ref(value), 0, 2); // the value from x2/v0
-        self.asm.bl_extern("_sprintf");
-        self.asm.add_sp_imm(16);
         self.load_local(RES, buf_off, &Type::I64); // return buf
         Ok(())
     }

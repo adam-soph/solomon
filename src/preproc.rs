@@ -315,21 +315,35 @@ impl<S: TokenStream> Preprocessor<S> {
             Some(TokenKind::Lt) => {
                 let path_str = angle_path(&toks[1..])
                     .ok_or_else(|| self.err(pos, "malformed #include <...> path"))?;
-                // First search directory that holds the file wins.
-                let canon = self
+                let display = format!("<{path_str}>");
+                // 1. The filesystem search path wins, so `SOLOMON_STDLIB`/`-I` can
+                //    override the bundled stdlib or add angle-includable files.
+                if let Some(canon) = self
                     .search
                     .iter()
                     .find_map(|d| d.join(&path_str).canonicalize().ok())
-                    .ok_or_else(|| {
-                        self.err(
-                            pos,
-                            format!(
-                                "cannot find #include <{path_str}> in the standard-library \
-                                 search path (set SOLOMON_STDLIB or pass -I)"
-                            ),
-                        )
-                    })?;
-                self.open_include(canon, &format!("<{path_str}>"), pos)
+                {
+                    return self.open_include(canon, &display, pos);
+                }
+                // 2. Otherwise the standard library embedded in the compiler at build
+                //    time (so no `lib/` on disk is required).
+                if let Some(src) = crate::embedded_stdlib(&path_str) {
+                    let path = PathBuf::from(format!("<stdlib:{path_str}>"));
+                    return self.push_frame(
+                        path,
+                        self.base_dir.clone(),
+                        src.to_string(),
+                        &display,
+                        pos,
+                    );
+                }
+                Err(self.err(
+                    pos,
+                    format!(
+                        "cannot find #include <{path_str}> in the search path or the embedded \
+                         stdlib (set SOLOMON_STDLIB or pass -I)"
+                    ),
+                ))
             }
             _ => Err(self.err(pos, "#include expects \"file\" or <name>")),
         }
@@ -339,26 +353,41 @@ impl<S: TokenStream> Preprocessor<S> {
     /// (after the cycle and depth checks). `display` is the original spelling, for
     /// error messages.
     fn open_include(&mut self, canon: PathBuf, display: &str, pos: Pos) -> LResult<()> {
-        if self.includes.iter().any(|f| f.path == canon) {
-            return Err(self.err(pos, format!("recursive #include of {display}")));
-        }
-        if self.includes.len() >= MAX_INCLUDE_DEPTH {
-            return Err(self.err(pos, "#include nested too deeply"));
-        }
         let contents = std::fs::read_to_string(&canon)
             .map_err(|e| self.err(pos, format!("cannot read #include {display}: {e}")))?;
         let dir = canon
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        // The token already read past the `#include` line resumes the parent
-        // once the included file is exhausted.
+        self.push_frame(canon, dir, contents, display, pos)
+    }
+
+    /// Push an include source (read from disk or supplied from the embedded stdlib)
+    /// onto the source stack, after the cycle and depth checks. `path` identifies the
+    /// frame for the cycle check (a real canonical path, or a `<stdlib:name>`
+    /// sentinel); `dir` is the base for that file's relative (`"..."`) includes.
+    fn push_frame(
+        &mut self,
+        path: PathBuf,
+        dir: PathBuf,
+        contents: String,
+        display: &str,
+        pos: Pos,
+    ) -> LResult<()> {
+        if self.includes.iter().any(|f| f.path == path) {
+            return Err(self.err(pos, format!("recursive #include of {display}")));
+        }
+        if self.includes.len() >= MAX_INCLUDE_DEPTH {
+            return Err(self.err(pos, "#include nested too deeply"));
+        }
+        // The token already read past the `#include` line resumes the parent once the
+        // included file is exhausted.
         let resume = self.lookahead.take();
         self.includes.push(IncludeFrame {
             lexer: Lexer::new(&contents),
             resume,
             dir,
-            path: canon,
+            path,
             cond_depth: self.conds.len(),
         });
         Ok(())

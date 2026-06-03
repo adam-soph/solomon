@@ -41,17 +41,44 @@ pub use x86_64::{X64Linux, X64Windows};
 /// Non-existent entries are simply skipped at resolution time.
 pub fn stdlib_dirs() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
-    let mut dirs = Vec::new();
-    if let Ok(env) = std::env::var("SOLOMON_STDLIB") {
-        dirs.extend(env.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            dirs.push(d.join("lib"));
-            dirs.push(d.join("../lib"));
-            dirs.push(d.join("../../lib"));
-        }
-    }
-    dirs.push(PathBuf::from("lib"));
-    dirs
+    // The standard library is embedded in the compiler (see `EMBEDDED_STDLIB`), so a
+    // `lib/` directory on disk is no longer required. This returns only the override
+    // dirs from `SOLOMON_STDLIB` (searched before the embedded copy), for developing
+    // against a working tree's `lib/` without recompiling the compiler.
+    std::env::var("SOLOMON_STDLIB")
+        .ok()
+        .into_iter()
+        .flat_map(|env| {
+            env.split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The HolyC standard library (`lib/*.hc`), embedded into the compiler **at build
+/// time** via `include_str!`, as `(angle-include name, source)` pairs. An angle
+/// include `#include <name>` resolves here when the filesystem search path
+/// (`SOLOMON_STDLIB`, `-I`) doesn't provide it — so the compiler is self-contained
+/// and needs no `lib/` on disk. Editing a `lib/*.hc` file triggers a recompile
+/// (Cargo tracks `include_str!` inputs), keeping the embedded copy in sync.
+pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
+    ("cstr.hc", include_str!("../lib/cstr.hc")),
+    ("ctype.hc", include_str!("../lib/ctype.hc")),
+    ("mem.hc", include_str!("../lib/mem.hc")),
+    ("vec.hc", include_str!("../lib/vec.hc")),
+    ("bignum.hc", include_str!("../lib/bignum.hc")),
+    ("strconv.hc", include_str!("../lib/strconv.hc")),
+    ("math.hc", include_str!("../lib/math.hc")),
+    ("time.hc", include_str!("../lib/time.hc")),
+];
+
+/// The embedded source for stdlib angle-include `name`, or `None` if it isn't a
+/// bundled standard-library module.
+pub fn embedded_stdlib(name: &str) -> Option<&'static str> {
+    EMBEDDED_STDLIB
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, src)| src)
 }

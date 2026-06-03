@@ -313,10 +313,22 @@ U0 Main() { "%.6f\n", Exp(1.0); }   // 2.718282
 Main;
 ```
 
-`#include <name>` resolves against the library search path (vs `#include "file"`,
-which is relative to the including file): the `SOLOMON_STDLIB` environment variable
-(`:`-separated), then `lib/` relative to the `hcc`/`hci` executable, then `./lib`.
-`hcc -I DIR` prepends extra directories. `lib/math.hc` provides the rounding ops
+The library is **embedded into the compiler at build time** (each `lib/*.hc` is
+`include_str!`'d into the binary), so `hcc`/`hci` are **self-contained** — no `lib/`
+directory is needed at runtime, and a single copied binary just works. `#include
+<name>` resolves first against an optional override search path — the
+`SOLOMON_STDLIB` environment variable (`:`-separated) or `hcc -I DIR` — and then the
+embedded copy, so you can point at a working tree's `lib/` for development without
+rebuilding the compiler. (`#include "file"` is unchanged: relative to the including
+file.)
+
+The modules: `lib/cstr.hc` (C-style `U8 *` string ops — `StrLen`/`StrCmp`/`StrCpy`/
+`StrFind`/…, number conversion incl. `F64ToStr`, `Abs`/`Sign`), `lib/mem.hc` (the
+`Mem*` family plus `ReAlloc`), `lib/ctype.hc` (`ToUpper`/`ToLower` and the `Is*`
+predicates), `lib/vec.hc` (`Vec`, a generic growable array), `lib/strconv.hc`
+(`StrToF64`, a correctly-rounded bignum `atof`) over `lib/bignum.hc` (a minimal
+arbitrary-precision integer), and the two below. `lib/math.hc` provides the
+rounding ops
 `Floor`/`Ceil`/`Round`/`Trunc`/`Fmod`, `Exp`/`Ln`/`Log2`/`Log10`/`Exp2`/`Pow`,
 the trig and inverse-trig `Sin`/`Cos`/`Tan`/`Atan`/`Asin`/`Acos`/`Atan2`, the
 hyperbolics `Sinh`/`Cosh`/`Tanh`, plus `Hypot`, exact `PowI`, and

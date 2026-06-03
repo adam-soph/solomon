@@ -144,14 +144,50 @@ enum Place {
         buf: Rc<RefCell<Vec<u8>>>,
         off: usize,
         ty: Type,
+        /// The interpreter's pointer table. A pointer stored into a byte buffer is
+        /// serialised as an 8-byte handle into this table (since a `PtrVal` is a
+        /// region + offset, not a real address) and read back through it — so the
+        /// heap can hold pointers (and classes containing them), and a byte-wise
+        /// `MemCpy` of the handle bytes still names the same pointer.
+        ptrs: PtrTable,
     },
+}
+
+/// A pointer is serialised in a byte buffer as `0` for NULL or a 1-based index into
+/// this table for any other pointer.
+type PtrTable = Rc<RefCell<Vec<PtrVal>>>;
+
+/// Serialise a value being stored into a `Type::Ptr`/`FuncPtr` byte slot to its
+/// 8-byte handle. A real pointer is interned in `ptrs`; NULL/0 is handle 0; any other
+/// value (an integer punned as a pointer) keeps its low bits.
+fn serialize_ptr(v: &Value, ptrs: &PtrTable) -> u64 {
+    match v {
+        Value::Ptr(None) => 0,
+        Value::Ptr(Some(pv)) => {
+            let mut table = ptrs.borrow_mut();
+            table.push(pv.clone());
+            table.len() as u64 // 1-based; 0 is reserved for NULL
+        }
+        other => other.as_i64().unwrap_or(0) as u64,
+    }
+}
+
+/// Reconstruct a pointer from an 8-byte handle (the inverse of [`serialize_ptr`]).
+fn deserialize_ptr(handle: u64, ptrs: &PtrTable) -> Value {
+    if handle == 0 {
+        return Value::Ptr(None);
+    }
+    match ptrs.borrow().get((handle - 1) as usize) {
+        Some(pv) => Value::Ptr(Some(pv.clone())),
+        None => Value::Ptr(None),
+    }
 }
 
 impl Place {
     fn load(&self, pos: Pos) -> Result<Value, CodegenError> {
         match self {
             Place::Cell(c) => Ok(c.borrow().clone()),
-            Place::Bytes { buf, off, ty } => {
+            Place::Bytes { buf, off, ty, ptrs } => {
                 let n = scalar_byte_size(ty);
                 let bytes = buf.borrow();
                 if off + n > bytes.len() {
@@ -161,6 +197,8 @@ impl Place {
                 le[..n].copy_from_slice(&bytes[*off..*off + n]);
                 if matches!(ty, Type::F64) {
                     Ok(Value::Float(f64::from_le_bytes(le)))
+                } else if is_pointer_ty(ty) {
+                    Ok(deserialize_ptr(u64::from_le_bytes(le), ptrs))
                 } else {
                     // Sign-extend signed types from their width to 64 bits.
                     let mut v = i64::from_le_bytes(le);
@@ -181,10 +219,12 @@ impl Place {
                 *c.borrow_mut() = stored.clone();
                 Ok(stored)
             }
-            Place::Bytes { buf, off, ty } => {
+            Place::Bytes { buf, off, ty, ptrs } => {
                 let n = scalar_byte_size(ty);
                 let le = if matches!(ty, Type::F64) {
                     v.as_f64().unwrap_or(0.0).to_le_bytes()
+                } else if is_pointer_ty(ty) {
+                    serialize_ptr(&v, ptrs).to_le_bytes()
                 } else {
                     v.as_i64()
                         .ok_or_else(|| {
@@ -201,6 +241,12 @@ impl Place {
             }
         }
     }
+}
+
+/// Whether `ty` is a pointer (or function pointer) — the kinds serialised through
+/// the [`PtrTable`] when stored in a byte buffer.
+fn is_pointer_ty(ty: &Type) -> bool {
+    matches!(ty, Type::Ptr(_) | Type::FuncPtr { .. })
 }
 
 /// A pointer value: a region plus an element offset into it.
@@ -347,6 +393,9 @@ pub struct Interpreter<W: Write> {
     /// Requested byte size of each `MAlloc`'d heap region, keyed by region identity,
     /// for `MSize` (the native backends use a size header instead).
     heap_sizes: HashMap<usize, i64>,
+    /// Pointers serialised into byte buffers (see [`PtrTable`]). Shared (cloned `Rc`)
+    /// into every `Place::Bytes` so a handle round-trips and survives `MemCpy`.
+    ptr_table: PtrTable,
 }
 
 impl<W: Write> Interpreter<W> {
@@ -365,6 +414,7 @@ impl<W: Write> Interpreter<W> {
             args: vec!["hcc".to_string()],
             va_stack: Vec::new(),
             heap_sizes: HashMap::new(),
+            ptr_table: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -1326,18 +1376,9 @@ impl<W: Write> Interpreter<W> {
                 self.write_bytes(&buf, &bytes, pos)?;
                 Ok(buf)
             }
-            "StrToF64" => {
-                let bytes = self.cstr_bytes(&args[0], pos)?;
-                Ok(Value::Float(parse_atof(&bytes)))
-            }
-            "F64ToStr" => {
-                // Format the value into buf with the `%g` conversion; return buf.
-                let s = self.format("%g", std::slice::from_ref(&args[0]), pos)?;
-                let mut bytes = s.into_bytes();
-                bytes.push(0);
-                self.write_bytes(&args[1], &bytes, pos)?;
-                Ok(args[1].clone())
-            }
+            // Float conversion is not a builtin: `StrToF64` is a correctly-rounded
+            // bignum `atof` in lib/strconv.hc, `F64ToStr` a `StrPrint("%g")` wrapper
+            // in lib/cstr.hc.
             // Storage is reclaimed by `Rc`; freeing is a no-op.
             "Free" => Ok(Value::Void),
             // Clock/time primitives — impure (read the host clock or sleep).
@@ -1548,6 +1589,7 @@ impl<W: Write> Interpreter<W> {
                         buf: buf.clone(),
                         off: pv.index.max(0) as usize,
                         ty: e.ty().unwrap_or(Type::I64),
+                        ptrs: self.ptr_table.clone(),
                     })
                 } else {
                     Ok(Place::Cell(pv.target(pos)?))
@@ -1556,11 +1598,12 @@ impl<W: Write> Interpreter<W> {
             // Assigning a scalar union field writes into the shared byte buffer.
             ExprKind::Member { base, field, arrow } => {
                 if let Some((buf, off, fty)) = self.union_field(base, field, *arrow, pos, env)? {
-                    if is_byte_heap_elem(&fty) {
+                    if is_byte_heap_elem(&fty) || is_pointer_ty(&fty) {
                         return Ok(Place::Bytes {
                             buf,
                             off: off as usize,
                             ty: fty,
+                            ptrs: self.ptr_table.clone(),
                         });
                     }
                     return Err(CodegenError::at(
@@ -1683,14 +1726,6 @@ impl<W: Write> Interpreter<W> {
         env: &mut Env,
     ) -> Result<Option<(Rc<RefCell<Vec<u8>>>, u64, Type)>, CodegenError> {
         let bv = self.eval(base, env)?;
-        let uv = if arrow {
-            match as_pointer(&bv) {
-                Some(Some(pv)) => pv.target(pos)?.borrow().clone(),
-                _ => return Ok(None),
-            }
-        } else {
-            bv
-        };
         // The base's class name from its static type (deref for `->`).
         let class = match base.ty() {
             Some(Type::Named(n)) if !arrow => n,
@@ -1699,6 +1734,28 @@ impl<W: Write> Interpreter<W> {
                 _ => return Ok(None),
             },
             _ => return Ok(None),
+        };
+        // `class->field` through a pointer into a byte **heap** buffer: the class is
+        // laid out as raw bytes there (e.g. a `Pt *` element of a `Vec`'s data), so
+        // the field is a typed view at its offset — exactly like a union member.
+        if arrow {
+            if let Some(Some(pv)) = as_pointer(&bv) {
+                if let Region::Heap(buf) = &pv.region {
+                    return Ok(self
+                        .field_order(&class)
+                        .into_iter()
+                        .find(|(n, _, _)| n == field)
+                        .map(|(_, fty, foff)| (buf.clone(), pv.index.max(0) as u64 + foff, fty)));
+                }
+            }
+        }
+        let uv = if arrow {
+            match as_pointer(&bv) {
+                Some(Some(pv)) => pv.target(pos)?.borrow().clone(),
+                _ => return Ok(None),
+            }
+        } else {
+            bv
         };
         match uv {
             // The base is itself a union: the field is a typed view into it.
@@ -1775,11 +1832,12 @@ impl<W: Write> Interpreter<W> {
         fty: &Type,
         pos: Pos,
     ) -> Result<Value, CodegenError> {
-        if is_byte_heap_elem(fty) {
+        if is_byte_heap_elem(fty) || is_pointer_ty(fty) {
             Place::Bytes {
                 buf,
                 off: off as usize,
                 ty: fty.clone(),
+                ptrs: self.ptr_table.clone(),
             }
             .load(pos)
         } else if matches!(fty, Type::Array(..)) {
@@ -2043,12 +2101,13 @@ impl<W: Write> Interpreter<W> {
         env: &mut Env,
         pos: Pos,
     ) -> Result<(), CodegenError> {
-        if is_byte_heap_elem(fty) {
+        if is_byte_heap_elem(fty) || is_pointer_ty(fty) {
             let v = self.eval(value, env)?;
             Place::Bytes {
                 buf: buf.clone(),
                 off: off as usize,
                 ty: fty.clone(),
+                ptrs: self.ptr_table.clone(),
             }
             .store(v, pos)?;
         }
@@ -2467,49 +2526,6 @@ fn values_equal(l: &Value, r: &Value) -> bool {
             _ => false,
         },
     }
-}
-
-/// Parse a floating value like libc `atof`: skip leading whitespace, then take
-/// the longest valid decimal-float prefix (`[+-]?digits[.digits][e[+-]digits]`)
-/// and parse it; anything else yields 0.0.
-fn parse_atof(bytes: &[u8]) -> f64 {
-    let s = match std::str::from_utf8(bytes) {
-        Ok(s) => s.trim_start_matches(|c: char| c.is_ascii_whitespace()),
-        Err(_) => return 0.0,
-    };
-    let b = s.as_bytes();
-    let mut i = 0;
-    if matches!(b.first(), Some(b'+' | b'-')) {
-        i += 1;
-    }
-    let mut saw_digit = false;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-        saw_digit = true;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-            saw_digit = true;
-        }
-    }
-    if !saw_digit {
-        return 0.0;
-    }
-    if i < b.len() && matches!(b[i], b'e' | b'E') {
-        let mut j = i + 1;
-        if j < b.len() && matches!(b[j], b'+' | b'-') {
-            j += 1;
-        }
-        if j < b.len() && b[j].is_ascii_digit() {
-            while j < b.len() && b[j].is_ascii_digit() {
-                j += 1;
-            }
-            i = j;
-        }
-    }
-    s[..i].parse::<f64>().unwrap_or(0.0)
 }
 
 /// Whether `ty` is a signed integer type — drives arithmetic vs logical `>>`,

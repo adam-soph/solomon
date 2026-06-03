@@ -49,14 +49,13 @@ pub fn all() -> Vec<BuiltinSig> {
     let sigs = vec![
         // `Print(fmt, ...)` — printf-style output.
         sig("Print", Type::U0, vec![u8p()], true),
-        // The printf-family string builders. Variadic — they consume `...`, which
-        // HolyC has no `va_arg` for, so they can't yet be ordinary library code.
         sig("StrPrint", u8p(), vec![u8p(), u8p()], true), // (dst, fmt, ...) -> dst
         sig("CatPrint", u8p(), vec![u8p(), u8p()], true), // sprintf-append
         sig("MStrPrint", u8p(), vec![u8p()], true),       // asprintf into a fresh buffer
-        // Float parse/format (correctly-rounded bignum, shared with `Print`'s %g).
-        sig("StrToF64", f64(), vec![u8p()], false),
-        sig("F64ToStr", u8p(), vec![f64(), u8p()], false),
+        // Float conversion is *not* here: both directions are pure HolyC in
+        // `lib/strconv.hc`/`lib/cstr.hc`. `StrToF64` is a correctly-rounded bignum
+        // `atof` (no host libc), and its inverse `F64ToStr` is a `StrPrint("%g")`
+        // wrapper — so neither needs to be a primitive.
         // Clock/time primitives — impure (read the OS clock or sleep), so
         // non-reproducible: conformance is by property, not value.
         sig("UnixNS", i64(), vec![], false), // wall-clock ns (CLOCK_REALTIME)
@@ -64,14 +63,14 @@ pub fn all() -> Vec<BuiltinSig> {
         sig("Sleep", Type::U0, vec![i64()], false),
         // Heap (mmap bump allocator freestanding, libc malloc/free hosted). The
         // only irreducible memory primitives — the byte-loop ops (`MemCpy`/`MemMove`/
-        // `MemSet`/`MemCmp`/`MemFind`/`MemSearch`) are pure HolyC in `lib/string.hc`.
+        // `MemSet`/`MemCmp`/`MemFind`/`MemSearch`) are pure HolyC in `lib/mem.hc`.
         sig("MAlloc", u8p(), vec![i64()], false),
         sig("Free", Type::U0, vec![u8p()], false),
         // `HeapExtend(ptr, old, new)` grows the block at `ptr` (originally `old`
         // bytes) to `new` bytes *in place*, returning `ptr` — but only when that's
         // free (a bump allocator extending its last block); otherwise NULL. The one
         // irreducible bit of a `realloc`: the move-and-copy fallback is pure HolyC
-        // (`ReAlloc` in `lib/string.hc`). NULL on the libc/interp heaps (no in-place
+        // (`ReAlloc` in `lib/mem.hc`). NULL on the libc/interp heaps (no in-place
         // API), so they always take the copy path — where `Free` actually reclaims.
         sig("HeapExtend", u8p(), vec![u8p(), i64(), i64()], false),
         // `MSize(ptr)` returns the byte size that was requested for the block at
@@ -85,7 +84,7 @@ pub fn all() -> Vec<BuiltinSig> {
         // models specially — it can't byte-pun a local). The reducible rounding ops
         // (`Floor`/`Ceil`/`Round`, exact via an I64 cast) live in `lib/math.hc`, as
         // does the splitmix64 `RandU64`; `ToUpper`/`ToLower` and the `Is*` ctype
-        // predicates (ASCII range checks) live in `lib/string.hc`.
+        // predicates (ASCII range checks) live in `lib/ctype.hc`.
         sig("Sqrt", f64(), vec![f64()], false),
         sig("Fabs", f64(), vec![f64()], false),
         // The captured command line.
@@ -110,11 +109,12 @@ pub fn libc_symbol(name: &str) -> Option<&'static str> {
         "MAlloc" => "_malloc",
         "Free" => "_free",
         "Fabs" => "_fabs",
-        "StrToF64" => "_atof",
         // `ArgC`/`ArgV` (read hidden globals) and `Print`/`StrPrint`/`CatPrint`/
-        // `MStrPrint`/`F64ToStr` (specially lowered) are not here. The string,
-        // memory, ctype and PRNG ops are no longer builtins at all — they live in
-        // `lib/string.hc` / `lib/math.hc` as pure HolyC.
+        // `MStrPrint` (specially lowered) are not here. The string, memory, ctype and
+        // PRNG ops — plus float conversion `F64ToStr` (a `StrPrint("%g")` wrapper) and
+        // `StrToF64` (a correctly-rounded bignum `atof`) — are no longer builtins at
+        // all: they live in `lib/cstr.hc`/`mem.hc`/`ctype.hc`/`strconv.hc` / `math.hc`
+        // as pure HolyC.
         _ => return None,
     })
 }

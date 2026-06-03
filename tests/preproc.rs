@@ -381,3 +381,23 @@ fn type_defined_in_an_include_is_usable() {
         "should pass semantic analysis"
     );
 }
+
+#[test]
+fn angle_include_resolves_from_the_embedded_stdlib() {
+    // `parse` carries no filesystem search path, so `#include <...>` of a standard
+    // library module must resolve from the copy embedded in the compiler at build
+    // time — and its types (`class Vec`) and functions (`StrLen`) become usable.
+    let src = "#include <vec.hc>\n#include <cstr.hc>\n\
+               U0 Main() { Vec v; VecInit(&v, 8); I64 n = StrLen(\"hi\"); }";
+    let program = parse(src).expect("angle include should resolve from the embedded stdlib");
+    assert!(
+        check_program(&program).is_empty(),
+        "embedded stdlib should type-check: {:?}",
+        check_program(&program)
+    );
+    // A non-stdlib angle include with no search path is still an error.
+    assert!(
+        parse("#include <does_not_exist.hc>\nU0 Main() {}").is_err(),
+        "unknown angle include without a search path should fail"
+    );
+}
