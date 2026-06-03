@@ -25,6 +25,8 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("json.hc", include_str!("../examples/json.hc")),
     ("report.hc", include_str!("../examples/report.hc")),
     ("gallery.hc", include_str!("../examples/gallery.hc")),
+    ("tuples.hc", include_str!("../examples/tuples.hc")),
+    ("hmap.hc", include_str!("../examples/hmap.hc")),
 ];
 
 /// Parse an example/source with the standard library on the angle-include search

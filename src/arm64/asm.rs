@@ -336,11 +336,18 @@ impl Asm {
             let immhi = ((imm as u32) >> 2) & 0x7_FFFF;
             self.words[*at] |= (immlo << 29) | (immhi << 5);
         }
-        // Freestanding globals live in the BSS that follows code+strings (`cursor`
-        // is the end of the file image, where the BSS begins). Resolve each to a
-        // PC-relative ADR pointing at `cursor + offset`.
+        // Freestanding globals live in the BSS that follows code+strings. The BSS base
+        // is the end of code+strings, **16-byte aligned** (the load vaddr is page
+        // aligned, so an aligned base + the per-global aligned offsets give naturally
+        // aligned addresses — required by the AArch64 acquire/exclusive atomics, which
+        // fault on misalignment). The image is zero-padded up to that base.
+        let bss_base = if self.global_adr_fixups.is_empty() {
+            cursor // Darwin (relocated globals) / no freestanding globals: unchanged
+        } else {
+            cursor.div_ceil(16) * 16
+        };
         for (at, off) in &self.global_adr_fixups {
-            let imm = (cursor as i64 + *off as i64) - (*at * 4) as i64;
+            let imm = (bss_base as i64 + *off as i64) - (*at * 4) as i64;
             if !(-(1 << 20)..(1 << 20)).contains(&imm) {
                 return Err(CodegenError::new("global too far for ADR (>1MB)", None));
             }
@@ -348,13 +355,14 @@ impl Asm {
             let immhi = ((imm as u32) >> 2) & 0x7_FFFF;
             self.words[*at] |= (immlo << 29) | (immhi << 5);
         }
-        let mut text = Vec::with_capacity(cursor);
+        let mut text = Vec::with_capacity(bss_base);
         for w in &self.words {
             text.extend_from_slice(&w.to_le_bytes());
         }
         for s in &self.strings {
             text.extend_from_slice(s);
         }
+        text.resize(bss_base, 0); // pad to the aligned BSS base
         let relocs = self
             .relocs
             .iter()
@@ -441,6 +449,15 @@ impl Asm {
     pub(super) fn str_idx8(&mut self, rt: u32, base: u32, idx: u32) {
         let w = 0xF820_7800 | (idx << 16) | (base << 5) | rt;
         self.emit_du(w, -1, gpb(rt) | gpb(base) | gpb(idx), B_NORMAL);
+    }
+    /// LDR Wt, [Xn] — load the 32-bit word at `[base, #0]` (zero-extended).
+    pub(super) fn ldr_w(&mut self, rt: u32, base: u32) {
+        self.emit_du(
+            0xB940_0000 | (base << 5) | rt,
+            rt as i32,
+            gpb(base),
+            B_NORMAL,
+        );
     }
     pub(super) fn lsrv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
@@ -597,6 +614,33 @@ impl Asm {
     }
     pub(super) fn patch_sub_sp(&mut self, idx: usize, imm: u32) {
         self.words[idx] |= (imm & 0xFFF) << 10;
+    }
+
+    // Atomic / acquire-release memory ops (for `sync.hc`), sized by `sz` = log2(bytes)
+    // — 0=byte (`*b`), 1=half (`*h`), 2=word (32-bit), 3=dword (64-bit) — in bits
+    // 31:30. The narrow loads zero-extend into the 64-bit register; the caller
+    // sign/zero-extends per the pointee type. `emit`'s conservative default tags
+    // (barrier, reads everything) keep the peephole pass from reordering/dropping them.
+    /// LDAR{B,H} <t>, [Xn] — load-acquire.
+    pub(super) fn ldar(&mut self, t: u32, n: u32, sz: u32) {
+        self.emit((sz << 30) | 0x08DF_FC00 | (n << 5) | t);
+    }
+    /// STLR{B,H} <t>, [Xn] — store-release.
+    pub(super) fn stlr(&mut self, t: u32, n: u32, sz: u32) {
+        self.emit((sz << 30) | 0x089F_FC00 | (n << 5) | t);
+    }
+    /// LDAXR{B,H} <t>, [Xn] — load-acquire exclusive (arms the exclusive monitor).
+    pub(super) fn ldaxr(&mut self, t: u32, n: u32, sz: u32) {
+        self.emit((sz << 30) | 0x085F_FC00 | (n << 5) | t);
+    }
+    /// STLXR{B,H} Ws, <t>, [Xn] — store-release exclusive; `Ws` = 0 on success, 1 if
+    /// the monitor was lost (retry).
+    pub(super) fn stlxr(&mut self, s: u32, t: u32, n: u32, sz: u32) {
+        self.emit((sz << 30) | 0x0800_FC00 | (s << 16) | (n << 5) | t);
+    }
+    /// DMB ISH — a full data memory barrier (inner-shareable): `AtomicFence`.
+    pub(super) fn dmb_ish(&mut self) {
+        self.emit(0xD503_3BBF);
     }
 
     // width-aware memory (offset 0 from `addr`)

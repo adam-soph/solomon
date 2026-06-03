@@ -20,6 +20,33 @@ fn hello_greets() {
 }
 
 #[test]
+fn tuples_multireturn_index_and_destructure() {
+    let out = run("tuples.hc", include_str!("../examples/tuples.hc"));
+    assert_eq!(
+        out,
+        "17 / 5 = 3 rem 2\n\
+         20 / 3 = 6\n\
+         p[0]=1 p[1]=2\n\
+         x=1 y=2\n\
+         sum=10 prod=21 avg=5.0\n"
+    );
+}
+
+#[test]
+fn hmap_lookup_returns_value_and_found() {
+    let out = run("hmap.hc", include_str!("../examples/hmap.hc"));
+    assert_eq!(
+        out,
+        "len=9\n\
+         zero: found=1 value=0\n\
+         missing: found=0 value=0\n\
+         two=22 one=1 f=15\n\
+         has(a)=1 del(a)=1 has(a)=0\n\
+         del(missing)=0 len=8\n"
+    );
+}
+
+#[test]
 fn linklist_sorts_and_computes() {
     let out = run("linklist.hc", include_str!("../examples/linklist.hc"));
     assert_eq!(out, "sorted: 1 2 3 5 7 8 9 \nlength=7 gcd(48,36)=12\n");

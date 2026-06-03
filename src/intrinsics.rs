@@ -55,6 +55,25 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // allocator freestanding, libc `malloc`/`free` hosted). `HeapExtend` is the
         // irreducible bit of `realloc`; `MSize` reads a block's tracked size.
         "MAlloc" | "Free" | "HeapExtend" | "MSize" => Primitive,
+        // The raw fd I/O primitives — `lib/io.hc` prototypes (files) and `lib/net.hc`
+        // (sockets); impure OS I/O (raw syscalls freestanding, libc on Darwin), so
+        // non-reproducible like the clock. `Read`/`Write`/`Close`/`Open`/`LSeek` are
+        // general fd ops shared by files and sockets; `Socket`/`Connect` are the
+        // socket-specific pair. (The libs build `ReadFile`/`TcpConnect`/… on top.)
+        "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" => Primitive,
+        // POSIX-style threads — `lib/thread.hc` prototypes; impure/concurrent (libc
+        // `pthread_create`/`pthread_join` on Darwin, raw `clone(2)` freestanding), so
+        // non-reproducible by value. The interpreter runs the body synchronously.
+        "Thread" | "Join" => Primitive,
+        // Atomics — `lib/sync.hc` prototypes; lowered to the hardware atomic
+        // instructions (`ldaxr`/`stlxr` loops, `lock xadd`/`xchg`/`cmpxchg`). The
+        // interpreter (synchronous threads, no contention) does a plain
+        // read-modify-write. `Mutex` is pure HolyC on top.
+        "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas" => Primitive,
+        // Memory fence + the kernel wait/wake behind the blocking `Mutex`: `dmb`/
+        // `mfence`, and `futex(2)` (freestanding) / `__ulock_*` (Darwin). No-ops in the
+        // synchronous interpreter.
+        "AtomicFence" | "FutexWait" | "FutexWake" => Primitive,
         _ => return None,
     })
 }

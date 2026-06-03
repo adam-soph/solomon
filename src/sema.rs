@@ -677,8 +677,14 @@ impl Analyzer {
                 self.error(pos, "returning a value from a U0 (void) function");
             }
             (Some(rt), Some(e)) if rt != Type::U0 => {
-                let vt = self.check_expr(e);
-                self.check_assignable(&rt, &vt, e.span.pos);
+                // A brace/tuple-literal return (`return a, b;`) is checked against the
+                // (tuple/aggregate) return type, like an initialiser.
+                if matches!(e.kind, ExprKind::InitList(_) | ExprKind::DesignatedInit(_)) {
+                    self.check_init(e, &rt, e.span.pos);
+                } else {
+                    let vt = self.check_expr(e);
+                    self.check_assignable(&rt, &vt, e.span.pos);
+                }
             }
             (Some(rt), None) if rt != Type::U0 => {
                 self.error(pos, "missing return value in non-void function");
@@ -976,6 +982,27 @@ impl Analyzer {
 
     fn check_index(&mut self, base: &Expr, index: &Expr) -> Type {
         let bt = Self::decay(self.check_expr(base));
+        // Tuple indexing: a **constant** index selects a positional slot, whose type
+        // depends on the index — so `t[0]` and `t[1]` may differ.
+        if let Type::Named(name) = &bt {
+            if crate::ast::is_tuple_name(name) {
+                self.check_expr(index);
+                let idx = match &index.kind {
+                    ExprKind::Int(n) if *n >= 0 => *n,
+                    _ => {
+                        self.error(index.span.pos, "a tuple index must be a constant integer");
+                        return Type::I64;
+                    }
+                };
+                return match self.lookup_field(name, &format!("_{idx}")) {
+                    Some(t) => t,
+                    None => {
+                        self.error(index.span.pos, format!("tuple index {idx} out of range"));
+                        Type::I64
+                    }
+                };
+            }
+        }
         let it = self.check_expr(index);
         if !is_integer(&it) {
             self.error(index.span.pos, "array index must be an integer");

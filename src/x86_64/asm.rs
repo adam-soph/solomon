@@ -117,7 +117,15 @@ impl Asm {
         }
         self.code.extend_from_slice(import);
         // The BSS region follows everything in the address space (zero-filled, never
-        // in the file). A global ref resolves to `bss_base + off`.
+        // in the file). A global ref resolves to `bss_base + off`. When there are
+        // globals, pad to a 16-byte boundary first so the per-global aligned offsets
+        // land at aligned addresses — a misaligned `lock`-prefixed atomic is a *split
+        // lock*, which faults (#AC) on CPUs with split-lock detection. (Skipped with no
+        // globals so a global-less image still ends exactly at its last instruction.)
+        if !self.global_fixups.is_empty() {
+            let new_len = self.code.len().div_ceil(16) * 16;
+            self.code.resize(new_len, 0);
+        }
         let bss_base = self.code.len();
         for &(pos, off) in &self.global_fixups {
             let disp = (bss_base as i64 + off as i64) - (pos as i64 + 4);
@@ -261,10 +269,72 @@ impl Asm {
         self.emit(&[0x85]);
         self.emit(&(-off).to_le_bytes());
     }
+    /// Narrow rax in place to `size` bytes, sign/zero-extending back to 64 bits
+    /// (`movsx`/`movzx`/`movsxd rax, <al/ax/eax>`). A no-op at 8 bytes. Used to
+    /// truncate a value to a narrow integer width in a register — e.g. a narrow
+    /// function return, where there is no store to do the truncation.
+    pub(super) fn cast_rax(&mut self, size: i32, signed: bool) {
+        if size >= 8 {
+            return;
+        }
+        self.emit(load_opcode(size, signed));
+        self.emit(&[0xC0]); // ModRM mod=11 reg=rax rm=rax (register source)
+    }
     /// Width-aware load through the address in rax (`rax = [rax]`). ModRM `0x00`.
     pub(super) fn load_through(&mut self, size: i32, signed: bool) {
         self.emit(load_opcode(size, signed));
         self.emit(&[0x00]);
+    }
+    /// Emit the operand-size prefix + (conditional) REX for a `size`-byte atomic on
+    /// `(reg, [rm])`: a `0x66` prefix for 16-bit, REX.W for 64-bit, REX.R/B for
+    /// extended registers. `size` is 1/2/4/8. (The narrow forms use al/cl/eax…
+    /// directly, so the registers used here never need a REX for their low byte.)
+    fn atomic_prefix(&mut self, reg: u8, rm: u8, size: i32) {
+        if size == 2 {
+            self.emit(&[0x66]);
+        }
+        let rex = 0x40
+            | if size == 8 { 0x08 } else { 0 }
+            | if reg >= 8 { 0x04 } else { 0 }
+            | if rm >= 8 { 0x01 } else { 0 };
+        if rex != 0x40 {
+            self.emit(&[rex]);
+        }
+    }
+    /// `lock xadd [base], src` (sized 1/2/4/8) — atomically `[base] += src`, and `src`
+    /// receives the old `[base]`. (`base` must not be rsp/rbp/r12/r13.)
+    pub(super) fn lock_xadd(&mut self, base: u8, src: u8, size: i32) {
+        self.emit(&[0xF0]);
+        self.atomic_prefix(src, base, size);
+        self.emit(if size == 1 {
+            &[0x0F, 0xC0]
+        } else {
+            &[0x0F, 0xC1]
+        });
+        self.emit(&[((src & 7) << 3) | (base & 7)]);
+    }
+    /// `xchg [base], src` (sized) — atomic exchange (lock is implicit for a memory
+    /// operand); `src` receives the old `[base]`.
+    pub(super) fn xchg_mem(&mut self, base: u8, src: u8, size: i32) {
+        self.atomic_prefix(src, base, size);
+        self.emit(if size == 1 { &[0x86] } else { &[0x87] });
+        self.emit(&[((src & 7) << 3) | (base & 7)]);
+    }
+    /// `lock cmpxchg [base], src` (sized) — if `[base] == <acc>` then `[base] = src`;
+    /// the accumulator (al/ax/eax/rax) always receives the old `[base]`.
+    pub(super) fn lock_cmpxchg(&mut self, base: u8, src: u8, size: i32) {
+        self.emit(&[0xF0]);
+        self.atomic_prefix(src, base, size);
+        self.emit(if size == 1 {
+            &[0x0F, 0xB0]
+        } else {
+            &[0x0F, 0xB1]
+        });
+        self.emit(&[((src & 7) << 3) | (base & 7)]);
+    }
+    /// `mfence` — a full memory barrier (`AtomicFence`).
+    pub(super) fn mfence(&mut self) {
+        self.emit(&[0x0F, 0xAE, 0xF0]);
     }
     /// Store the low `size` bytes of rax through the address in rcx (`[rcx] = rax`).
     pub(super) fn store_through(&mut self, size: i32) {

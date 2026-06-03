@@ -464,3 +464,39 @@ fn expr_calls(e: &Expr, names: &[&str]) -> bool {
         ExprKind::DesignatedInit(fs) => fs.iter().any(|(_, e)| expr_calls(e, names)),
     }
 }
+
+/// Whether `name` is a compiler-synthesized tuple struct (`$Tup$…`) — a tuple type
+/// `(T1, …, Tn)` lowered to a positional struct with fields `_0`, `_1`, ….
+pub fn is_tuple_name(name: &str) -> bool {
+    name.starts_with("$Tup")
+}
+
+/// If `e` is `tuple[k]` (a tuple-typed base with a constant index), return the
+/// equivalent member access `tuple._k`, carrying `e`'s already-inferred slot type.
+/// Tuple indexing is positional field access, so every backend rewrites it this way.
+pub fn tuple_index_as_member(e: &Expr) -> Option<Expr> {
+    let ExprKind::Index { base, index } = &e.kind else {
+        return None;
+    };
+    let Some(Type::Named(name)) = base.ty() else {
+        return None;
+    };
+    let ExprKind::Int(k) = &index.kind else {
+        return None;
+    };
+    if !is_tuple_name(&name) || *k < 0 {
+        return None;
+    }
+    let m = Expr::new(
+        ExprKind::Member {
+            base: base.clone(),
+            field: format!("_{k}"),
+            arrow: false,
+        },
+        e.span,
+    );
+    if let Some(t) = e.ty() {
+        m.set_ty(t);
+    }
+    Some(m)
+}

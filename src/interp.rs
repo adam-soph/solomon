@@ -249,6 +249,15 @@ fn is_pointer_ty(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_) | Type::FuncPtr { .. })
 }
 
+/// The pointee type of an atomic op's pointer argument (its width directs the access),
+/// defaulting to `I64` for an untyped / non-pointer expression.
+fn pointee_or_i64(e: &Expr) -> Type {
+    match e.ty() {
+        Some(Type::Ptr(inner)) | Some(Type::Array(inner, _)) => *inner,
+        _ => Type::I64,
+    }
+}
+
 /// A pointer value: a region plus an element offset into it.
 #[derive(Clone)]
 pub struct PtrVal {
@@ -396,6 +405,29 @@ pub struct Interpreter<W: Write> {
     /// Pointers serialised into byte buffers (see [`PtrTable`]). Shared (cloned `Rc`)
     /// into every `Place::Bytes` so a handle round-trips and survives `MemCpy`.
     ptr_table: PtrTable,
+    /// Open file descriptors for the POSIX-style fd intrinsics — `Socket`/`Connect`
+    /// (sockets) and `Open`/`LSeek` (files), with the shared `Read`/`Write`/`Close`.
+    /// The interpreter emulates them over `std::net`/`std::fs`. (Impure — these do
+    /// real I/O, so they're property-tested, not compared to the backends by value.)
+    fds: HashMap<i64, FdObj>,
+    /// The next synthetic fd handed out by `Socket`/`Open` (past stdin/out/err).
+    next_fd: i64,
+    /// `Thread`/`Join` emulation: the interpreter runs each spawned thread body
+    /// **synchronously at spawn time** (it isn't re-entrant across OS threads) and
+    /// stashes the function's return here, keyed by handle, for `Join` to return.
+    /// Sound for interleaving-independent work — the documented `thread.hc` contract.
+    thread_results: HashMap<i64, i64>,
+    /// The next `Thread` handle (a namespace distinct from fds).
+    next_thread: i64,
+}
+
+/// An interpreter file descriptor: a reserved-but-unconnected socket, a live TCP
+/// stream, or an open file. `Read`/`Write` go to the stream/file; `LSeek` only to a
+/// file.
+enum FdObj {
+    PendingSocket,
+    Tcp(std::net::TcpStream),
+    File(std::fs::File),
 }
 
 impl<W: Write> Interpreter<W> {
@@ -415,6 +447,10 @@ impl<W: Write> Interpreter<W> {
             va_stack: Vec::new(),
             heap_sizes: HashMap::new(),
             ptr_table: Rc::new(RefCell::new(Vec::new())),
+            fds: HashMap::new(),
+            next_fd: 3,
+            thread_results: HashMap::new(),
+            next_thread: 1,
         }
     }
 
@@ -601,6 +637,17 @@ impl<W: Write> Interpreter<W> {
             StmtKind::Continue => Ok(Flow::Continue),
             StmtKind::Return(opt) => {
                 let v = match opt {
+                    // A brace/tuple-literal return builds the aggregate against the
+                    // return type sema recorded on the node.
+                    Some(e)
+                        if matches!(
+                            e.kind,
+                            ExprKind::InitList(_) | ExprKind::DesignatedInit(_)
+                        ) =>
+                    {
+                        let ty = e.ty().unwrap_or(Type::I64);
+                        self.eval_init(e, &ty, env)?
+                    }
                     Some(e) => self.eval(e, env)?,
                     None => Value::Void,
                 };
@@ -1239,6 +1286,19 @@ impl<W: Write> Interpreter<W> {
         // A direct call to a named function/builtin, unless a variable shadows it.
         if let ExprKind::Ident(name) = &callee.kind {
             if self.resolve(env, name).is_none() {
+                // Atomics are width-directed by the pointer's pointee type, which is
+                // only available here (at the expression level) — handle them before
+                // the value-only `call`. A user function with a body still shadows.
+                let shadowed = self.funcs.get(name).is_some_and(|f| f.body.is_some());
+                if !shadowed
+                    && matches!(
+                        name.as_str(),
+                        "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas"
+                    )
+                {
+                    let pty = pointee_or_i64(&args[0]);
+                    return self.eval_atomic(name, &pty, &argv, pos);
+                }
                 return self.call(name, argv, pos);
             }
         }
@@ -1255,7 +1315,13 @@ impl<W: Write> Interpreter<W> {
         // implemented by the interpreter directly. An *optimization* intrinsic like
         // `Sqrt` is an ordinary lib function with a real body, so it falls through to
         // the user-function path below and runs that body.
-        if crate::builtins::is_builtin(name) || crate::intrinsics::is_primitive(name) {
+        // A user-defined function with a real body shadows a like-named primitive
+        // intrinsic (e.g. a program's own `Join`/`Read`): only do the bespoke builtin
+        // lowering when no body is in scope (the lib prototype, which has none).
+        let user_defined = self.funcs.get(name).is_some_and(|f| f.body.is_some());
+        if !user_defined
+            && (crate::builtins::is_builtin(name) || crate::intrinsics::is_primitive(name))
+        {
             return self.call_builtin(name, &args, pos);
         }
         if let Some(f) = self.funcs.get(name).cloned() {
@@ -1402,6 +1468,157 @@ impl<W: Write> Interpreter<W> {
                 std::thread::sleep(std::time::Duration::from_nanos(ns));
                 Ok(Value::Void)
             }
+            // POSIX fd primitives — a thin emulator over `std::net`/`std::fs`. The
+            // socket `domain`/`type`/`proto` are ignored (only AF_INET/SOCK_STREAM is
+            // modelled, like the native `socket(2)`); `Socket` just reserves an fd and
+            // `Connect` does the real `TcpStream::connect` from the `sockaddr` bytes.
+            "Socket" => {
+                let fd = self.next_fd;
+                self.next_fd += 1;
+                self.fds.insert(fd, FdObj::PendingSocket);
+                Ok(Value::Int(fd))
+            }
+            "Connect" => {
+                let fd = self.to_i64(args[0].clone(), pos)?;
+                let sa = self.read_n_bytes(&args[1], 16, pos)?; // sockaddr_in
+                let port = u16::from_be_bytes([sa[2], sa[3]]);
+                let ip = std::net::Ipv4Addr::new(sa[4], sa[5], sa[6], sa[7]);
+                if !matches!(self.fds.get(&fd), Some(FdObj::PendingSocket)) {
+                    return Ok(Value::Int(-1)); // not a fresh socket fd
+                }
+                match std::net::TcpStream::connect((ip, port)) {
+                    Ok(stream) => {
+                        self.fds.insert(fd, FdObj::Tcp(stream));
+                        Ok(Value::Int(0))
+                    }
+                    Err(_) => Ok(Value::Int(-1)),
+                }
+            }
+            // `Open(path, flags, mode)` — the canonical flags are Linux's (see
+            // `lib/io.hc`); map them to `OpenOptions` (`O_RDONLY`/`O_WRONLY`/`O_RDWR`
+            // plus `O_CREAT`/`O_TRUNC`/`O_APPEND`).
+            "Open" => {
+                use std::os::unix::ffi::OsStrExt;
+                let path_bytes = self.cstr_bytes(&args[0], pos)?;
+                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&path_bytes));
+                let flags = self.to_i64(args[1].clone(), pos)?;
+                let mut opts = std::fs::OpenOptions::new();
+                match flags & 0b11 {
+                    0 => opts.read(true),             // O_RDONLY
+                    1 => opts.write(true),            // O_WRONLY
+                    _ => opts.read(true).write(true), // O_RDWR
+                };
+                if flags & 0x40 != 0 {
+                    opts.create(true); // O_CREAT
+                }
+                if flags & 0x200 != 0 {
+                    opts.truncate(true); // O_TRUNC
+                }
+                if flags & 0x400 != 0 {
+                    opts.append(true); // O_APPEND
+                }
+                if flags & 0x40 != 0 {
+                    // O_CREAT: honour the requested permission bits (like the native
+                    // `open(2)`), so a created file is readable/writable as asked.
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mode = self.to_i64(args[2].clone(), pos)?;
+                    opts.mode(mode as u32);
+                }
+                match opts.open(path) {
+                    Ok(file) => {
+                        let fd = self.next_fd;
+                        self.next_fd += 1;
+                        self.fds.insert(fd, FdObj::File(file));
+                        Ok(Value::Int(fd))
+                    }
+                    // Mirror the syscall contract: a negative `-errno` (the common
+                    // POSIX codes — ENOENT=2, EACCES=13, … — agree across Linux and
+                    // macOS, so `StrError` renders the same on every target).
+                    Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
+                }
+            }
+            "LSeek" => {
+                let fd = self.to_i64(args[0].clone(), pos)?;
+                let off = self.to_i64(args[1].clone(), pos)?;
+                let whence = self.to_i64(args[2].clone(), pos)?;
+                let from = match whence {
+                    0 => std::io::SeekFrom::Start(off as u64),
+                    1 => std::io::SeekFrom::Current(off),
+                    2 => std::io::SeekFrom::End(off),
+                    _ => return Ok(Value::Int(-1)),
+                };
+                match self.fds.get_mut(&fd) {
+                    Some(FdObj::File(f)) => match std::io::Seek::seek(f, from) {
+                        Ok(p) => Ok(Value::Int(p as i64)),
+                        Err(_) => Ok(Value::Int(-1)),
+                    },
+                    _ => Ok(Value::Int(-1)), // not a seekable fd
+                }
+            }
+            "Write" => {
+                let fd = self.to_i64(args[0].clone(), pos)?;
+                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
+                let bytes = self.read_n_bytes(&args[1], n, pos)?;
+                let res = match self.fds.get_mut(&fd) {
+                    Some(FdObj::Tcp(s)) => std::io::Write::write(s, &bytes),
+                    Some(FdObj::File(f)) => std::io::Write::write(f, &bytes),
+                    _ => return Ok(Value::Int(-1)),
+                };
+                Ok(Value::Int(res.map(|w| w as i64).unwrap_or(-1)))
+            }
+            "Read" => {
+                let fd = self.to_i64(args[0].clone(), pos)?;
+                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
+                let mut buf = vec![0u8; n];
+                let got = match self.fds.get_mut(&fd) {
+                    Some(FdObj::Tcp(s)) => std::io::Read::read(s, &mut buf),
+                    Some(FdObj::File(f)) => std::io::Read::read(f, &mut buf),
+                    _ => return Ok(Value::Int(-1)),
+                };
+                match got {
+                    Ok(cnt) => {
+                        self.write_bytes(&args[1], &buf[..cnt], pos)?;
+                        Ok(Value::Int(cnt as i64))
+                    }
+                    Err(_) => Ok(Value::Int(-1)),
+                }
+            }
+            "Close" => {
+                let fd = self.to_i64(args[0].clone(), pos)?;
+                self.fds.remove(&fd); // dropping the stream/file closes it
+                Ok(Value::Int(0))
+            }
+            // Threads, emulated synchronously (see the `thread_results` note): run the
+            // function body now, save its return for `Join`. `fn` is a function pointer
+            // (`&Fn`), i.e. a `Value::Func(name)`.
+            "Thread" => {
+                let Value::Func(fname) = &args[0] else {
+                    return Err(CodegenError::at(
+                        pos,
+                        "Thread: first argument must be a function pointer (`&Fn`)",
+                    ));
+                };
+                let fname = fname.clone();
+                let arg = args[1].clone();
+                let ret = self.call(&fname, vec![arg], pos)?;
+                let rv = match ret {
+                    Value::Void => 0,
+                    other => value_as_i64(&other),
+                };
+                let handle = self.next_thread;
+                self.next_thread += 1;
+                self.thread_results.insert(handle, rv);
+                Ok(Value::Int(handle))
+            }
+            "Join" => {
+                let handle = self.to_i64(args[0].clone(), pos)?;
+                Ok(Value::Int(self.thread_results.remove(&handle).unwrap_or(0)))
+            }
+            // (Atomics are handled in `eval_atomic`, dispatched from `eval_call` where
+            // the pointer's pointee width is known.) Threads run synchronously, so the
+            // fence and the futex wait/wake are no-ops (a thread never actually blocks).
+            "AtomicFence" => Ok(Value::Void),
+            "FutexWait" | "FutexWake" => Ok(Value::Int(0)),
             "ArgC" => Ok(Value::Int(self.args.len() as i64)),
             "ArgV" => {
                 let i = self.to_i64(args[0].clone(), pos)?;
@@ -1437,6 +1654,113 @@ impl<W: Write> Interpreter<W> {
                 pos,
                 format!("builtin `{name}` is not implemented"),
             )),
+        }
+    }
+
+    /// An atomic op (`sync.hc`), width-directed by the pointer's pointee type `pty`.
+    /// The interpreter runs threads synchronously (no real contention), so each is a
+    /// plain read-modify-write of the `pty`-sized scalar the pointer names — values
+    /// masked/extended to the pointee width so it matches the native hardware-atomic
+    /// lowering for any integer width (`U32` counter, pointer, `U8`, …).
+    fn eval_atomic(
+        &mut self,
+        name: &str,
+        pty: &Type,
+        argv: &[Value],
+        pos: Pos,
+    ) -> Result<Value, CodegenError> {
+        let place = self.atomic_place(&argv[0], pty, pos)?;
+        let fit = |v: i64| cast_value(pty, Value::Int(v)).as_i64().unwrap_or(v);
+        match name {
+            "AtomicLoad" => Ok(cast_value(pty, place.load(pos)?)),
+            "AtomicStore" => {
+                let v = self.to_i64(argv[1].clone(), pos)?;
+                place.store(cast_value(pty, Value::Int(v)), pos)?;
+                Ok(Value::Void)
+            }
+            "AtomicAdd" => {
+                let delta = self.to_i64(argv[1].clone(), pos)?;
+                let old = place.load(pos)?.as_i64().unwrap_or(0);
+                let new = fit(old.wrapping_add(delta));
+                place.store(Value::Int(new), pos)?;
+                Ok(Value::Int(new))
+            }
+            "AtomicSwap" => {
+                let v = self.to_i64(argv[1].clone(), pos)?;
+                let old = fit(place.load(pos)?.as_i64().unwrap_or(0));
+                place.store(cast_value(pty, Value::Int(v)), pos)?;
+                Ok(Value::Int(old))
+            }
+            "AtomicCas" => {
+                let expected = fit(self.to_i64(argv[1].clone(), pos)?);
+                let desired = self.to_i64(argv[2].clone(), pos)?;
+                let old = fit(place.load(pos)?.as_i64().unwrap_or(0));
+                if old == expected {
+                    place.store(cast_value(pty, Value::Int(desired)), pos)?;
+                }
+                Ok(Value::Int(old))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Resolve a pointer value (passed to an atomic op) to the `Place` of the `pty`-
+    /// sized scalar it names — a heap byte slot or a backing cell — so the atomic can
+    /// load/store it like an ordinary scalar of that width.
+    fn atomic_place(&self, ptr: &Value, pty: &Type, pos: Pos) -> Result<Place, CodegenError> {
+        match ptr {
+            Value::Ptr(Some(pv)) => {
+                if let Region::Heap(buf) = &pv.region {
+                    Ok(Place::Bytes {
+                        buf: buf.clone(),
+                        off: pv.index.max(0) as usize,
+                        ty: pty.clone(),
+                        ptrs: self.ptr_table.clone(),
+                    })
+                } else {
+                    Ok(Place::Cell(pv.target(pos)?))
+                }
+            }
+            Value::Ptr(None) => Err(CodegenError::at(pos, "atomic op on a null pointer")),
+            _ => Err(CodegenError::at(pos, "atomic op expects a pointer")),
+        }
+    }
+
+    /// Read exactly `n` bytes from the buffer `ptr` points at (a heap byte buffer, a
+    /// cell-backed array/pointer, or a string literal), zero-padding if it's shorter.
+    /// Marshals a fixed-size buffer (a `sockaddr`, a read target) out of HolyC memory.
+    fn read_n_bytes(&self, ptr: &Value, n: usize, pos: Pos) -> Result<Vec<u8>, CodegenError> {
+        match ptr {
+            Value::Str(s) => {
+                let b = s.as_bytes();
+                Ok((0..n).map(|i| b.get(i).copied().unwrap_or(0)).collect())
+            }
+            Value::Ptr(Some(p)) if matches!(p.region, Region::Heap(_)) => {
+                let Region::Heap(buf) = &p.region else {
+                    unreachable!()
+                };
+                let buf = buf.borrow();
+                let base = p.index.max(0) as usize;
+                Ok((0..n)
+                    .map(|i| buf.get(base + i).copied().unwrap_or(0))
+                    .collect())
+            }
+            Value::Ptr(Some(p)) => Ok((0..n as i64)
+                .map(|i| {
+                    p.region
+                        .cell_at(p.index + i)
+                        .and_then(|c| c.borrow().as_i64())
+                        .unwrap_or(0) as u8
+                })
+                .collect()),
+            Value::Array(elems) => {
+                let e = elems.borrow();
+                Ok((0..n)
+                    .map(|i| e.get(i).and_then(|c| c.borrow().as_i64()).unwrap_or(0) as u8)
+                    .collect())
+            }
+            Value::Ptr(None) => Err(CodegenError::at(pos, "socket buffer is a null pointer")),
+            _ => Err(CodegenError::at(pos, "expected a buffer pointer")),
         }
     }
 
@@ -1633,6 +1957,10 @@ impl<W: Write> Interpreter<W> {
                 index: 0,
             }),
             ExprKind::Index { base, index } => {
+                // Tuple `t[k]` is positional field access `t._k`.
+                if let Some(m) = crate::ast::tuple_index_as_member(e) {
+                    return self.eval_addr(&m, env);
+                }
                 let bv = self.eval(base, env)?;
                 let i = self.to_i64_eval(index, pos, env)?;
                 match as_pointer(&bv) {

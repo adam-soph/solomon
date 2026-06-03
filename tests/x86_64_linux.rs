@@ -714,6 +714,16 @@ fn printing_matches_the_interpreter() {
         r#"U0 Main(){ U8 p[8] = "hi"; "%c%c%d%d\n", p[0], p[1], p[2], p[7]; } Main;"#,
         r#"U0 Main(){ U8 t[3] = "abc"; "%c%c%c\n", t[0], t[1], t[2]; } Main;"#,
         r#"U8 g[] = "global"; U0 Main(){ U8 *q = "ptr"; "%s %s\n", g, q; } Main;"#,
+        // Narrow (sub-8-byte) scalar parameters: a `U32`/`U8` param sits in a
+        // 4-/1-byte frame slot, so the prologue must spill it at the slot width —
+        // an 8-byte spill ran past the slot and clobbered the adjacent pointer
+        // param, corrupting `sa` and faulting on the store (the `MakeSockaddr` bug).
+        r#"U0 Fill(U8 *sa, U32 ip, I64 port){ I64 i; for(i=0;i<16;i++) sa[i]=0; sa[2]=(port>>8)&0xFF; sa[3]=port&0xFF; sa[4]=(ip>>24)&0xFF; sa[7]=ip&0xFF; } U0 Main(){ U8 sa[16]; Fill(sa, 0x7F000001, 8080); "%d %d %d %d %d\n", sa[2],sa[3],sa[4],sa[5],sa[7]; } Main;"#,
+        r#"I64 Lo(U8 a, U16 b, U32 c, I64 d){ return (a ^ b ^ c ^ d) & 0xFF; } U0 Main(){ "%d\n", Lo(0x11, 0x2233, 0x44556677, 0x8899AABBCCDDEEFF); } Main;"#,
+        // Narrow (sub-8-byte) return values are truncated to the declared width — C
+        // semantics — sign- or zero-extended per signedness, in a register (there's no
+        // store to do it). `U8 300 -> 44`, `I8 200 -> -56`, `I16 40000 -> -25536`, …
+        r#"U8 A(){return 300;} I8 B(){return 200;} U16 C(){return 70000;} I16 D(){return 40000;} U32 E(){return 0x1FFFFFFFF;} I32 F(){return 0xFFFFFFFF;} U0 Main(){ "%d %d %d %d %u %d\n", A(), B(), C(), D(), E(), F(); } Main;"#,
     ];
 
     let dir = temp_out();

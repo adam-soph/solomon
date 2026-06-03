@@ -78,6 +78,27 @@ fn decimal_hex_binary_integers() {
 }
 
 #[test]
+fn octal_integers() {
+    // A leading `0` on a multi-digit integer is octal (C semantics); a bare `0` and a
+    // float starting with `0` are unaffected.
+    assert_eq!(
+        kinds("0 010 0644 0755 0.5"),
+        vec![
+            TokenKind::Int(0),
+            TokenKind::Int(8),
+            TokenKind::Int(420),
+            TokenKind::Int(493),
+            TokenKind::Float(0.5),
+        ]
+    );
+}
+
+#[test]
+fn invalid_octal_digit_is_an_error() {
+    assert!(solomon::tokenize("08").is_err());
+}
+
+#[test]
 fn high_bit_hex_wraps_to_negative() {
     // 0xFFFFFFFFFFFFFFFF is a valid 64-bit pattern == -1 as i64.
     assert_eq!(kinds("0xFFFFFFFFFFFFFFFF"), vec![TokenKind::Int(-1)]);

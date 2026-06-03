@@ -56,6 +56,10 @@ pub use linux::Arm64Linux;
 
 use asm::{Asm, CodeImage};
 
+/// The `FutexWait` safety-net timeout: a missed wakeup degrades to a re-check at this
+/// period instead of deadlocking (≈1 ms — never reached when wakeups work).
+const FUTEX_TIMEOUT_NS: i64 = 1_000_000;
+
 const RES: u32 = 9; // integer/pointer expression result
 const T2: u32 = 10; // secondary integer temporary
 const SCRATCH: u32 = 8; // scratch (e.g. `%` quotient, strides, fp<->gpr conduit)
@@ -1039,12 +1043,24 @@ impl Cg {
             StmtKind::Return(val) => {
                 match val {
                     Some(e) if is_aggregate(&self.cur_ret) => {
+                        // RES = source address of the aggregate. A brace/tuple literal
+                        // (`return a, b;`) is built into a temp first; anything else
+                        // already denotes an address.
+                        let ty = self.cur_ret.clone();
+                        if matches!(e.kind, ExprKind::InitList(_)) {
+                            let size = self.type_size(&ty).max(1);
+                            let align = self.type_align(&ty);
+                            let tmp = self.alloc(size, align);
+                            self.gen_init_into(&Place::Local(tmp), &ty, 0, e)?;
+                            self.asm.sub_imm(RES, FP, tmp);
+                        } else {
+                            self.gen_expr(e)?; // RES = source address
+                        }
                         // Copy the aggregate through the saved sret pointer.
-                        self.gen_expr(e)?; // RES = source address
                         let off = self.sret_off.expect("aggregate return needs sret slot");
                         self.asm.sub_imm(T2, FP, off);
                         self.asm.load_mem(T2, T2, 8, false); // T2 = sret pointer
-                        let n = self.type_size(&self.cur_ret);
+                        let n = self.type_size(&ty);
                         self.gen_memcpy(T2, RES, n, SCRATCH);
                     }
                     Some(e) if is_f64(&self.cur_ret) => {
@@ -1650,6 +1666,10 @@ impl Cg {
                 }
             }
             ExprKind::Index { base, index } => {
+                // Tuple `t[k]` is positional field access `t._k`.
+                if let Some(m) = crate::ast::tuple_index_as_member(e) {
+                    return self.gen_addr(&m);
+                }
                 let bty = self.expr_ty(base);
                 let elem = bty
                     .elem()
@@ -2373,11 +2393,16 @@ impl Cg {
         // A name that is neither a registered builtin nor a primitive intrinsic is an
         // ordinary function call — even if it shares a name with a former builtin now
         // living in the stdlib (`Sign`, `StrToUpper`, `StrRev`, `StrLen`, …). Skip the
-        // bespoke lowering and call the compiled body. (Primitive intrinsics — the
-        // printf family, heap, clock — fall through to the name-keyed lowering below;
-        // an optimization intrinsic like `Sqrt` is intercepted earlier, in
-        // `gen_call_expr`.)
-        if !crate::builtins::is_builtin(name) && !crate::intrinsics::is_primitive(name) {
+        // bespoke lowering and call the compiled body. A **compiled user function also
+        // shadows a like-named primitive** (a program's own `Join`/`Read`): `funcs`
+        // holds only real definitions (bodyless lib prototypes aren't compiled), so its
+        // presence means "call the body." (Primitive intrinsics — the printf family,
+        // heap, clock, sockets, threads — otherwise fall through to the name-keyed
+        // lowering below; an optimization intrinsic like `Sqrt` is intercepted earlier,
+        // in `gen_call_expr`.)
+        if self.funcs.contains_key(name)
+            || (!crate::builtins::is_builtin(name) && !crate::intrinsics::is_primitive(name))
+        {
             return self.emit_user_call(name, args, pos);
         }
         // `ArgC()` / `ArgV(i)` — read the command line captured at the entry.
@@ -2417,6 +2442,41 @@ impl Cg {
         }
         if name == "Sleep" {
             return self.gen_sleep(&args[0], pos);
+        }
+        // POSIX fd primitives. Freestanding lowers to raw Linux syscalls; hosted
+        // Darwin calls libc. `Open` needs per-target massaging (an `openat` AT_FDCWD
+        // prepend freestanding, a Linux→macOS flag translation on Darwin); the rest
+        // map their args straight to the syscall/libc registers.
+        if name == "Open" {
+            return self.gen_open(args, pos);
+        }
+        if matches!(
+            name,
+            "Socket" | "Connect" | "LSeek" | "Read" | "Write" | "Close"
+        ) {
+            return self.gen_socket(name, args, pos);
+        }
+        // POSIX-style threads: `pthread_create`/`pthread_join` on Darwin, raw `clone`
+        // freestanding.
+        if name == "Thread" {
+            return self.gen_thread(args, pos);
+        }
+        if name == "Join" {
+            return self.gen_join(args, pos);
+        }
+        // Atomics (`sync.hc`) — hardware `ldaxr`/`stlxr` loops, acquire/release.
+        if matches!(
+            name,
+            "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas"
+        ) {
+            return self.gen_atomic(name, args, pos);
+        }
+        if name == "AtomicFence" {
+            self.asm.dmb_ish();
+            return Ok(());
+        }
+        if matches!(name, "FutexWait" | "FutexWake") {
+            return self.gen_futex(name, args, pos);
         }
         // Variadic-argument access: read the hidden va buffer the prologue saved.
         if let Some(name) = name
@@ -2524,6 +2584,393 @@ impl Cg {
             return Ok(());
         }
         self.emit_user_call(name, args, pos)
+    }
+
+    /// Lower a BSD socket primitive (`Socket`/`Connect`/`Read`/`Write`/`Close`).
+    /// Freestanding emits the raw Linux syscall (`svc`); hosted Darwin calls the
+    /// libc wrapper. Arguments go through the normal ABI lowering. macOS
+    /// `socket`/`connect`/`close` return a C `int`, so their result is
+    /// sign-extended from `w0`; the Linux syscalls and `read`/`write` already
+    /// return a full 64-bit value.
+    fn gen_socket(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        let params: Vec<Param> = args
+            .iter()
+            .map(|a| Param {
+                ty: self.expr_ty(a),
+                name: None,
+                default: None,
+                span: Span::dummy(),
+            })
+            .collect();
+        let target = if self.freestanding {
+            // aarch64 Linux syscall numbers.
+            let nr = match name {
+                "Socket" => 198,
+                "Connect" => 203,
+                "LSeek" => 62,
+                "Read" => 63,
+                "Write" => 64,
+                "Close" => 57,
+                _ => unreachable!(),
+            };
+            CallTarget::Syscall(nr)
+        } else {
+            let sym = match name {
+                "Socket" => "_socket",
+                "Connect" => "_connect",
+                "LSeek" => "_lseek",
+                "Read" => "_read",
+                "Write" => "_write",
+                "Close" => "_close",
+                _ => unreachable!(),
+            };
+            CallTarget::Extern(sym)
+        };
+        self.emit_call(target, &params, args, &Type::I64, name, pos, false)?;
+        if !self.freestanding && matches!(name, "Socket" | "Connect" | "Close") {
+            self.gen_cast(&Type::I32); // sign-extend the libc `int` return
+        }
+        Ok(())
+    }
+
+    /// Lower `Open(path, flags, mode)`. The `io.hc` flags are Linux's; freestanding
+    /// uses `openat(AT_FDCWD, …)` (aarch64 has no bare `open`) with them verbatim,
+    /// while Darwin calls libc `open` after translating the flag bits that differ
+    /// (`O_CREAT`/`O_TRUNC`/`O_APPEND`) to their macOS values and sign-extending the
+    /// `int` result. Args are evaluated onto the stack, then popped into place.
+    fn gen_open(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
+        self.gen_expr(&args[0])?; // path
+        self.asm.push(RES);
+        self.gen_expr(&args[1])?; // RES = flags (Linux values)
+        if !self.freestanding {
+            // macos = (f & 3) | (O_CREAT 0x40→0x200) | (O_TRUNC 0x200→0x400) |
+            //         (O_APPEND 0x400→0x8) — each `from`-bit moved to its `to`-bit.
+            self.asm.and_imm_lowbits(T2, RES, 2); // access mode (low 2 bits)
+            for (from, to) in [(6u32, 9u32), (9, 10), (10, 3)] {
+                self.asm.lsr_imm(SCRATCH, RES, from);
+                self.asm.and_imm_lowbits(SCRATCH, SCRATCH, 1);
+                self.asm.lsl_imm(SCRATCH, SCRATCH, to);
+                self.asm.orr(T2, T2, SCRATCH);
+            }
+            self.asm.mov_reg(RES, T2);
+        }
+        self.asm.push(RES); // flags
+        self.gen_expr(&args[2])?; // mode
+        self.asm.push(RES);
+        if self.freestanding {
+            self.asm.pop(3); // x3 = mode
+            self.asm.pop(2); // x2 = flags
+            self.asm.pop(1); // x1 = path
+            self.asm.load_imm(0, -100); // x0 = AT_FDCWD
+            self.asm.load_imm(SCRATCH, 56); // x8 = SYS_openat
+            self.asm.svc();
+            self.asm.mov_reg(RES, 0); // result (fd / -errno) is in x0
+        } else {
+            // Apple AArch64 ABI: libc `open` is variadic (`int open(path, oflag,
+            // ...)`), so the `mode` arg travels on the stack (the named path/flags go
+            // in x0/x1); reserve a 16-byte-aligned slot and place it at `[sp]`.
+            self.asm.pop(SCRATCH); // mode
+            self.asm.pop(1); // x1 = flags (translated)
+            self.asm.pop(0); // x0 = path
+            self.asm.sub_sp_imm(16);
+            self.asm.str_sp(SCRATCH, 0); // [sp] = mode (first stack vararg)
+            self.asm.bl_extern("_open");
+            self.asm.add_sp_imm(16);
+            self.asm.mov_reg(RES, 0); // open's return is in x0
+            self.gen_cast(&Type::I32); // sign-extend the libc `int` return
+            // libc `open` returns -1 and stashes the reason in `errno`; the
+            // freestanding path already yields `-errno`, so convert here too:
+            // `if (ret < 0) ret = -*__error();` (`___error()` is errno's address).
+            let ok = self.asm.new_label();
+            self.asm.cmp_imm(RES, 0);
+            self.asm.b_cond(COND_GE, ok);
+            self.asm.bl_extern("___error");
+            self.asm.ldr_w(0, 0); // w0 = errno
+            self.asm.neg(RES, 0); // RES = -errno
+            self.asm.place(ok);
+        }
+        Ok(())
+    }
+
+    /// Lower `Thread(fn, arg)` → `pthread_create(&tid, NULL, fn, arg)`, returning the
+    /// `pthread_t` as the handle. The HolyC thread function `I64 Fn(I64)` matches the
+    /// `void *(*)(void *)` start-routine ABI exactly (arg in x0, result in x0), so the
+    /// function pointer is passed straight through.
+    fn gen_thread(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        if self.freestanding {
+            return self.gen_thread_fs(args, pos);
+        }
+        let tid_off = self.alloc(8, 8);
+        self.gen_expr(&args[0])?; // start routine (the function pointer)
+        self.asm.push(RES);
+        self.gen_expr(&args[1])?; // arg
+        self.asm.push(RES);
+        self.asm.pop(3); // x3 = arg
+        self.asm.pop(2); // x2 = start routine
+        self.asm.sub_imm(0, FP, tid_off); // x0 = &tid
+        self.asm.load_imm(1, 0); // x1 = NULL attr
+        self.asm.bl_extern("_pthread_create");
+        self.load_local(RES, tid_off, &Type::I64); // RES = tid (handle)
+        let _ = pos;
+        Ok(())
+    }
+
+    /// Lower `Join(handle)` → `pthread_join(handle, &retval)`, returning the value the
+    /// thread function returned (its `void *` result, read back from `retval`).
+    fn gen_join(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
+        if self.freestanding {
+            return self.gen_join_fs(args, pos);
+        }
+        let rv_off = self.alloc(8, 8);
+        self.gen_expr(&args[0])?; // RES = handle (pthread_t)
+        self.asm.mov_reg(0, RES); // x0 = thread
+        self.asm.sub_imm(1, FP, rv_off); // x1 = &retval
+        self.asm.bl_extern("_pthread_join");
+        self.load_local(RES, rv_off, &Type::I64); // RES = retval
+        let _ = pos;
+        Ok(())
+    }
+
+    /// Freestanding `Thread`: spawn a real `CLONE_THREAD` thread via `clone(2)` onto
+    /// an `mmap`'d stack, running `fn(arg)`. A 32-byte **thread control block** at the
+    /// stack base — `[retval | ctid futex | fn | arg]` — passes `fn`/`arg` in and
+    /// carries the result back; its address is the handle. `CLONE_CHILD_SETTID` makes
+    /// the kernel write the new TID into the `ctid` word and `CLONE_CHILD_CLEARTID`
+    /// zero it + futex-wake on exit, which is how `Join` waits. The child inherits the
+    /// register file, so `base` rides in via the callee-saved x19.
+    /// Lower an atomic op (`sync.hc`), width-directed by the pointer's pointee type:
+    /// `ldar`/`stlr` (load/store) and `ldaxr`/`stlxr` retry loops (add/swap/cas), sized
+    /// 1/2/4/8 bytes. Each loaded value is sign/zero-extended to the pointee width
+    /// (`gen_cast`) so the result matches a normal load (and the add is correct for a
+    /// signed narrow type). The pointer lives in T2, the value operand(s) in SCRATCH
+    /// (and x12 for a CAS expected), the store-exclusive status in w11; result in RES.
+    fn gen_atomic(&mut self, name: &str, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
+        const STATUS: u32 = 11;
+        const EXP: u32 = 12;
+        let pty = match self.expr_ty(&args[0]) {
+            Type::Ptr(inner) | Type::Array(inner, _) => *inner,
+            _ => Type::I64,
+        };
+        let sz = match self.type_size(&pty) {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => 3, // 8-byte / pointer (and any non-scalar fallback)
+        };
+        match name {
+            "AtomicLoad" => {
+                self.gen_expr(&args[0])?; // RES = p
+                self.asm.mov_reg(T2, RES);
+                self.asm.ldar(RES, T2, sz);
+                self.gen_cast(&pty); // sign/zero-extend to the pointee width
+            }
+            "AtomicStore" => {
+                self.gen_expr(&args[1])?; // v
+                self.asm.push(RES);
+                self.gen_expr(&args[0])?; // p
+                self.asm.mov_reg(T2, RES);
+                self.asm.pop(RES); // RES = v
+                self.asm.stlr(RES, T2, sz); // stores the low `width` bytes
+            }
+            "AtomicAdd" => {
+                self.gen_expr(&args[1])?; // delta
+                self.asm.push(RES);
+                self.gen_expr(&args[0])?; // p
+                self.asm.mov_reg(T2, RES);
+                self.asm.pop(SCRATCH); // SCRATCH = delta
+                let l = self.asm.new_label();
+                self.asm.place(l);
+                self.asm.ldaxr(RES, T2, sz); // old
+                self.gen_cast(&pty); // extend old (correct add for a signed narrow)
+                self.asm.add(RES, RES, SCRATCH); // new = old + delta
+                self.asm.stlxr(STATUS, RES, T2, sz);
+                self.asm.cbnz(STATUS, l);
+                self.gen_cast(&pty); // extend the stored-width result for the return
+            }
+            "AtomicSwap" => {
+                self.gen_expr(&args[1])?; // v
+                self.asm.push(RES);
+                self.gen_expr(&args[0])?; // p
+                self.asm.mov_reg(T2, RES);
+                self.asm.pop(SCRATCH); // SCRATCH = v
+                let l = self.asm.new_label();
+                self.asm.place(l);
+                self.asm.ldaxr(RES, T2, sz); // old (the result)
+                self.asm.stlxr(STATUS, SCRATCH, T2, sz);
+                self.asm.cbnz(STATUS, l);
+                self.gen_cast(&pty);
+            }
+            "AtomicCas" => {
+                self.gen_expr(&args[2])?; // desired
+                self.asm.push(RES);
+                self.gen_expr(&args[1])?; // expected
+                self.asm.push(RES);
+                self.gen_expr(&args[0])?; // p
+                self.asm.mov_reg(T2, RES);
+                self.asm.pop(EXP); // x12 = expected
+                self.asm.pop(SCRATCH); // SCRATCH = desired
+                let l = self.asm.new_label();
+                let done = self.asm.new_label();
+                self.asm.place(l);
+                self.asm.ldaxr(RES, T2, sz); // RES = old (the witnessed value)
+                self.gen_cast(&pty); // extend so the compare matches a width value
+                self.asm.cmp_reg(RES, EXP);
+                self.asm.b_cond(COND_NE, done); // mismatch -> return old, no store
+                self.asm.stlxr(STATUS, SCRATCH, T2, sz);
+                self.asm.cbnz(STATUS, l); // store lost the monitor -> retry
+                self.asm.place(done);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` (`sync.hc`). Freestanding →
+    /// the Linux `futex(2)` syscall (`FUTEX_WAIT`/`FUTEX_WAKE` on the low 32 bits of
+    /// `*addr`); Darwin → libc `__ulock_wait`/`__ulock_wake` (`UL_COMPARE_AND_WAIT`).
+    /// A `FutexWait` carries a short **timeout** so a (buggy/lost) missed wakeup only
+    /// turns into a periodic re-check, never a deadlock — matching the documented
+    /// spurious-wakeup contract (callers always re-test the condition in a loop).
+    fn gen_futex(&mut self, name: &str, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
+        let wake = name == "FutexWake";
+        if self.freestanding {
+            self.gen_expr(&args[1])?; // val (expected / n)
+            self.asm.push(RES);
+            self.gen_expr(&args[0])?; // addr
+            self.asm.mov_reg(0, RES); // x0 = uaddr
+            self.asm.pop(2); // x2 = val
+            self.asm.load_imm(1, if wake { 1 } else { 0 }); // x1 = FUTEX_WAKE / FUTEX_WAIT
+            if wake {
+                self.asm.load_imm(3, 0); // no timeout for wake
+            } else {
+                // Relative `struct timespec {0, FUTEX_TIMEOUT_NS}` on the stack -> x3.
+                self.asm.sub_sp_imm(16);
+                self.asm.load_imm(RES, 0);
+                self.asm.str_sp(RES, 0); // tv_sec
+                self.asm.load_imm(RES, FUTEX_TIMEOUT_NS);
+                self.asm.str_sp(RES, 8); // tv_nsec
+                self.asm.add_imm(3, SP, 0); // x3 = &timespec
+            }
+            self.asm.load_imm(4, 0); // uaddr2
+            self.asm.load_imm(5, 0); // val3
+            self.asm.load_imm(SCRATCH, 98); // SYS_futex
+            self.asm.svc();
+            if !wake {
+                self.asm.add_sp_imm(16);
+            }
+            self.asm.mov_reg(RES, 0);
+        } else {
+            // __ulock_wait(op, addr, value, timeout_us) / __ulock_wake(op, addr, wake_value)
+            self.gen_expr(&args[1])?; // value (ignored for wake)
+            self.asm.push(RES);
+            self.gen_expr(&args[0])?; // addr
+            self.asm.mov_reg(1, RES); // x1 = addr
+            self.asm.pop(2); // x2 = value
+            if wake {
+                self.asm.load_imm(2, 0); // wake_value 0 = wake one
+                self.asm.load_imm(3, 0);
+            } else {
+                self.asm.load_imm(3, FUTEX_TIMEOUT_NS / 1000); // timeout in microseconds
+            }
+            self.asm.load_imm(0, 1); // UL_COMPARE_AND_WAIT
+            self.asm.bl_extern(if wake {
+                "___ulock_wake"
+            } else {
+                "___ulock_wait"
+            });
+            self.asm.mov_reg(RES, 0);
+            self.gen_cast(&Type::I32); // libc `int` return
+        }
+        Ok(())
+    }
+
+    fn gen_thread_fs(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
+        const STACK_SIZE: i64 = 0x2_0000; // 128 KiB stack + TCB
+        // CLONE_VM|FS|FILES|SIGHAND|THREAD|PARENT_SETTID|CHILD_CLEARTID. PARENT_SETTID
+        // writes the new tid into the futex word **synchronously** (before clone
+        // returns), so `Join` can't race a not-yet-set word; CHILD_CLEARTID zeroes it
+        // + futex-wakes on exit.
+        const FLAGS: i64 = 0x31_0F00;
+        let base_slot = self.alloc(8, 8);
+        // mmap(0, SIZE, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) -> x0 = base.
+        self.asm.load_imm(0, 0);
+        self.asm.load_imm(1, STACK_SIZE);
+        self.asm.load_imm(2, 3); // PROT_READ|PROT_WRITE
+        self.asm.load_imm(3, 0x22); // MAP_PRIVATE|MAP_ANONYMOUS
+        self.asm.load_imm(4, -1);
+        self.asm.load_imm(5, 0);
+        self.asm.load_imm(SCRATCH, 222); // SYS_mmap
+        self.asm.svc();
+        self.asm.sub_imm(T2, FP, base_slot);
+        self.asm.store_mem(0, T2, 8); // base_slot = base
+        // TCB.fn / TCB.arg.
+        self.gen_expr(&args[0])?; // RES = fn (function address)
+        self.load_local(T2, base_slot, &Type::I64);
+        self.asm.add_imm(T2, T2, 16);
+        self.asm.store_mem(RES, T2, 8); // [base+16] = fn
+        self.gen_expr(&args[1])?; // RES = arg
+        self.load_local(T2, base_slot, &Type::I64);
+        self.asm.add_imm(T2, T2, 24);
+        self.asm.store_mem(RES, T2, 8); // [base+24] = arg
+        // clone(FLAGS, child_sp, ptid=0, tls=0, ctid=&TCB.futex). arm64 arg order is
+        // (flags, stack, ptid, tls, ctid).
+        let l_child = self.asm.new_label();
+        let l_done = self.asm.new_label();
+        self.asm.push(19);
+        self.load_local(19, base_slot, &Type::I64); // x19 = base (rides into child)
+        self.asm.load_imm(SCRATCH, STACK_SIZE - 16);
+        self.asm.add(1, 19, SCRATCH); // x1 = child stack top
+        self.asm.load_imm(0, FLAGS);
+        self.asm.add_imm(2, 19, 8); // x2 = ptid = &TCB.futex (set synchronously)
+        self.asm.load_imm(3, 0); // tls
+        self.asm.add_imm(4, 19, 8); // x4 = ctid = &TCB.futex (cleared on exit)
+        self.asm.load_imm(SCRATCH, 220); // SYS_clone
+        self.asm.svc();
+        self.asm.cbz(0, l_child);
+        // parent: x0 = child tid (the futex word tracks liveness — nothing to store).
+        self.asm.mov_reg(RES, 19); // handle = base
+        self.asm.pop(19); // restore the caller's x19
+        self.asm.b(l_done);
+        // child: fn(arg), stash the return, exit (fires CLONE_CHILD_CLEARTID).
+        self.asm.place(l_child);
+        self.asm.add_imm(T2, 19, 16);
+        self.asm.load_mem(RES, T2, 8, false); // RES = fn
+        self.asm.add_imm(T2, 19, 24);
+        self.asm.load_mem(0, T2, 8, false); // x0 = arg
+        self.asm.blr(RES);
+        self.asm.store_mem(0, 19, 8); // [base+0] = retval
+        self.asm.load_imm(0, 0);
+        self.asm.load_imm(SCRATCH, 93); // SYS_exit (this thread)
+        self.asm.svc();
+        self.asm.place(l_done);
+        Ok(())
+    }
+
+    /// Freestanding `Join`: futex-wait on the TCB's `ctid` word until the kernel
+    /// clears it (thread exit), then return the `retval` the thread left. (The handle
+    /// is the TCB address.)
+    fn gen_join_fs(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
+        self.gen_expr(&args[0])?; // RES = handle (TCB base)
+        self.asm.push(19);
+        self.asm.mov_reg(19, RES); // x19 = base (preserved across syscalls)
+        let l_wait = self.asm.new_label();
+        let l_done = self.asm.new_label();
+        self.asm.place(l_wait);
+        self.asm.add_imm(T2, 19, 8);
+        self.asm.load_mem(RES, T2, 8, false); // RES = *ctid (0 once the thread exits)
+        self.asm.cbz(RES, l_done);
+        // futex(&ctid, FUTEX_WAIT=0, val=*ctid, timeout=NULL).
+        self.asm.add_imm(0, 19, 8); // uaddr
+        self.asm.load_imm(1, 0); // FUTEX_WAIT
+        self.asm.mov_reg(2, RES); // val (the tid we observed)
+        self.asm.load_imm(3, 0); // timeout = NULL
+        self.asm.load_imm(SCRATCH, 98); // SYS_futex
+        self.asm.svc();
+        self.asm.b(l_wait);
+        self.asm.place(l_done);
+        self.asm.load_mem(RES, 19, 8, false); // RES = [base+0] = retval
+        self.asm.pop(19); // restore the caller's x19
+        Ok(())
     }
 
     /// Emit a direct call to a user-defined function's compiled body.
@@ -2833,6 +3280,10 @@ impl Cg {
         match target {
             CallTarget::Label(label) => self.asm.bl(label),
             CallTarget::Extern(sym) => self.asm.bl_extern(sym),
+            CallTarget::Syscall(nr) => {
+                self.asm.load_imm(SCRATCH, nr); // x8 = syscall number
+                self.asm.svc();
+            }
             CallTarget::Indirect(_) => {
                 // The function address was spilled first, so it is on top of the
                 // stack now that the arguments have been popped into registers.
@@ -5200,6 +5651,10 @@ enum CallTarget<'a> {
     Label(usize),
     Extern(&'static str),
     Indirect(&'a Expr),
+    /// A raw Linux `svc #0` syscall with this number in `x8` (freestanding only).
+    /// Arguments are passed in `x0..` exactly like the AAPCS register sequence, so
+    /// the same `emit_call` argument lowering drives it; the result is in `x0`.
+    Syscall(i64),
 }
 
 fn is_aggregate(ty: &Type) -> bool {

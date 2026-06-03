@@ -381,9 +381,15 @@ primitives that can't be library functions at all (they read hidden globals / ne
 ABI support, with no `#include`). Everything else became a lib function or
 `Primitive` intrinsic: the printf family → `lib/fmt.hc`; the heap
 `MAlloc`/`Free`/`HeapExtend`/`MSize` → `lib/mem.hc`; the clock `UnixNS`/`NanoNS`/
-`Sleep` → `lib/time.hc`; `Sqrt`/`Fabs` + rounding/transcendentals → `lib/math.hc`;
-`StrToF64`/`F64ToStr` → `lib/strconv.hc`/`lib/cstr.hc`; and the string/memory/ctype
-ops → their modules. (`libc_symbol` stays only as a name→symbol map for the hosted
+`Sleep` → `lib/time.hc`; the fd I/O primitives `Open`/`LSeek`/`Read`/`Write`/`Close`
+→ `lib/io.hc` (files) and the socket pair `Socket`/`Connect` → `lib/net.hc`; the
+thread primitives `Thread`/`Join` → `lib/thread.hc`; the atomics
+`AtomicLoad`/`AtomicStore`/`AtomicAdd`/`AtomicSwap`/`AtomicCas` → `lib/sync.hc`;
+`Sqrt`/`Fabs` + rounding/transcendentals → `lib/math.hc`; `StrToF64`/`F64ToStr` →
+`lib/strconv.hc`/`lib/cstr.hc`; and the string/memory/ctype ops → their modules. A
+**compiled user function shadows a like-named primitive** (a program's own
+`Join`/`Read`): the interpreter and both backends call the body when one is in scope,
+falling back to the bespoke lowering only for the bodyless lib prototype. (`libc_symbol` stays only as a name→symbol map for the hosted
 Darwin lowering of `MAlloc`/`Free`, independent of `all()`.) Calling a migrated
 function by name now needs its `#include` — but bare strings and the `"fmt", args`
 comma form are inline, not `Print` calls. For reference, the historical full builtin
@@ -482,6 +488,79 @@ The math library is layered into four modules (each includes the one below):
 - `lib/rand.hc` — the deterministic `RandU64` splitmix64 over a `__rand_state`
   global (fixed zero seed), plus `SeedRand(seed)` to start a different deterministic
   stream. Standalone (no math dependency).
+- `lib/io.hc` — file-descriptor I/O. The raw `Open`/`LSeek`/`Read`/`Write`/`Close`
+  `Primitive` intrinsics (the `Read`/`Write`/`Close` trio is **shared with sockets**)
+  lower to libc on Darwin and raw **syscalls** freestanding, routed through the same
+  `emit_call`/`gen_int_args` arg path + a `CallTarget::Syscall`/`mov rax,nr; syscall`
+  tail as the sockets. The fd ops map their args straight to the syscall registers;
+  `Open` needs per-target massaging (`gen_open`): freestanding uses `openat` with an
+  AT_FDCWD (`-100`) prepend (aarch64 syscall 56 has no bare `open`; x86-64 uses `open`
+  2), and Darwin's libc `open` is **variadic** so the `mode` arg goes on the stack
+  (Apple ABI) after a Linux→macOS **open-flag translation** (`O_CREAT`/`O_TRUNC`/
+  `O_APPEND` differ). The `io.hc` flag `#define`s are the canonical **Linux** values
+  (Darwin + the interpreter translate); the mode is `MODE_0644 = 0644` (octal). On top
+  it builds `WriteAll`/`ReadFile`/`WriteFile`/
+  `AppendFile`/`FileSize`. Impure, so property-tested (`tests/io.rs`: write→read a
+  temp file, same stdout on the interpreter, arm64 Darwin, and both freestanding ELFs
+  under `docker`). The interpreter emulates fds over `std::fs`/`std::net` in a unified
+  `fds` table (`FdObj::{PendingSocket,Tcp,File}`).
+- `lib/net.hc` — TCP networking; `#include <io.hc>` for the shared
+  `Read`/`Write`/`Close`/`WriteAll`. The socket-specific `Socket`/`Connect`
+  `Primitive` intrinsics lower to libc on Darwin and raw socket **syscalls**
+  freestanding (arm64 Linux 198/203, x86-64 Linux 41/42; Darwin int returns are
+  `sxtw`-sign-extended). On top it builds `ParseIPv4`, `MakeSockaddr` (a 16-byte
+  `sockaddr_in` in a `U8[16]`), `TcpConnect`, and a minimal `HttpGet`. Property-tested
+  (`tests/net.rs`: an echo round-trip on the interpreter, arm64 Darwin, and both
+  freestanding ELFs under `docker` with an in-container `socat` echo).
+- `lib/thread.hc` — POSIX-style threads: `Thread(fn, arg)` / `Join(handle)`
+  (`Primitive` intrinsics). Darwin lowers to libc `pthread_create`/`pthread_join` (the
+  HolyC `I64 Fn(I64)` matches the `void *(*)(void *)` start-routine ABI exactly, so the
+  function pointer passes straight through). Freestanding spawns a real `CLONE_THREAD`
+  thread via raw `clone(2)` onto an `mmap`'d stack: a 32-byte TCB at the base —
+  `[retval | ctid futex | fn | arg]` — carries the closure in and the result out, and
+  `Join` is a **futex** wait on the `ctid` word (`CLONE_PARENT_SETTID` sets it
+  synchronously so the join can't race; `CLONE_CHILD_CLEARTID` zeroes it + wakes on
+  exit). The TCB base is captured into the **child via a callee-saved register**
+  (x19 / rbx — inherited at clone), *not* a frame slot, since the parent overwrites the
+  slot on the next spawn. The x86-64 freestanding path uses glibc's exact flag set
+  (incl. `CLONE_SYSVSEM`) and a valid TLS self-pointer, which the emulated x86-64 docker
+  runtime (Rosetta/qemu) requires for thread clones. Impure/concurrent, so the
+  interpreter runs each body **synchronously at spawn time** (`thread_results`) and is
+  conformant for interleaving-independent work (per-thread results, no shared-state
+  race) — `tests/thread.rs` spawns workers, joins, and sums, the same stdout on the
+  interpreter, arm64 Darwin, and both freestanding ELFs.
+- `lib/sync.hc` — atomics + a mutex for sharing mutable state between threads. The
+  five atomic ops `AtomicLoad`/`AtomicStore`/`AtomicAdd`/`AtomicSwap`/`AtomicCas`
+  (`Primitive` intrinsics) lower to the hardware atomics, **width-directed by the
+  pointer's pointee type** (1/2/4/8 bytes — a `U32` counter, a pointer, `U8`, …; the
+  result is sign/zero-extended per the pointee like a normal load, masked the same way
+  in the interpreter via `cast_value`). AArch64 `ldar`/`stlr` for load/store and
+  sized `ldaxr`/`stlxr` retry loops for add/swap/cas (acquire/release); x86-64 plain
+  aligned `mov` for load/store and the sized `lock`-prefixed `xadd`/`xchg`/`cmpxchg`.
+  (Because `check_call` validates only argument *count*, the prototypes stay `I64 *p`
+  and the pointee width comes from the call-site type — in the interpreter via
+  `eval_atomic`, dispatched from `eval_call`.) `AtomicFence` is a full barrier
+  (`dmb ish` / `mfence`). `Mutex` (Init/Lock/TryLock/Unlock) is a **blocking** 3-state
+  futex lock (Drepper) in pure HolyC over `AtomicCas`/`AtomicSwap` + the low-level
+  `FutexWait`/`FutexWake` intrinsics — the Linux `futex(2)` syscall freestanding
+  (`FUTEX_WAIT`/`FUTEX_WAKE` on the low 32 bits) and libc `__ulock_wait`/`__ulock_wake`
+  on Darwin; each `FutexWait` carries a ~1 ms safety-net timeout (a relative `timespec`
+  freestanding, µs on Darwin) so a lost wakeup re-checks instead of deadlocking. The
+  On the same primitives, in pure HolyC: a **condition variable** `Cond` (Init/Wait/
+  Signal/Broadcast — a seq-counter futex; `CondWait` snapshots the seq, drops the
+  mutex, futex-waits, re-locks) and a readers-preferred **`RwLock`** (Init/RLock/
+  RUnlock/WLock/WUnlock — one signed state word: `N>0` readers, `-1` a writer). The
+  interpreter, with synchronous threads, does a plain read-modify-write (no contention),
+  treats the fence/futex ops as no-ops, and always acquires on the first try.
+  **Freestanding globals are 16-byte-aligned** for these (the BSS base is rounded up +
+  the image padded, gated on the program having globals): the AArch64 acquire/exclusive
+  ops *fault* on misalignment (SIGBUS) and a misaligned x86 `lock` op is a split-lock
+  (`#AC`). `tests/sync.rs`: threads hammer a shared atomic counter + the uncontended
+  mutex fast path on all four targets; the *contended* blocking mutex, the producer/
+  consumer `Cond`, and the `RwLock` run on the native arm64 runners (the `RwLock` —
+  interleaving-independent — on the interpreter too); the x86 docker emulation
+  deadlocks blocking sync, and the synchronous interpreter can't model a condvar
+  consumer waiting on a later producer.
 
 (The transcendentals are deliberately *not* builtins: an intrinsic must have a
 portable, solomon-defined value, but a transcendental's would be only "whatever the
@@ -589,8 +668,11 @@ from one `keywords!` table to avoid drift.
   boundary: on store (interp `coerce_to`/`cast_value`; native store width or an
   explicit cast), on **argument passing** (interp coerces the arg to `p.ty` in
   `call`; native spills at the param width), and on **return** (interp coerces to
-  `f.ret`; native `gen_cast(&cur_ret)` — `SBFM`/`UBFM`). So `U8 f(){return 300;}`
-  yields `44`. The arg-truncation case was an interp-only gap before this.
+  `f.ret`; arm64 `gen_cast(&cur_ret)` — `SBFM`/`UBFM`; x86-64 `Asm::cast_rax` — an
+  in-register `movsx`/`movzx`/`movsxd rax`, since there's no store to truncate). So
+  `U8 f(){return 300;}` yields `44`, `I8 f(){return 200;}` `-56`. The arg-truncation
+  case was an interp-only gap, and the x86-64 return-truncation an x86-64-only gap,
+  before these.
 - **`>>`, `/`, `%` are signedness-directed** in both backends (C semantics),
   keyed off the left operand's `ty()` (the lvalue's type for the `>>=`/`/=`/`%=`
   compound forms), threaded through `apply_binop` (interp) and `emit_int_binop`

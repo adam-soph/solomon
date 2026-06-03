@@ -614,7 +614,16 @@ impl Cg {
             let indirect = matches!(p.ty, Type::Array(..));
             let off = self.declare(name, p.ty.clone(), indirect);
             self.asm.mov_rax_argreg(gpr);
-            self.asm.store_local(off, 8); // a register-passed arg is 8 bytes wide
+            // Spill at the slot's width: a narrow scalar (`U8`/`U32`/…) has a
+            // sub-8-byte slot, so an 8-byte store would run past it and clobber the
+            // adjacent local. The caller already truncated the value to the param
+            // width, and reads sign/zero-extend it back, so the low bytes suffice.
+            let store_w = if indirect {
+                8
+            } else {
+                self.size_of(&p.ty).clamp(1, 8)
+            };
+            self.asm.store_local(off, store_w);
             gpr += 1;
         }
         for (dest, ptr_tmp, size) in class_copies {
@@ -778,11 +787,19 @@ impl Cg {
             StmtKind::Return(val) => {
                 let ret = self.cur_ret.clone();
                 if matches!(ret, Type::Named(_)) {
-                    // Copy the class result through the saved sret pointer.
+                    // Copy the class result through the saved sret pointer. A
+                    // brace/tuple literal (`return a, b;`) is built into a temp first.
                     if let Some(e) = val {
                         let off = self.sret_off.expect("class return needs an sret slot");
                         let size = self.size_of(&ret);
-                        self.gen_expr(e)?; // rax = source address
+                        if matches!(e.kind, ExprKind::InitList(_)) {
+                            let align = self.align_of(&ret);
+                            let tmp = self.alloc(size, align);
+                            self.gen_init_into(Place::Local(tmp), &ret, 0, e)?;
+                            self.asm.lea_local(tmp); // rax = &temp
+                        } else {
+                            self.gen_expr(e)?; // rax = source address
+                        }
                         self.asm.mov_rsi_rax(); // rsi = src
                         self.asm.load_local(off, 8, false); // rax = sret pointer
                         self.asm.mov_rdi_rax(); // rdi = dest
@@ -799,7 +816,15 @@ impl Cg {
                     }
                 } else {
                     match val {
-                        Some(e) => self.gen_int_expr(e, &ret)?,
+                        Some(e) => {
+                            self.gen_int_expr(e, &ret)?;
+                            // C truncates the return value to the declared width (a
+                            // narrow `U8`/`I16`/… return); there is no store to do it,
+                            // so narrow the register in place, matching the interpreter
+                            // and the arm64 backend.
+                            self.asm
+                                .cast_rax(self.size_of(&ret), !is_unsigned_int(&ret));
+                        }
                         None => self.asm.mov_rax_imm(0),
                     }
                 }
@@ -1524,6 +1549,10 @@ impl Cg {
                 expr,
             } => self.gen_expr(expr)?, // the pointer value *is* the address
             ExprKind::Index { base, index } => {
+                // Tuple `t[k]` is positional field access `t._k`.
+                if let Some(m) = crate::ast::tuple_index_as_member(e) {
+                    return self.gen_addr(&m);
+                }
                 let bty = self.expr_ty(base);
                 let elem = elem_of(&bty).ok_or_else(|| {
                     CodegenError::at(pos, "x86_64 backend: cannot index a non-array/pointer")
@@ -1810,10 +1839,12 @@ impl Cg {
         if self.try_intrinsic(name, args, pos)? {
             return Ok(());
         }
-        // A primitive intrinsic (printf family / heap / clock — a lib prototype with
-        // no body) is lowered like the old builtins. (`Print` itself reaches the
-        // backend via `as_print` at the statement level, not here.)
-        if crate::intrinsics::is_primitive(name) {
+        // A primitive intrinsic (printf family / heap / clock / sockets / threads — a
+        // lib prototype with no body) is lowered like the old builtins, **unless a
+        // compiled user function shadows the name** (a program's own `Join`/`Read`):
+        // `funcs` holds only real definitions, so its presence means "call the body."
+        // (`Print` itself reaches the backend via `as_print`, not here.)
+        if !self.funcs.contains_key(name) && crate::intrinsics::is_primitive(name) {
             return self.gen_builtin(name, args, pos);
         }
         // A user function shadows nothing; otherwise a builtin is lowered inline
@@ -2028,6 +2059,231 @@ impl Cg {
         Ok(())
     }
 
+    /// Freestanding `Thread(fn, arg)` → spawn a real `CLONE_THREAD` thread via
+    /// `clone(2)` onto an `mmap`'d stack running `fn(arg)`. A 32-byte thread control
+    /// block (TCB) at the stack base — `[retval | ctid futex | fn | arg]` — passes the
+    /// closure in and carries the result back; its address is the handle.
+    /// `CLONE_PARENT_SETTID` writes the new tid into the futex word synchronously (so
+    /// `Join` can't race a not-yet-set word) and `CLONE_CHILD_CLEARTID` zeroes it +
+    /// futex-wakes on exit. The child inherits `rbp`/the shared VM, so it reads the TCB
+    /// pointer back from the frame slot the parent stored it in.
+    fn gen_thread(&mut self, args: &[Expr]) -> Result<(), CodegenError> {
+        const SIZE: i32 = 0x2_0000; // 128 KiB stack + TCB
+        // The exact flag set glibc's pthread_create uses: CLONE_VM|FS|FILES|SIGHAND|
+        // THREAD|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID. The emulated x86-64
+        // runtime (Rosetta/qemu) rejects thread clones without SYSVSEM + a valid TLS
+        // (whose first word self-points), so we set both even though the compiled code
+        // uses no TLS.
+        const FLAGS: i32 = 0x3D_0F00;
+        const TLS_OFF: i32 = 0x40; // a TLS self-pointer slot, just past the 32-byte TCB
+        let base_slot = self.alloc(8, 8);
+        // mmap(0, SIZE, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) -> rax = base.
+        self.asm.mov_ri(RDI, 0);
+        self.asm.mov_ri(RSI, SIZE);
+        self.asm.mov_ri(RDX, 3); // PROT_READ|PROT_WRITE
+        self.asm.mov_ri(R10, 0x22); // MAP_PRIVATE|MAP_ANONYMOUS
+        self.asm.mov_ri(R8, -1);
+        self.asm.mov_ri(R9, 0);
+        self.asm.mov_ri(RAX, 9); // mmap
+        self.asm.syscall();
+        self.asm.store_local(base_slot, 8); // base_slot = base
+        // TCB.fn / TCB.arg (push the evaluated value, recover base, store at offset).
+        for (e, tcb_off) in [(&args[0], 16i32), (&args[1], 24)] {
+            self.gen_int_expr(e, &Type::I64)?; // rax = fn / arg
+            self.asm.push_rax();
+            self.asm.load_local(base_slot, 8, false); // rax = base
+            self.asm.mov_rr(RCX, RAX);
+            self.asm.add_ri(RCX, tcb_off); // rcx = base + off
+            self.asm.pop_rax(); // rax = value
+            self.asm.store_qword_at(RCX, RAX); // [base+off] = value
+        }
+        // TLS self-pointer: [base+TLS_OFF] = base+TLS_OFF (x86-64 thread-pointer ABI).
+        self.asm.load_local(base_slot, 8, false);
+        self.asm.mov_rr(RCX, RAX);
+        self.asm.add_ri(RCX, TLS_OFF); // rcx = &TLS
+        self.asm.store_qword_at(RCX, RCX); // [&TLS] = &TLS
+        let l_child = self.asm.new_label();
+        let l_done = self.asm.new_label();
+        // `base` rides into the child in callee-saved rbx (the child inherits the
+        // register file): the frame slot is shared and the parent overwrites it on the
+        // next spawn, so a concurrent child must NOT re-read base from it. Save the
+        // caller's rbx (a frame slot) and restore it on the parent path.
+        let rbx_slot = self.alloc(8, 8);
+        self.asm.mov_rr(RAX, RBX);
+        self.asm.store_local(rbx_slot, 8); // rbx_slot = caller's rbx
+        self.asm.load_local(base_slot, 8, false);
+        self.asm.mov_rr(RBX, RAX); // rbx = base (captured into the child)
+        // clone(FLAGS, child_stack_top, ptid=&futex, ctid=&futex, tls=&TLS). x86-64 arg
+        // order is (flags, stack, ptid, ctid, tls).
+        self.asm.mov_rr(RSI, RBX);
+        self.asm.add_ri(RSI, SIZE - 16); // rsi = child stack top
+        self.asm.mov_rr(RDX, RBX);
+        self.asm.add_ri(RDX, 8); // rdx = ptid = &futex
+        self.asm.mov_rr(R10, RBX);
+        self.asm.add_ri(R10, 8); // r10 = ctid = &futex
+        self.asm.mov_rr(R8, RBX);
+        self.asm.add_ri(R8, TLS_OFF); // r8 = tls = &TLS self-pointer
+        self.asm.mov_ri(RDI, FLAGS);
+        self.asm.mov_ri(RAX, 56); // clone
+        self.asm.syscall();
+        self.asm.test_rax();
+        self.asm.je(l_child);
+        // parent: rax = child tid (the futex tracks liveness). Restore rbx; the result
+        // is `base`.
+        self.asm.load_local(rbx_slot, 8, false);
+        self.asm.mov_rr(RBX, RAX); // restore caller's rbx
+        self.asm.load_local(base_slot, 8, false); // rax = base (handle)
+        self.asm.jmp(l_done);
+        // child: rax == 0, rbx = base. Read fn/arg from the TCB, run it. rbx survives
+        // the call (callee-saved), so it still holds base afterward.
+        self.asm.place(l_child);
+        self.asm.mov_rr(RDX, RBX);
+        self.asm.add_ri(RDX, 24);
+        self.asm.load_qword_at(RDI, RDX); // rdi = arg
+        self.asm.mov_rr(RDX, RBX);
+        self.asm.add_ri(RDX, 16);
+        self.asm.load_qword_at(RAX, RDX); // rax = fn
+        self.asm.call_reg(RAX); // fn(arg); rax = return
+        self.asm.store_qword_at(RBX, RAX); // [base+0] = return
+        self.asm.mov_ri(RDI, 0);
+        self.asm.mov_ri(RAX, 60); // exit (this thread; fires CLONE_CHILD_CLEARTID)
+        self.asm.syscall();
+        self.asm.place(l_done);
+        Ok(())
+    }
+
+    /// Freestanding `Join(handle)` → futex-wait on the TCB's `ctid` word until the
+    /// kernel clears it (thread exit), then return the stashed `retval`.
+    fn gen_join(&mut self, args: &[Expr]) -> Result<(), CodegenError> {
+        let base_slot = self.alloc(8, 8);
+        self.gen_int_expr(&args[0], &Type::I64)?; // rax = handle (TCB base)
+        self.asm.store_local(base_slot, 8);
+        let l_wait = self.asm.new_label();
+        let l_done = self.asm.new_label();
+        self.asm.place(l_wait);
+        self.asm.load_local(base_slot, 8, false); // rax = base
+        self.asm.mov_rr(RCX, RAX);
+        self.asm.add_ri(RCX, 8); // rcx = &futex
+        self.asm.load_qword_at(RAX, RCX); // rax = *futex (high 4 bytes stay 0)
+        self.asm.test_rax();
+        self.asm.je(l_done);
+        // futex(&futex, FUTEX_WAIT=0, val=observed tid, timeout=NULL).
+        self.asm.mov_rr(RDX, RAX); // rdx = val
+        self.asm.load_local(base_slot, 8, false);
+        self.asm.mov_rr(RDI, RAX);
+        self.asm.add_ri(RDI, 8); // rdi = &futex
+        self.asm.mov_ri(RSI, 0); // FUTEX_WAIT
+        self.asm.mov_ri(R10, 0); // timeout = NULL
+        self.asm.mov_ri(RAX, 202); // SYS_futex
+        self.asm.syscall();
+        self.asm.jmp(l_wait);
+        self.asm.place(l_done);
+        self.asm.load_local(base_slot, 8, false); // rax = base
+        self.asm.load_qword_at(RAX, RAX); // rax = [base+0] = retval
+        Ok(())
+    }
+
+    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` → the Linux `futex(2)`
+    /// syscall (`FUTEX_WAIT` 0 / `FUTEX_WAKE` 1) on the low 32 bits of `*addr`. A
+    /// `FutexWait` carries a short relative timeout (a `struct timespec` on the stack)
+    /// so a missed wakeup re-checks rather than deadlocks — the documented
+    /// spurious-wakeup contract.
+    fn gen_futex(&mut self, name: &str, args: &[Expr]) -> Result<(), CodegenError> {
+        // ≈1 ms — never reached when wakeups work.
+        const FUTEX_TIMEOUT_NS: i32 = 1_000_000;
+        let wake = name == "FutexWake";
+        self.gen_int_expr(&args[1], &Type::I64)?; // val (expected / n)
+        self.asm.push_rax();
+        self.gen_int_expr(&args[0], &Type::I64)?; // addr
+        self.asm.mov_rr(RDI, RAX); // rdi = uaddr
+        self.asm.pop_rax();
+        self.asm.mov_rr(RDX, RAX); // rdx = val
+        self.asm.mov_ri(RSI, if wake { 1 } else { 0 }); // FUTEX_WAKE / FUTEX_WAIT
+        if wake {
+            self.asm.mov_ri(R10, 0); // no timeout
+        } else {
+            // Relative `struct timespec {0, FUTEX_TIMEOUT_NS}` on the stack -> r10.
+            self.asm.add_ri(RSP, -16);
+            self.asm.store_rsp_imm(0, 0); // tv_sec
+            self.asm.store_rsp_imm(8, FUTEX_TIMEOUT_NS); // tv_nsec
+            self.asm.mov_rr(R10, RSP); // r10 = &timespec
+        }
+        self.asm.mov_ri(R8, 0); // uaddr2
+        self.asm.mov_ri(R9, 0); // val3
+        self.asm.mov_ri(RAX, 202); // SYS_futex
+        self.asm.syscall();
+        if !wake {
+            self.asm.add_ri(RSP, 16);
+        }
+        Ok(())
+    }
+
+    /// Lower an atomic op (`sync.hc`), width-directed by the pointer's pointee type
+    /// (1/2/4/8 bytes). Plain (aligned) `mov` already gives an atomic acquire load /
+    /// release store on x86-64; add/swap/cas use the `lock`-prefixed
+    /// `xadd`/`xchg`/`cmpxchg`. The loaded value is sign/zero-extended to the pointee
+    /// width (`cast_rax`); the result lands in rax.
+    fn gen_atomic(&mut self, name: &str, args: &[Expr]) -> Result<(), CodegenError> {
+        let pty = match self.expr_ty(&args[0]) {
+            Type::Ptr(inner) | Type::Array(inner, _) => *inner,
+            _ => Type::I64,
+        };
+        let w = match self.size_of(&pty) {
+            n @ (1 | 2 | 4) => n,
+            _ => 8,
+        };
+        let signed = !is_unsigned_int(&pty);
+        match name {
+            "AtomicLoad" => {
+                self.gen_int_expr(&args[0], &Type::I64)?; // rax = p
+                self.asm.load_through(w, signed); // rax = [p], sign/zero-extended
+            }
+            "AtomicStore" => {
+                self.gen_int_expr(&args[1], &Type::I64)?; // v
+                self.asm.push_rax();
+                self.gen_int_expr(&args[0], &Type::I64)?; // p
+                self.asm.mov_rr(RCX, RAX); // rcx = p (store_through writes [rcx])
+                self.asm.pop_rax(); // rax = v
+                self.asm.store_through(w); // [p] = low `w` bytes of v
+            }
+            "AtomicAdd" => {
+                self.gen_int_expr(&args[1], &Type::I64)?; // delta
+                self.asm.push_rax();
+                self.gen_int_expr(&args[0], &Type::I64)?; // p
+                self.asm.mov_rsi_rax(); // rsi = p
+                self.asm.pop_rax(); // rax = delta
+                self.asm.mov_rr(RDX, RAX); // rdx = delta (kept past the xadd)
+                self.asm.lock_xadd(RSI, RAX, w); // rax = old, [rsi] += delta
+                self.asm.cast_rax(w, signed); // extend old (correct signed-narrow add)
+                self.asm.add_rr(RAX, RDX); // rax = old + delta = new
+                self.asm.cast_rax(w, signed); // truncate+extend new for the return
+            }
+            "AtomicSwap" => {
+                self.gen_int_expr(&args[1], &Type::I64)?; // v
+                self.asm.push_rax();
+                self.gen_int_expr(&args[0], &Type::I64)?; // p
+                self.asm.mov_rsi_rax(); // rsi = p
+                self.asm.pop_rax(); // rax = v
+                self.asm.xchg_mem(RSI, RAX, w); // rax = old, [rsi] = v
+                self.asm.cast_rax(w, signed);
+            }
+            "AtomicCas" => {
+                self.gen_int_expr(&args[2], &Type::I64)?; // desired
+                self.asm.push_rax();
+                self.gen_int_expr(&args[1], &Type::I64)?; // expected
+                self.asm.push_rax();
+                self.gen_int_expr(&args[0], &Type::I64)?; // p
+                self.asm.mov_rsi_rax(); // rsi = p
+                self.asm.pop_rax(); // rax = expected (the cmpxchg comparand)
+                self.asm.pop_rcx(); // rcx = desired
+                self.asm.lock_cmpxchg(RSI, RCX, w); // if [rsi]==acc then [rsi]=rcx; acc=old
+                self.asm.cast_rax(w, signed); // extend the witnessed old for the return
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     /// Evaluate `args` into the argument registers, then call runtime routine
     /// `routine` (result in rax).
     fn call_rt(&mut self, routine: &'static str, args: &[&Expr]) -> Result<(), CodegenError> {
@@ -2122,6 +2378,39 @@ impl Cg {
             "StrPrint" => self.gen_strprint(args, false, pos),
             "CatPrint" => self.gen_strprint(args, true, pos),
             "MStrPrint" => self.gen_mstrprint(args, pos),
+            // POSIX fd primitives via raw Linux syscalls (x86-64 numbers: read 0,
+            // write 1, open 2, close 3, lseek 8, socket 41, connect 42). Each takes
+            // ≤3 args, so the System V arg registers (rdi/rsi/rdx) coincide with the
+            // syscall registers; the `io.hc` open flags are Linux's, so they pass
+            // straight through. The result (an fd, byte count, offset, or -errno) is
+            // in rax.
+            "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" => {
+                let nr: i32 = match name {
+                    "Read" => 0,
+                    "Write" => 1,
+                    "Open" => 2,
+                    "Close" => 3,
+                    "LSeek" => 8,
+                    "Socket" => 41,
+                    "Connect" => 42,
+                    _ => unreachable!(),
+                };
+                let arg_refs: Vec<&Expr> = args.iter().collect();
+                self.gen_int_args(&arg_refs)?;
+                self.asm.mov_ri(RAX, nr);
+                self.asm.syscall();
+                Ok(())
+            }
+            "Thread" => self.gen_thread(args),
+            "Join" => self.gen_join(args),
+            "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas" => {
+                self.gen_atomic(name, args)
+            }
+            "AtomicFence" => {
+                self.asm.mfence();
+                Ok(())
+            }
+            "FutexWait" | "FutexWake" => self.gen_futex(name, args),
             "MAlloc" => self.call_rt("MAlloc", &[&args[0]]),
             "HeapExtend" => self.call_rt("HeapExtend", &[&args[0], &args[1], &args[2]]),
             "MSize" => self.call_rt("MSize", &[&args[0]]),

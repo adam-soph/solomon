@@ -278,6 +278,18 @@ impl Lexer {
                 Ok(v) => Ok(self.tok(TokenKind::Float(v), start, pos)),
                 Err(_) => self.err(pos, format!("invalid float literal `{text}`")),
             }
+        } else if text.len() > 1 && text.starts_with('0') {
+            // A leading `0` on a multi-digit integer is an **octal** literal (C
+            // semantics) — `0x`/`0b` were handled above and floats took the branch
+            // above, so a `0...` integer here is octal. `08`/`09` (a non-octal digit)
+            // is an error, like C.
+            match parse_int_str(text, 8) {
+                Some(v) => Ok(self.tok(TokenKind::Int(v), start, pos)),
+                None => self.err(
+                    pos,
+                    format!("invalid octal literal `{text}` (digits must be 0-7)"),
+                ),
+            }
         } else {
             match parse_int_str(text, 10) {
                 Some(v) => Ok(self.tok(TokenKind::Int(v), start, pos)),
