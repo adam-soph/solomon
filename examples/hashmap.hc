@@ -4,6 +4,7 @@
 // class threaded through functions by pointer.
 
 #include <cstr.hc>
+#include <mem.hc>    // MAlloc/Free
 
 #define NBUCKETS 8
 

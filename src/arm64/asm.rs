@@ -505,13 +505,33 @@ impl Asm {
     pub(super) fn fneg(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E61_4000 | (dn << 5) | dd);
     }
-    /// FABS / FSQRT — scalar double-precision unary FP ops for the two algebraic
-    /// math builtins (`Fabs`/`Sqrt`); rounding moved to `lib/math.hc`.
+    /// FSQRT Dd, Dn — scalar double-precision square root, emitted in place of a call
+    /// to the lib `Sqrt` (the [`crate::intrinsics`] optimization).
+    pub(super) fn fsqrt(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E61_C000 | (dn << 5) | dd);
+    }
+    /// FABS Dd, Dn — scalar double-precision absolute value (lib `Fabs` optimization).
     pub(super) fn fabs(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E60_C000 | (dn << 5) | dd);
     }
-    pub(super) fn fsqrt(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E61_C000 | (dn << 5) | dd);
+    /// The directed-rounding `FRINT*` family (scalar double), emitted in place of the
+    /// lib rounding functions: `Floor`→`frintm` (−∞), `Ceil`→`frintp` (+∞),
+    /// `Trunc`→`frintz` (0), `Round`→`frinta` (ties away), `RoundToEven`→`frintn`
+    /// (ties even).
+    pub(super) fn frintm(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E65_4000 | (dn << 5) | dd);
+    }
+    pub(super) fn frintp(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E64_C000 | (dn << 5) | dd);
+    }
+    pub(super) fn frintz(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E65_C000 | (dn << 5) | dd);
+    }
+    pub(super) fn frinta(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E66_4000 | (dn << 5) | dd);
+    }
+    pub(super) fn frintn(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E64_4000 | (dn << 5) | dd);
     }
     /// FCMP Dn, Dm — set NZCV for an ordered comparison.
     pub(super) fn fcmp(&mut self, dn: u32, dm: u32) {

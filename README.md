@@ -323,18 +323,35 @@ rebuilding the compiler. (`#include "file"` is unchanged: relative to the includ
 file.)
 
 The modules: `lib/cstr.hc` (C-style `U8 *` string ops — `StrLen`/`StrCmp`/`StrCpy`/
-`StrFind`/…, number conversion incl. `F64ToStr`, `Abs`/`Sign`), `lib/mem.hc` (the
-`Mem*` family plus `ReAlloc`), `lib/ctype.hc` (`ToUpper`/`ToLower` and the `Is*`
-predicates), `lib/vec.hc` (`Vec`, a generic growable array), `lib/strconv.hc`
-(`StrToF64`, a correctly-rounded bignum `atof`) over `lib/bignum.hc` (a minimal
-arbitrary-precision integer), and the two below. `lib/math.hc` provides the
-rounding ops
-`Floor`/`Ceil`/`Round`/`Trunc`/`Fmod`, `Exp`/`Ln`/`Log2`/`Log10`/`Exp2`/`Pow`,
-the trig and inverse-trig `Sin`/`Cos`/`Tan`/`Atan`/`Asin`/`Acos`/`Atan2`, the
-hyperbolics `Sinh`/`Cosh`/`Tanh`, plus `Hypot`, exact `PowI`, and
-`Gcd`/`Factorial`/`Min`/`Max`/`Clamp` — all range-reduced + series, reproducible
-by construction. Only the *irreducible* float ops stay as builtins: `Sqrt`
-(correctly-rounded) and `Fabs` (a sign-bit clear). `lib/time.hc` adds calendar math
+`StrFind`/…, number conversion incl. `F64ToStr`), `lib/mem.hc` (the
+heap intrinsics `MAlloc`/`Free`/`HeapExtend`/`MSize`, the `Mem*` family, `ReAlloc`),
+`lib/fmt.hc` (the printf family `Print`/`StrPrint`/`CatPrint`/`MStrPrint`),
+`lib/time.hc` (the clock `UnixNS`/`NanoNS`/`Sleep` + calendar math), `lib/ctype.hc` (`ToUpper`/`ToLower` and
+the `Is*` predicates), `lib/vec.hc` (`Vec`, a generic growable array),
+`lib/strconv.hc` (`StrToF64`, a correctly-rounded bignum `atof`) over `lib/bignum.hc`
+(a minimal arbitrary-precision integer), and `lib/rand.hc` (the deterministic
+splitmix64 `RandU64` + `SeedRand`). The printf/heap/clock modules are **intrinsics** —
+declared in lib, but the compiler emits their lowering (the builtin registry is now
+just `ArgC`/`ArgV`/`VarArg*`). The math library is layered as `lib/bits.hc` (the IEEE
+bit/classification ops — `Float64bits`/`Float64frombits`/`IsNaN`/`IsInf`/`Signbit`/
+`NaN`/`Inf`/`Copysign`) → `lib/math.hc` (elementary) → `lib/special.hc` (Erf/Gamma/
+Bessel). `lib/math.hc` provides the rounding ops
+`Floor`/`Ceil`/`Round`/`RoundToEven`/`Trunc`/`Mod`(`Fmod`), `Exp`/`Log`(`Ln`)/`Log2`/
+`Log10`/`Exp2`/`Expm1`/`Log1p`/`Pow`/`Pow10`/`Cbrt`, the trig/inverse-trig
+`Sin`/`Cos`/`Tan`/`Sincos`/`Atan`/`Asin`/`Acos`/`Atan2`, the hyperbolics + inverses
+`Sinh`/`Cosh`/`Tanh`/`Asinh`/`Acosh`/`Atanh`, `Hypot`, exact `PowI`,
+`Gcd`/`Factorial`/`Min`/`Max`/`Clamp`, `FMA`, a **correctly-rounded `Sqrt`** (Newton +
+a Dekker exact-residual correction, bit-identical to the hardware `fsqrt`), and a
+Go-`math`-style surface — IEEE bit ops (`Float64bits`/`Float64frombits`),
+classification (`IsNaN`/`IsInf`/`Signbit`/`NaN`/`Inf`/`Copysign`), exponent
+(`Frexp`/`Ldexp`/`Logb`/`Ilogb`), `Modf`/`Dim`/`Remainder`/`Nextafter`, and the
+error-function / gamma family (`Erf`/`Erfc`/`Erfinv`/`Erfcinv`/`Gamma`/`Lgamma` —
+Taylor + continued-fraction erf, Winitzki+Newton inverses, Lanczos g=7 gamma), and
+the Bessel functions (`J0`/`J1`/`Jn`/`Y0`/`Y1`/`Yn` — power/log series for small x,
+asymptotic amplitude/phase beyond, Miller downward recurrence for `Jn`) — all
+matching libm to ~10 decimals. All reproducible by construction, so *no* float op is
+a builtin (the rounding/abs/sqrt ones are **optimization intrinsics** — a backend
+emits the FP instruction in place, falling back to the HolyC body). `lib/time.hc` adds calendar math
 on the `UnixNS` clock: `FromUnix`/`ToUnix` (Hinnant's civil↔days, exact for any
 date), `FmtISO` (`YYYY-MM-DD HH:MM:SS`), `IsLeap`, and an impure `Now`.
 

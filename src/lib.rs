@@ -13,6 +13,7 @@ pub mod builtins;
 pub mod codegen;
 pub mod fmt;
 pub mod interp;
+pub mod intrinsics;
 pub mod layout;
 pub mod lexer;
 pub mod parser;
@@ -68,9 +69,13 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("ctype.hc", include_str!("../lib/ctype.hc")),
     ("mem.hc", include_str!("../lib/mem.hc")),
     ("vec.hc", include_str!("../lib/vec.hc")),
+    ("fmt.hc", include_str!("../lib/fmt.hc")),
     ("bignum.hc", include_str!("../lib/bignum.hc")),
     ("strconv.hc", include_str!("../lib/strconv.hc")),
+    ("bits.hc", include_str!("../lib/bits.hc")),
     ("math.hc", include_str!("../lib/math.hc")),
+    ("special.hc", include_str!("../lib/special.hc")),
+    ("rand.hc", include_str!("../lib/rand.hc")),
     ("time.hc", include_str!("../lib/time.hc")),
 ];
 

@@ -12,6 +12,7 @@
 // handled, and containers hold up to 32 elements.
 
 #include <cstr.hc>
+#include <mem.hc>    // MAlloc/Free
 
 #define J_NULL 0
 #define J_BOOL 1

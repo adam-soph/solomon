@@ -90,37 +90,30 @@ fn call_to_undeclared_function_is_an_error() {
 }
 
 #[test]
-fn print_intrinsic_is_known() {
-    // `Print` is a registered intrinsic (the interpreter implements it), so
-    // calling it is not flagged even though there's no user definition.
-    ok("U0 F() { Print(\"hello\"); }");
+fn print_intrinsic_needs_its_lib_header() {
+    // `Print` is a primitive intrinsic declared in `lib/fmt.hc` (the compiler is its
+    // implementation), so — like any library function — it must be included to be
+    // called by name. (A bare string or the `"fmt", args` comma form needs nothing.)
+    has(
+        "U0 F() { Print(\"hello\"); }",
+        "undeclared function `Print`",
+    );
+    ok("#include <fmt.hc>\nU0 F() { Print(\"hello\"); }");
 }
 
 #[test]
 fn stdlib_builtins_are_known() {
-    // The remaining irreducible intrinsics are registered, so calls type-check and
-    // yield their declared return types. (The reducible string/memory/ctype/PRNG
-    // helpers moved to the `lib/*.hc` stdlib — they're ordinary library calls now,
-    // covered by the `tests/stdlib.rs` conformance suite.)
-    ok("U0 F() { F64 r = Sqrt(2.0); F64 fa = Fabs(-1.0); }");
-    ok("U0 F() { \
-          U8 *p = MAlloc(16); \
-          F64 sq = Sqrt(2.0); F64 fa = Fabs(-1.0); \
-          U8 *sp = StrPrint(p, \"%d\", 1); U8 *cp = CatPrint(p, \"%d\", 2); \
-          U8 *mp = MStrPrint(\"%d\", 3); \
-          I64 ns = UnixNS(); I64 mn = NanoNS(); Sleep(0); \
-          Free(p); \
-        }");
+    // The registry is now just `ArgC`/`ArgV`/`VarArg*` — the few primitives that
+    // can't be library functions at all; they type-check with no `#include`. (The
+    // printf family, heap, clock, and algebraic/string/etc. ops are lib functions /
+    // intrinsics now, covered by `tests/stdlib.rs` and the conformance suites.)
+    ok("U0 F() { I64 c = ArgC(); U8 *a = ArgV(0); }");
+    ok("U0 V(I64 n, ...) { I64 k = VarArgCnt(); I64 x = VarArgI64(0); F64 f = VarArgF64(1); }");
 }
 
 #[test]
 fn stdlib_builtin_arity_is_checked() {
-    has("U0 F() { Sqrt(1.0, 2.0); }", "got 2");
-    has("U0 F() { MAlloc(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { Sqrt(); }", "expects 1 argument(s), got 0");
-    has("U0 F() { StrPrint(0); }", "at least 2 argument(s), got 1");
-    has("U0 F() { CatPrint(0); }", "at least 2 argument(s), got 1");
-    has("U0 F() { MStrPrint(); }", "at least 1 argument(s), got 0");
+    has("U0 F() { ArgV(); }", "expects 1 argument(s), got 0");
 }
 
 // ---- name resolution ----

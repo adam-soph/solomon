@@ -4,6 +4,7 @@
 // all rendered identically by the interpreter and the native backend.
 
 #include <cstr.hc>
+#include <mem.hc>    // MAlloc/Free
 
 class Item {
   U8 *name;

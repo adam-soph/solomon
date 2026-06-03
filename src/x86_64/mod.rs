@@ -1756,12 +1756,66 @@ impl Cg {
         self.gen_indirect_call(callee, args, pos)
     }
 
+    /// Emit a recognized stdlib intrinsic ([`crate::intrinsics`]) inline — a hardware
+    /// instruction in place of a call to the function's lib implementation. Returns
+    /// whether it was handled; an unhandled name falls through to an ordinary call,
+    /// so the lib HolyC body (which the interpreter runs) is the fallback. An
+    /// optimization intrinsic computes the same value, so conformance holds.
+    fn try_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        _pos: Pos,
+    ) -> Result<bool, CodegenError> {
+        if crate::intrinsics::kind(name).is_none() || args.len() != 1 {
+            return Ok(false);
+        }
+        // Only optimize a call that resolves to the lib intrinsic — a single F64 arg,
+        // F64 result. A user override with a different signature must be called
+        // normally (the instruction would leave the result in the wrong register).
+        let is_f64_unary = self.funcs_sig.get(name).is_some_and(|(p, r)| {
+            matches!(r, Type::F64) && p.len() == 1 && matches!(p[0], Type::F64)
+        });
+        if !is_f64_unary {
+            return Ok(false);
+        }
+        // SSE2 single-instruction equivalents. (The `Floor`/`Ceil`/`Trunc`/`Round*`
+        // intrinsics would need SSE4.1 `roundsd`, which isn't baseline x86-64, so they
+        // fall through to the HolyC body in `lib/math.hc`.)
+        match name {
+            "Sqrt" => {
+                self.gen_foperand(&args[0])?; // value in xmm0
+                self.asm.sqrtsd(0, 0);
+                Ok(true)
+            }
+            "Fabs" => {
+                self.gen_foperand(&args[0])?; // value in xmm0
+                self.asm.mov_ri64(RAX, 0x7FFF_FFFF_FFFF_FFFF); // clear the sign bit
+                self.asm.movq_xmm_from_r(1, RAX);
+                self.asm.andpd(0, 1);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn gen_call_by_name(
         &mut self,
         name: &str,
         args: &[Expr],
         pos: Pos,
     ) -> Result<(), CodegenError> {
+        // A recognized stdlib intrinsic ([`crate::intrinsics`]) the backend lowers
+        // inline (e.g. `Sqrt` → `sqrtsd`) in place of a call to its lib body.
+        if self.try_intrinsic(name, args, pos)? {
+            return Ok(());
+        }
+        // A primitive intrinsic (printf family / heap / clock — a lib prototype with
+        // no body) is lowered like the old builtins. (`Print` itself reaches the
+        // backend via `as_print` at the statement level, not here.)
+        if crate::intrinsics::is_primitive(name) {
+            return self.gen_builtin(name, args, pos);
+        }
         // A user function shadows nothing; otherwise a builtin is lowered inline
         // (the x86-64 backend has no libc, so each is emitted from scratch).
         let label = match self.funcs.get(name) {
@@ -1984,25 +2038,10 @@ impl Cg {
     }
 
     /// Lower a builtin call. Integer/pointer/string/memory builtins go to emitted
-    /// runtime routines; the SSE-feasible `F64` ones are inlined. The rest
-    /// (transcendental math, the sprintf family) are not supported without libc.
+    /// runtime routines. (The algebraic float ops `Sqrt`/`Fabs` are pure HolyC in
+    /// `lib/math.hc` now; the rest — transcendentals, the sprintf family — go through
+    /// the lib or aren't supported without libc.)
     fn gen_builtin(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        // F64 builtins doable with SSE2 (result in xmm0).
-        match name {
-            "Sqrt" => {
-                self.gen_foperand(&args[0])?;
-                self.asm.sqrtsd(0, 0);
-                return Ok(());
-            }
-            "Fabs" => {
-                self.gen_foperand(&args[0])?;
-                self.asm.mov_ri64(RAX, 0x7FFF_FFFF_FFFF_FFFF); // clear the sign bit
-                self.asm.movq_xmm_from_r(1, RAX);
-                self.asm.andpd(0, 1);
-                return Ok(());
-            }
-            _ => {}
-        }
         match name {
             // `Free` is a no-op (the bump allocator never reclaims); still evaluate
             // the argument for its side effects.

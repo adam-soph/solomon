@@ -14,11 +14,21 @@ fn run(src: &str) -> String {
     let mut s = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
     // `math.hc` only when the source uses the moved `RandU64` PRNG — see the note
     // on `common::with_stdlib_prelude`.
-    if src.contains("RandU64") && !src.contains("#include <math.hc>") {
+    if (src.contains("Abs") || src.contains("Fabs") || src.contains("Sqrt") || src.contains("Sign"))
+        && !src.contains("#include <math.hc>")
+    {
         s.push_str("#include <math.hc>\n");
+    }
+    if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
+        s.push_str("#include <rand.hc>\n");
     }
     if src.contains("StrToF64") && !src.contains("#include <strconv.hc>") {
         s.push_str("#include <strconv.hc>\n");
+    }
+    if (src.contains("UnixNS") || src.contains("NanoNS") || src.contains("Sleep"))
+        && !src.contains("#include <time.hc>")
+    {
+        s.push_str("#include <time.hc>\n");
     }
     s.push_str(src);
     let program = parse_with(&s, std::path::Path::new("."), &[lib])

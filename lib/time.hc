@@ -1,11 +1,26 @@
 #ifndef _TIME_HC
 #define _TIME_HC
-// time.hc — calendar math on top of the impure `UnixNS` clock primitive.
+// time.hc — the impure OS clock primitives plus calendar math over them.
 //
-// `FromUnix`/`ToUnix`/`FmtISO` are pure (a defined algorithm — Howard Hinnant's
-// civil/days conversion, exact for any proleptic-Gregorian date), so they compute
-// the same bits on the interpreter and every backend. Only `Now` reads the clock,
-// so it alone is non-reproducible. Include with `#include <time.hc>`.
+// The clock primitives `UnixNS`/`NanoNS`/`Sleep` are **intrinsics** (declared here
+// as prototypes; the compiler lowers them to `clock_gettime`/`nanosleep` syscalls
+// freestanding, libc on Darwin, kernel32 on Windows). They read the OS clock or
+// sleep, so they are the one **non-reproducible** group — conformance for them is by
+// *property* (monotonic across a `Sleep`, wall clock past 1970), never by
+// interp-vs-native value comparison.
+//
+// The calendar layer (`FromUnix`/`ToUnix`/`FmtISO`) is pure (a defined algorithm —
+// Howard Hinnant's civil/days conversion, exact for any proleptic-Gregorian date),
+// so it computes the same bits everywhere; only `Now` reads the clock. Include with
+// `#include <time.hc>`.
+
+#include <fmt.hc>    // StrPrint/CatPrint for FmtISO
+
+// --- clock primitives (intrinsics) -------------------------------------------
+
+I64 UnixNS();        // wall-clock nanoseconds since 1970 (CLOCK_REALTIME)
+I64 NanoNS();        // monotonic nanoseconds from an arbitrary origin (CLOCK_MONOTONIC)
+U0 Sleep(I64 ns);    // sleep for `ns` nanoseconds
 
 class DateTime {
   I64 year, month, day;   // month 1..12, day 1..31

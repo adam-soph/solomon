@@ -2370,11 +2370,14 @@ impl Cg {
     // ---- calls & printing ----
 
     fn gen_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        // A name that isn't a registered builtin is an ordinary function call —
-        // even if it shares a name with a former builtin now living in the stdlib
-        // (`Sign`, `StrToUpper`, `StrRev`, `StrLen`, …). Skip the builtin lowering
-        // and call the compiled body.
-        if !crate::builtins::is_builtin(name) {
+        // A name that is neither a registered builtin nor a primitive intrinsic is an
+        // ordinary function call — even if it shares a name with a former builtin now
+        // living in the stdlib (`Sign`, `StrToUpper`, `StrRev`, `StrLen`, …). Skip the
+        // bespoke lowering and call the compiled body. (Primitive intrinsics — the
+        // printf family, heap, clock — fall through to the name-keyed lowering below;
+        // an optimization intrinsic like `Sqrt` is intercepted earlier, in
+        // `gen_call_expr`.)
+        if !crate::builtins::is_builtin(name) && !crate::intrinsics::is_primitive(name) {
             return self.emit_user_call(name, args, pos);
         }
         // `ArgC()` / `ArgV(i)` — read the command line captured at the entry.
@@ -2585,13 +2588,62 @@ impl Cg {
 
     /// Dispatch a call expression: a bare function/builtin name is a direct call;
     /// anything else (a function-pointer variable or computed value) is indirect.
+    /// Emit a recognized stdlib intrinsic ([`crate::intrinsics`]) inline — a hardware
+    /// instruction in place of a call to the function's lib implementation, where
+    /// this backend supports it. Returns whether it was handled; an unhandled name
+    /// (or one this backend can't inline) falls through to an ordinary call, so the
+    /// lib HolyC body is the fallback. The interpreter always runs that body, and an
+    /// optimization intrinsic computes the same value (`Sqrt` is correctly rounded
+    /// either way), so conformance holds.
+    fn try_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        _pos: Pos,
+    ) -> Result<bool, CodegenError> {
+        if crate::intrinsics::kind(name).is_none() || args.len() != 1 {
+            return Ok(false);
+        }
+        // Only optimize a call that actually resolves to the lib intrinsic — a single
+        // F64 arg, F64 result. A user function that shadows the name with a different
+        // signature (e.g. `I64 Trunc(F64)`) must be called normally, since the
+        // instruction leaves its result in the FP register, not the integer one.
+        if !self.is_f64_unary(name) {
+            return Ok(false);
+        }
+        // Each maps to a single AArch64 FP instruction over the value in FRES.
+        let emit: fn(&mut Asm, u32, u32) = match name {
+            "Sqrt" => Asm::fsqrt,
+            "Fabs" => Asm::fabs,
+            "Floor" => Asm::frintm,
+            "Ceil" => Asm::frintp,
+            "Trunc" => Asm::frintz,
+            "Round" => Asm::frinta,
+            "RoundToEven" => Asm::frintn,
+            _ => return Ok(false),
+        };
+        self.gen_fexpr(&args[0])?; // FRES = value
+        emit(&mut self.asm, FRES, FRES);
+        Ok(true)
+    }
+
+    /// Whether `name` resolves to a one-argument `F64 -> F64` function — the shape of
+    /// the algebraic/rounding intrinsics, so it's safe to replace with the FP
+    /// instruction. A user override with a different signature returns `false`.
+    fn is_f64_unary(&self, name: &str) -> bool {
+        self.funcs.get(name).is_some_and(|f| {
+            matches!(f.ret, Type::F64) && f.params.len() == 1 && matches!(f.params[0].ty, Type::F64)
+        })
+    }
+
     fn gen_call_expr(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), CodegenError> {
         let pos = callee.span.pos;
         if let ExprKind::Ident(name) = &callee.kind {
-            // Builtins with bespoke lowering. Gated on `is_builtin` so a user
-            // function sharing one of these names (e.g. a stdlib `I64ToStr`) is an
-            // ordinary call, not a mis-lowered builtin.
-            if crate::builtins::is_builtin(name) {
+            // Registry builtins (`ArgC`/`ArgV`/`VarArg*`) and **primitive intrinsics**
+            // (the printf family `fmt.hc`, the heap, the clock) get bespoke lowering;
+            // an ordinary user function sharing one of these names would not reach
+            // here as a builtin/intrinsic.
+            if crate::builtins::is_builtin(name) || crate::intrinsics::is_primitive(name) {
                 match name.as_str() {
                     "Print" => return self.gen_print_call(args, pos),
                     "StrPrint" => return self.gen_formatted_write(args, pos, false),
@@ -2601,6 +2653,11 @@ impl Cg {
                 }
             }
             if !self.is_variable(name) {
+                // A recognized stdlib intrinsic the backend lowers inline (e.g.
+                // `Sqrt` → `fsqrt`), in place of calling its lib implementation.
+                if self.try_intrinsic(name, args, pos)? {
+                    return Ok(());
+                }
                 return self.gen_call(name, args, pos);
             }
         }
@@ -3606,20 +3663,7 @@ impl Cg {
     /// Freestanding lowering of a libc-backed builtin: inline scalar ops, or a call
     /// to an emitted runtime routine (same ABI as the libc function it replaces).
     fn gen_builtin_fs(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        match name {
-            // The two irreducible algebraic F64 primitives — single AArch64 FP
-            // instructions. (Rounding/transcendentals are reducible HolyC now.)
-            "Sqrt" | "Fabs" => {
-                self.gen_fexpr(&args[0])?; // FRES = value
-                if name == "Sqrt" {
-                    self.asm.fsqrt(FRES, FRES);
-                } else {
-                    self.asm.fabs(FRES, FRES);
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
+        // (`Sqrt`/`Fabs` are pure HolyC in lib/math.hc now — no inline FP op here.)
         // Routine-backed builtins (standard ABI: args in x0.., result in x0).
         let sname: &'static str = match name {
             "MAlloc" => "MAlloc",

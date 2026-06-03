@@ -200,7 +200,7 @@ fn args_capture_calls_getcommandline() {
 
 #[test]
 fn malloc_lowers_to_virtualalloc() {
-    let pe = build_pe("U8 *p = MAlloc(16); p[0] = 7;");
+    let pe = build_pe("#include <mem.hc>\nU8 *p = MAlloc(16); p[0] = 7;");
 
     // The `emit_page_alloc` shim, byte for byte (disp32 aside):
     //   xor ecx,ecx; mov rdx,rsi; mov r8d,0x3000; mov r9d,4; sub rsp,32; call [VirtualAlloc]; add rsp,32
@@ -238,7 +238,7 @@ fn time_builtins_lower_to_kernel32() {
         ("I64 t = NanoNS();", "GetTickCount64"),
         ("Sleep(1000000);", "Sleep"),
     ] {
-        let pe = build_pe(src);
+        let pe = build_pe(&format!("#include <time.hc>\n{src}"));
         let at = find_code(&pe, shim);
         let call = at + shim.len() - 2;
         assert_eq!(call_target(&pe, call), fname, "for `{src}`");

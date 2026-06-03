@@ -243,8 +243,8 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   with `BnMul`/`BnDiv10`/`BnShl`/`BnShr` (round-half-even in `BnShr`; `÷10` via a
   64-iteration shift/subtract since AArch64 has no 128÷64 divide), the bump allocator
   `MAlloc` over `mmap`, the sprintf family (and the lone `StrLen` routine its
-  `CatPrint` append calls), and the FP algebraic ops `Sqrt`/`Fabs` (single AArch64
-  FP instructions). The reducible string/memory/ctype/PRNG ops are pure HolyC in
+  `CatPrint` append calls), and the FP algebraic op `Sqrt` (a single AArch64
+  `fsqrt`). The reducible string/memory/ctype/PRNG ops are pure HolyC in
   `lib/*.hc` now, so they compile as ordinary functions rather than emitted
   runtime. `tests/arm64_linux.rs` compiles **all 18 examples** freestanding and
   runs them under `docker --platform linux/arm64` (native on Apple silicon, no qemu),
@@ -324,7 +324,7 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   bytes (the BSS follows in vaddr space). The **irreducible core-library builtins**
   are lowered inline or to emitted runtime routines (`gen_builtin` +
   `emit_rt_routines`): `MAlloc`/`Free` (a bump allocator over `mmap`'d 1 MiB
-  chunks; `Free` is a no-op), SSE `Sqrt`/`Fabs`, and the **sprintf family**
+  chunks; `Free` is a no-op), and the **sprintf family**
   `StrPrint`/`CatPrint` (printf into a buffer via the output sink;
   `CatPrint` appends at `dst + StrLen(dst)`, so `StrLen` is the one string runtime
   routine still emitted). The reducible string/memory/ctype/PRNG ops are pure HolyC
@@ -332,7 +332,8 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   routines, the `emit_rt_ctype` range-checker and the `RandU64` splitmix were
   removed with the migration. The transcendentals aren't builtins at all (see the
   `builtins.rs` note — they're excluded project-wide), so nothing math-related is
-  missing; `Sqrt`/`Fabs` are single SSE ops (`sqrtsd`, a sign-bit `andpd`).
+  missing; `Sqrt`/`Fabs` are pure HolyC in `lib/math.hc` (a Newton sqrt and a union
+  sign-clear), so this backend lowers no algebraic float builtin.
   `MStrPrint` (a **growing sink** like libc's `vasprintf`: `MAlloc` a small owned
   buffer, then format in one pass while the sink reallocs-and-copies on overflow —
   `Helper::GrowSink`, doubling capacity — so the result is just `out_base` when
@@ -351,15 +352,42 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   against the interpreter (incl. whole example programs), self-skipping when
   neither runner is available.
 
-### builtins: one source of truth
+### builtins vs. intrinsics
 
-`builtins.rs` is the single registry of built-in functions (`all()`,
-`is_builtin()`, `libc_symbol()`). **sema seeds its signatures from here; the
-interpreter dispatches behavior from here; the arm64 backend lowers them via
-`libc_symbol()`.** Adding/altering a builtin means touching this module so the
-backends stay in sync. The set has been **pared down to the irreducible
-primitives** — anything expressible as reproducible HolyC has moved to the
-standard library (`lib/*.hc`). Current set: the printf family `Print` (→
+Two mechanisms give a function compiler-provided behaviour. **`builtins.rs`** is the
+registry of true builtins — names sema seeds with a signature *without* a source
+definition (no `#include` needed). **`intrinsics.rs`** ([`crate::intrinsics`]) is the
+newer, preferred seam: a recognized **standard-library** function — declared in
+`lib/*.hc` (so it's resolved like any library call, *with* an include) — that the
+backends lower specially. The arc is to keep the builtin *registry* down to the few
+things that can't be library functions at all and push everything else through
+intrinsics. Two intrinsic flavours (`IntrinsicKind`): an **Optimization** has a real
+HolyC body the backend may replace with an instruction where the target supports it,
+else it calls the body (`Sqrt` → `fsqrt`/`sqrtsd`, else the lib Newton; the
+interpreter always runs the body, and both are correctly rounded, so they agree); a
+**Primitive** is a lib *prototype* (no body) the backend *must* lower because it
+bundles OS syscalls or the format machinery — currently the printf family
+`Print`/`StrPrint`/`CatPrint`/`MStrPrint` (declared in `lib/fmt.hc`). The dispatch in
+both backends and the interpreter gates the bespoke lowering on
+`builtins::is_builtin(name) || intrinsics::is_primitive(name)`; a `Primitive`'s
+body-less prototype is naturally skipped by the per-function emission loop, and the
+call site is intercepted before any label lookup. (Bare strings and the `"fmt", args`
+comma form are lowered inline — *not* calls to `Print` — so they need no include.)
+
+`builtins.rs` (`all()`, `is_builtin()`, `libc_symbol()`) **seeds sema signatures, the
+interpreter dispatches behaviour, and the arm64 backend lowers via `libc_symbol()`.**
+The registry is now **just `ArgC`/`ArgV` and the `VarArg*` accessors** — the
+primitives that can't be library functions at all (they read hidden globals / need
+ABI support, with no `#include`). Everything else became a lib function or
+`Primitive` intrinsic: the printf family → `lib/fmt.hc`; the heap
+`MAlloc`/`Free`/`HeapExtend`/`MSize` → `lib/mem.hc`; the clock `UnixNS`/`NanoNS`/
+`Sleep` → `lib/time.hc`; `Sqrt`/`Fabs` + rounding/transcendentals → `lib/math.hc`;
+`StrToF64`/`F64ToStr` → `lib/strconv.hc`/`lib/cstr.hc`; and the string/memory/ctype
+ops → their modules. (`libc_symbol` stays only as a name→symbol map for the hosted
+Darwin lowering of `MAlloc`/`Free`, independent of `all()`.) Calling a migrated
+function by name now needs its `#include` — but bare strings and the `"fmt", args`
+comma form are inline, not `Print` calls. For reference, the historical full builtin
+set was: the printf family `Print` (→
 `printf`), `StrPrint` (→ `sprintf`, returns dst), `CatPrint` (sprintf-append, into
 `dst+strlen(dst)`) and `MStrPrint` (asprintf-style) — they could read `...` in HolyC
 now (the `VarArg*` accessors exist), but stay builtins because they bundle the
@@ -375,10 +403,11 @@ allocator's last block in place, else NULL; the move+copy `ReAlloc` is HolyC in
 `lib/mem.hc`) and `MSize(ptr)` (the requested size of a block — when a program
 uses it, `MAlloc` prepends an 8-byte size header, **gated** so size-agnostic
 programs keep the lean header-free heap byte-for-byte; the interpreter keeps a side
-table, Darwin wraps libc `malloc`/`free` with the header); the two
-**algebraic** float ops `Sqrt` (a correctly-rounded hardware instruction) and
-`Fabs` (a sign-bit clear the interpreter models specially — it can't byte-pun a
-local); the captured command line `ArgC`/`ArgV`; the variadic-argument accessors
+table, Darwin wraps libc `malloc`/`free` with the header); **no algebraic float
+ops** — `Sqrt` (a correctly-rounded Newton + Dekker-residual implementation) and
+`Fabs` (a `union` sign-bit clear) are both pure HolyC in `lib/math.hc` now, so a
+program with no special needs links no math builtin at all; the
+captured command line `ArgC`/`ArgV`; the variadic-argument accessors
 `VarArgCnt`/`VarArgI64`/`VarArgF64`/`VarArg` (need ABI support); and the impure
 clock primitives `UnixNS`/`NanoNS`/`Sleep` (below). `NULL`/`TRUE`/`FALSE` are const
 builtins. **Everything reducible now lives in `lib/*.hc`** as pure HolyC built on
@@ -393,11 +422,19 @@ includable on its own:
 
 - `lib/cstr.hc` — C-style `U8 *` NUL-terminated string primitives (the `<string.h>`
   `str*` family): `StrLen`/`StrCmp`/`StrNCmp`/`StrCpy`/`StrNCpy`/`StrCat`/`StrFind`/
-  `StrChr`/`StrLastChr`/`StrSpn`/`StrCSpn`/`StrToUpper`/`StrToLower`/`StrRev`, number
-  conversion (`StrToI64`/`I64ToStr`, and `F64ToStr` = `StrPrint("%g")`), and the
-  `Abs`/`Sign` integer helpers.
-- `lib/mem.hc` — raw memory + heap (the `mem*` family): `MemCpy`/`MemMove`/`MemSet`/
-  `MemCmp`/`MemFind`/`MemSearch`, plus `ReAlloc` over the `HeapExtend` builtin.
+  `StrChr`/`StrLastChr`/`StrSpn`/`StrCSpn`/`StrToUpper`/`StrToLower`/`StrRev`, and
+  number conversion (`StrToI64`/`I64ToStr`, and `F64ToStr` = `StrPrint("%g")`). (The
+  `Abs`/`Sign` integer helpers moved to `<math.hc>`, next to the float ops.)
+- `lib/mem.hc` — raw memory + the **heap intrinsics** (`MAlloc`/`Free`/`HeapExtend`/
+  `MSize` prototypes — the compiler is their implementation), the `mem*` family
+  (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`), and `ReAlloc` over
+  `HeapExtend`.
+- `lib/fmt.hc` — the **printf-family intrinsics**: `Print`/`StrPrint`/`CatPrint`/
+  `MStrPrint` prototypes (the backends render them; bare strings and the `"fmt", args`
+  comma form need no include).
+- `lib/time.hc` — the impure **clock intrinsics** `UnixNS`/`NanoNS`/`Sleep` prototypes
+  (the one non-reproducible group — conformance by property, not value), plus calendar
+  math over them (`DateTime`, `FromUnix`/`ToUnix`/`FmtISO`/`IsLeap`/`Now`).
 - `lib/bignum.hc` — `class Bn`, a minimal arbitrary-precision **nonnegative** integer
   (little-endian base-2^32 limbs, fixed `d[72]`): build-from-digits, scale by powers
   of two, compare, subtract. No division/general multiply — only what decimal→binary
@@ -420,10 +457,31 @@ includable on its own:
   class-value elements work because the interpreter byte-serialises pointers through
   its `PtrTable` (see below).
   `VecInit`/`VecFree`/`VecClear`/`VecReserve`/`VecPush`/`VecPop`/`VecAt`/`VecClone`.
-- `lib/math.hc` — rounding (`Floor`/`Ceil`/`Round`/`Trunc`/`Fmod`, exact via an I64
-  cast + adjust), the transcendentals (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…, each with a
-  *defined* series so it's reproducible — unlike a libm call), and the deterministic
-  `RandU64` splitmix64 (over a `__rand_state` global, fixed zero seed).
+
+The math library is layered into four modules (each includes the one below):
+
+- `lib/bits.hc` — the lowest layer: the `__F64Bits` union and the IEEE bit/
+  classification ops (`Float64bits`/`Float64frombits`/`NaN`/`Inf`/`IsNaN`/`IsInf`/
+  `Signbit`/`Copysign`), pure bit manipulation with no other dependency.
+- `lib/math.hc` — elementary functions (includes `<bits.hc>`): `Fabs` (a `union`
+  sign-bit clear), **`Sqrt`** (a correctly-rounded software square root: reduce
+  `x = f·2^(2k)`, Newton-iterate `√f`, then a Dekker exact-residual correction —
+  bit-identical to hardware `fsqrt` over a 500k battery), the rounding family
+  (`Floor`/`Ceil`/`Round`/`RoundToEven`/`Trunc`/`Mod`/`Fmod`), exponent ops
+  (`Frexp`/`Ldexp`/`Logb`/`Ilogb`), the transcendentals (`Sin`/`Cos`/`Pow`/`Exp`/
+  `Ln`/…, each with a *defined* series, reproducible — unlike a libm call), and the
+  rest of the Go-`math` elementary surface (`Cbrt`/`Expm1`/`Log1p`/`Asinh`/…/
+  `Modf`/`Dim`/`Remainder`/`Nextafter`/`FMA`/`Sincos`). `Fabs`/`Sqrt` and the
+  rounding ops are also **optimization intrinsics** — a backend emits the FP
+  instruction in place, falling back to the HolyC body — so **no float op is a
+  builtin**.
+- `lib/special.hc` — the bulky special functions (includes `<math.hc>`): the error
+  function / gamma families (`Erf`/`Erfc`/`Erfinv`/`Erfcinv`/`Gamma`/`Lgamma`) and
+  Bessel (`J0`/`J1`/`Jn`/`Y0`/`Y1`/`Yn` — series for small x, asymptotic beyond,
+  Miller recurrence). Split out because they're rarely used.
+- `lib/rand.hc` — the deterministic `RandU64` splitmix64 over a `__rand_state`
+  global (fixed zero seed), plus `SeedRand(seed)` to start a different deterministic
+  stream. Standalone (no math dependency).
 
 (The transcendentals are deliberately *not* builtins: an intrinsic must have a
 portable, solomon-defined value, but a transcendental's would be only "whatever the
@@ -434,7 +492,7 @@ special-cased in the arm64 backend
 (`gen_print`/`gen_formatted_write`/`gen_mstrprint`) to translate the format
 string (`translate_format`) and pass variadic args on the stack (Apple ABI); the
 interpreter renders them with the shared `fmt` module. The remaining libc-backed
-builtins (`Sqrt`/`Fabs`/`MAlloc`/`Free`) keep their HolyC signature 1:1
+builtins (`MAlloc`/`Free`) keep their HolyC signature 1:1
 with the libc one, so they lower through the generic path with no special-casing.
 (The string/memory/ctype/PRNG lowering machinery the backends used to carry —
 `gen_str_case`, the `ctype_ranges` emitter, the `RNG_STATE_GLOBAL` splitmix, the
@@ -630,8 +688,10 @@ backend — positional, designated/out-of-order, nested, partial, and arrays of
 classes, for both locals (slot zeroed first) and globals (BSS-zeroed).
 `#include "file"` is resolved (read + spliced, relative to the including file,
 with cycle/depth guards), and the irreducible core-library primitives are
-builtins (`Sqrt`, `Fabs`, `MAlloc`, `Free`, the printf family, …; the reducible
-ops moved to `lib/*.hc` — see the `builtins.rs` note above). Function pointers
+builtins (`MAlloc`, `Free`, the printf family, the clock/vararg/argv groups, …; the
+reducible ops — including `Sqrt` (a Newton + Dekker-residual sqrt) and `Fabs` (a
+`union` sign-bit clear) — moved to `lib/*.hc`, see the `builtins.rs` note above).
+Function pointers
 work end to end: the `ret (*name)
 (types)` declarator (in var decls and as callback parameters), `&Func` to take a
 function's address, and calls through a pointer (`fp(args)`) — both native backends

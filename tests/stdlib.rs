@@ -88,6 +88,124 @@ fn math_extended_functions() {
 }
 
 #[test]
+fn math_go_style_functions() {
+    // The Go-`math`-style additions: IEEE bits/classification, exponent ops, and the
+    // extra elementary functions. Values match a reference `strtod`/libm; the native
+    // backends are held to this same output by the conformance suites.
+    let out = run_with_stdlib(
+        r#"
+        #include <math.hc>
+        U0 Main() {
+          "%x %g\n", Float64bits(1.0), Float64frombits(4611686018427387904);
+          "%d %d %d %d\n", IsNaN(NaN()), IsInf(Inf(1), 1), IsInf(Inf(-1), -1), Signbit(-0.0);
+          "%.1f %.1f\n", Copysign(3.0, -1.0), Copysign(-3.0, 1.0);
+          "%d %.1f\n", Ilogb(8.0), Logb(8.0);
+          I64 e; F64 fr = Frexp(12.0, &e); "%.4f %d %.1f\n", fr, e, Ldexp(0.75, 4);
+          F64 ip; F64 fp = Modf(3.75, &ip); "%.2f %.2f %.1f\n", ip, fp, Dim(5.0, 2.0);
+          "%.6f %.6f %.6f\n", Cbrt(27.0), Expm1(1e-6), Log1p(1e-6);
+          "%.6f %.6f %.6f\n", Asinh(1.0), Acosh(2.0), Atanh(0.5);
+          "%.6f %.6f %.1f\n", Remainder(5.3, 2.0), FMA(2.0, 3.0, 4.0), Pow10(3);
+          F64 s, c; Sincos(0.5, &s, &c); "%.6f %.6f\n", s, c;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "3ff0000000000000 2\n\
+         1 1 1 1\n\
+         -3.0 3.0\n\
+         3 3.0\n\
+         0.7500 4 12.0\n\
+         3.00 0.75 3.0\n\
+         3.000000 0.000001 0.000001\n\
+         0.881374 1.316958 0.549306\n\
+         -0.700000 10.000000 1000.0\n\
+         0.479426 0.877583\n"
+    );
+}
+
+#[test]
+fn math_erf_and_gamma() {
+    // The error-function and gamma family. Values match libm/scipy to ~10 decimals
+    // (Taylor + continued-fraction erf, Winitzki+Newton inverses, Lanczos g=7 gamma);
+    // the native backends are held to this exact output by the conformance suites.
+    let out = run_with_stdlib(
+        r#"
+        #include <special.hc>
+        U0 Main() {
+          "%.10f %.10f %.10f\n", Erf(0.5), Erf(1.0), Erf(2.0);
+          "%.10g %.10g\n", Erfc(2.0), Erfc(3.0);
+          "%.10f %.10f %.10f\n", Erfinv(0.5), Erfinv(0.9), Erfcinv(0.5);
+          "%.10f %.10f %.10f\n", Gamma(0.5), Gamma(5.0), Gamma(-0.5);
+          I64 s1, s2, s3;
+          F64 l1 = Lgamma(5.0, &s1), l2 = Lgamma(0.5, &s2), l3 = Lgamma(-0.5, &s3);
+          "%.10f %d %.10f %d %.10f %d\n", l1, s1, l2, s2, l3, s3;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "0.5204998778 0.8427007929 0.9953222650\n\
+         0.004677734981 2.2090497e-05\n\
+         0.4769362762 1.1630871537 0.4769362762\n\
+         1.7724538509 24.0000000000 -3.5449077018\n\
+         3.1780538303 1 0.5723649429 1 1.2655121235 -1\n"
+    );
+}
+
+#[test]
+fn math_bessel() {
+    // J0/J1/Jn and Y0/Y1/Yn, spanning the small-x series and the large-x asymptotic
+    // (the x=20 column crosses the threshold). Values match standard tables to 10
+    // decimals; the Wronskian J1·Y0 − J0·Y1 = 2/(πx) holds to ~1e-12 across the range.
+    let out = run_with_stdlib(
+        r#"
+        #include <special.hc>
+        U0 Main() {
+          "%.10f %.10f %.10f\n", J0(1.0), J0(5.0), J0(20.0);
+          "%.10f %.10f %.10f\n", J1(1.0), J1(5.0), J1(20.0);
+          "%.10f %.10f %.10f\n", Y0(1.0), Y0(5.0), Y0(20.0);
+          "%.10f %.10f %.10f\n", Y1(1.0), Y1(5.0), Y1(20.0);
+          "%.10f %.10f %.10f\n", Jn(2, 3.0), Jn(5, 10.0), Jn(10, 2.0);
+          "%.10f %.10f %.10f\n", Yn(2, 3.0), Yn(5, 10.0), Yn(3, 8.0);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "0.7651976866 -0.1775967713 0.1670246643\n\
+         0.4400505857 -0.3275791376 0.0668331242\n\
+         0.0882569642 -0.3085176252 0.0626405968\n\
+         -0.7812128213 0.1478631434 -0.1655116144\n\
+         0.4860912606 -0.2340615282 0.0000002515\n\
+         -0.1604003935 0.1354030477 0.0265421593\n"
+    );
+}
+
+#[test]
+fn rand_seed_controls_the_stream() {
+    // `rand.hc`: the generator is deterministic, and `SeedRand` makes the stream
+    // reproducible (same seed → same value) and seed-dependent (a different seed
+    // gives a different value).
+    let out = run_with_stdlib(
+        r#"
+        #include <rand.hc>
+        U0 Main() {
+          SeedRand(1); I64 a = RandU64();
+          SeedRand(1); I64 b = RandU64();
+          SeedRand(2); I64 c = RandU64();
+          "%d %d\n", a == b, a != c;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "1 1\n");
+}
+
+#[test]
 fn strtof64_parses_correctly_rounded() {
     // The pure-HolyC `atof` (bignum, correctly rounded). Covers the Clinger fast
     // path, the exact bignum slow path (long significands, large/small exponents,

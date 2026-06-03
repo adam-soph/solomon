@@ -601,20 +601,6 @@ impl Asm {
     pub(super) fn syscall(&mut self) {
         self.emit(&[0x0F, 0x05]);
     }
-    /// `sqrtsd xmm_d, xmm_s`.
-    pub(super) fn sqrtsd(&mut self, xd: u8, xs: u8) {
-        self.sse_rr(0xF2, 0x51, xd, xs);
-    }
-    /// `andpd xmm_d, xmm_s` — bitwise AND of doubles (for `Fabs`, masking the sign).
-    pub(super) fn andpd(&mut self, xd: u8, xs: u8) {
-        // 66 0F 54 /r
-        let mut bytes = vec![0x66u8];
-        if xd >= 8 || xs >= 8 {
-            bytes.push(0x40 | if xd >= 8 { 0x04 } else { 0 } | if xs >= 8 { 0x01 } else { 0 });
-        }
-        bytes.extend_from_slice(&[0x0F, 0x54, modrm_rr(xd, xs)]);
-        self.emit(&bytes);
-    }
 
     // ---- SSE2 (F64) encoders. The expression evaluator uses xmm0 as the float
     // result and xmm1 as the temp; argument passing reaches xmm0..xmm7. ----
@@ -646,6 +632,22 @@ impl Asm {
     }
     pub(super) fn divsd(&mut self, xd: u8, xs: u8) {
         self.sse_rr(0xF2, 0x5E, xd, xs);
+    }
+    /// `sqrtsd xmm_d, xmm_s` — emitted in place of a call to the lib `Sqrt` (the
+    /// [`crate::intrinsics`] optimization).
+    pub(super) fn sqrtsd(&mut self, xd: u8, xs: u8) {
+        self.sse_rr(0xF2, 0x51, xd, xs);
+    }
+    /// `andpd xmm_d, xmm_s` — bitwise AND of doubles (for the lib `Fabs` optimization,
+    /// masking off the sign bit).
+    pub(super) fn andpd(&mut self, xd: u8, xs: u8) {
+        // 66 0F 54 /r
+        let mut bytes = vec![0x66u8];
+        if xd >= 8 || xs >= 8 {
+            bytes.push(0x40 | if xd >= 8 { 0x04 } else { 0 } | if xs >= 8 { 0x01 } else { 0 });
+        }
+        bytes.extend_from_slice(&[0x0F, 0x54, modrm_rr(xd, xs)]);
+        self.emit(&bytes);
     }
     /// `ucomisd xmm_a, xmm_b` — set EFLAGS from an (unordered) double compare.
     pub(super) fn ucomisd(&mut self, xa: u8, xb: u8) {

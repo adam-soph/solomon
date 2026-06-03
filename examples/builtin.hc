@@ -10,6 +10,7 @@
 #include <cstr.hc>    // StrLen/StrCmp/StrCpy/StrCat
 #include <mem.hc>     // MemCpy/MemSet/MemCmp
 #include <ctype.hc>   // ToUpper
+#include <math.hc>    // Sqrt
 
 // Uppercase a NUL-terminated string in place; returns its new length.
 I64 Upcase(U8 *s) {

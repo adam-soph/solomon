@@ -1,13 +1,15 @@
 #ifndef _MATH_HC
 #define _MATH_HC
-// math.hc — the solomon standard math library.
+// math.hc — the solomon standard math library (elementary functions).
 //
-// Pure HolyC built on F64 arithmetic and the two irreducible algebraic builtins
-// `Sqrt` (correctly-rounded — a hardware primitive) and `Fabs` (a sign-bit clear
-// the interpreter models specially). Everything else — rounding, logs, the
-// transcendentals — has a *defined algorithm* here, so it computes the same bits
-// on the interpreter and every native backend (IEEE-754 F64 ops are
-// deterministic). Include it with `#include <math.hc>`.
+// Pure HolyC built on F64 arithmetic and the `Sqrt`/`Fabs` optimization intrinsics:
+// everything — rounding, logs, the transcendentals, exponent/`Modf`/etc. — has a
+// *defined algorithm* here, so it computes the same bits on the interpreter and
+// every native backend (IEEE-754 F64 ops are deterministic). The IEEE bit and
+// classification ops are split into `<bits.hc>` (included below); the bulky special
+// functions (Erf/Gamma/Bessel) into `<special.hc>`. Include with `#include <math.hc>`.
+
+#include <bits.hc>   // __F64Bits, Float64bits/frombits, IsNaN/IsInf/Inf/NaN/Signbit/Copysign
 
 #define PI      3.14159265358979311600
 #define HALF_PI 1.57079632679489655800
@@ -23,6 +25,9 @@
 #define TWO52   4503599627370496.0
 
 // --- small integer helpers ---------------------------------------------------
+
+I64 Abs(I64 n)  { if (n < 0) return -n; return n; }
+I64 Sign(I64 n) { return (n > 0) - (n < 0); }
 
 I64 IMin(I64 a, I64 b) { if (a < b) return a; return b; }
 I64 IMax(I64 a, I64 b) { if (a > b) return a; return b; }
@@ -48,6 +53,77 @@ F64 FMin(F64 a, F64 b) { if (a < b) return a; return b; }
 F64 FMax(F64 a, F64 b) { if (a > b) return a; return b; }
 F64 Clamp(F64 x, F64 lo, F64 hi) { return FMax(lo, FMin(x, hi)); }
 
+// Absolute value: clear the IEEE-754 sign bit (`__F64Bits` from <bits.hc> puns the
+// double to its pattern). Exact libm semantics — `Fabs(-0.0)` is `+0.0`, NaN is made
+// positive — unlike a `x < 0 ? -x : x` test.
+F64 Fabs(F64 x)
+{
+  __F64Bits v;
+  v.f = x;
+  v.u = v.u & 0x7FFFFFFFFFFFFFFF;
+  return v.f;
+}
+
+// Square root, **correctly rounded** (bit-identical to the IEEE-754 hardware
+// instruction — verified over a 500k-value battery). Reduce `x = f·2^(2k)` with
+// `f ∈ [1,4)` via the exponent bits, Newton-iterate `√f`, then take one
+// exact-residual correction step — `r = f − y²` computed exactly with a Dekker
+// two-product (there's no FMA), so `y + r/(2y)` lands on the correctly-rounded
+// result — and scale back by `2^k`. (The one float op with no closed-form HolyC
+// equivalent; a later compiler pass may recognise this and emit `fsqrt`/`sqrtsd`.)
+F64 Sqrt(F64 x)
+{
+  __F64Bits b;
+  b.f = x;
+  U64 bits = b.u;
+  if ((bits & 0x7FFFFFFFFFFFFFFF) == 0) return x;                 // ±0
+  if (bits & 0x8000000000000000) { __F64Bits n; n.u = 0x7FF8000000000000; return n.f; } // x<0 → NaN
+  if ((bits >> 52) == 0x7FF) return x;                            // +inf or NaN
+
+  // Normalise a subnormal into the normal range (√ of a subnormal is normal).
+  F64 scale = 1.0;
+  if ((bits >> 52) == 0) {
+    x = x * 18014398509481984.0;                                  // ×2^54
+    b.f = x;
+    bits = b.u;
+    scale = 0.00000000745058059692382812;                        // ×2^-27 on the way out
+  }
+
+  // x = f·2^(2k), f ∈ [1,4).
+  I64 e = (I64)((bits >> 52) & 0x7FF) - 1023;
+  I64 k = e >> 1;
+  I64 e2 = e - (k << 1);
+  __F64Bits fb;
+  fb.u = (bits & 0x000FFFFFFFFFFFFF) | (((U64)(e2 + 1023)) << 52);
+  F64 f = fb.f;
+
+  // √f by Newton from a linear guess (≤25% error → below 1 ULP after 6 steps).
+  F64 y = (f + 1.0) * 0.5;
+  y = (y + f / y) * 0.5;
+  y = (y + f / y) * 0.5;
+  y = (y + f / y) * 0.5;
+  y = (y + f / y) * 0.5;
+  y = (y + f / y) * 0.5;
+  y = (y + f / y) * 0.5;
+
+  // One correctly-rounding step with the exact residual f − y² (Dekker product).
+  F64 c = 134217729.0;                                           // 2^27 + 1 (Veltkamp split)
+  F64 t = c * y;
+  F64 yh = t - (t - y);
+  F64 yl = y - yh;
+  F64 ph = y * y;
+  F64 pl = ((yh * yh - ph) + 2.0 * yh * yl) + yl * yl;
+  F64 r = (f - ph) - pl;
+  y = y + r / (y + y);
+
+  // result = y·2^k (exact: add k to the exponent field).
+  __F64Bits rb;
+  rb.f = y;
+  I64 yexp = (I64)((rb.u >> 52) & 0x7FF);
+  rb.u = (rb.u & 0x800FFFFFFFFFFFFF) | (((U64)(yexp + k)) << 52);
+  return rb.f * scale;
+}
+
 // --- rounding (truncate toward zero + adjust; exact for all finite F64) ------
 
 F64 Trunc(F64 x)
@@ -60,12 +136,24 @@ F64 Trunc(F64 x)
 F64 Floor(F64 x) { F64 t = Trunc(x); if (t > x) return t - 1.0; return t; }
 F64 Ceil(F64 x)  { F64 t = Trunc(x); if (t < x) return t + 1.0; return t; }
 
-// Round to nearest, ties away from zero (matching the old builtin / `frinta`).
+// Round to nearest, ties away from zero (matching `frinta`).
 F64 Round(F64 x)
 {
   F64 t = Trunc(x), d = x - t;
   if (d >= 0.5) return t + 1.0;
   if (d <= -0.5) return t - 1.0;
+  return t;
+}
+
+// Round to nearest, ties to even (matching `frintn` / IEEE round-to-nearest). At a
+// tie the truncated value `t` is integral and small enough that `(I64)t` is exact.
+F64 RoundToEven(F64 x)
+{
+  F64 t = Trunc(x), d = x - t;
+  if (d > 0.5) return t + 1.0;
+  if (d < -0.5) return t - 1.0;
+  if (d == 0.5) { if (((I64)t & 1) == 0) return t; return t + 1.0; }
+  if (d == -0.5) { if (((I64)t & 1) == 0) return t; return t - 1.0; }
   return t;
 }
 
@@ -206,17 +294,145 @@ F64 Sinh(F64 x) { return (Exp(x) - Exp(-x)) / 2.0; }
 F64 Cosh(F64 x) { return (Exp(x) + Exp(-x)) / 2.0; }
 F64 Tanh(F64 x) { F64 a = Exp(x), b = Exp(-x); return (a - b) / (a + b); }
 
-// --- pseudo-random (deterministic splitmix64, fixed zero seed) ----------------
+// --- exponent / mantissa ------------------------------------------------------
 
-U64 __rand_state = 0;
-
-U64 RandU64()
+// The unbiased binary exponent: `x = m·2^e`, `m ∈ [1,2)`. 0 → MinI32, Inf/NaN → MaxI32.
+I64 Ilogb(F64 x)
 {
-  __rand_state += 0x9e3779b97f4a7c15;
-  U64 z = __rand_state;
-  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
-  z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
-  return z ^ (z >> 31);
+  if (x == 0.0) return -2147483648;
+  if (x != x || IsInf(x, 0)) return 2147483647;
+  __F64Bits v;
+  v.f = x;
+  I64 e = (v.u >> 52) & 0x7FF;
+  if (e == 0) { v.f = x * 18446744073709551616.0; e = ((v.u >> 52) & 0x7FF) - 64; } // subnormal
+  return e - 1023;
+}
+
+F64 Logb(F64 x)
+{
+  if (x == 0.0) return Inf(-1);
+  if (x != x || IsInf(x, 0)) return Fabs(x);
+  return (F64)Ilogb(x);
+}
+
+// frac·2^exp == f, with frac ∈ [0.5,1). Writes the exponent through `exp`.
+F64 Frexp(F64 f, I64 *exp)
+{
+  if (f == 0.0 || f != f || IsInf(f, 0)) { *exp = 0; return f; }
+  __F64Bits v;
+  v.f = f;
+  I64 e = (v.u >> 52) & 0x7FF;
+  if (e == 0) { v.f = f * 18446744073709551616.0; e = ((v.u >> 52) & 0x7FF) - 64; } // subnormal
+  *exp = e - 1022;
+  v.u = (v.u & 0x800FFFFFFFFFFFFF) | (1022 << 52);  // force exponent so frac ∈ [0.5,1)
+  return v.f;
+}
+
+// frac·2^exp (overflows to ±Inf, underflows to 0 — like Go).
+F64 Ldexp(F64 frac, I64 exp)
+{
+  if (frac == 0.0 || frac != frac || IsInf(frac, 0)) return frac;
+  F64 r = frac;
+  while (exp > 0) { r = r * 2.0; exp--; }
+  while (exp < 0) { r = r / 2.0; exp++; }
+  return r;
+}
+
+// --- misc real functions ------------------------------------------------------
+
+F64 Mod(F64 x, F64 y) { return Fmod(x, y); }  // Go's Mod == truncated remainder
+F64 Log(F64 x)        { return Ln(x); }        // Go's Log == natural log
+
+// Integer + fractional parts (both carry f's sign); the int part is written via `ip`.
+F64 Modf(F64 f, F64 *ip) { F64 i = Trunc(f); *ip = i; return f - i; }
+
+// max(x-y, 0).
+F64 Dim(F64 x, F64 y) { F64 d = x - y; if (d > 0.0) return d; if (d != d) return d; return 0.0; }
+
+// IEEE remainder: x - y·RoundToEven(x/y).
+F64 Remainder(F64 x, F64 y)
+{
+  if (y == 0.0 || x != x || y != y || IsInf(x, 0)) return NaN();
+  if (IsInf(y, 0)) return x;
+  return x - y * RoundToEven(x / y);
+}
+
+// Cube root (Newton-refined over an exp/log initial guess; preserves sign).
+F64 Cbrt(F64 x)
+{
+  if (x == 0.0 || x != x || IsInf(x, 0)) return x;
+  F64 s = 1.0, a = x;
+  if (a < 0.0) { s = -1.0; a = -a; }
+  F64 y = Exp(Ln(a) / 3.0);
+  y = (2.0 * y + a / (y * y)) / 3.0;
+  y = (2.0 * y + a / (y * y)) / 3.0;
+  return s * y;
+}
+
+// 10^n for integer n.
+F64 Pow10(I64 n)
+{
+  if (n < 0) return 1.0 / Pow10(-n);
+  F64 p = 1.0;
+  while (n > 0) { p = p * 10.0; n--; }
+  return p;
+}
+
+// exp(x)-1, accurate near 0 (series there, avoiding cancellation).
+F64 Expm1(F64 x)
+{
+  if (Fabs(x) < 1.0e-5) return x * (1.0 + x * (0.5 + x * 0.16666666666666666));
+  return Exp(x) - 1.0;
+}
+
+// log(1+x), accurate near 0.
+F64 Log1p(F64 x)
+{
+  if (Fabs(x) < 1.0e-4) return x * (1.0 - x * (0.5 - x * 0.3333333333333333));
+  return Ln(1.0 + x);
+}
+
+// --- inverse hyperbolic -------------------------------------------------------
+
+F64 Asinh(F64 x) { if (x < 0.0) return -Asinh(-x); return Ln(x + Sqrt(x * x + 1.0)); }
+F64 Acosh(F64 x) { if (x < 1.0) return NaN(); return Ln(x + Sqrt(x * x - 1.0)); }
+F64 Atanh(F64 x)
+{
+  if (x >= 1.0) { if (x == 1.0) return Inf(1); return NaN(); }
+  if (x <= -1.0) { if (x == -1.0) return Inf(-1); return NaN(); }
+  return 0.5 * Ln((1.0 + x) / (1.0 - x));
+}
+
+// sin and cos together (written through the pointers).
+U0 Sincos(F64 x, F64 *s, F64 *c) { *s = Sin(x); *c = Cos(x); }
+
+// Fused multiply-add `x*y+z`: the product is formed exactly with a Dekker
+// two-product, then summed with `z` so only the final result rounds (near the
+// correctly-rounded FMA, and identical on every backend — *not* an instruction
+// intrinsic, since a hardware `fmadd` could round differently in the last bit).
+F64 FMA(F64 x, F64 y, F64 z)
+{
+  F64 c = 134217729.0;                       // 2^27 + 1 (Veltkamp split)
+  F64 t = c * x; F64 xh = t - (t - x); F64 xl = x - xh;
+  t = c * y; F64 yh = t - (t - y); F64 yl = y - yh;
+  F64 ph = x * y;
+  F64 pl = ((xh * yh - ph) + xh * yl + xl * yh) + xl * yl;
+  F64 s = ph + z;                            // two-sum of ph and z
+  F64 bb = s - ph;
+  F64 err = (ph - (s - bb)) + (z - bb);
+  return s + (err + pl);
+}
+
+// The adjacent representable double after `x`, in the direction of `y`.
+F64 Nextafter(F64 x, F64 y)
+{
+  if (x != x || y != y) return NaN();
+  if (x == y) return y;
+  __F64Bits v;
+  if (x == 0.0) { v.u = 1; if (y < 0.0) v.u = 0x8000000000000001; return v.f; }
+  v.f = x;
+  if ((y > x) == (x > 0.0)) v.u = v.u + 1; else v.u = v.u - 1;
+  return v.f;
 }
 
 #endif

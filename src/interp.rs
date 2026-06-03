@@ -1250,6 +1250,14 @@ impl<W: Write> Interpreter<W> {
     }
 
     fn call(&mut self, name: &str, args: Vec<Value>, pos: Pos) -> Result<Value, CodegenError> {
+        // Registry builtins (`ArgC`/`ArgV`/`VarArg*`) and **primitive intrinsics**
+        // (the printf family, heap, clock — lib prototypes with no HolyC body) are
+        // implemented by the interpreter directly. An *optimization* intrinsic like
+        // `Sqrt` is an ordinary lib function with a real body, so it falls through to
+        // the user-function path below and runs that body.
+        if crate::builtins::is_builtin(name) || crate::intrinsics::is_primitive(name) {
+            return self.call_builtin(name, &args, pos);
+        }
         if let Some(f) = self.funcs.get(name).cloned() {
             let mut env = Env::func();
             for (i, p) in f.params.iter().enumerate() {
@@ -1289,11 +1297,6 @@ impl<W: Write> Interpreter<W> {
             return Ok(coerce_to(&f.ret, result?));
         }
 
-        // Intrinsics (signatures are registered for type-checking in
-        // `sema::seed_builtin_funcs`; the registry lives in `crate::builtins`).
-        if crate::builtins::is_builtin(name) {
-            return self.call_builtin(name, &args, pos);
-        }
         Err(CodegenError::at(
             pos,
             format!("call to unknown function `{name}` (external functions are not supported)"),
@@ -1430,16 +1433,6 @@ impl<W: Write> Interpreter<W> {
             // The two irreducible algebraic F64 primitives — exactly reproducible in
             // every backend (hardware `sqrt`, a sign-bit clear). Rounding and the
             // transcendentals are reducible and live in `lib/math.hc`.
-            "Sqrt" | "Fabs" => {
-                let a = args[0]
-                    .as_f64()
-                    .ok_or_else(|| CodegenError::at(pos, "math builtin expects a number"))?;
-                Ok(Value::Float(if name == "Sqrt" {
-                    a.sqrt()
-                } else {
-                    a.abs()
-                }))
-            }
             _ => Err(CodegenError::at(
                 pos,
                 format!("builtin `{name}` is not implemented"),

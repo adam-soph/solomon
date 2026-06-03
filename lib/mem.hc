@@ -6,6 +6,18 @@
 // Pure HolyC built on the irreducible heap primitives (`MAlloc`/`Free`/`HeapExtend`),
 // so it computes identically on the interpreter and every native backend. Include
 // with `#include <mem.hc>` (idempotent via the guard above).
+//
+// The heap primitives themselves are **intrinsics**: declared here as prototypes, the
+// compiler is their implementation — an `mmap` bump allocator (freestanding) or libc
+// `malloc`/`free` (hosted). `MAlloc(n)` returns `n` uninitialised bytes; `Free(p)`
+// releases them (a no-op on the bump allocators); `HeapExtend(ptr, old, new)` grows
+// the last block in place or returns NULL; `MSize(ptr)` is the block's requested size
+// (the allocator prepends an 8-byte header when a program uses `MSize`).
+
+U8 *MAlloc(I64 n);
+U0 Free(U8 *ptr);
+U8 *HeapExtend(U8 *ptr, I64 old, I64 newsz);
+I64 MSize(U8 *ptr);
 
 U8 *MemCpy(U8 *dst, U8 *src, I64 n)
 {

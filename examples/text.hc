@@ -5,6 +5,7 @@
 
 #include <cstr.hc>    // StrLen/StrCpy/StrFind
 #include <ctype.hc>   // ToUpper
+#include <mem.hc>    // MAlloc/Free
 
 I64 WordCount(U8 *s) {
   I64 words = 0;

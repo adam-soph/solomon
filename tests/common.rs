@@ -47,17 +47,30 @@ pub fn parse_example(src: &str) -> Result<solomon::Program, solomon::ParseError>
 ///
 /// The string/memory/ctype modules are prepended unconditionally — they're guarded
 /// (so re-including is a no-op) and define no name any example/test collides with.
-/// `math.hc` is gated on `RandU64` usage, since the rest of it (`Pow`/`Floor`/`Gcd`/
-/// `PI`/…) collides with examples that roll their own; `strconv.hc` is gated on
-/// `StrToF64` (it pulls in the bignum, so only programs that parse floats want it).
+/// `math.hc` is gated on `Abs`/`Fabs`/`Sqrt`/`Sign` usage, since the rest of it
+/// (`Pow`/`Floor`/`Gcd`/`PI`/…) collides with examples that roll their own; `rand.hc`
+/// on `RandU64`; `strconv.hc` on `StrToF64` (it pulls in the bignum); `time.hc` on the
+/// clock primitives.
 #[allow(dead_code)]
 pub fn with_stdlib_prelude(src: &str) -> String {
     let mut prelude = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
-    if src.contains("RandU64") && !src.contains("#include <math.hc>") {
+    if (src.contains("Abs") || src.contains("Fabs") || src.contains("Sqrt") || src.contains("Sign"))
+        && !src.contains("#include <math.hc>")
+    {
         prelude.push_str("#include <math.hc>\n");
+    }
+    if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
+        prelude.push_str("#include <rand.hc>\n");
     }
     if src.contains("StrToF64") && !src.contains("#include <strconv.hc>") {
         prelude.push_str("#include <strconv.hc>\n");
+    }
+    // `time.hc` holds the clock intrinsics (and calendar math), gated on use so its
+    // `DateTime`/`FromUnix`/… don't collide with tests/examples that roll their own.
+    if (src.contains("UnixNS") || src.contains("NanoNS") || src.contains("Sleep"))
+        && !src.contains("#include <time.hc>")
+    {
+        prelude.push_str("#include <time.hc>\n");
     }
     prelude.push_str(src);
     prelude

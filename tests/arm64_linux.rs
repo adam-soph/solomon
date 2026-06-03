@@ -325,7 +325,9 @@ fn time_builtins_run_natively() {
     // Time is impure (non-reproducible), so assert *properties* of the native run
     // rather than byte-comparing to the interpreter: wall clock past 1970, and a
     // monotonic clock that doesn't go backwards across a Sleep.
-    let src = r#"U0 Main() {
+    let src = r#"
+    #include <time.hc>
+    U0 Main() {
         I64 a = NanoNS();
         Sleep(2000000);
         I64 b = NanoNS();

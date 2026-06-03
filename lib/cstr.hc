@@ -1,12 +1,15 @@
 #ifndef _CSTR_HC
 #define _CSTR_HC
 // cstr.hc — C-style primitives over NUL-terminated byte strings (the `<string.h>`
-// `str*` family), number <-> string conversion, and the `Abs`/`Sign` integer
-// helpers.
+// `str*` family) and number <-> string conversion. (The `Abs`/`Sign` integer
+// helpers moved to `<math.hc>`, next to the float `Fabs`/`FMin`/… and the other
+// integer helpers.)
 //
 // Pure HolyC over raw byte pointers (`U8 *`). Byte values are `U8` (unsigned), so the
 // `<`/`>` comparisons are unsigned — matching libc's `strcmp` family. Include with
 // `#include <cstr.hc>`.
+
+#include <fmt.hc>   // F64ToStr is a StrPrint("%g") wrapper
 
 // --- length & comparison (sign-normalised to -1/0/1) ---
 
@@ -185,10 +188,5 @@ U8 *I64ToStr(I64 n, U8 *buf)
 // a single `%g`, so it needs no float-formatting code of its own — that lives once,
 // in the backends' correctly-rounded bignum formatter.
 U8 *F64ToStr(F64 v, U8 *buf) { return StrPrint(buf, "%g", v); }
-
-// --- integer helpers ---
-
-I64 Abs(I64 n) { if (n < 0) return -n; return n; }
-I64 Sign(I64 n) { return (n > 0) - (n < 0); }
 
 #endif
