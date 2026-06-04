@@ -16,9 +16,8 @@ use solomon::sema::check_program;
 use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
 
 // The portable program (runs on all four targets): a *single* shared atomic counter
-// under real threads (the one concurrent pattern the x86 docker *emulation* handles —
-// see the `contended_mutex` note below), the mutex exercised on its *uncontended* fast
-// path (single-threaded, no kernel block), a fence, and the full width matrix.
+// under real threads, the mutex exercised on its *uncontended* fast path
+// (single-threaded, no kernel block), a fence, and the full width matrix.
 const PROGRAM: &str = r#"
     #include <sync.hc>
     #include <thread.hc>
@@ -59,9 +58,8 @@ const EXPECTED: &str =
 
 // The *blocking* mutex under real contention — 4 threads incrementing a shared counter
 // in a critical section, so the futex wait/wake path runs. Verified on the native
-// runners (arm64 Darwin, arm64 docker); NOT on the x86 docker *emulation*, whose
-// multithreaded memory model deadlocks blocking synchronization (a known emulation gap
-// — real x86 hardware is fine).
+// runners (arm64 Darwin here; the freestanding Linux path on a native linux/aarch64
+// or linux/x86_64 host, e.g. CI).
 const CONTENDED: &str = r#"
     #include <sync.hc>
     #include <thread.hc>
@@ -182,63 +180,43 @@ fn native_arm64_sync() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
 
-fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["info"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn freestanding_sync_stdout(
-    platform: &str,
-    out: &std::path::Path,
-    mut backend: impl Codegen,
-    src: &str,
-) -> String {
+/// Build `src` with `backend` to a temp ELF and run it **natively** (only on a
+/// matching Linux host); the atomics/futex ops hit the real kernel. Returns stdout.
+fn freestanding_sync_stdout(out: &std::path::Path, mut backend: impl Codegen, src: &str) -> String {
     backend
         .run(&compile(src))
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--platform",
-            platform,
-            "-v",
-            &format!("{}:/prog:ro", out.display()),
-            "alpine",
-            "/prog",
-        ])
+    let output = Command::new(out)
         .output()
-        .unwrap_or_else(|e| panic!("docker run failed: {e}"));
+        .unwrap_or_else(|e| panic!("could not run produced ELF: {e}"));
     let _ = std::fs::remove_file(out);
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 /// Atomics + mutex through the **freestanding x86-64** backend (`lock`-prefixed
-/// `xadd`/`xchg`/`cmpxchg`) with real `clone(2)` threads, in a `linux/amd64` container.
+/// `xadd`/`xchg`/`cmpxchg`) with real `clone(2)` threads. Runs only on a linux/x86_64
+/// host (CI); self-skips elsewhere.
 #[test]
 fn native_x86_64_freestanding_sync() {
-    if !docker_available() {
-        eprintln!("skipping: freestanding sync test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 sync test needs a linux/x86_64 host");
         return;
     }
     let out = std::env::temp_dir().join(format!("solomon-x64-sync-{}", std::process::id()));
-    let got = freestanding_sync_stdout("linux/amd64", &out, X64Linux::new(&out), PROGRAM);
+    let got = freestanding_sync_stdout(&out, X64Linux::new(&out), PROGRAM);
     assert_eq!(got, EXPECTED, "x86_64 freestanding");
 }
 
-/// Atomics + mutex through the **freestanding aarch64** backend (`ldaxr`/`stlxr`),
-/// in a `linux/arm64` container.
+/// Atomics + mutex through the **freestanding aarch64** backend (`ldaxr`/`stlxr`).
+/// Runs only on a linux/aarch64 host; self-skips elsewhere.
 #[test]
 fn native_arm64_freestanding_sync() {
-    if !docker_available() {
-        eprintln!("skipping: freestanding sync test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        eprintln!("skipping: freestanding aarch64 sync test needs a linux/aarch64 host");
         return;
     }
     let out = std::env::temp_dir().join(format!("solomon-arm-sync-{}", std::process::id()));
-    let got = freestanding_sync_stdout("linux/arm64", &out, Arm64Linux::new(&out), PROGRAM);
+    let got = freestanding_sync_stdout(&out, Arm64Linux::new(&out), PROGRAM);
     assert_eq!(got, EXPECTED, "arm64 freestanding");
 }
 
@@ -262,17 +240,16 @@ fn native_arm64_contended_mutex() {
 }
 
 /// The blocking futex mutex under real contention through the **freestanding aarch64**
-/// backend (the Linux `futex(2)` wait/wake path), run *natively* in a `linux/arm64`
-/// container on Apple silicon. (The x86 docker emulation can't run this — see the
-/// `CONTENDED` note — so there is no x86 counterpart.)
+/// backend (the Linux `futex(2)` wait/wake path). Runs only on a linux/aarch64 host;
+/// self-skips elsewhere (the Darwin path above covers the arm64 logic on the Mac).
 #[test]
 fn native_arm64_freestanding_contended_mutex() {
-    if !docker_available() {
-        eprintln!("skipping: contended mutex test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        eprintln!("skipping: freestanding aarch64 contended mutex test needs a linux/aarch64 host");
         return;
     }
     let out = std::env::temp_dir().join(format!("solomon-arm-cmu-{}", std::process::id()));
-    let got = freestanding_sync_stdout("linux/arm64", &out, Arm64Linux::new(&out), CONTENDED);
+    let got = freestanding_sync_stdout(&out, Arm64Linux::new(&out), CONTENDED);
     assert_eq!(
         got, CONTENDED_EXPECTED,
         "arm64 freestanding contended mutex"
@@ -302,8 +279,7 @@ fn interp_rwlock() {
 
 /// Condition variable + reader/writer lock under real contention on the native arm64
 /// runners (Darwin `__ulock`, freestanding `futex`). Native-only — the producer/
-/// consumer condvar can't run on the synchronous interpreter, and blocking sync
-/// deadlocks on the x86 docker emulation.
+/// consumer condvar can't run on the synchronous interpreter.
 #[test]
 fn native_arm64_condvar_rwlock() {
     if darwin_toolchain() {
@@ -324,18 +300,18 @@ fn native_arm64_condvar_rwlock() {
 
 #[test]
 fn native_arm64_freestanding_condvar_rwlock() {
-    if !docker_available() {
-        eprintln!("skipping: condvar/rwlock test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        eprintln!("skipping: freestanding aarch64 condvar/rwlock test needs a linux/aarch64 host");
         return;
     }
     let out = std::env::temp_dir().join(format!("solomon-arm-cr-{}", std::process::id()));
     assert_eq!(
-        freestanding_sync_stdout("linux/arm64", &out, Arm64Linux::new(&out), CONDVAR),
+        freestanding_sync_stdout(&out, Arm64Linux::new(&out), CONDVAR),
         CONDVAR_EXPECTED,
         "arm64 freestanding condvar"
     );
     assert_eq!(
-        freestanding_sync_stdout("linux/arm64", &out, Arm64Linux::new(&out), RWLOCK),
+        freestanding_sync_stdout(&out, Arm64Linux::new(&out), RWLOCK),
         RWLOCK_EXPECTED,
         "arm64 freestanding rwlock"
     );

@@ -111,24 +111,11 @@ fn native_arm64_tcp_echo_roundtrip() {
     );
 }
 
-/// Whether `docker` is usable (the freestanding socket tests run the static ELF in
-/// a `linux/<arch>` container alongside an in-container `socat` echo server).
-fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["info"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Build `program` with `backend` to a temp ELF, then run it under
-/// `docker --platform <platform>` in the `alpine/socat` image, which first starts a
-/// plain TCP echo server on 127.0.0.1:8080 (so a bare `socat … EXEC:cat` returns the
-/// bytes verbatim). The HolyC program connects there, sends `"ping"`, and prints the
-/// reply — so the freestanding socket *syscalls* (socket/connect/write/read/close)
-/// are exercised against a real kernel. Returns the program's stdout.
+/// Build `src` with `backend` to a temp ELF and run it **natively** (only on a
+/// matching Linux host) against the in-process host echo server. The freestanding
+/// socket *syscalls* (socket/connect/write/read/close) hit the real kernel. Returns
+/// the program's stdout.
 fn freestanding_socket_stdout(
-    platform: &str,
     out: &std::path::Path,
     mut backend: impl Codegen,
     src: &str,
@@ -139,65 +126,38 @@ fn freestanding_socket_stdout(
     backend
         .run(&program)
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--platform",
-            platform,
-            "-v",
-            &format!("{}:/prog:ro", out.display()),
-            "--entrypoint",
-            "sh",
-            "alpine/socat",
-            "-c",
-            "socat TCP-LISTEN:8080,reuseaddr,fork EXEC:cat & sleep 1; /prog",
-        ])
+    let output = Command::new(out)
         .output()
-        .unwrap_or_else(|e| panic!("docker run failed: {e}"));
-    let _ = std::fs::remove_file(&out);
+        .unwrap_or_else(|e| panic!("could not run produced ELF: {e}"));
+    let _ = std::fs::remove_file(out);
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 /// The connect/send/recv round-trip through the **freestanding x86-64** backend —
-/// raw Linux socket syscalls (no libc), executed in a `linux/amd64` container. A
-/// plain echo server returns `"ping"`, so the program prints `received: ping`.
+/// raw Linux socket syscalls (no libc). Runs only on a linux/x86_64 host (CI);
+/// self-skips elsewhere.
 #[test]
 fn native_x86_64_freestanding_tcp_echo() {
-    if !docker_available() {
-        eprintln!("skipping: freestanding socket test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 socket test needs a linux/x86_64 host");
         return;
     }
+    let port = spawn_echo();
     let out = std::env::temp_dir().join(format!("solomon-x64-net-{}", std::process::id()));
-    let got = freestanding_socket_stdout(
-        "linux/amd64",
-        &out,
-        X64Linux::new(&out),
-        &echo_program(8080),
-    );
-    assert!(
-        got.contains("received: ping"),
-        "x86_64 freestanding: {got:?}"
-    );
+    let got = freestanding_socket_stdout(&out, X64Linux::new(&out), &echo_program(port));
+    assert_eq!(got, "received: echo:ping\n", "x86_64 freestanding");
 }
 
 /// The same round-trip through the **freestanding aarch64** backend (raw arm64 Linux
-/// socket syscalls), in a `linux/arm64` container.
+/// socket syscalls). Runs only on a linux/aarch64 host; self-skips elsewhere.
 #[test]
 fn native_arm64_freestanding_tcp_echo() {
-    if !docker_available() {
-        eprintln!("skipping: freestanding socket test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        eprintln!("skipping: freestanding aarch64 socket test needs a linux/aarch64 host");
         return;
     }
+    let port = spawn_echo();
     let out = std::env::temp_dir().join(format!("solomon-arm-net-{}", std::process::id()));
-    let got = freestanding_socket_stdout(
-        "linux/arm64",
-        &out,
-        Arm64Linux::new(&out),
-        &echo_program(8080),
-    );
-    assert!(
-        got.contains("received: ping"),
-        "arm64 freestanding: {got:?}"
-    );
+    let got = freestanding_socket_stdout(&out, Arm64Linux::new(&out), &echo_program(port));
+    assert_eq!(got, "received: echo:ping\n", "arm64 freestanding");
 }

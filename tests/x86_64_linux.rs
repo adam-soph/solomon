@@ -1,10 +1,11 @@
 //! Tests for the x86-64 / ELF backend.
 //!
 //! The structural checks run everywhere (they only inspect the produced ELF
-//! image). The end-to-end "run it and check the exit code" test executes the
-//! emitted Linux/x86-64 static ELF — directly on a linux/x86_64 host, otherwise
-//! in one `docker run --platform linux/amd64` container — and self-skips when
-//! neither is available.
+//! image). The end-to-end "run it and check the exit code" tests execute the
+//! emitted Linux/x86-64 static ELF **natively**, so they run only on a
+//! linux/x86_64 host (CI's `ubuntu-latest`) and self-skip elsewhere — off a Mac a
+//! `cargo test` therefore exercises the x86-64 *emitter* via the structural
+//! checks, not execution.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -153,48 +154,25 @@ fn main_is_framed_and_exits_via_syscall() {
     );
 }
 
-/// Run ELFs `names` in `dir` and return their exit codes — directly on a
-/// linux/x86_64 host, otherwise in a single `docker run --platform linux/amd64`
-/// container (the static ELF needs no libc, so a bare `alpine` runs it). Returns
-/// `None` to skip when neither path is available.
+/// Run ELFs `names` in `dir` and return their exit codes — **natively**, only on a
+/// linux/x86_64 host (the freestanding ELF runs directly, no libc, no emulation).
+/// Returns `None` to skip off a non-matching host; the Linux targets are covered by
+/// CI (`ubuntu-latest`), so a Mac run exercises the *emitter* via the structural
+/// checks, not execution.
 fn run_exit_codes(dir: &std::path::Path, names: &[String]) -> Option<Vec<i32>> {
     use std::process::Command;
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return names
-            .iter()
-            .map(|n| {
-                Command::new(dir.join(n))
-                    .status()
-                    .ok()
-                    .and_then(|s| s.code())
-            })
-            .collect();
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return None;
     }
-    let script = names
+    names
         .iter()
-        .map(|n| format!("/c/{n}; echo $?"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let out = Command::new("docker")
-        .args([
-            "run",
-            "--platform",
-            "linux/amd64",
-            "--rm",
-            "-v",
-            &format!("{}:/c:ro", dir.display()),
-            "alpine",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .output()
-        .ok()?;
-    let codes: Vec<i32> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse().ok())
-        .collect();
-    (codes.len() == names.len()).then_some(codes)
+        .map(|n| {
+            Command::new(dir.join(n))
+                .status()
+                .ok()
+                .and_then(|s| s.code())
+        })
+        .collect()
 }
 
 #[test]
@@ -549,7 +527,7 @@ fn programs_run_with_the_expected_exit_code() {
     let codes = run_exit_codes(&dir, &names);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(codes) = codes else {
-        eprintln!("skipping x86-64 execution: needs a linux/x86_64 host or docker (linux/amd64)");
+        eprintln!("skipping x86-64 execution: needs a linux/x86_64 host");
         return;
     };
     for ((src, expected), got) in cases.iter().zip(codes) {
@@ -557,45 +535,22 @@ fn programs_run_with_the_expected_exit_code() {
     }
 }
 
-/// Run each ELF in `dir` and capture its stdout — directly on a linux/x86_64
-/// host, otherwise in one docker container (outputs split on a `0x1F` marker
-/// printed after each). Returns `None` to skip when neither path is available.
+/// Run each ELF in `dir` and capture its stdout — **natively**, only on a
+/// linux/x86_64 host. Returns `None` to skip off a non-matching host.
 fn run_stdouts(dir: &std::path::Path, names: &[String]) -> Option<Vec<String>> {
     use std::process::Command;
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return names
-            .iter()
-            .map(|n| {
-                Command::new(dir.join(n))
-                    .output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            })
-            .collect();
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return None;
     }
-    let script = names
+    names
         .iter()
-        .map(|n| format!("/c/{n}; printf '\\037'"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let out = Command::new("docker")
-        .args([
-            "run",
-            "--platform",
-            "linux/amd64",
-            "--rm",
-            "-v",
-            &format!("{}:/c:ro", dir.display()),
-            "alpine",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let parts: Vec<String> = text.split('\u{1f}').map(|p| p.to_string()).collect();
-    (parts.len() > names.len()).then(|| parts[..names.len()].to_vec())
+        .map(|n| {
+            Command::new(dir.join(n))
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        })
+        .collect()
 }
 
 #[test]
@@ -746,7 +701,7 @@ fn printing_matches_the_interpreter() {
     let got = run_stdouts(&dir, &names);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 print conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 print conformance: needs a linux/x86_64 host");
         return;
     };
     for ((src, want), out) in cases.iter().zip(&expected).zip(&got) {
@@ -797,7 +752,7 @@ fn buildable_examples_match_the_interpreter() {
     let got = run_stdouts(&dir, &names);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 example conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 example conformance: needs a linux/x86_64 host");
         return;
     };
     for ((name, _), (out, want)) in examples.iter().zip(got.iter().zip(&expected)) {
@@ -840,7 +795,7 @@ fn stdlib_math_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 stdlib conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 stdlib conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], want, "native != interp stdout for the math stdlib");
@@ -879,7 +834,7 @@ fn strtof64_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 StrToF64 conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 StrToF64 conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], want, "native != interp stdout for StrToF64");
@@ -907,7 +862,7 @@ fn time_builtins_run_natively() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 time conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 time conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], "1 1\n", "time builtin properties hold natively");
@@ -940,7 +895,7 @@ fn variadic_functions_match_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 varargs conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 varargs conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], want, "native != interp for varargs");
@@ -991,9 +946,7 @@ fn function_pointers_match_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!(
-            "skipping x86-64 function-pointer conformance: needs a linux/x86_64 host or docker"
-        );
+        eprintln!("skipping x86-64 function-pointer conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], want, "native != interp for function pointers");
@@ -1027,7 +980,7 @@ fn msize_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 MSize conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 MSize conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], want, "native != interp for MSize");
@@ -1082,7 +1035,7 @@ fn vec_object_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 Vec conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 Vec conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], want, "native != interp for the Vec object");
@@ -1113,7 +1066,7 @@ fn time_calendar_math_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping x86-64 time.hc conformance: needs a linux/x86_64 host or docker");
+        eprintln!("skipping x86-64 time.hc conformance: needs a linux/x86_64 host");
         return;
     };
     assert_eq!(got[0], want, "native != interp for lib/time.hc");

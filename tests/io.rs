@@ -141,66 +141,44 @@ fn native_arm64_file_roundtrip() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
 
-/// Whether `docker` is usable (the freestanding file tests run the static ELF in a
-/// `linux/<arch>` container, writing to the container's own `/tmp`).
-fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["info"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Build `program` with `backend` to a temp ELF and run it under
-/// `docker --platform <platform>` (a bare `alpine`; the static ELF needs no libc).
-/// The program writes/reads a file in the container's own `/tmp`. Returns stdout.
-fn freestanding_file_stdout(
-    platform: &str,
-    out: &std::path::Path,
-    mut backend: impl Codegen,
-) -> String {
+/// Build `program` with `backend` to a temp ELF and run it **natively** (the static
+/// ELF needs no libc). Only called on a matching Linux host; writes/reads its file in
+/// the host's own `/tmp`. Returns stdout.
+fn freestanding_file_stdout(out: &std::path::Path, mut backend: impl Codegen) -> String {
     backend
         .run(&compile(&file_program("/tmp/solomon_io_test.txt")))
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--platform",
-            platform,
-            "-v",
-            &format!("{}:/prog:ro", out.display()),
-            "alpine",
-            "/prog",
-        ])
+    let output = Command::new(out)
         .output()
-        .unwrap_or_else(|e| panic!("docker run failed: {e}"));
+        .unwrap_or_else(|e| panic!("could not run produced ELF: {e}"));
     let _ = std::fs::remove_file(out);
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 /// File round-trip through the **freestanding x86-64** backend — raw Linux file
-/// syscalls (open/lseek/read/write/close), in a `linux/amd64` container.
+/// syscalls (open/lseek/read/write/close). Runs only on a linux/x86_64 host (CI);
+/// self-skips elsewhere.
 #[test]
 fn native_x86_64_freestanding_file() {
-    if !docker_available() {
-        eprintln!("skipping: freestanding file test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 file test needs a linux/x86_64 host");
         return;
     }
     let out = std::env::temp_dir().join(format!("solomon-x64-io-{}", std::process::id()));
-    let got = freestanding_file_stdout("linux/amd64", &out, X64Linux::new(&out));
+    let got = freestanding_file_stdout(&out, X64Linux::new(&out));
     assert_eq!(got, EXPECTED, "x86_64 freestanding");
 }
 
 /// File round-trip through the **freestanding aarch64** backend (raw arm64 Linux
-/// syscalls — `openat`+AT_FDCWD, lseek 62), in a `linux/arm64` container.
+/// syscalls — `openat`+AT_FDCWD, lseek 62). Runs only on a linux/aarch64 host;
+/// self-skips elsewhere.
 #[test]
 fn native_arm64_freestanding_file() {
-    if !docker_available() {
-        eprintln!("skipping: freestanding file test needs docker");
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        eprintln!("skipping: freestanding aarch64 file test needs a linux/aarch64 host");
         return;
     }
     let out = std::env::temp_dir().join(format!("solomon-arm-io-{}", std::process::id()));
-    let got = freestanding_file_stdout("linux/arm64", &out, Arm64Linux::new(&out));
+    let got = freestanding_file_stdout(&out, Arm64Linux::new(&out));
     assert_eq!(got, EXPECTED, "arm64 freestanding");
 }

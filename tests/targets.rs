@@ -28,7 +28,7 @@ fn checked(src: &str) -> solomon::Program {
 fn aarch64_freestanding_emits_a_static_elf_executable() {
     // The freestanding target emits a self-contained static ELF *executable* (no
     // libc, no linker) — like the x86-64 Linux backend. Byte-check its structure
-    // on any host; `programs_run_under_docker`-style execution is covered by the
+    // on any host; execution is covered (natively) by the
     // arm64 conformance suite. `object()` returns the finished executable here,
     // since `compile` produces the runnable image directly for a freestanding
     // target.
@@ -68,7 +68,7 @@ fn aarch64_freestanding_prints_without_libc() {
     // A program that prints integers/strings still emits a self-contained image —
     // no `printf` (or any libc) reference; the formatting + `write` syscall are
     // emitted inline. Behaviour is verified byte-for-byte against the interpreter
-    // under docker in the arm64 conformance run; here we just confirm the image is
+    // natively in the arm64 conformance run; here we just confirm the image is
     // freestanding and structurally an executable.
     let program = checked(r#"U0 Main(){ "x=%d hex=%x s=%s\n", 42, 255, "hi"; } Main;"#);
     let elf = Arm64Linux::new(temp()).object(&program).unwrap();
@@ -87,7 +87,7 @@ fn aarch64_freestanding_prints_without_libc() {
 fn aarch64_freestanding_globals_and_runtime_need_no_libc() {
     // Globals (BSS, self-addressed), the heap (`MAlloc` over `mmap`), and the
     // string/memory builtins are all emitted — no libc reference and no leftover
-    // relocation. Behaviour is checked against the interpreter under docker.
+    // relocation. Behaviour is checked against the interpreter by the per-target conformance suites.
     let program = checked(
         r#"#include <cstr.hc>
            #include <mem.hc>
@@ -113,7 +113,7 @@ fn aarch64_freestanding_globals_and_runtime_need_no_libc() {
 fn aarch64_freestanding_float_printf_needs_no_libc() {
     // `%f` is emitted as the inline bignum formatter (no libc `printf`/`snprintf`),
     // correctly rounded to match the interpreter. Behaviour (incl. round-half-even)
-    // is checked against the interpreter under docker; here we confirm the image is
+    // is checked against the interpreter by the conformance suites; here we confirm the image is
     // freestanding.
     let program = checked(r#"U0 Main(){ "%.2f %9.3f %f\n", 2.5, 3.14159, -0.001; } Main;"#);
     let elf = Arm64Linux::new(temp()).object(&program).unwrap();

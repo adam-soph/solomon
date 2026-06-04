@@ -1,9 +1,9 @@
 //! Conformance for the freestanding `aarch64-unknown-linux` backend: compile every
-//! example to a self-contained static ELF (no libc, no linker) and run it — natively
-//! on a linux/aarch64 host, otherwise in one `docker run --platform linux/arm64`
-//! container (which runs AArch64 **natively** under Docker Desktop on Apple silicon —
-//! no qemu) — asserting its stdout is byte-for-byte the interpreter's. Self-skips
-//! when neither runner is available.
+//! example to a self-contained static ELF (no libc, no linker) and run it
+//! **natively**, asserting its stdout is byte-for-byte the interpreter's. Execution
+//! runs only on a linux/aarch64 host and self-skips elsewhere — off a Mac a
+//! `cargo test` exercises the AArch64 freestanding *emitter* via the build, not
+//! execution (the shared AArch64 emitter is executed on Darwin by `arm64_darwin`).
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -23,44 +23,22 @@ fn temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("solomon-arm64fs-{}-{id}", std::process::id()))
 }
 
-/// Run each freestanding ELF in `dir` and capture its stdout — directly on a
-/// linux/aarch64 host, otherwise in one docker container (outputs split on a `0x1F`
-/// marker printed after each). `None` to skip when neither path works.
+/// Run each freestanding ELF in `dir` and capture its stdout — **natively**, only on
+/// a linux/aarch64 host (the freestanding ELF runs directly, no emulation). Returns
+/// `None` to skip off a non-matching host; CI covers the Linux targets.
 fn run_stdouts(dir: &std::path::Path, names: &[String]) -> Option<Vec<String>> {
-    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        return names
-            .iter()
-            .map(|n| {
-                Command::new(dir.join(n))
-                    .output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            })
-            .collect();
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        return None;
     }
-    let script = names
+    names
         .iter()
-        .map(|n| format!("/c/{n}; printf '\\037'"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let out = Command::new("docker")
-        .args([
-            "run",
-            "--platform",
-            "linux/arm64",
-            "--rm",
-            "-v",
-            &format!("{}:/c:ro", dir.display()),
-            "alpine",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let parts: Vec<String> = text.split('\u{1f}').map(str::to_string).collect();
-    (parts.len() > names.len()).then(|| parts[..names.len()].to_vec())
+        .map(|n| {
+            Command::new(dir.join(n))
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        })
+        .collect()
 }
 
 #[test]
@@ -84,9 +62,7 @@ fn freestanding_matches_the_interpreter_for_every_example() {
     let got = run_stdouts(&dir, &names);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!(
-            "skipping aarch64 freestanding conformance: needs a linux/aarch64 host or docker"
-        );
+        eprintln!("skipping aarch64 freestanding conformance: needs a linux/aarch64 host");
         return;
     };
     for (name, (out, want)) in names.iter().zip(got.iter().zip(&expected)) {
@@ -131,7 +107,7 @@ fn extreme_field_width_and_precision_do_not_overflow() {
     let got = run_stdouts(&dir, &names);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping aarch64 width-clamp conformance: needs a linux/aarch64 host or docker");
+        eprintln!("skipping aarch64 width-clamp conformance: needs a linux/aarch64 host");
         return;
     };
     for ((src, want), out) in cases.iter().zip(&expected).zip(&got) {
@@ -177,9 +153,7 @@ fn realloc_extends_the_last_block_in_place() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!(
-            "skipping aarch64 ReAlloc in-place conformance: needs a linux/aarch64 host or docker"
-        );
+        eprintln!("skipping aarch64 ReAlloc in-place conformance: needs a linux/aarch64 host");
         return;
     };
     // In place every time → the bump pointer is never abandoned.
@@ -225,7 +199,7 @@ fn dynamic_width_and_precision_match_the_interpreter() {
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
         eprintln!(
-            "skipping aarch64 dynamic width/precision conformance: needs a linux/aarch64 host or docker"
+            "skipping aarch64 dynamic width/precision conformance: needs a linux/aarch64 host"
         );
         return;
     };
@@ -270,7 +244,7 @@ fn stdlib_math_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping aarch64 stdlib conformance: needs a linux/aarch64 host or docker");
+        eprintln!("skipping aarch64 stdlib conformance: needs a linux/aarch64 host");
         return;
     };
     assert_eq!(
@@ -311,7 +285,7 @@ fn strtof64_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping aarch64 StrToF64 conformance: needs a linux/aarch64 host or docker");
+        eprintln!("skipping aarch64 StrToF64 conformance: needs a linux/aarch64 host");
         return;
     };
     assert_eq!(
@@ -344,7 +318,7 @@ fn time_builtins_run_natively() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping aarch64 time conformance: needs a linux/aarch64 host or docker");
+        eprintln!("skipping aarch64 time conformance: needs a linux/aarch64 host");
         return;
     };
     assert_eq!(got[0], "1 1\n", "time builtin properties hold natively");
@@ -376,7 +350,7 @@ fn variadic_functions_match_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping aarch64 varargs conformance: needs a linux/aarch64 host or docker");
+        eprintln!("skipping aarch64 varargs conformance: needs a linux/aarch64 host");
         return;
     };
     assert_eq!(got[0], want, "freestanding native != interp for varargs");
@@ -408,7 +382,7 @@ fn time_calendar_math_matches_the_interpreter() {
     let got = run_stdouts(&dir, &[name]);
     let _ = std::fs::remove_dir_all(&dir);
     let Some(got) = got else {
-        eprintln!("skipping aarch64 time.hc conformance: needs a linux/aarch64 host or docker");
+        eprintln!("skipping aarch64 time.hc conformance: needs a linux/aarch64 host");
         return;
     };
     assert_eq!(
