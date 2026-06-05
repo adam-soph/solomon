@@ -64,7 +64,7 @@ U0 Main()
   I64 i;
   for (i = 0; i < VecLen(&words); i++) {
     U8 *w = VecAt(&words, i);                 // T = U8 *
-    (I64 c, Bool found) = HmapGet(&counts, w); // (I64, Bool)
+    c, found := HmapGet(&counts, w); // (I64, Bool)
     HmapPut(&counts, w, found ? c + 1 : 1);    // value from the receiver
   }
   "tokens=%d distinct=%d\n", VecLen(&words), HmapLen(&counts);
@@ -75,7 +75,7 @@ U0 Main()
   "by word:\n";
   for (i = 0; i < VecLen(&keys); i++) {
     U8 *k = VecAt(&keys, i);
-    (I64 c, Bool _f) = HmapGet(&counts, k);
+    c, _f := HmapGet(&counts, k);
     "  %s %d\n", k, c;
   }
 
@@ -94,7 +94,7 @@ U0 Main()
   HmapInit(&bylen, &HmapI64Hash, &HmapI64Eq);
   for (i = 0; i < VecLen(&keys); i++) {
     I64 len = StrLen(VecAt(&keys, i));
-    (I64 n, Bool f) = HmapGet(&bylen, len);
+    n, f := HmapGet(&bylen, len);
     HmapPut(&bylen, len, f ? n + 1 : 1);
   }
   Vec<I64> lens;
@@ -102,7 +102,7 @@ U0 Main()
   "by length:\n";
   for (i = 0; i < VecLen(&lens); i++) {
     I64 l = VecAt(&lens, i);
-    (I64 n, Bool _f) = HmapGet(&bylen, l);
+    n, _f := HmapGet(&bylen, l);
     "  len %d: %d\n", l, n;
   }
 

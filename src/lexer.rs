@@ -532,6 +532,7 @@ impl Lexer {
             },
             b':' => match b2 {
                 Some(b':') => self.eat2(ColonColon),
+                Some(b'=') => self.eat2(ColonEq),
                 _ => self.eat1(Colon),
             },
             b'?' => self.eat1(Question),

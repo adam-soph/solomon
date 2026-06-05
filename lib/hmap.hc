@@ -8,7 +8,7 @@
 //     Hmap<U8 *, I64> m;
 //     HmapInit(&m, &HmapStrHash, &HmapStrEq);   // string keys
 //     HmapPut(&m, "answer", 42);
-//     (I64 v, Bool ok) = HmapGet(&m, "answer"); // `ok` distinguishes a stored 0 from a miss
+//     v, ok := HmapGet(&m, "answer");           // `ok` distinguishes a stored 0 from a miss
 //
 // Stock key ops: `HmapI64Hash`/`HmapI64Eq` (I64 keys) and `HmapStrHash`/`HmapStrEq`
 // (`U8 *` string keys — content-hashed/compared). Built on <mem.hc>, <cstr.hc> (string
@@ -148,7 +148,7 @@ U0 HmapPut<K, V>(Hmap<K, V> *m, K key, V val)
 
 Bool HmapHas<K, V>(Hmap<K, V> *m, K key)
 {
-  (V _, Bool ok) = HmapGet<K, V>(m, key);
+  _, ok := HmapGet<K, V>(m, key);
   return ok;
 }
 

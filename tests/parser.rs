@@ -621,12 +621,16 @@ fn generic_inference_resolves_member_index_deref_and_arithmetic() {
 }
 
 #[test]
-fn generic_inference_does_not_see_a_later_function() {
-    // `fn_rets` is "seen so far": a call-result argument whose function is defined
-    // *after* the call site isn't resolvable, so it requires the explicit form.
-    let err =
-        parse("T Id<T>(T x){return x;} I64 a = Id(Later()); I64 Later(){return 4;}").unwrap_err();
-    assert!(err.to_string().contains("cannot infer"), "got: {err}");
+fn generic_inference_sees_a_forward_declared_function() {
+    // The hoist pre-pass seeds top-level function return types into `fn_rets`, so a
+    // call-result argument whose function is defined *below* the call site infers fine.
+    let p = parse("T Id<T>(T x){return x;} I64 a = Id(Later()); I64 Later(){return 4;}").unwrap();
+    assert!(
+        p.items
+            .iter()
+            .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == "Id_I64")),
+        "Id<I64> should be instantiated from the forward-declared Later's return type"
+    );
 }
 
 #[test]
@@ -650,58 +654,117 @@ fn program_carries_generic_templates() {
 }
 
 #[test]
-fn unparenthesized_typed_tuple_unpack() {
-    // `T0 a, T1 b = e;` (a type before each name) is a tuple unpack — it desugars to a
-    // hidden tuple temp plus one declarator per slot (3 declarators here).
-    let p = prog("(I64, I64) Mk() { return 1, 2; } I64 a, I64 b = Mk();");
-    let decls = p
-        .items
-        .iter()
-        .find_map(|s| match &s.kind {
-            StmtKind::VarDecl { decls } => Some(decls),
-            _ => None,
-        })
-        .expect("a VarDecl from the unpack");
-    assert_eq!(decls.len(), 3, "tuple temp + a + b: {decls:?}");
-    assert_eq!(decls[1].name, "a");
-    assert_eq!(decls[1].ty, Type::I64);
-    assert_eq!(decls[2].name, "b");
+fn colon_eq_tuple_unpack() {
+    // `a, b := e;` is the sole unpack syntax: it declares each name (`_` discards) with
+    // the element type inferred from the tuple, desugaring to a hidden tuple temp plus
+    // one declarator per named slot.
+    let unpack_decls = |src: &str| -> Vec<Declarator> {
+        prog(src)
+            .items
+            .iter()
+            .find_map(|s| match &s.kind {
+                StmtKind::VarDecl { decls } => Some(decls.clone()),
+                _ => None,
+            })
+            .expect("a VarDecl from the unpack")
+    };
 
-    // No type after the comma => an ordinary declaration list (`b` shares `I64`), which
-    // must NOT be mistaken for an unpack.
+    // From a tuple-returning function: 2 names + the temp = 3 declarators, typed I64.
+    let d = unpack_decls("(I64, I64) Mk() { return 1, 2; } a, b := Mk();");
+    assert_eq!(d.len(), 3, "temp + a + b: {d:?}");
+    assert_eq!(d[1].name, "a");
+    assert_eq!(d[1].ty, Type::I64);
+    assert_eq!(d[2].name, "b");
+
+    // From a tuple literal, element types inferred per element (I64, F64).
+    let d = unpack_decls("x, y := (10, 2.5);");
+    assert_eq!(d[1].ty, Type::I64);
+    assert_eq!(d[2].ty, Type::F64);
+
+    // `_` discards a slot (no declarator emitted for it): temp + only `b`.
+    let d = unpack_decls("(I64, I64) Mk() { return 1, 2; } _, b := Mk();");
+    assert_eq!(d.len(), 2, "temp + b only: {d:?}");
+    assert_eq!(d[1].name, "b");
+}
+
+#[test]
+fn colon_eq_single_infers_type() {
+    // `n := e;` with ONE name is an inferred-type declaration — one declarator whose
+    // type comes from the right-hand side (no tuple temp).
+    // Find the declarator named `want` (a `:=` with one name produces a single decl).
+    let decl = |src: &str, want: &str| -> Declarator {
+        prog(src)
+            .items
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::VarDecl { decls } => Some(decls),
+                _ => None,
+            })
+            .flatten()
+            .find(|d| d.name == want)
+            .unwrap_or_else(|| panic!("no declarator `{want}`"))
+            .clone()
+    };
+    assert_eq!(decl("n := 5;", "n").ty, Type::I64);
+    assert_eq!(decl("f := 2.5;", "f").ty, Type::F64);
+    assert_eq!(decl("s := \"hi\";", "s").ty, Type::Ptr(Box::new(Type::U8)));
+    // A whole tuple bound to one variable (its type is the tuple type, not unpacked).
+    let d = decl("(I64, I64) Mk(){return 1,2;} p := Mk();", "p");
+    assert!(matches!(d.ty, Type::Named(_)), "tuple type: {:?}", d.ty);
+    // A pointer-returning generic call infers its pointer return type.
+    let d = decl(
+        "T *Id<T>(T *x){return x;} I64 n = 0; p := Id<I64>(&n);",
+        "p",
+    );
+    assert_eq!(
+        d.ty,
+        Type::Ptr(Box::new(Type::I64)),
+        "pointer return: {:?}",
+        d.ty
+    );
+}
+
+#[test]
+fn colon_eq_through_generic_calls() {
+    // A generic call's tuple return is inferred for `:=`, both inferred and explicit
+    // type-arg forms (the instance's return type is recorded at the call site).
+    let unpacks = |src: &str| -> bool {
+        parse(src).is_ok_and(|p| {
+            p.items
+                .iter()
+                .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name.starts_with("Pick_")))
+        })
+    };
+    let prog = "(T, Bool) Pick<T>(T x) { return x, 1; } ";
+    // inferred type arg
+    assert!(
+        unpacks(&format!("{prog} U0 F(){{ v, ok := Pick(5); }}")),
+        "inferred"
+    );
+    // explicit type arg
+    assert!(
+        unpacks(&format!("{prog} U0 F(){{ v, ok := Pick<I64>(5); }}")),
+        "explicit"
+    );
+}
+
+#[test]
+fn colon_eq_errors() {
+    // Arity mismatch is a clear error.
+    let err = parse("(I64, I64, I64) Mk(){return 1,2,3;} a, b := Mk();").unwrap_err();
+    assert!(err.to_string().contains("3 element"), "got: {err}");
+
+    // A non-tuple RHS can't be unpacked.
+    let err = parse("U0 F(){ a, b := 5; }").unwrap_err();
+    assert!(err.to_string().contains("cannot infer"), "got: {err}");
+
+    // A single name whose RHS type can't be inferred at parse time (a ternary) errors.
+    let err = parse("U0 F(){ I64 x = 1; a := x ? 1 : 2; }").unwrap_err();
+    assert!(err.to_string().contains("cannot infer"), "got: {err}");
+
+    // `I64 a, b = 5;` is still an ordinary declaration list, not an unpack.
     match stmt("I64 a, b = 5;") {
         StmtKind::VarDecl { decls } => assert_eq!(decls.len(), 2, "plain decl list"),
         other => panic!("expected a decl list, got {other:?}"),
     }
-}
-
-#[test]
-fn same_type_bare_unpack_inferred_from_tuple_rhs() {
-    // `I64 a, b = <tuple>` (same type, no repeat) is reinterpreted as an unpack because
-    // the RHS types to a tuple — the decl-list reading would assign a tuple to a scalar.
-    let p = prog("(I64, I64) Mk() { return 1, 2; } I64 a, b = Mk();");
-    let decls = p
-        .items
-        .iter()
-        .find_map(|s| match &s.kind {
-            StmtKind::VarDecl { decls } => Some(decls),
-            _ => None,
-        })
-        .expect("a VarDecl from the unpack");
-    assert_eq!(decls.len(), 3, "tuple temp + a + b: {decls:?}");
-    assert_eq!(decls[1].name, "a");
-    assert_eq!(decls[2].name, "b");
-
-    // A scalar RHS keeps the ordinary decl-list meaning (b = 5, a uninitialised).
-    match stmt("I64 a, b = 5;") {
-        StmtKind::VarDecl { decls } => {
-            assert_eq!(decls.len(), 2);
-            assert_eq!(decls[1].init, Some(e(ExprKind::Int(5))));
-        }
-        other => panic!("expected a decl list, got {other:?}"),
-    }
-
-    // A name/tuple-arity mismatch is a clear error, not a silent drop.
-    let err = parse("(I64, I64, I64) Mk(){return 1,2,3;} I64 a, b = Mk();").unwrap_err();
-    assert!(err.to_string().contains("tuple has 3"), "got: {err}");
 }

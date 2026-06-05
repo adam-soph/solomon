@@ -516,10 +516,46 @@ impl<S: TokenStream> Parser<S> {
             }
         }
         let mangled = mangle_generic(name, &type_args);
+        // Record the instance's return type (so a `:=` / call-result inference can see
+        // through a generic call like `c, found := HmapGet(...)`, which returns a tuple).
+        self.record_generic_ret(&tmpl, &type_args, &mangled);
         self.generics
             .pending_fns
             .push((name.to_string(), type_args));
         Ok(mangled)
+    }
+
+    /// Compute a generic-function instance's concrete return type — substitute the bound
+    /// type args into the template's return-type tokens (everything before the function
+    /// name) and parse them — and record it in `fn_rets`, so call-result inference can
+    /// see a generic call's type at parse time. Handles a pointer return (`T *Foo`),
+    /// where the `*` sits between the base type and the name. Best-effort: only recorded
+    /// when the tokens parse cleanly in full.
+    pub(super) fn record_generic_ret(
+        &mut self,
+        tmpl: &GenericFn,
+        type_args: &[Type],
+        mangled: &str,
+    ) {
+        let subst: HashMap<&str, Vec<Token>> = tmpl
+            .type_params
+            .iter()
+            .zip(type_args)
+            .map(|(p, a)| (p.as_str(), type_to_tokens(a)))
+            .collect();
+        let mut out = Vec::new();
+        for t in &tmpl.tokens[..tmpl.name_index] {
+            if let TokenKind::Ident(s) = &t.kind {
+                if let Some(rep) = subst.get(s.as_str()) {
+                    out.extend(rep.iter().cloned());
+                    continue;
+                }
+            }
+            out.push(t.clone());
+        }
+        if let Some(ty) = self.parse_type_from_tokens(out) {
+            self.generics.fn_rets.insert(mangled.to_string(), ty);
+        }
     }
 
     /// Best-effort static type of a generic call's argument expression, used to infer

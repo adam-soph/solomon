@@ -292,6 +292,7 @@ pub enum TokenKind {
     Question,   // ?
     Colon,      // :
     ColonColon, // ::
+    ColonEq,    // :=   (tuple-unpack declaration: `a, b := tuple`)
     DotDotDot,  // ...   (varargs / case ranges)
     At,         // @
     Hash,       // #     (preprocessor directives: #include, #define, ...)

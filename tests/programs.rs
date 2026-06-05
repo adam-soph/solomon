@@ -26,13 +26,16 @@ fn tuples_multireturn_index_and_destructure() {
     let out = run("tuples.hc", include_str!("../examples/tuples.hc"));
     assert_eq!(
         out,
-        "17 / 5 = 3 rem 2\n\
-         23 / 4 = 5 rem 3\n\
-         30 / 7 = 4 rem 2\n\
-         20 / 3 = 6\n\
-         p[0]=1 p[1]=2\n\
-         x=1 y=2\n\
-         sum=10 prod=21 avg=5.0\n"
+        "infer: 5 1.5 items 10 (3,1)\n\
+         divmod: 3 rem 2\n\
+         stats: sum=10 prod=21 avg=5.0\n\
+         tagged: answer\n\
+         indexed: t[0]=3 t[1]=2\n\
+         swapped: 9 8\n\
+         pair: 1 2\n\
+         range #1: 4 rem 3\n\
+         vec: key=2 val=20\n\
+         hmap: 7->49 (ok=1)  8 found=0\n"
     );
 }
 

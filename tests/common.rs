@@ -136,7 +136,7 @@ U0 Main()
   Vec<I64> k, v; Vec<HmapKV<I64, I64>> e;
   HmapKeys(&m, &k); HmapValues(&m, &v); HmapEntries(&m, &e);
   "len=%d k=%d v=%d e=%d\n", HmapLen(&m), VecLen(&k), VecLen(&v), VecLen(&e);
-  I64 x = 7; (I64 val, Bool ok) = HmapGet(&m, x);
+  I64 x = 7; val, ok := HmapGet(&m, x);
   "get=%d del=%d has=%d\n", ok, HmapDel(&m, x), HmapHas(&m, x);
   VecFree(&k); VecFree(&v); VecFree(&e); HmapFree(&m);
 }

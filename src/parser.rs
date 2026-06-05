@@ -143,6 +143,10 @@ pub struct Parser<S: TokenStream> {
     /// nested expression/statement passes through), so pathologically deep input
     /// fails with a `ParseError` instead of overflowing the stack and aborting.
     depth: u32,
+    /// Top-level function return-type tokens collected by the hoist pre-pass, parsed
+    /// into `generics.fn_rets` up front by `seed_fn_rets` — so `:=` / call-result
+    /// inference sees functions defined *below* the use site.
+    hoisted_fn_rets: HashMap<String, Vec<Token>>,
 }
 
 /// Maximum expression/statement nesting depth before the parser bails out.
@@ -169,6 +173,7 @@ impl<S: TokenStream> Parser<S> {
             tuple_types: HashSet::new(),
             generics: Generics::new(),
             depth: 0,
+            hoisted_fn_rets: HashMap::new(),
         }
     }
 
@@ -185,6 +190,9 @@ impl<S: TokenStream> Parser<S> {
 
     /// Parse a whole translation unit.
     pub fn parse_program(&mut self) -> PResult<Program> {
+        // Parse the hoisted function return types up front so forward references resolve
+        // for `:=` / call-result inference (the parser's own recording is "seen so far").
+        self.seed_fn_rets();
         let mut items = Vec::new();
         while !self.at(&TokenKind::Eof)? {
             let stmt = self.parse_stmt()?;
@@ -211,6 +219,40 @@ impl<S: TokenStream> Parser<S> {
             files,
             generics,
         })
+    }
+
+    /// Parse each hoisted top-level function's return-type tokens into `fn_rets`, so a
+    /// `:=` / call-result inference sees forward-declared functions. Best-effort.
+    fn seed_fn_rets(&mut self) {
+        let entries: Vec<(String, Vec<Token>)> = self.hoisted_fn_rets.drain().collect();
+        for (name, toks) in entries {
+            if let Some(ty) = self.parse_type_from_tokens(toks) {
+                self.generics.fn_rets.entry(name).or_insert(ty);
+            }
+        }
+    }
+
+    /// Parse a standalone type from a token vec (a hoisted or generic-instance return
+    /// type). Trailing `*`s belong to the type (`T *Foo` returns `T *`). Returns `None`
+    /// unless the tokens parse cleanly in full. Swaps the look-ahead buffer to read the
+    /// supplied tokens, then restores it.
+    fn parse_type_from_tokens(&mut self, mut toks: Vec<Token>) -> Option<Type> {
+        toks.push(Token::new(TokenKind::Eof, Span::dummy()));
+        let saved = std::mem::take(&mut self.buf);
+        self.buf = toks.into();
+        let parsed = self.parse_base_type().map(|mut ty| {
+            while matches!(self.peek_kind(), Ok(TokenKind::Star)) {
+                let _ = self.advance();
+                ty = Type::Ptr(Box::new(ty));
+            }
+            ty
+        });
+        let exhausted = matches!(self.peek_kind(), Ok(TokenKind::Eof));
+        self.buf = saved;
+        match (parsed, exhausted) {
+            (Ok(ty), true) => Some(ty),
+            _ => None,
+        }
     }
 
     // ---- token buffer / look-ahead ----
@@ -491,157 +533,139 @@ impl<S: TokenStream> Parser<S> {
         name
     }
 
-    /// Does the statement begin with a tuple destructuring pattern — `(` … `)` `=`
-    /// with a top-level comma inside? (The comma rules it out as `(lvalue) = e`.)
-    fn looks_like_destructure(&mut self) -> PResult<bool> {
-        if !matches!(self.peek_kind()?, TokenKind::LParen) {
-            return Ok(false);
-        }
-        let mut depth = 0i32;
+    /// Look-ahead: does the statement begin with a tuple unpack `name (, name)* :=`?
+    /// (`_` is an identifier, so it's allowed as a discard slot.)
+    fn looks_like_unpack(&mut self) -> PResult<bool> {
         let mut i = 0;
-        let mut saw_comma = false;
         loop {
-            match self.peek_n(i)?.kind.clone() {
-                TokenKind::LParen | TokenKind::LBracket => depth += 1,
-                TokenKind::RParen | TokenKind::RBracket => {
-                    depth -= 1;
-                    if depth == 0 {
-                        // The matching `)` of the leading group: a destructure iff
-                        // it had a top-level comma and `=` follows.
-                        let next = self.peek_n(i + 1)?.kind.clone();
-                        return Ok(saw_comma && next == TokenKind::Eq);
-                    }
-                }
-                TokenKind::Comma if depth == 1 => saw_comma = true,
-                TokenKind::Eof => return Ok(false),
-                _ => {}
+            if !matches!(self.peek_n(i)?.kind, TokenKind::Ident(_)) {
+                return Ok(false);
             }
             i += 1;
+            match self.peek_n(i)?.kind {
+                TokenKind::Comma => i += 1,
+                TokenKind::ColonEq => return Ok(true),
+                _ => return Ok(false),
+            }
             if i > 512 {
                 return Ok(false);
             }
         }
     }
 
-    /// Parse and desugar `(slot, …) = rhs;`. Each slot is a typed binding
-    /// (`T name` / `T _`), or — in the all-untyped *assignment* form — an existing
-    /// variable (`name` / `_`). The typed form lowers to a hidden tuple temp plus a
-    /// declaration per named slot; the untyped form requires a side-effect-free
-    /// source and assigns each slot directly. Both ride the existing tuple-struct
-    /// member machinery, so no backend changes are needed.
-    fn parse_destructure(&mut self, m: Mark) -> PResult<Stmt> {
-        self.expect(&TokenKind::LParen, "`(`")?;
-        // (declared type or None, binding name or None for `_`)
-        let mut slots: Vec<(Option<Type>, Option<String>)> = Vec::new();
+    /// Parse and desugar a `:=` short declaration. With **one** name it's an inferred
+    /// -type variable declaration (`n := e;` declares `n` with `e`'s static type); with
+    /// **two or more** it's a tuple unpack (`a, b := e;` declares each name with the
+    /// corresponding tuple element type, `_` discards). The sole destructuring syntax —
+    /// explicit (`:=` marks it), no parentheses, no written types. The unpack lowers to
+    /// a hidden tuple temp plus one declaration per named slot.
+    fn parse_unpack(&mut self, m: Mark) -> PResult<Stmt> {
+        let mut names: Vec<Option<String>> = Vec::new();
         loop {
-            let ty = if self.is_type_start()? {
-                Some(self.parse_type_no_name()?)
-            } else {
-                None
-            };
-            let name = self.expect_ident()?;
-            slots.push((ty, if name == "_" { None } else { Some(name) }));
+            let n = self.expect_ident()?;
+            names.push(if n == "_" { None } else { Some(n) });
             if !self.eat(&TokenKind::Comma)? {
                 break;
             }
         }
-        self.expect(&TokenKind::RParen, "`)` to close a destructuring pattern")?;
-        self.expect(&TokenKind::Eq, "`=`")?;
+        self.expect(&TokenKind::ColonEq, "`:=`")?;
         let rhs = self.parse_assign()?;
         self.expect(&TokenKind::Semicolon, "`;`")?;
-        self.desugar_destructure(slots, rhs, m)
-    }
 
-    /// Parse the unparenthesized typed-binding destructure `T0 n0, T1 n1, … = rhs;`
-    /// (a tuple unpack written like a multi-type declaration). The first binding's type
-    /// and name are already parsed; we're positioned at the `,` before the second. A
-    /// `, <type>` (rather than `, <name>`) is what distinguishes this from an ordinary
-    /// declaration list, which shares a single base type. Always the typed form.
-    fn parse_typed_unpack(&mut self, first: (String, Type), m: Mark) -> PResult<Stmt> {
-        let (name, ty) = first;
-        let mut slots: Vec<(Option<Type>, Option<String>)> =
-            vec![(Some(ty), if name == "_" { None } else { Some(name) })];
-        while self.eat(&TokenKind::Comma)? {
-            let bty = self.parse_type_no_name()?;
-            let bname = self.expect_ident()?;
-            slots.push((Some(bty), if bname == "_" { None } else { Some(bname) }));
+        // Single name: an inferred-type declaration — the type comes from the RHS.
+        if names.len() == 1 {
+            let Some(name) = names.pop().unwrap() else {
+                return self.err_at(m.pos, "`_ := e` binds nothing — write `e;` instead");
+            };
+            let Some(ty) = self.arg_type(&rhs) else {
+                return self.err_at(
+                    m.pos,
+                    "cannot infer the type for `:=`; the right-hand side's type is not \
+                     known at parse time — declare it with an explicit type",
+                );
+            };
+            let decl = Declarator {
+                name,
+                ty,
+                init: Some(rhs),
+                span: self.finish(m),
+            };
+            return Ok(self.st(StmtKind::VarDecl { decls: vec![decl] }, m));
         }
-        self.expect(&TokenKind::Eq, "`=`")?;
-        let rhs = self.parse_assign()?;
-        self.expect(&TokenKind::Semicolon, "`;`")?;
+
+        let Some(elems) = self.tuple_elem_types(&rhs) else {
+            return self.err_at(
+                m.pos,
+                "cannot infer the tuple element types for `:=`; the right-hand side's \
+                 type is not known at parse time — bind it to a typed variable first",
+            );
+        };
+        if elems.len() != names.len() {
+            return self.err_at(
+                m.pos,
+                format!(
+                    "`:=` binds {} name(s) but the tuple has {} element(s)",
+                    names.len(),
+                    elems.len()
+                ),
+            );
+        }
+        let slots: Vec<(Type, Option<String>)> = elems.into_iter().zip(names).collect();
         self.desugar_destructure(slots, rhs, m)
     }
 
-    /// Lower a collected destructuring pattern (typed bindings or untyped assignment
-    /// targets) plus its `rhs` source into the existing tuple-struct machinery — shared
-    /// by the parenthesized `(…) = e` and the bare `T0 a, T1 b = e` forms.
+    /// Best-effort tuple element types of an unpack's right-hand side: a tuple literal
+    /// `(e0, …)` (each element typed via `arg_type`), or any expression whose static
+    /// type is a known tuple (read from `class_fields`). `None` ⇒ can't infer.
+    fn tuple_elem_types(&self, rhs: &Expr) -> Option<Vec<Type>> {
+        if let ExprKind::InitList(items) = &rhs.kind {
+            return items.iter().map(|e| self.arg_type(e)).collect();
+        }
+        let Type::Named(tup) = self.arg_type(rhs)? else {
+            return None;
+        };
+        if !self.tuple_types.contains(&tup) {
+            return None;
+        }
+        Some(
+            self.generics
+                .class_fields
+                .get(&tup)?
+                .iter()
+                .map(|(_, t)| t.clone())
+                .collect(),
+        )
+    }
+
+    /// Lower a tuple unpack into the existing tuple-struct machinery: bind `rhs` to a
+    /// hidden tuple temp, then declare each named slot from its field — all in one
+    /// `VarDecl` so the new names land in the enclosing scope. A `None` name (`_`) keeps
+    /// its place in the tuple shape but binds nothing.
     fn desugar_destructure(
         &mut self,
-        slots: Vec<(Option<Type>, Option<String>)>,
+        slots: Vec<(Type, Option<String>)>,
         rhs: Expr,
         m: Mark,
     ) -> PResult<Stmt> {
-        let typed = slots.iter().any(|(t, _)| t.is_some());
-        if typed && slots.iter().any(|(t, _)| t.is_none()) {
-            return self.err_at(
-                m.pos,
-                "destructuring slots must be either all typed (a declaration) or all untyped (an assignment); use `T _` to discard a typed slot",
-            );
-        }
-
-        if typed {
-            // Declaration form: bind the source to a hidden tuple temp, then declare
-            // each named slot from its field — all in one `VarDecl` so the new names
-            // land in the enclosing scope (a `Block` would hide them) and later
-            // declarators can read the temp. `T _` slots keep their place in the
-            // tuple shape but bind nothing.
-            let elems: Vec<Type> = slots.iter().map(|(t, _)| t.clone().unwrap()).collect();
-            let tup = self.intern_tuple_type(&elems, m);
-            let tmp = format!("$dst{}", m.start);
-            let mut decls = vec![Declarator {
-                name: tmp.clone(),
-                ty: Type::Named(tup),
-                init: Some(rhs),
+        let elems: Vec<Type> = slots.iter().map(|(t, _)| t.clone()).collect();
+        let tup = self.intern_tuple_type(&elems, m);
+        let tmp = format!("$dst{}", m.start);
+        let mut decls = vec![Declarator {
+            name: tmp.clone(),
+            ty: Type::Named(tup),
+            init: Some(rhs),
+            span: self.finish(m),
+        }];
+        for (i, (ty, name)) in slots.iter().enumerate() {
+            let Some(name) = name else { continue };
+            decls.push(Declarator {
+                name: name.clone(),
+                ty: ty.clone(),
+                init: Some(self.tuple_field(&tmp, i, m)),
                 span: self.finish(m),
-            }];
-            for (i, (ty, name)) in slots.iter().enumerate() {
-                let Some(name) = name else { continue };
-                decls.push(Declarator {
-                    name: name.clone(),
-                    ty: ty.clone().unwrap(),
-                    init: Some(self.tuple_field(&tmp, i, m)),
-                    span: self.finish(m),
-                });
-            }
-            return Ok(self.st(StmtKind::VarDecl { decls }, m));
+            });
         }
-
-        let mut stmts: Vec<Stmt> = Vec::new();
-        {
-            // Assignment form: assign each slot from the source's fields. The source
-            // is read once per slot, so it must be side-effect free.
-            if !is_simple_source(&rhs) {
-                return self.err_at(
-                    m.pos,
-                    "an untyped destructuring assignment needs a simple source (a variable or field path); bind with types to capture a computed tuple",
-                );
-            }
-            for (i, (_, name)) in slots.iter().enumerate() {
-                let Some(name) = name else { continue };
-                let target = self.ex(ExprKind::Ident(name.clone()), m);
-                let field = self.tuple_member(rhs.clone(), i, m);
-                let assign = self.ex(
-                    ExprKind::Assign {
-                        op: AssignOp::Assign,
-                        target: Box::new(target),
-                        value: Box::new(field),
-                    },
-                    m,
-                );
-                stmts.push(self.st(StmtKind::Expr(assign), m));
-            }
-        }
-        Ok(self.st(StmtKind::Block(stmts), m))
+        Ok(self.st(StmtKind::VarDecl { decls }, m))
     }
 
     /// `<var>._<i>` — read field `i` of a tuple-typed variable.
@@ -774,9 +798,10 @@ impl<S: TokenStream> Parser<S> {
             return Ok(self.st(StmtKind::Label(name), m));
         }
 
-        // Tuple destructuring: `(T0 a, T1 b) = e;` or `(a, b) = e;`.
-        if self.looks_like_destructure()? {
-            return self.parse_destructure(m);
+        // Tuple unpack: `a, b := e;` — the `:=` declares each name, with the element
+        // types inferred from the tuple `e`. The only destructuring syntax.
+        if self.looks_like_unpack()? {
+            return self.parse_unpack(m);
         }
 
         // A generic function definition `Ret Name<T>(…) { … }` — detected here (not via
@@ -1062,70 +1087,10 @@ impl<S: TokenStream> Parser<S> {
                 m,
             ))
         } else {
-            // Unparenthesized tuple unpack `T0 a, T1 b = e;`: a `,` followed by a *type*
-            // (not a bare name) is the signal — an ordinary declaration list shares one
-            // base type, so `T a, b` has a name, not a type, after the comma.
-            if self.at(&TokenKind::Comma)? {
-                let after = self.peek_n(1)?.kind.clone();
-                if self.kind_is_type_start(&after) {
-                    return self.parse_typed_unpack((name, ty), m);
-                }
-            }
             let decls = self.parse_var_decls(&base, (name, ty), dm)?;
             self.expect(&TokenKind::Semicolon, "`;`")?;
-            // A same-type bare unpack `I64 a, b = pair;` parses as an ordinary decl list
-            // (only the last declarator initialised). If that init's static type is a
-            // tuple, reinterpret it as an unpack — the decl-list reading would assign a
-            // tuple to a scalar, always a type error, so no valid program changes meaning.
-            if let Some(unpack) = self.try_bare_tuple_unpack(&decls, m)? {
-                return Ok(unpack);
-            }
             Ok(self.st(StmtKind::VarDecl { decls }, m))
         }
-    }
-
-    /// Reinterpret a parsed declaration list as a tuple unpack when it has the shape
-    /// `T a, b, … = e;` (≥2 declarators, only the last initialised) and `e`'s inferred
-    /// static type is a tuple. Returns `None` when it isn't such a case (stay a decl
-    /// list), or an error when it clearly *is* one but the slot count ≠ tuple arity.
-    fn try_bare_tuple_unpack(&mut self, decls: &[Declarator], m: Mark) -> PResult<Option<Stmt>> {
-        if decls.len() < 2 || decls[..decls.len() - 1].iter().any(|d| d.init.is_some()) {
-            return Ok(None);
-        }
-        let Some(rhs) = decls.last().and_then(|d| d.init.clone()) else {
-            return Ok(None);
-        };
-        // The init's static type must be a known tuple type for this to be an unpack.
-        let Some(Type::Named(tup)) = self.arg_type(&rhs) else {
-            return Ok(None);
-        };
-        if !self.tuple_types.contains(&tup) {
-            return Ok(None);
-        }
-        let arity = self.generics.class_fields.get(&tup).map_or(0, |f| f.len());
-        if arity != decls.len() {
-            return self.err_at(
-                m.pos,
-                format!(
-                    "tuple unpack binds {} name(s) but the tuple has {arity} element(s)",
-                    decls.len()
-                ),
-            );
-        }
-        let slots: Vec<(Option<Type>, Option<String>)> = decls
-            .iter()
-            .map(|d| {
-                (
-                    Some(d.ty.clone()),
-                    if d.name == "_" {
-                        None
-                    } else {
-                        Some(d.name.clone())
-                    },
-                )
-            })
-            .collect();
-        Ok(Some(self.desugar_destructure(slots, rhs, m)?))
     }
 
     /// Finish a variable declaration list whose first declarator is already
@@ -1663,6 +1628,11 @@ impl<S: TokenStream> Parser<S> {
             if self.at(&TokenKind::Lt)? {
                 let type_args = self.parse_type_args()?;
                 let mangled = mangle_generic(&name, &type_args);
+                // Record the instance's return type (mirrors the inferred-call path), so
+                // `:=` / call-result inference works on an explicit `Name<...>(...)` too.
+                if let Some(tmpl) = self.generics.fns.get(&name).cloned() {
+                    self.record_generic_ret(&tmpl, &type_args, &mangled);
+                }
                 self.generics.pending_fns.push((name, type_args));
                 e = self.ex(ExprKind::Ident(mangled), m);
             }
@@ -2086,24 +2056,6 @@ fn mangle_type(t: &Type) -> String {
     }
 }
 
-/// A side-effect-free lvalue source for an untyped destructuring assignment
-/// (`(a, b) = src;`): a variable or a field/constant-index path rooted at one, so
-/// re-reading it per slot is safe. A call or other computed expression is not.
-fn is_simple_source(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::Ident(_) => true,
-        ExprKind::Member { base, .. } => is_simple_source(base),
-        ExprKind::Index { base, index } => {
-            matches!(index.kind, ExprKind::Int(_)) && is_simple_source(base)
-        }
-        ExprKind::Unary {
-            op: UnOp::Deref,
-            expr,
-        } => is_simple_source(expr),
-        _ => false,
-    }
-}
-
 pub fn parse(src: &str) -> PResult<Program> {
     parse_in_dir(src, std::path::Path::new("."))
 }
@@ -2139,40 +2091,112 @@ fn parse_core(
     search: &[std::path::PathBuf],
     with_prelude: bool,
 ) -> PResult<Program> {
-    let known_types = hoist_type_names(src, dir, search, with_prelude)?;
+    let (known_types, fn_ret_tokens) = hoist_type_names(src, dir, search, with_prelude)?;
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
         pp = pp.with_prelude(prelude());
     }
-    Parser::with_known_types(pp, known_types).parse_program()
+    let mut parser = Parser::with_known_types(pp, known_types);
+    parser.hoisted_fn_rets = fn_ret_tokens;
+    parser.parse_program()
 }
 
-/// Stream the preprocessed tokens and collect every `class`/`union` name,
-/// descending into `#include`d files (so a type defined there can be used).
+/// Stream the preprocessed tokens and collect, descending into `#include`d files:
+///   * every `class`/`union` *name* (so a type can be used before it's defined), and
+///   * every top-level **function**'s return-type *tokens* (so a `:=` / call-result
+///     inference can see a function defined *below* its use — the parser's incremental
+///     `fn_rets` is "seen so far", but these are seeded up front).
+///
+/// Function detection is a conservative token scan: at brace/paren depth 0, an `Ident`
+/// immediately before the parameter-list `(`, with a non-empty, **type-only** prefix
+/// (the return type) — so a function *call* in an expression (`x = Foo(1)`, whose
+/// prefix contains `=`) is not mistaken for a declaration. Best-effort: anything it
+/// can't cleanly classify is simply skipped (the old, explicit-type behaviour).
+type Hoisted = (HashSet<String>, HashMap<String, Vec<Token>>);
 fn hoist_type_names(
     src: &str,
     dir: &std::path::Path,
     search: &[std::path::PathBuf],
     with_prelude: bool,
-) -> PResult<HashSet<String>> {
+) -> PResult<Hoisted> {
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
         pp = pp.with_prelude(prelude());
     }
     let mut names = HashSet::new();
+    let mut fn_rets: HashMap<String, Vec<Token>> = HashMap::new();
+    let mut brace = 0i32; // `{}` depth — only top-level (0) declarations are scanned
+    let mut paren = 0i32; // `()`/`[]` depth — the param-list `(` opens at 0
+    let mut cur: Vec<Token> = Vec::new(); // tokens of the current top-level statement
     loop {
         let t = pp.next_token()?;
-        match t.kind {
+        match &t.kind {
             TokenKind::Eof => break,
             TokenKind::Keyword(Keyword::Class) | TokenKind::Keyword(Keyword::Union) => {
-                if let TokenKind::Ident(name) = pp.next_token()?.kind {
-                    names.insert(name);
+                cur.push(t);
+                let nt = pp.next_token()?;
+                if let TokenKind::Ident(name) = &nt.kind {
+                    names.insert(name.clone());
+                }
+                cur.push(nt);
+            }
+            TokenKind::LBrace => {
+                brace += 1;
+                cur.clear();
+            }
+            TokenKind::RBrace => {
+                brace -= 1;
+                cur.clear();
+            }
+            TokenKind::Semicolon if brace == 0 && paren == 0 => cur.clear(),
+            TokenKind::LParen => {
+                // A function declaration's parameter list: `<return type> Name (`.
+                if brace == 0 && paren == 0 && cur.len() >= 2 {
+                    if let TokenKind::Ident(name) = &cur[cur.len() - 1].kind {
+                        let ret = &cur[..cur.len() - 1];
+                        if ret.iter().all(is_type_token) {
+                            fn_rets.entry(name.clone()).or_insert_with(|| ret.to_vec());
+                        }
+                    }
+                }
+                paren += 1;
+                cur.push(t);
+            }
+            TokenKind::LBracket => {
+                paren += 1;
+                cur.push(t);
+            }
+            TokenKind::RParen | TokenKind::RBracket => {
+                paren -= 1;
+                if brace == 0 {
+                    cur.push(t);
                 }
             }
-            _ => {}
+            _ => {
+                if brace == 0 {
+                    cur.push(t);
+                }
+            }
         }
     }
-    Ok(names)
+    Ok((names, fn_rets))
+}
+
+/// Whether a token may appear in a (return) type — the whitelist that lets the hoist
+/// scan tell a function declaration's return type from an expression prefix.
+fn is_type_token(t: &Token) -> bool {
+    match &t.kind {
+        TokenKind::Keyword(kw) => kw.is_type(),
+        TokenKind::Ident(_) => true,
+        TokenKind::Star
+        | TokenKind::Lt
+        | TokenKind::Gt
+        | TokenKind::Shr
+        | TokenKind::Comma
+        | TokenKind::LParen
+        | TokenKind::RParen => true,
+        _ => false,
+    }
 }

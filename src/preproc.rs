@@ -808,6 +808,7 @@ fn render_kind(k: &TokenKind, out: &mut String) {
         Question => "?",
         Colon => ":",
         ColonColon => "::",
+        ColonEq => ":=",
         DotDotDot => "...",
         At => "@",
         Hash => "#",
