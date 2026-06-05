@@ -2035,7 +2035,10 @@ impl Cg {
         // Variadic: stage the trailing args into a frame buffer (8 bytes each, an
         // F64 by its bit pattern), then push va_ptr + va_cnt for the next two int
         // registers. Buffer element j is at slot offset `off - j*8`.
-        let va = if varargs && !extra.is_empty() {
+        // Always pass the hidden va_ptr/va_cnt for a variadic callee — even with zero
+        // trailing args (`Sum()`), count 0; otherwise the callee reads them from
+        // uninitialised registers and derefs a garbage `VargV`.
+        let va = if varargs {
             if gpr + 1 >= ARG_REGS {
                 return Err(CodegenError::at(
                     pos,

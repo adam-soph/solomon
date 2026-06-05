@@ -148,6 +148,11 @@ pub struct Parser<S: TokenStream> {
     /// A generic class instance's mangled name → (template name, type args), so a
     /// `Vec<T>` parameter can be matched against a `Vec_I64` argument to bind `T`.
     generic_instances: HashMap<String, (String, Vec<Type>)>,
+    /// Declared function/prototype return types seen so far, so a generic call's type
+    /// arguments can be inferred from a *call-result* argument (`Id(Mk())`). Like
+    /// `var_types` it is recording-only and "seen so far" — a function defined after the
+    /// call site won't be found (fall back to explicit `<...>` then).
+    fn_rets: HashMap<String, Type>,
     /// Current recursion depth through `parse_unary`/`parse_stmt` (the funnels every
     /// nested expression/statement passes through), so pathologically deep input
     /// fails with a `ParseError` instead of overflowing the stack and aborting.
@@ -184,6 +189,7 @@ impl<S: TokenStream> Parser<S> {
             pending_generic_classes: Vec::new(),
             var_types: HashMap::new(),
             generic_instances: HashMap::new(),
+            fn_rets: HashMap::new(),
             depth: 0,
         }
     }
@@ -1246,6 +1252,9 @@ impl<S: TokenStream> Parser<S> {
 
         if self.at(&TokenKind::LParen)? {
             let (params, varargs) = self.parse_params()?;
+            // Record the return type for call-result type inference (`Id(Mk())`), before
+            // the body so a recursive call's result is inferable too. Recording-only.
+            self.fn_rets.insert(name.clone(), ty.clone());
             let body = if self.at(&TokenKind::LBrace)? {
                 Some(self.parse_block()?)
             } else {
@@ -1697,7 +1706,9 @@ impl<S: TokenStream> Parser<S> {
     }
 
     /// Best-effort static type of a generic call's argument expression — enough for
-    /// the common forms (a variable, `&variable`, a literal). `None` ⇒ can't infer.
+    /// the common forms (a literal, a variable, `&variable`, an explicit cast, or a
+    /// call whose callee's return type has been seen). `None` ⇒ can't infer (the call
+    /// must then give explicit `<...>` type arguments).
     fn arg_type(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Char(_) => Some(Type::I64),
@@ -1708,6 +1719,14 @@ impl<S: TokenStream> Parser<S> {
                 op: UnOp::AddrOf,
                 expr,
             } => Some(Type::Ptr(Box::new(self.arg_type(expr)?))),
+            // An explicit cast names its own type.
+            ExprKind::Cast { ty, .. } => Some(ty.clone()),
+            // A call result: the callee's recorded return type (a plain named call only —
+            // a function pointer or a not-yet-seen function isn't resolvable here).
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Ident(n) => self.fn_rets.get(n).cloned(),
+                _ => None,
+            },
             _ => None,
         }
     }

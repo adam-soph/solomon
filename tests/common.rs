@@ -19,7 +19,6 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("mathlib.hc", include_str!("../examples/mathlib.hc")),
     ("matrix.hc", include_str!("../examples/matrix.hc")),
     ("builtin.hc", include_str!("../examples/builtin.hc")),
-    ("vector.hc", include_str!("../examples/vector.hc")),
     ("text.hc", include_str!("../examples/text.hc")),
     ("hashmap.hc", include_str!("../examples/hashmap.hc")),
     ("shuffle.hc", include_str!("../examples/shuffle.hc")),
@@ -27,10 +26,11 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("report.hc", include_str!("../examples/report.hc")),
     ("gallery.hc", include_str!("../examples/gallery.hc")),
     ("tuples.hc", include_str!("../examples/tuples.hc")),
-    ("hmap.hc", include_str!("../examples/hmap.hc")),
     ("sort.hc", include_str!("../examples/sort.hc")),
     ("generic.hc", include_str!("../examples/generic.hc")),
     ("exe.hc", include_str!("../examples/exe.hc")),
+    ("args.hc", include_str!("../examples/args.hc")),
+    ("varargs.hc", include_str!("../examples/varargs.hc")),
 ];
 
 // ---- container-library edge-case programs ----

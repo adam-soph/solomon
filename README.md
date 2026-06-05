@@ -288,8 +288,9 @@ on each native backend with byte-identical output.
 | `preproc.hc` | macros, conditionals, and a forward type reference (hoisting) |
 | `mathlib.hc` | a preprocessor-heavy macro math library |
 | `builtin.hc` | a tour of the core-library built-ins (string/memory/math) |
-| `vector.hc` | a growable heap dynamic array of `I64` |
 | `text.hc` | text processing — word counting and `StrFind` search |
+| `args.hc` | the command line via the ambient `ArgC`/`ArgV` globals |
+| `varargs.hc` | variadic functions via the ambient `VargC`/`VargV` locals |
 | `hashmap.hc` | a string→`I64` hash map with separate chaining |
 | `shuffle.hc` | a Fisher–Yates shuffle of `0..N-1` driven by `RandU64` |
 | `json.hc` | recursive-descent JSON parser → heap tree → re-serialize with `switch [tag]` |

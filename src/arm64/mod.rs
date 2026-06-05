@@ -3364,8 +3364,11 @@ impl Cg {
         // in our frame (so it outlives the call); its address and count are passed
         // as two hidden integer args after the named ones. `va_ptr = FP - off`
         // (element 0); element j is at `FP - (off - j*8)`.
-        let va = if varargs && args.len() > n {
-            let extra = &args[n..];
+        // For a variadic callee, always pass the hidden va_ptr/va_cnt — even with zero
+        // trailing args (`Sum()`), where the count is 0; otherwise the callee would read
+        // them from uninitialised registers and deref a garbage `VargV`.
+        let va = if varargs {
+            let extra = args.get(n..).unwrap_or(&[]);
             let k = extra.len() as u32;
             let off = self.alloc(k * 8, 8);
             for (j, arg) in extra.iter().enumerate() {

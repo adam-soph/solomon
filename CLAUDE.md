@@ -914,11 +914,18 @@ Calls may give the type args **explicitly** (`VecPush<I64>(…)`) or have them
 variable/parameter types (`var_types`, recording-only so non-generic code is unaffected)
 and, for each generic function, the per-parameter [`TypePattern`]s
 (`param_type_patterns` — `T` → `Param`, `Vec<T>*` → `Ptr(Generic("Vec",[Param]))`). At an
-un-annotated call it computes each argument's static type (`arg_type`: a variable,
-`&variable`, or a literal) and unifies it against the patterns (`unify_pattern`), using
-the `generic_instances` reverse map (`Vec_I64` → `("Vec",[I64])`) so a `Vec<T>*`
-parameter matched against a `Vec_I64*` argument binds `T=I64`. If a parameter can't be
-inferred it's a clear error suggesting the explicit form. See `examples/generic.hc`.
+un-annotated call it computes each argument's static type (`arg_type`: a literal, a
+variable, `&variable`, an explicit **cast** — its own type — or a **call result** — the
+callee's return type from the recording-only `fn_rets` map) and unifies it against the
+patterns (`unify_pattern`), using the `generic_instances` reverse map (`Vec_I64` →
+`("Vec",[I64])`) so a `Vec<T>*` parameter matched against a `Vec_I64*` argument binds
+`T=I64`. If a parameter can't be inferred it's a clear error suggesting the explicit
+form. `arg_type` is **syntactic and parse-time** (inference runs before sema), so the
+forms it can't type — member access, indexing, arithmetic, deref, and a call to a
+function defined *after* the call site (`fn_rets` is "seen so far") — fall back to the
+explicit `<...>`. A type parameter only needs *some* inferable argument: it's typically
+recovered from a `Vec<T>*`/`Hmap<K,V>*` receiver, so a complex other argument is fine.
+See `examples/generic.hc`.
 Still genuinely absent: most of the TempleOS core/standard library and DolDoc.
 
 The worked HolyC programs live in `examples/*.hc` (top-level), listed once in

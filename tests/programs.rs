@@ -35,20 +35,25 @@ fn tuples_multireturn_index_and_destructure() {
 }
 
 #[test]
-fn hmap_lookup_returns_value_and_found() {
-    let out = run("hmap.hc", include_str!("../examples/hmap.hc"));
+fn varargs_vargc_and_vargv() {
+    // A `...` function reads `VargC` (count) and `VargV` (raw 8-byte arg slots),
+    // including the zero-argument call `Sum()`.
+    let out = run("varargs.hc", include_str!("../examples/varargs.hc"));
     assert_eq!(
         out,
-        "len=9\n\
-         zero: found=1 value=0\n\
-         missing: found=0 value=0\n\
-         two=22 one=1 f=15\n\
-         has(a)=1 del(a)=1 has(a)=0\n\
-         del(missing)=0 len=8\n\
-         b=11 c=12 d=13 e=14 f=15 one=1 two=22 zero=0 \n\
-         sum=88 count=8\n\
-         b:11 c:12 d:13 e:14 f:15 one:1 two:22 zero:0 \n"
+        "sum()        = 0\n\
+         sum(1,2,3)   = 6\n\
+         sum(10..40)  = 100\n\
+         max(4,9,2,7) = 9\n"
     );
+}
+
+#[test]
+fn args_reads_argc_argv() {
+    // `ArgC`/`ArgV` are ambient globals. `run_to_string` supplies one arg (the
+    // program name), so `ArgC == 1` and there are no extra args to echo.
+    let out = run("args.hc", include_str!("../examples/args.hc"));
+    assert_eq!(out, "argc=1\n(no extra args)\n");
 }
 
 // ---- container-library edge cases (interpreter-pinned; the source is shared with the
@@ -210,14 +215,6 @@ fn stdlib_builtins_showcase() {
          OK---\n\
          sqrt=12\n"
     );
-}
-
-#[test]
-fn vector_grows_on_the_heap() {
-    // 10 pushes (squares 1..100) into a vector that starts with capacity 2,
-    // doubling to 16; the sum of the first ten squares is 385.
-    let out = run("vector.hc", include_str!("../examples/vector.hc"));
-    assert_eq!(out, "len=10 cap=16\nfirst=1 last=100 sum=385\n");
 }
 
 #[test]

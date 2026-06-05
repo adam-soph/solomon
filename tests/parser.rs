@@ -560,3 +560,45 @@ fn generic_function_infers_type_args() {
         .collect();
     assert!(funcs.iter().any(|f| f.name == "Id_I64"));
 }
+
+#[test]
+fn generic_function_infers_from_cast_and_call_result() {
+    // `arg_type` now types an explicit cast (its own type) and a call result (the
+    // callee's recorded return type), so neither needs an explicit `<...>`.
+    let p = prog(
+        "T Id<T>(T x){return x;} I64 Mk(){return 7;} F64 MkF(){return 2.5;} \
+         I64 a = Id(Mk()); F64 b = Id(MkF()); F64 c = Id((F64)3);",
+    );
+    let names: Vec<&str> = p
+        .items
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StmtKind::Func(f) => Some(f.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"Id_I64"), "call-result I64: {names:?}");
+    assert!(
+        names.contains(&"Id_F64"),
+        "call-result F64 + cast F64: {names:?}"
+    );
+}
+
+#[test]
+fn generic_inference_still_needs_explicit_for_member_access() {
+    // The documented boundary: `arg_type` doesn't type a member access (it would need
+    // class-field resolution at parse time), so it falls back to a clear error that
+    // points at the explicit form.
+    let err =
+        parse("class Box{I64 v;} T Id<T>(T x){return x;} Box b; I64 a = Id(b.v);").unwrap_err();
+    assert!(err.to_string().contains("cannot infer"), "got: {err}");
+}
+
+#[test]
+fn generic_inference_does_not_see_a_later_function() {
+    // `fn_rets` is "seen so far": a call-result argument whose function is defined
+    // *after* the call site isn't resolvable, so it requires the explicit form.
+    let err =
+        parse("T Id<T>(T x){return x;} I64 a = Id(Later()); I64 Later(){return 4;}").unwrap_err();
+    assert!(err.to_string().contains("cannot infer"), "got: {err}");
+}

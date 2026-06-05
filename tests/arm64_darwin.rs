@@ -2230,11 +2230,6 @@ fn native_matches_stdlib_showcase() {
          OK---\n\
          sqrt=12\n"
     );
-    // The heap-growing vector sample also matches natively.
-    assert_eq!(
-        build_and_capture(include_str!("../examples/vector.hc")),
-        "len=10 cap=16\nfirst=1 last=100 sum=385\n"
-    );
     // The text-processing sample (StrFind, word count, uppercase).
     assert_eq!(
         build_and_capture(include_str!("../examples/text.hc")),
