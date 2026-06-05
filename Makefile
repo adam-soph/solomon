@@ -37,14 +37,16 @@ HOST_OS := $(shell uname -s)
 
 # OS/arch targets to build. Override on the command line, e.g.
 #   make all TARGETS="x86_64-unknown-linux-gnu aarch64-apple-darwin"
+# The `hcc`/`hci` tools are POSIX (the interpreter emulates fds/files/ids via
+# `std::os::unix`), so they build for Unix hosts only — no Windows host binaries.
+# (The compiler can still *emit* a Windows PE via the X64Windows codegen backend;
+# that's an output target, not a host the tools run on.)
 TARGETS ?= \
 	aarch64-apple-darwin \
 	x86_64-apple-darwin \
 	x86_64-unknown-linux-gnu \
 	aarch64-unknown-linux-gnu \
-	x86_64-unknown-linux-musl \
-	x86_64-pc-windows-gnu \
-	i686-pc-windows-gnu
+	x86_64-unknown-linux-musl
 
 # Apple targets used to build the universal (fat) binary.
 MACOS_TARGETS := aarch64-apple-darwin x86_64-apple-darwin

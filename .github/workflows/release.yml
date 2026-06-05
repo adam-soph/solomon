@@ -34,15 +34,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The `hcc`/`hci` tools are POSIX (the interpreter emulates fds/files/ids via
+          # `std::os::unix`), so they build for Unix hosts only — there are no Windows
+          # host binaries. (The compiler can still *emit* Windows PE output via the
+          # X64Windows backend; that's a codegen target, not a host.)
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, apt: musl-tools }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
           - { target: aarch64-apple-darwin, os: macos-15 }
           - { target: x86_64-apple-darwin, os: macos-15 }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest, ext: .exe, rustflags: -C target-feature=+crt-static }
-          - { target: i686-pc-windows-msvc, os: windows-latest, ext: .exe, rustflags: -C target-feature=+crt-static }
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v5
 
