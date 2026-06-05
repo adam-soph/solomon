@@ -276,6 +276,26 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
     // start-up code call `_main` and turn its return into the exit status.
     if cg.freestanding {
         cg.asm.place(start_label);
+        // At the ELF entry the kernel leaves the initial stack as
+        // `[sp]=argc, [sp+8..]=argv[0..argc], NULL, envp[..], NULL, …`. `_main`
+        // captures argc/argv/envp from x0/x1/x2 (the Darwin libc convention), so the
+        // freestanding `_start` materialises them there from the stack before the call
+        // (otherwise `_main` reads stale registers — argc came out 0). Gated on use so
+        // an arg-free program's entry is byte-for-byte unchanged.
+        if cg.uses_args || cg.uses_env {
+            cg.asm.load_mem(0, SP, 8, false); // x0 = [sp] = argc
+        }
+        if cg.uses_args {
+            cg.asm.add_imm(1, SP, 8); // x1 = sp + 8 = &argv[0]
+        }
+        if cg.uses_env {
+            // x2 = &envp[0] = sp + 16 + argc*8 (past argv[0..argc] and its NULL).
+            cg.asm.load_imm(SCRATCH, 8);
+            cg.asm.mul(2, 0, SCRATCH); // x2 = argc * 8
+            cg.asm.add_imm(2, 2, 16); // x2 = argc*8 + 16
+            cg.asm.add_imm(SCRATCH, SP, 0); // x8 = sp (ADD #0 reads SP; MOV can't)
+            cg.asm.add(2, 2, SCRATCH); // x2 = sp + argc*8 + 16
+        }
         cg.asm.bl(main_label); // x0 = Main()
         cg.asm.load_imm(8, 94); // x8 = SYS_exit_group
         cg.asm.svc(); // exit(x0)
