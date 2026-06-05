@@ -1,9 +1,10 @@
 name: Release
 
-# Build the release binaries for every supported OS/arch on a matching **native**
-# GitHub runner (no Docker, no cross-emulation) and publish them to a GitHub release.
-# Trigger by pushing a version tag (`git tag v1.2.3 && git push --tags`) or run it
-# manually from the Actions tab, supplying the tag. (This replaces the old local
+# Run the full test suite, then — only if it passes — build the release binaries for
+# every supported OS/arch on a matching **native** GitHub runner (no Docker, no
+# cross-emulation) and publish them to a GitHub release. Trigger by pushing a version
+# tag (`git tag v1.2.3 && git push --tags`) or run it manually from the Actions tab,
+# supplying the tag. (This supersedes the old `CI` workflow and the local
 # `make release`, which cross-compiled the foreign targets under emulated Docker.)
 on:
   push:
@@ -18,9 +19,16 @@ permissions:
   contents: write # create the release + upload assets
 
 jobs:
+  # Gate the whole release on the full test suite (the Test workflow, reused) — every
+  # code generator held byte-for-byte to the interpreter across the native runners.
+  # Nothing builds or publishes unless this passes.
+  test:
+    uses: ./.github/workflows/test.yml
+
   # One leg per target, each on a runner whose OS/arch matches so the build is native.
   build:
     name: ${{ matrix.target }}
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

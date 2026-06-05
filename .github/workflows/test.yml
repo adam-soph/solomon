@@ -1,17 +1,20 @@
-name: CI
+name: Test
 
-# Manual trigger only — run from the Actions tab (or `gh workflow run CI`).
-on:
-  workflow_dispatch:
-
-# One leg per native execution target. The tests are host-gated (no Docker, no
-# QEMU): each backend's *execution* tests run only on a matching host and self-skip
-# elsewhere, so the matrix below is what actually runs the whole suite —
+# The full test suite. Run it on its own (Actions tab / `gh workflow run Test`), and
+# it is also reused as the gate at the front of the Release workflow (`workflow_call`).
+#
+# One leg per native execution target. The tests are host-gated (no Docker, no QEMU):
+# each backend's *execution* tests run only on a matching host and self-skip elsewhere,
+# so the matrix below is what actually runs the whole suite —
 #   • linux-x86_64  → executes the freestanding x86-64 static ELFs
 #   • linux-aarch64 → executes the freestanding aarch64 static ELFs
 #   • macos-aarch64 → links + executes the arm64 Mach-O binaries (via `cc`)
 # Their union exercises every code generator against the interpreter (the oracle).
 # Building on each OS also compile-checks the per-target `cfg`-gated paths.
+on:
+  workflow_dispatch:
+  workflow_call:
+
 jobs:
   test:
     name: ${{ matrix.name }}

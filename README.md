@@ -6,7 +6,7 @@
 
 A full compiler front end, a tree-walking interpreter, and three hand-rolled native code generators. No LLVM, no Cranelift, no assembler.
 
-[![CI](https://github.com/adam-soph/solomon/actions/workflows/ci.yml/badge.svg)](https://github.com/adam-soph/solomon/actions/workflows/ci.yml)
+[![Test](https://github.com/adam-soph/solomon/actions/workflows/test.yml/badge.svg)](https://github.com/adam-soph/solomon/actions/workflows/test.yml)
 ![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-CE412B?logo=rust&logoColor=white)
 ![Codegen](https://img.shields.io/badge/codegen-hand--rolled-success)
 ![Native targets](https://img.shields.io/badge/native_targets-3-blue)
