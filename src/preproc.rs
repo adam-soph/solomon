@@ -12,6 +12,10 @@
 //!     stack so its tokens splice in (relative to the including file's
 //!     directory; cycles and runaway nesting are rejected); unknown directives
 //!     are dropped.
+//!   * `#exe { ... }` runs the block as HolyC at **compile time** (via the
+//!     interpreter) and pushes its stdout onto the same source stack, so the
+//!     generated text streams in where `#exe` appeared (TempleOS-style compile-time
+//!     code execution).
 //!
 //! Directives run to the end of their line. The lexer discards newlines, but
 //! every token carries `span.pos.line`, so the preprocessor finds line
@@ -106,6 +110,9 @@ pub struct Preprocessor<S: TokenStream> {
     /// (entry 0 is the base/top-level source). Carries each file's directory for
     /// `_`-directory privacy. Never shrinks, so ids stay valid for the whole parse.
     files: Vec<FileInfo>,
+    /// Counter for `#exe` compile-time blocks, so each generated frame gets a unique
+    /// synthetic path (the include cycle check keys on the path).
+    exe_count: usize,
 }
 
 impl<S: TokenStream> Preprocessor<S> {
@@ -158,6 +165,7 @@ impl<S: TokenStream> Preprocessor<S> {
             search,
             includes: Vec::new(),
             files: vec![base_info],
+            exe_count: 0,
         }
     }
 
@@ -233,7 +241,23 @@ impl<S: TokenStream> Preprocessor<S> {
     /// Handle a directive line introduced by `hash`.
     fn directive(&mut self, hash: Token) -> LResult<()> {
         let line = hash.span.pos.line;
+        // `#exe { ... }` is special: its block spans lines and braces, so it reads its
+        // own brace-balanced body from the stream rather than the line-based collection.
+        let first = self.inner_next()?;
+        let same_line = !matches!(first.kind, TokenKind::Eof) && first.span.pos.line == line;
+        if same_line {
+            if let TokenKind::Ident(name) = &first.kind {
+                if name == "exe" {
+                    return self.do_exe(hash.span.pos);
+                }
+            }
+        }
         let mut toks = Vec::new();
+        if same_line {
+            toks.push(first);
+        } else {
+            self.lookahead = Some(first); // belongs to the next line (or Eof)
+        }
         loop {
             let t = self.inner_next()?;
             if matches!(t.kind, TokenKind::Eof) || t.span.pos.line != line {
@@ -263,6 +287,53 @@ impl<S: TokenStream> Preprocessor<S> {
             // Unknown directive (e.g. `#help_index`): drop it.
             _ => Ok(()),
         }
+    }
+
+    /// `#exe { … }` — run the block as HolyC at **compile time** and splice its stdout
+    /// back into the token stream (TempleOS's compile-time-execution directive). The
+    /// block's brace-balanced body is read from the stream, reconstructed to source,
+    /// parsed + run through the interpreter, and its output pushed as a source frame
+    /// (the `#include` machinery), so it streams in exactly where `#exe` appeared.
+    fn do_exe(&mut self, pos: Pos) -> LResult<()> {
+        // Expect the opening `{`.
+        let open = self.inner_next()?;
+        if !matches!(open.kind, TokenKind::LBrace) {
+            return Err(self.err(open.span.pos, "#exe must be followed by `{`"));
+        }
+        // Collect the body tokens up to the matching `}` (strings/chars are single
+        // tokens, so brace counting over tokens is safe).
+        let mut body = Vec::new();
+        let mut depth = 1i32;
+        loop {
+            let t = self.inner_next()?;
+            match t.kind {
+                TokenKind::Eof => {
+                    return Err(self.err(pos, "unterminated #exe block (missing `}`)"));
+                }
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            body.push(t);
+        }
+        if !self.active() {
+            return Ok(()); // inside an inactive #ifdef branch: consumed, not run
+        }
+        // Reconstruct source, run it, capture stdout.
+        let src = render_tokens(&body);
+        let program = crate::parser::parse(&src)
+            .map_err(|e| self.err(pos, format!("#exe block failed to parse: {e}")))?;
+        let out = crate::interp::run_to_string(&program)
+            .map_err(|e| self.err(pos, format!("#exe block failed at runtime: {e}")))?;
+        // Splice the generated source as a frame (a public file, privacy-wise).
+        self.exe_count += 1;
+        let path = PathBuf::from(format!("<exe#{}>", self.exe_count));
+        self.push_frame(path, self.base_dir.clone(), out, "<exe>", pos, FileInfo::root())
     }
 
     fn do_define(&mut self, toks: &[Token]) -> LResult<()> {
@@ -644,6 +715,79 @@ impl<S: TokenStream> TokenStream for Preprocessor<S> {
 
 /// The directive keyword after `#`. Most directive names lex as identifiers;
 /// `else` is the lone keyword among them.
+/// Reconstruct HolyC source text from a token slice (for re-parsing an `#exe` block).
+/// Tokens are space-joined; literals are rendered faithfully — strings re-escaped,
+/// floats with a decimal point, char constants as their packed integer value.
+fn render_tokens(toks: &[Token]) -> String {
+    let mut s = String::new();
+    let mut prev_line: Option<u32> = None;
+    for t in toks {
+        // Newlines are preserved (line directives like `#include` are line-oriented, so
+        // flattening would let one swallow the rest of the block); same-line tokens are
+        // space-separated.
+        match prev_line {
+            Some(l) if t.span.pos.line != l => s.push('\n'),
+            Some(_) => s.push(' '),
+            None => {}
+        }
+        render_kind(&t.kind, &mut s);
+        prev_line = Some(t.span.pos.line);
+    }
+    s
+}
+
+fn render_kind(k: &TokenKind, out: &mut String) {
+    use std::fmt::Write;
+    use TokenKind::*;
+    let lit = match k {
+        Int(n) => {
+            let _ = write!(out, "{n}");
+            return;
+        }
+        Float(f) => {
+            let _ = write!(out, "{f:?}"); // {:?} always keeps a `.`/`e`
+            return;
+        }
+        Char(n) => {
+            let _ = write!(out, "{n}"); // a char constant is its int value
+            return;
+        }
+        Str(s) => return render_string(s, out),
+        Ident(s) => return out.push_str(s),
+        Keyword(kw) => return out.push_str(kw.as_str()),
+        Plus => "+", Minus => "-", Star => "*", Slash => "/", Percent => "%",
+        Eq => "=", PlusEq => "+=", MinusEq => "-=", StarEq => "*=", SlashEq => "/=",
+        PercentEq => "%=", AmpEq => "&=", PipeEq => "|=", CaretEq => "^=",
+        ShlEq => "<<=", ShrEq => ">>=",
+        PlusPlus => "++", MinusMinus => "--",
+        EqEq => "==", Ne => "!=", Lt => "<", Gt => ">", Le => "<=", Ge => ">=",
+        AndAnd => "&&", OrOr => "||", Not => "!",
+        Amp => "&", Pipe => "|", Caret => "^", Tilde => "~", Shl => "<<", Shr => ">>",
+        LParen => "(", RParen => ")", LBrace => "{", RBrace => "}",
+        LBracket => "[", RBracket => "]", Comma => ",", Semicolon => ";",
+        Dot => ".", Arrow => "->", Question => "?", Colon => ":", ColonColon => "::",
+        DotDotDot => "...", At => "@", Hash => "#", Backtick => "`",
+        Eof => "",
+    };
+    out.push_str(lit);
+}
+
+fn render_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 fn directive_name(tok: &Token) -> Option<String> {
     match &tok.kind {
         TokenKind::Ident(s) => Some(s.clone()),
@@ -696,10 +840,10 @@ fn angle_path(toks: &[Token]) -> Option<String> {
         return None;
     }
     let mut s = String::new();
-    for (i, t) in inner.iter().enumerate() {
-        if i > 0 && inner[i - 1].span.end != t.span.start {
-            return None; // a gap means embedded whitespace — not a path
-        }
+    for (_i, t) in inner.iter().enumerate() {
+        // Whitespace between the `<…>` tokens is tolerated (a reconstructed `#exe`
+        // block may render `<math.hc>` as `< math . hc >`); the path is just the
+        // concatenation of the inner tokens' text.
         match &t.kind {
             TokenKind::Ident(x) => s.push_str(x),
             TokenKind::Int(n) => s.push_str(&n.to_string()),

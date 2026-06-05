@@ -93,6 +93,28 @@ fn hmap_i64_keys_values_entries() {
 }
 
 #[test]
+fn exe_runs_at_compile_time() {
+    // `#exe { ... }` runs at compile time and splices its output into the source: a
+    // compile-time cos table and generated `pow2_*` constants.
+    let out = run("exe.hc", include_str!("../examples/exe.hc"));
+    assert_eq!(
+        out,
+        "cos0=1.0000 cos2=0.0000 cos4=-1.0000\n\
+         pow2: 1 2 4 8 16\n"
+    );
+}
+
+#[test]
+fn calloc_zeroes() {
+    let out = run(
+        "calloc",
+        "#include <mem.hc>\nU0 Main(){ I64 *a=CAlloc(3*sizeof(I64)); \
+         \"%d %d %d\\n\", a[0], a[1], a[2]; Free(a); } Main;",
+    );
+    assert_eq!(out, "0 0 0\n");
+}
+
+#[test]
 fn generic_classes_monomorphize() {
     let out = run("generic.hc", include_str!("../examples/generic.hc"));
     assert_eq!(

@@ -30,6 +30,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("hmap.hc", include_str!("../examples/hmap.hc")),
     ("sort.hc", include_str!("../examples/sort.hc")),
     ("generic.hc", include_str!("../examples/generic.hc")),
+    ("exe.hc", include_str!("../examples/exe.hc")),
 ];
 
 // ---- container-library edge-case programs ----

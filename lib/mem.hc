@@ -44,6 +44,16 @@ U8 *MemSet(U8 *dst, I64 c, I64 n)
   return dst;
 }
 
+// Allocate `n` zero-filled bytes (HolyC `CAlloc`). `MAlloc` returns uninitialised
+// memory, so zero it explicitly (correct on every target — the hosted libc heap is
+// not zeroed).
+U8 *CAlloc(I64 n)
+{
+  U8 *p = MAlloc(n);
+  if (p) MemSet(p, 0, n);
+  return p;
+}
+
 // Sign-normalised to -1/0/1 (bytes compared unsigned), like the old builtin.
 I64 MemCmp(U8 *a, U8 *b, I64 n)
 {

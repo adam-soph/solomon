@@ -441,8 +441,9 @@ includable on its own:
 - `lib/mem.hc` — raw memory + the **advanced heap intrinsics** (`HeapExtend`/`MSize`
   prototypes — the compiler is their implementation; the universal `MAlloc`/`Free` pair
   is in the prelude `lib/builtin.hc` instead, ambient with no `#include`), the `mem*`
-  family (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`), and `ReAlloc` over
-  `HeapExtend`.
+  family (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`), `CAlloc` (zeroed
+  allocation — `MAlloc` + `MemSet`, since the hosted libc heap isn't zeroed), and
+  `ReAlloc` over `HeapExtend`.
 - `lib/fmt.hc` — the **printf-family intrinsics**: `Print`/`StrPrint`/`CatPrint`/
   `MStrPrint` prototypes (the backends render them; bare strings and the `"fmt", args`
   comma form need no include).
