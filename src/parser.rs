@@ -62,44 +62,18 @@ struct Mark {
 // `ast.rs` now — they ride along on `Program::generics` for a future `mono` pass. The
 // parser uses them via the `use crate::ast::*` glob above.
 
-/// All generic-monomorphization state, grouped so it travels as one unit. Held by the
-/// [`Parser`] as `self.generics`; the methods that operate on it live in the `generics`
-/// submodule. (Phase 1 of decoupling inference from parsing — see the `generics` module.)
+/// The generic-template **registry** the parser builds while parsing. It records the
+/// template *names* (so a `Name<...>` use is recognized as generic rather than a
+/// less-than) and their parsed-once AST bodies. Everything else — instantiation,
+/// worklists, dedup, and type-directed inference — lives in the [`mono`](crate::mono)
+/// pass, which takes these templates off [`Program::generics`] after the parse.
 #[derive(Default)]
 struct Generics {
     /// Generic `class`/`union` templates, by name, registered at their declaration
     /// (define-before-use, like `typedef` aliases).
     classes: HashMap<String, GenericClass>,
-    /// Mangled names of generic class instantiations already injected, so each distinct
-    /// `(template, type-args)` mints exactly one synthetic class.
-    class_done: HashSet<String>,
     /// Generic function templates, by name (define-before-use).
     fns: HashMap<String, GenericFn>,
-    /// Mangled names of generic-function instances already generated.
-    fn_done: HashSet<String>,
-    /// Pending `(fn-name, type-args)` instantiations discovered at call sites, drained
-    /// after the main parse into concrete functions.
-    pending_fns: Vec<(String, Vec<Type>)>,
-    /// Pending `(class-name, type-args)` instantiations discovered at type uses, drained
-    /// after the main parse into concrete classes.
-    pending_classes: Vec<(String, Vec<Type>)>,
-    /// Declared variable/parameter types seen so far, for inferring a generic call's
-    /// type arguments from its argument expressions. Recording-only — it never affects
-    /// any other parse decision (so non-generic code is unchanged).
-    var_types: HashMap<String, Type>,
-    /// A generic class instance's mangled name → (template name, type args), so a
-    /// `Vec<T>` parameter can be matched against a `Vec_I64` argument to bind `T`.
-    instances: HashMap<String, (String, Vec<Type>)>,
-    /// Declared function/prototype return types seen so far, so a generic call's type
-    /// arguments can be inferred from a *call-result* argument (`Id(Mk())`). Like
-    /// `var_types` it is recording-only and "seen so far" — a function defined after the
-    /// call site won't be found (fall back to explicit `<...>` then).
-    fn_rets: HashMap<String, Type>,
-    /// Direct field types of each class/union seen so far (`name` → `[(field, type)]`),
-    /// so a generic call's type can be inferred from a *member-access* argument
-    /// (`Id(p.field)`). Recording-only and "seen so far"; inherited (base-class) fields
-    /// aren't recorded, so a member access of one falls back to explicit `<...>`.
-    class_fields: HashMap<String, Vec<(String, Type)>>,
 }
 
 impl Generics {
@@ -131,22 +105,18 @@ pub struct Parser<S: TokenStream> {
     pending_types: Vec<Stmt>,
     /// Counter for naming anonymous embedded unions (`$anonN`).
     anon_counter: u32,
-    /// Canonical names of tuple types `(T1, …, Tn)` already injected as synthetic
-    /// structs, so each distinct element-list mints exactly one `$Tup…` class.
-    tuple_types: HashSet<String>,
-    /// All generic-monomorphization state — templates, instantiation worklists, dedup
-    /// sets, and the recording-only type maps used for call-site inference. Grouped so
-    /// the whole unit travels together (and can be lifted into a later pass). See
-    /// [`Generics`] and the `generics` submodule.
+    /// The generic-template registry (names + parsed-once template ASTs). See
+    /// [`Generics`]; instantiation happens later, in the [`mono`](crate::mono) pass.
     generics: Generics,
     /// Current recursion depth through `parse_unary`/`parse_stmt` (the funnels every
     /// nested expression/statement passes through), so pathologically deep input
     /// fails with a `ParseError` instead of overflowing the stack and aborting.
     depth: u32,
-    /// Top-level function return-type tokens collected by the hoist pre-pass, parsed
-    /// into `generics.fn_rets` up front by `seed_fn_rets` — so `:=` / call-result
-    /// inference sees functions defined *below* the use site.
-    hoisted_fn_rets: HashMap<String, Vec<Token>>,
+    /// The type parameters of the generic template currently being parsed (`None`
+    /// outside one). While set, `parse_base_type` resolves a parameter name to
+    /// `Type::Param`, keeping a template body's parameters symbolic for `mono` to
+    /// substitute.
+    template_params: Option<Vec<String>>,
 }
 
 /// Maximum expression/statement nesting depth before the parser bails out.
@@ -170,10 +140,9 @@ impl<S: TokenStream> Parser<S> {
             type_aliases: HashMap::new(),
             pending_types: Vec::new(),
             anon_counter: 0,
-            tuple_types: HashSet::new(),
             generics: Generics::new(),
             depth: 0,
-            hoisted_fn_rets: HashMap::new(),
+            template_params: None,
         }
     }
 
@@ -190,9 +159,6 @@ impl<S: TokenStream> Parser<S> {
 
     /// Parse a whole translation unit.
     pub fn parse_program(&mut self) -> PResult<Program> {
-        // Parse the hoisted function return types up front so forward references resolve
-        // for `:=` / call-result inference (the parser's own recording is "seen so far").
-        self.seed_fn_rets();
         let mut items = Vec::new();
         while !self.at(&TokenKind::Eof)? {
             let stmt = self.parse_stmt()?;
@@ -201,58 +167,21 @@ impl<S: TokenStream> Parser<S> {
             items.append(&mut self.pending_types);
             items.push(stmt);
         }
-        // Drain generic instantiations discovered during parsing to a fixpoint, appending
-        // the synthetic concrete definitions as top-level items.
-        self.drain_generics(&mut items)?;
         // The accumulated include table (indexed by `Span::file`) rides along for
         // `_`-directory privacy checks in sema.
         let files = self.stream.source_files();
-        // Carry the generic templates + instance map for a future `mono` pass. Inert
-        // today (the parser already instantiated everything; `items` is concrete).
+        // Carry the generic templates for the `mono` pass, which instantiates every
+        // deferred generic use/call (`items` still holds `Type::Generic`/`GenericCall`/
+        // `Type::Tuple`/`ShortDecl` nodes until then).
         let generics = GenericTemplates {
             classes: std::mem::take(&mut self.generics.classes),
             fns: std::mem::take(&mut self.generics.fns),
-            instances: std::mem::take(&mut self.generics.instances),
         };
         Ok(Program {
             items,
             files,
             generics,
         })
-    }
-
-    /// Parse each hoisted top-level function's return-type tokens into `fn_rets`, so a
-    /// `:=` / call-result inference sees forward-declared functions. Best-effort.
-    fn seed_fn_rets(&mut self) {
-        let entries: Vec<(String, Vec<Token>)> = self.hoisted_fn_rets.drain().collect();
-        for (name, toks) in entries {
-            if let Some(ty) = self.parse_type_from_tokens(toks) {
-                self.generics.fn_rets.entry(name).or_insert(ty);
-            }
-        }
-    }
-
-    /// Parse a standalone type from a token vec (a hoisted or generic-instance return
-    /// type). Trailing `*`s belong to the type (`T *Foo` returns `T *`). Returns `None`
-    /// unless the tokens parse cleanly in full. Swaps the look-ahead buffer to read the
-    /// supplied tokens, then restores it.
-    fn parse_type_from_tokens(&mut self, mut toks: Vec<Token>) -> Option<Type> {
-        toks.push(Token::new(TokenKind::Eof, Span::dummy()));
-        let saved = std::mem::take(&mut self.buf);
-        self.buf = toks.into();
-        let parsed = self.parse_base_type().map(|mut ty| {
-            while matches!(self.peek_kind(), Ok(TokenKind::Star)) {
-                let _ = self.advance();
-                ty = Type::Ptr(Box::new(ty));
-            }
-            ty
-        });
-        let exhausted = matches!(self.peek_kind(), Ok(TokenKind::Eof));
-        self.buf = saved;
-        match (parsed, exhausted) {
-            (Ok(ty), true) => Some(ty),
-            _ => None,
-        }
     }
 
     // ---- token buffer / look-ahead ----
@@ -390,7 +319,12 @@ impl<S: TokenStream> Parser<S> {
     fn kind_is_type_start(&self, k: &TokenKind) -> bool {
         match k {
             TokenKind::Keyword(kw) => kw.is_type(),
-            TokenKind::Ident(s) => self.known_types.contains(s),
+            // A class/union name, or — inside a generic template — a type parameter
+            // (so `T x;` / `V zero;` in a template body parses as a declaration).
+            TokenKind::Ident(s) => {
+                self.known_types.contains(s)
+                    || self.template_params.as_ref().is_some_and(|p| p.contains(s))
+            }
             _ => false,
         }
     }
@@ -446,11 +380,21 @@ impl<S: TokenStream> Parser<S> {
             // with `(args)` is monomorphized; any other identifier is a class/union
             // name.
             TokenKind::Ident(s) => {
+                // Inside a generic template, a parameter name stays symbolic.
+                if let Some(params) = &self.template_params {
+                    if params.contains(&s) {
+                        return Ok(Type::Param(s));
+                    }
+                }
                 if let Some(ty) = self.type_aliases.get(&s) {
                     return Ok(ty.clone());
                 }
+                // A generic-class use `Name<args>` is **deferred** to a `Type::Generic`
+                // — the `mono` pass instantiates it (so all monomorphization happens in
+                // one type-directed place, not during parsing).
                 if self.generics.classes.contains_key(&s) && self.at(&TokenKind::Lt)? {
-                    return self.instantiate_generic(&s, t.span.pos);
+                    let args = self.parse_type_args()?;
+                    return Ok(Type::Generic(s, args));
                 }
                 Ok(Type::Named(s))
             }
@@ -471,12 +415,12 @@ impl<S: TokenStream> Parser<S> {
         Ok(ty)
     }
 
-    /// Parse a tuple type `(T1, …, Tn)` (n ≥ 2). Each distinct element-list mints one
-    /// canonical synthetic struct `$Tup$…` with positional fields `_0`, `_1`, …, so
-    /// the tuple rides on the ordinary struct/`sret`/member machinery. `(T)` (a single
+    /// Parse a tuple type `(T1, …, Tn)` (n ≥ 2) into a deferred [`Type::Tuple`]. The
+    /// [`mono`](crate::mono) pass interns each distinct element-list as one canonical
+    /// synthetic struct `$Tup$…` with positional fields `_0`, `_1`, …, so the tuple
+    /// rides on the ordinary struct/`sret`/member machinery. `(T)` (a single
     /// parenthesised type) is just `T`.
     fn parse_tuple_type(&mut self) -> PResult<Type> {
-        let m = self.mark()?;
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut elems = Vec::new();
         loop {
@@ -489,48 +433,10 @@ impl<S: TokenStream> Parser<S> {
         if elems.len() == 1 {
             return Ok(elems.pop().unwrap()); // `(T)` is just `T`
         }
-        Ok(Type::Named(self.intern_tuple_type(&elems, m)))
-    }
-
-    /// Intern the canonical tuple struct for `elems` and return its type name,
-    /// injecting the synthetic `class $Tup$…` once (shared with tuple types and
-    /// destructuring temps).
-    fn intern_tuple_type(&mut self, elems: &[Type], m: Mark) -> String {
-        let name = tuple_type_name(elems);
-        if self.tuple_types.insert(name.clone()) {
-            // Record the slot types for inference (`arg_type` member access) and so the
-            // bare same-type unpack can read the tuple's arity from `class_fields`.
-            self.generics.class_fields.insert(
-                name.clone(),
-                elems
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| (format!("_{i}"), t.clone()))
-                    .collect(),
-            );
-            let fields = elems
-                .iter()
-                .enumerate()
-                .map(|(i, t)| Declarator {
-                    name: format!("_{i}"),
-                    ty: t.clone(),
-                    init: None,
-                    span: Span::dummy(),
-                })
-                .collect();
-            let def = self.st(
-                StmtKind::Class(ClassDef {
-                    is_union: false,
-                    name: name.clone(),
-                    base: None,
-                    fields,
-                }),
-                m,
-            );
-            self.known_types.insert(name.clone());
-            self.pending_types.push(def);
-        }
-        name
+        // A tuple type is **deferred** to a `Type::Tuple`; the `mono` pass interns the
+        // canonical `$Tup` struct (so interning, like all type resolution, happens in
+        // one place after parsing).
+        Ok(Type::Tuple(elems))
     }
 
     /// Look-ahead: does the statement begin with a tuple unpack `name (, name)* :=`?
@@ -553,12 +459,13 @@ impl<S: TokenStream> Parser<S> {
         }
     }
 
-    /// Parse and desugar a `:=` short declaration. With **one** name it's an inferred
-    /// -type variable declaration (`n := e;` declares `n` with `e`'s static type); with
-    /// **two or more** it's a tuple unpack (`a, b := e;` declares each name with the
-    /// corresponding tuple element type, `_` discards). The sole destructuring syntax —
-    /// explicit (`:=` marks it), no parentheses, no written types. The unpack lowers to
-    /// a hidden tuple temp plus one declaration per named slot.
+    /// Parse a `:=` short declaration into a deferred [`StmtKind::ShortDecl`]. With
+    /// **one** name it's an inferred-type variable declaration (`n := e;` declares `n`
+    /// with `e`'s static type); with **two or more** it's a tuple unpack (`a, b := e;`
+    /// declares each name with the corresponding tuple element type, `_` discards). The
+    /// sole destructuring syntax — explicit (`:=` marks it), no parentheses, no written
+    /// types. The [`mono`](crate::mono) pass types the RHS and desugars it (one
+    /// declaration per named slot, plus a hidden tuple temp for an unpack).
     fn parse_unpack(&mut self, m: Mark) -> PResult<Stmt> {
         let mut names: Vec<Option<String>> = Vec::new();
         loop {
@@ -571,119 +478,7 @@ impl<S: TokenStream> Parser<S> {
         self.expect(&TokenKind::ColonEq, "`:=`")?;
         let rhs = self.parse_assign()?;
         self.expect(&TokenKind::Semicolon, "`;`")?;
-
-        // Single name: an inferred-type declaration — the type comes from the RHS.
-        if names.len() == 1 {
-            let Some(name) = names.pop().unwrap() else {
-                return self.err_at(m.pos, "`_ := e` binds nothing — write `e;` instead");
-            };
-            let Some(ty) = self.arg_type(&rhs) else {
-                return self.err_at(
-                    m.pos,
-                    "cannot infer the type for `:=`; the right-hand side's type is not \
-                     known at parse time — declare it with an explicit type",
-                );
-            };
-            let decl = Declarator {
-                name,
-                ty,
-                init: Some(rhs),
-                span: self.finish(m),
-            };
-            return Ok(self.st(StmtKind::VarDecl { decls: vec![decl] }, m));
-        }
-
-        let Some(elems) = self.tuple_elem_types(&rhs) else {
-            return self.err_at(
-                m.pos,
-                "cannot infer the tuple element types for `:=`; the right-hand side's \
-                 type is not known at parse time — bind it to a typed variable first",
-            );
-        };
-        if elems.len() != names.len() {
-            return self.err_at(
-                m.pos,
-                format!(
-                    "`:=` binds {} name(s) but the tuple has {} element(s)",
-                    names.len(),
-                    elems.len()
-                ),
-            );
-        }
-        let slots: Vec<(Type, Option<String>)> = elems.into_iter().zip(names).collect();
-        self.desugar_destructure(slots, rhs, m)
-    }
-
-    /// Best-effort tuple element types of an unpack's right-hand side: a tuple literal
-    /// `(e0, …)` (each element typed via `arg_type`), or any expression whose static
-    /// type is a known tuple (read from `class_fields`). `None` ⇒ can't infer.
-    fn tuple_elem_types(&self, rhs: &Expr) -> Option<Vec<Type>> {
-        if let ExprKind::InitList(items) = &rhs.kind {
-            return items.iter().map(|e| self.arg_type(e)).collect();
-        }
-        let Type::Named(tup) = self.arg_type(rhs)? else {
-            return None;
-        };
-        if !self.tuple_types.contains(&tup) {
-            return None;
-        }
-        Some(
-            self.generics
-                .class_fields
-                .get(&tup)?
-                .iter()
-                .map(|(_, t)| t.clone())
-                .collect(),
-        )
-    }
-
-    /// Lower a tuple unpack into the existing tuple-struct machinery: bind `rhs` to a
-    /// hidden tuple temp, then declare each named slot from its field — all in one
-    /// `VarDecl` so the new names land in the enclosing scope. A `None` name (`_`) keeps
-    /// its place in the tuple shape but binds nothing.
-    fn desugar_destructure(
-        &mut self,
-        slots: Vec<(Type, Option<String>)>,
-        rhs: Expr,
-        m: Mark,
-    ) -> PResult<Stmt> {
-        let elems: Vec<Type> = slots.iter().map(|(t, _)| t.clone()).collect();
-        let tup = self.intern_tuple_type(&elems, m);
-        let tmp = format!("$dst{}", m.start);
-        let mut decls = vec![Declarator {
-            name: tmp.clone(),
-            ty: Type::Named(tup),
-            init: Some(rhs),
-            span: self.finish(m),
-        }];
-        for (i, (ty, name)) in slots.iter().enumerate() {
-            let Some(name) = name else { continue };
-            decls.push(Declarator {
-                name: name.clone(),
-                ty: ty.clone(),
-                init: Some(self.tuple_field(&tmp, i, m)),
-                span: self.finish(m),
-            });
-        }
-        Ok(self.st(StmtKind::VarDecl { decls }, m))
-    }
-
-    /// `<var>._<i>` — read field `i` of a tuple-typed variable.
-    fn tuple_field(&self, var: &str, i: usize, m: Mark) -> Expr {
-        let base = self.ex(ExprKind::Ident(var.to_string()), m);
-        self.tuple_member(base, i, m)
-    }
-
-    /// `<base>._<i>` — positional tuple field access.
-    fn tuple_member(&self, base: Expr, i: usize, m: Mark) -> Expr {
-        self.ex(
-            ExprKind::Member {
-                base: Box::new(base),
-                field: format!("_{i}"),
-                arrow: false,
-            },
-            m,
-        )
+        Ok(self.st(StmtKind::ShortDecl { names, rhs }, m))
     }
 
     /// Parse `*`… `name` `[dim]`… given a base type, returning the declared name
@@ -1067,9 +862,6 @@ impl<S: TokenStream> Parser<S> {
 
         if self.at(&TokenKind::LParen)? {
             let (params, varargs) = self.parse_params()?;
-            // Record the return type for call-result type inference (`Id(Mk())`), before
-            // the body so a recursive call's result is inferable too. Recording-only.
-            self.generics.fn_rets.insert(name.clone(), ty.clone());
             let body = if self.at(&TokenKind::LBrace)? {
                 Some(self.parse_block()?)
             } else {
@@ -1124,8 +916,6 @@ impl<S: TokenStream> Parser<S> {
                 init = Some(list);
             }
         }
-        // Record the variable's type for generic-call type-argument inference.
-        self.generics.var_types.insert(name.clone(), ty.clone());
         Ok(Declarator {
             name,
             ty,
@@ -1218,10 +1008,6 @@ impl<S: TokenStream> Parser<S> {
                 } else {
                     None
                 };
-                if let Some(n) = &name {
-                    // Record the parameter type for generic-call inference.
-                    self.generics.var_types.insert(n.clone(), ty.clone());
-                }
                 params.push(Param {
                     ty,
                     name,
@@ -1258,17 +1044,6 @@ impl<S: TokenStream> Parser<S> {
 
         let fields = self.parse_class_fields()?;
         self.eat(&TokenKind::Semicolon)?; // optional trailing `;`
-
-        // Record the direct field types for member-access type inference (`Id(p.x)`).
-        // Recording-only; covers user classes and (since instances re-parse through
-        // here) monomorphized generic classes.
-        self.generics.class_fields.insert(
-            name.clone(),
-            fields
-                .iter()
-                .map(|d| (d.name.clone(), d.ty.clone()))
-                .collect(),
-        );
 
         Ok(self.st(
             StmtKind::Class(ClassDef {
@@ -1618,23 +1393,31 @@ impl<S: TokenStream> Parser<S> {
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let m = self.mark()?;
         let mut e = self.parse_primary()?;
-        // A generic function call `Name<TypeArgs>(...)`: rewrite the callee to the
-        // mangled instance name and queue it for monomorphization.
-        let gen_name = match &e.kind {
-            ExprKind::Ident(n) if self.generics.fns.contains_key(n) => Some(n.clone()),
-            _ => None,
-        };
-        if let Some(name) = gen_name {
-            if self.at(&TokenKind::Lt)? {
-                let type_args = self.parse_type_args()?;
-                let mangled = mangle_generic(&name, &type_args);
-                // Record the instance's return type (mirrors the inferred-call path), so
-                // `:=` / call-result inference works on an explicit `Name<...>(...)` too.
-                if let Some(tmpl) = self.generics.fns.get(&name).cloned() {
-                    self.record_generic_ret(&tmpl, &type_args, &mangled);
-                }
-                self.generics.pending_fns.push((name, type_args));
-                e = self.ex(ExprKind::Ident(mangled), m);
+        // A generic-function call is **deferred** to a `GenericCall` node — explicit
+        // `Name<args>(…)` or inferred `Name(…)`. The `mono` pass infers the type
+        // arguments (with a real typer) and rewrites it to a concrete call, so all
+        // monomorphization happens in one type-directed place after parsing.
+        if let ExprKind::Ident(n) = &e.kind {
+            if self.generics.fns.contains_key(n)
+                && (self.at(&TokenKind::Lt)? || self.at(&TokenKind::LParen)?)
+            {
+                let name = n.clone();
+                let type_args = if self.at(&TokenKind::Lt)? {
+                    self.parse_type_args()?
+                } else {
+                    Vec::new()
+                };
+                self.expect(&TokenKind::LParen, "`(`")?;
+                let args = self.parse_call_args()?;
+                self.expect(&TokenKind::RParen, "`)`")?;
+                e = self.ex(
+                    ExprKind::GenericCall {
+                        name,
+                        type_args,
+                        args,
+                    },
+                    m,
+                );
             }
         }
         loop {
@@ -1644,15 +1427,6 @@ impl<S: TokenStream> Parser<S> {
                     self.advance()?;
                     let args = self.parse_call_args()?;
                     self.expect(&TokenKind::RParen, "`)`")?;
-                    // An un-annotated call to a generic function — infer its type
-                    // arguments from the argument types and resolve to the instance.
-                    if let ExprKind::Ident(n) = &e.kind {
-                        if self.generics.fns.contains_key(n) {
-                            let name = n.clone();
-                            let mangled = self.infer_generic_call(&name, &args, m.pos)?;
-                            e = self.ex(ExprKind::Ident(mangled), m);
-                        }
-                    }
                     e = self.ex(
                         ExprKind::Call {
                             callee: Box::new(e),
@@ -1890,7 +1664,7 @@ fn infix_op(k: &TokenKind) -> Option<(BinOp, u8)> {
 /// lazy.
 /// The canonical name of the tuple type with these element types — a deterministic
 /// mangling, so two `(I64, Error)`s anywhere name the same synthetic struct.
-fn tuple_type_name(elems: &[Type]) -> String {
+pub(crate) fn tuple_type_name(elems: &[Type]) -> String {
     let mut s = String::from("$Tup");
     for t in elems {
         s.push('$');
@@ -1901,132 +1675,13 @@ fn tuple_type_name(elems: &[Type]) -> String {
 
 /// The mangled name of a generic instantiation, e.g. `Vec` + `[I8]` → `Vec_I8`,
 /// `Vec` + `[U8 *]` → `Vec_PU8`, `Pair` + `[I64, F64]` → `Pair_I64_F64`.
-fn mangle_generic(name: &str, args: &[Type]) -> String {
+pub(crate) fn mangle_generic(name: &str, args: &[Type]) -> String {
     let mut s = name.to_string();
     for a in args {
         s.push('_');
         s.push_str(&mangle_type(a));
     }
     s
-}
-
-/// Split a generic function's value-parameter tokens into one [`TypePattern`] per
-/// parameter (for call-site type inference). Each parameter's type is the tokens up to
-/// its trailing name identifier.
-fn param_type_patterns(toks: &[Token], type_params: &[String]) -> Vec<TypePattern> {
-    let mut out = Vec::new();
-    if toks.is_empty() {
-        return out;
-    }
-    // Split on top-level commas.
-    let mut parts: Vec<&[Token]> = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0i32;
-    for (i, t) in toks.iter().enumerate() {
-        match t.kind {
-            TokenKind::LParen | TokenKind::Lt | TokenKind::LBracket => depth += 1,
-            TokenKind::RParen | TokenKind::Gt | TokenKind::RBracket => depth -= 1,
-            TokenKind::Shr => depth -= 2,
-            TokenKind::Comma if depth == 0 => {
-                parts.push(&toks[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&toks[start..]);
-    for part in parts {
-        if part.iter().any(|t| t.kind == TokenKind::DotDotDot) {
-            out.push(TypePattern::Concrete); // `...` varargs — no binding
-            continue;
-        }
-        // Drop the trailing parameter name (an identifier), leaving the type tokens.
-        let type_toks = if matches!(part.last().map(|t| &t.kind), Some(TokenKind::Ident(_))) {
-            &part[..part.len() - 1]
-        } else {
-            part
-        };
-        out.push(parse_type_pattern_at(type_toks, 0, type_params).0);
-    }
-    out
-}
-
-/// Parse a type pattern from `toks` starting at index `i`, returning the pattern and
-/// the index just past it. Type-parameter names become `Param`; a known generic class
-/// use becomes `Generic`; pointer stars wrap the base.
-fn parse_type_pattern_at(toks: &[Token], mut i: usize, tparams: &[String]) -> (TypePattern, usize) {
-    let mut base = match toks.get(i).map(|t| &t.kind) {
-        Some(TokenKind::Keyword(_)) => {
-            i += 1;
-            TypePattern::Concrete
-        }
-        Some(TokenKind::Ident(s)) => {
-            let name = s.clone();
-            i += 1;
-            if tparams.iter().any(|p| p == &name) {
-                TypePattern::Param(name)
-            } else if matches!(toks.get(i).map(|t| &t.kind), Some(TokenKind::Lt)) {
-                i += 1; // `<`
-                let mut args = Vec::new();
-                loop {
-                    let (a, ni) = parse_type_pattern_at(toks, i, tparams);
-                    args.push(a);
-                    i = ni;
-                    match toks.get(i).map(|t| &t.kind) {
-                        Some(TokenKind::Comma) => i += 1,
-                        Some(TokenKind::Gt) | Some(TokenKind::Shr) => {
-                            i += 1;
-                            break;
-                        }
-                        _ => break,
-                    }
-                }
-                TypePattern::Generic(name, args)
-            } else {
-                TypePattern::Concrete
-            }
-        }
-        _ => TypePattern::Concrete,
-    };
-    while matches!(toks.get(i).map(|t| &t.kind), Some(TokenKind::Star)) {
-        i += 1;
-        base = TypePattern::Ptr(Box::new(base));
-    }
-    (base, i)
-}
-
-/// Render a concrete type back into tokens (with placeholder spans), for splicing a
-/// type argument into a generic function's captured token stream at instantiation.
-fn type_to_tokens(ty: &Type) -> Vec<Token> {
-    let mut out = Vec::new();
-    push_type_tokens(ty, &mut out);
-    out
-}
-
-fn push_type_tokens(ty: &Type, out: &mut Vec<Token>) {
-    let kw = |k| Token::new(TokenKind::Keyword(k), Span::dummy());
-    match ty {
-        Type::U0 => out.push(kw(Keyword::U0)),
-        Type::I8 => out.push(kw(Keyword::I8)),
-        Type::U8 => out.push(kw(Keyword::U8)),
-        Type::I16 => out.push(kw(Keyword::I16)),
-        Type::U16 => out.push(kw(Keyword::U16)),
-        Type::I32 => out.push(kw(Keyword::I32)),
-        Type::U32 => out.push(kw(Keyword::U32)),
-        Type::I64 => out.push(kw(Keyword::I64)),
-        Type::U64 => out.push(kw(Keyword::U64)),
-        Type::F64 => out.push(kw(Keyword::F64)),
-        Type::Bool => out.push(kw(Keyword::Bool)),
-        Type::Named(s) => out.push(Token::new(TokenKind::Ident(s.clone()), Span::dummy())),
-        Type::Ptr(inner) => {
-            push_type_tokens(inner, out);
-            out.push(Token::new(TokenKind::Star, Span::dummy()));
-        }
-        // Array / function-pointer type arguments are uncommon; approximate by the
-        // element / return type (enough for the type-token splice).
-        Type::Array(inner, _) => push_type_tokens(inner, out),
-        Type::FuncPtr { ret, .. } => push_type_tokens(ret, out),
-    }
 }
 
 fn mangle_type(t: &Type) -> String {
@@ -2050,6 +1705,18 @@ fn mangle_type(t: &Type) -> String {
             for p in params {
                 s.push('_');
                 s.push_str(&mangle_type(p));
+            }
+            s
+        }
+        // A bare param mangles to its name; a deferred application reuses the generic
+        // mangling (`Vec<I64>` → `Vec_I64`).
+        Type::Param(name) => name.clone(),
+        Type::Generic(name, args) => mangle_generic(name, args),
+        Type::Tuple(elems) => {
+            let mut s = String::from("Tup");
+            for e in elems {
+                s.push('_');
+                s.push_str(&mangle_type(e));
             }
             s
         }
@@ -2091,112 +1758,50 @@ fn parse_core(
     search: &[std::path::PathBuf],
     with_prelude: bool,
 ) -> PResult<Program> {
-    let (known_types, fn_ret_tokens) = hoist_type_names(src, dir, search, with_prelude)?;
+    let known_types = hoist_type_names(src, dir, search, with_prelude)?;
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
         pp = pp.with_prelude(prelude());
     }
     let mut parser = Parser::with_known_types(pp, known_types);
-    parser.hoisted_fn_rets = fn_ret_tokens;
-    parser.parse_program()
+    let program = parser.parse_program()?;
+    // The `mono` pass resolves every deferred generic construct (generic type/call
+    // uses, tuple types, `:=`) into concrete AST before sema/layout/codegen.
+    crate::mono::expand(program).map_err(|e| ParseError {
+        message: e.message,
+        pos: e.pos,
+    })
 }
 
-/// Stream the preprocessed tokens and collect, descending into `#include`d files:
-///   * every `class`/`union` *name* (so a type can be used before it's defined), and
-///   * every top-level **function**'s return-type *tokens* (so a `:=` / call-result
-///     inference can see a function defined *below* its use — the parser's incremental
-///     `fn_rets` is "seen so far", but these are seeded up front).
-///
-/// Function detection is a conservative token scan: at brace/paren depth 0, an `Ident`
-/// immediately before the parameter-list `(`, with a non-empty, **type-only** prefix
-/// (the return type) — so a function *call* in an expression (`x = Foo(1)`, whose
-/// prefix contains `=`) is not mistaken for a declaration. Best-effort: anything it
-/// can't cleanly classify is simply skipped (the old, explicit-type behaviour).
-type Hoisted = (HashSet<String>, HashMap<String, Vec<Token>>);
+/// Stream the preprocessed tokens (descending into `#include`d files) and collect
+/// every `class`/`union` *name*, so a type can be used before it's defined (the parser
+/// is two-pass for this reason). Forward references in *value* positions are handled
+/// later by the [`mono`](crate::mono) pass's whole-program typer, so no return-type
+/// hoisting is needed here.
 fn hoist_type_names(
     src: &str,
     dir: &std::path::Path,
     search: &[std::path::PathBuf],
     with_prelude: bool,
-) -> PResult<Hoisted> {
+) -> PResult<HashSet<String>> {
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
         pp = pp.with_prelude(prelude());
     }
     let mut names = HashSet::new();
-    let mut fn_rets: HashMap<String, Vec<Token>> = HashMap::new();
-    let mut brace = 0i32; // `{}` depth — only top-level (0) declarations are scanned
-    let mut paren = 0i32; // `()`/`[]` depth — the param-list `(` opens at 0
-    let mut cur: Vec<Token> = Vec::new(); // tokens of the current top-level statement
     loop {
         let t = pp.next_token()?;
         match &t.kind {
             TokenKind::Eof => break,
             TokenKind::Keyword(Keyword::Class) | TokenKind::Keyword(Keyword::Union) => {
-                cur.push(t);
-                let nt = pp.next_token()?;
-                if let TokenKind::Ident(name) = &nt.kind {
+                if let TokenKind::Ident(name) = &pp.next_token()?.kind {
                     names.insert(name.clone());
                 }
-                cur.push(nt);
             }
-            TokenKind::LBrace => {
-                brace += 1;
-                cur.clear();
-            }
-            TokenKind::RBrace => {
-                brace -= 1;
-                cur.clear();
-            }
-            TokenKind::Semicolon if brace == 0 && paren == 0 => cur.clear(),
-            TokenKind::LParen => {
-                // A function declaration's parameter list: `<return type> Name (`.
-                if brace == 0 && paren == 0 && cur.len() >= 2 {
-                    if let TokenKind::Ident(name) = &cur[cur.len() - 1].kind {
-                        let ret = &cur[..cur.len() - 1];
-                        if ret.iter().all(is_type_token) {
-                            fn_rets.entry(name.clone()).or_insert_with(|| ret.to_vec());
-                        }
-                    }
-                }
-                paren += 1;
-                cur.push(t);
-            }
-            TokenKind::LBracket => {
-                paren += 1;
-                cur.push(t);
-            }
-            TokenKind::RParen | TokenKind::RBracket => {
-                paren -= 1;
-                if brace == 0 {
-                    cur.push(t);
-                }
-            }
-            _ => {
-                if brace == 0 {
-                    cur.push(t);
-                }
-            }
+            _ => {}
         }
     }
-    Ok((names, fn_rets))
-}
-
-/// Whether a token may appear in a (return) type — the whitelist that lets the hoist
-/// scan tell a function declaration's return type from an expression prefix.
-fn is_type_token(t: &Token) -> bool {
-    match &t.kind {
-        TokenKind::Keyword(kw) => kw.is_type(),
-        TokenKind::Ident(_) => true,
-        TokenKind::Star
-        | TokenKind::Lt
-        | TokenKind::Gt
-        | TokenKind::Shr
-        | TokenKind::Comma
-        | TokenKind::LParen
-        | TokenKind::RParen => true,
-        _ => false,
-    }
+    Ok(names)
 }

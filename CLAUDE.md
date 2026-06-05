@@ -71,12 +71,15 @@ the Makefile / README for the target list.
 Source flows through one direction, each stage a separate module:
 
 ```
-lexer → preprocessor → parser → sema → layout → backend
+lexer → preprocessor → parser → mono → sema → layout → backend
 ```
 
 `parser::parse(src)` is the front-end entry point and is **two-pass**: it first
 `hoist_type_names` (streams the preprocessed tokens just to collect `class`/`union`
-names) so a type can be used before it is defined, then does the real parse.
+names) so a type can be used before it is defined, then does the real parse — and
+finally runs the **`mono`** pass (`src/mono.rs`), which monomorphizes every deferred
+generic construct into concrete AST (see "Monomorphization is its own pass" below), so
+everything downstream sees an ordinary, fully-concrete `Program`.
 `sema::check_program(&Program) -> Vec<SemaError>` runs name resolution + type
 inference. `layout::compute(&Program)` computes `repr(C)` sizes/offsets. The CLI
 (`src/bin/hcc.rs`) wires these together per mode.
@@ -880,56 +883,39 @@ never reach the AST as `Named` types and must be defined before use; they are
 not hoisted (the C rule). The bracketed `switch [x]` form and `start:` / `end:`
 sub-labels (prologue/epilogue) are lowered in both backends.
 
-**Generic classes (monomorphization).** `class Vec<T> { T *data; … }` declares a
-generic `class`/`union` template; each use in **type position** (`Vec<I64>`,
-`Pair<I64, F64>`, nested `Vec<Vec<I64>>`) is monomorphized at **parse time** into a
-concrete synthetic class with the parameters substituted — `Vec_I64`, `Pair_I64_F64`
-(mangled via `mangle_generic`/`mangle_type`, pointer args as `PU8` etc.). The parser
-records templates in `Parser::generic_classes` (define-before-use, like `typedef`),
-`parse_base_type` detects `Name<args>` and calls `instantiate_generic` (substitute via
-`subst_type`, dedup by mangled name in `generic_done`, inject the concrete `ClassDef`
-through the existing `pending_types` path). So sema/layout/all backends only ever see
-ordinary concrete classes — **no downstream changes**. Arg type-args parse recursively,
-giving nesting/fixpoint for free; nested `Vec<Vec<I64>>` works because `expect_generic_gt`
-splits the `>>` (`Shr`) token.
+**Monomorphization is its own pass (`src/mono.rs`), between parse and sema.** The
+parser never instantiates a generic; it only *recognizes* templates and *defers* every
+generic use to a dedicated AST node — a type use `Vec<I64>` → `Type::Generic`, a tuple
+type `(I64,F64)` → `Type::Tuple`, a call `Id<I64>(x)`/`Id(x)` →
+`ExprKind::GenericCall { name, type_args, args }`, and a `:=` → `StmtKind::ShortDecl`.
+The parser carries the parsed-once templates on `Program::generics`
+(`GenericTemplates { classes, fns }`; `parse_generic_class`/`capture_generic_fn` parse
+each template body under a `template_params` scope so `T` stays `Type::Param` and a
+nested `Vec<T>` a deferred `Type::Generic`). `mono::expand(program)` then resolves all
+of it and returns a **fully concrete** program (no `Generic`/`Tuple`/`GenericCall`/
+`ShortDecl` remain), so sema/layout/interp/all backends are untouched (they keep
+`unreachable!` arms for the deferred kinds as assertions). The pass: a two-pass walk —
+signatures first (so forward references resolve), then bodies — over a scope stack;
+`resolve_type` turns a `Type::Generic` into the mangled `Named` (queuing the class
+instance) and interns a `Type::Tuple`'s `$Tup` struct; `resolve_expr` rewrites a
+`GenericCall` to a concrete `Call`; `resolve_stmt` desugars a `ShortDecl`. Instantiation
+is **AST substitution** (`subst_type`/`subst_stmt`/`subst_expr` bind the type params in
+the cloned template `FuncDef`/fields — no token re-parse), and a worklist drains both
+class and function instances to a fixpoint (deduped by mangled name). Nesting/`>>` works
+because the type-arg grammar parses recursively (`expect_generic_gt` splits `Shr`).
 
-**Generic functions (monomorphization).** `T VecPush<T>(Vec<T> *v, T x) { … }` declares a
-generic function; a call `VecPush<I64>(&v, x)` monomorphizes it to a concrete
-`VecPush_I64`. Because a function body can mention `T`/`Vec<T>` in many positions
-(params, casts, `sizeof`, locals, return), the template is captured as **raw tokens**
-(never AST-parsed in generic form): `looks_like_generic_fn` detects `Ret Name<…>(` at
-statement level (so it's recognised even when the return type is a bare type param like
-`T`), `capture_generic_fn` grabs the tokens through the body `}` and records the name +
-type-param list. A call site (`parse_postfix`) rewrites `Name<args>(…)` to a call to the
-mangled `Name_I64` and queues `(name, type-args)`. After the main parse, `parse_program`
-drains the queue: `instantiate_generic_fn` substitutes the type-param **tokens** with the
-argument's tokens (`type_to_tokens`), drops the `<T>` list, renames to the mangled name,
-and **re-parses** the result through the same parser (so `Vec<I64>` in the body
-instantiates the class and nested generic calls re-queue) — to a fixpoint, deduped by
-`generic_fn_done`. The generated concrete functions/classes are appended as top-level
-items, so again **nothing downstream changes**.
-
-Calls may give the type args **explicitly** (`VecPush<I64>(…)`) or have them
-**inferred** (`VecPush(&v, x)`). Inference is parse-time: the parser records declared
-variable/parameter types (`var_types`, recording-only so non-generic code is unaffected)
-and, for each generic function, the per-parameter [`TypePattern`]s
-(`param_type_patterns` — `T` → `Param`, `Vec<T>*` → `Ptr(Generic("Vec",[Param]))`). At an
-un-annotated call it computes each argument's static type (`arg_type`) and unifies it
-against the patterns (`unify_pattern`), using the `generic_instances` reverse map
-(`Vec_I64` → `("Vec",[I64])`) so a `Vec<T>*` parameter matched against a `Vec_I64*`
-argument binds `T=I64`. If a parameter can't be inferred it's a clear error suggesting
-the explicit form. `arg_type` is a **parse-time mini-typer** (inference runs before sema,
-over the recording-only `var_types`/`fn_rets`/`class_fields` maps): it resolves literals,
-variables, `&e`, casts (own type), call results (`fn_rets`), **member access**
-(`class_fields` — direct fields), **indexing** (element type), **deref** (pointee), and
-**arithmetic** (HolyC integer promotion to `I64`, `F64` if either operand is float;
-comparisons are boolean). It is intentionally partial and "seen so far", so the cases it
-*can't* resolve fall back to the explicit `<...>`: a call to a function/class declared
-*after* the call site, a function-pointer call result, an inherited (base-class) field,
-or an instance-of-a-generic's field whose instance isn't generated yet. A type parameter
-only needs *some* inferable argument, though — typically recovered from a
-`Vec<T>*`/`Hmap<K,V>*` receiver, so a complex other argument is fine. See
-`examples/generic.hc`.
+**Type-directed inference.** A call may give type args **explicitly** (`VecPush<I64>(…)`)
+or have them **inferred** (`VecPush(&v, x)`). Inference (`Mono::infer`) unifies each
+parameter's *template* type (the `Type::Param`/`Type::Generic` it was parsed as) against
+the argument's static type via `Mono::type_expr` — a **real, scoped, recursive typer**
+over the whole already-parsed program (the `instances` reverse map binds a `Vec<T>*`
+parameter from a `Vec_I64*` argument). Because it runs after the full parse, it sees
+forward-declared functions, **ternary** arguments, **function-pointer call results**, and
+**inherited (base-class) fields** — the gaps the old parse-time "seen so far" `arg_type`
+fell back to explicit `<...>` on are now inferred. The same typer drives `:=` (a
+single-name `n := e` declares `n` with `e`'s type; `a, b := e` unpacks a tuple). A type
+parameter only needs *some* inferable argument; if none binds it, the error suggests the
+explicit form. See `examples/generic.hc`.
 Still genuinely absent: most of the TempleOS core/standard library and DolDoc.
 
 The worked HolyC programs live in `examples/*.hc` (top-level), listed once in

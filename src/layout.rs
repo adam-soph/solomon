@@ -302,6 +302,10 @@ fn scalar_size(ty: &Type) -> Option<u64> {
         Type::I32 | Type::U32 => 4,
         Type::I64 | Type::U64 | Type::F64 | Type::Ptr(_) | Type::FuncPtr { .. } => 8,
         Type::Named(_) | Type::Array(..) => return None,
+        // Generic templates are monomorphized away before layout runs.
+        Type::Param(_) | Type::Generic(..) | Type::Tuple(_) => {
+            unreachable!("unresolved generic type reached layout")
+        }
     })
 }
 

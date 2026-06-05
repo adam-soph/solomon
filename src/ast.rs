@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::token::{FileInfo, Keyword, Span, Token};
+use crate::token::{FileInfo, Keyword, Span};
 
 /// A whole translation unit. HolyC is script-like: the top level is just a
 /// sequence of statements, which may include function and class definitions.
@@ -22,11 +22,10 @@ pub struct Program {
     /// file's directory for `_`-directory privacy checks in sema. Provenance
     /// metadata, so — like spans — it is ignored by `PartialEq`.
     pub files: Vec<FileInfo>,
-    /// The generic-template registry captured during parsing. Phase 1 monomorphization
-    /// happens in the parser (call sites are already rewritten to concrete mangled
-    /// names, so `items` is fully concrete), and this is **inert** — nothing reads it
-    /// yet. It is carried so a future type-directed `mono` pass can take the templates
-    /// post-parse. Like `files`, it is ignored by `PartialEq`.
+    /// The generic-template registry captured during parsing, the input to the
+    /// [`mono`](crate::mono) pass — which instantiates every deferred generic use and
+    /// then leaves this empty (so a post-`mono` `Program` is fully concrete). Like
+    /// `files`, it is ignored by `PartialEq`.
     pub generics: GenericTemplates,
 }
 
@@ -36,34 +35,29 @@ impl PartialEq for Program {
     }
 }
 
-/// The generic `class`/function templates and instance map captured during parsing,
-/// carried on the [`Program`] for a future monomorphization pass. (Today the parser
-/// instantiates everything, so this is recorded but unused.)
+/// The generic `class`/function templates captured during parsing, carried on the
+/// [`Program`] for the [`mono`](crate::mono) pass to instantiate. The parser leaves
+/// every generic *use* deferred (`Type::Generic`/`Type::Tuple`/`ExprKind::GenericCall`/
+/// `StmtKind::ShortDecl`); `mono` consumes these templates and resolves the uses.
 #[derive(Clone, Debug, Default)]
 pub struct GenericTemplates {
     /// Generic `class`/`union` templates, by name.
     pub classes: HashMap<String, GenericClass>,
     /// Generic function templates, by name.
     pub fns: HashMap<String, GenericFn>,
-    /// A generic class instance's mangled name → `(template name, type args)`, so a
-    /// `Vec<T>` parameter can be matched against a `Vec_I64` argument to bind `T`.
-    pub instances: HashMap<String, (String, Vec<Type>)>,
 }
 
-/// A captured generic-function template: its raw tokens plus the metadata an
-/// instantiation needs. The signature is never AST-parsed in generic form (so `T` /
-/// `Vec<T>` never mis-resolve); each call substitutes the type-parameter tokens,
-/// drops the `<T>` list, renames, and re-parses into a concrete function.
+/// A captured generic-function template: its type-parameter names and the function
+/// parsed once into a `FuncDef` with those parameters left symbolic. The
+/// [`mono`](crate::mono) pass substitutes the parameters in this AST per instantiation
+/// (no token re-parse).
 #[derive(Clone, Debug)]
 pub struct GenericFn {
     pub type_params: Vec<String>,
-    pub tokens: Vec<Token>,
-    /// Index of the function-name token in `tokens`.
-    pub name_index: usize,
-    /// Index of the type-parameter list's closing `>` (the `<` is `name_index + 1`).
-    pub gt_index: usize,
-    /// One pattern per value parameter, for call-site type-argument inference.
-    pub param_patterns: Vec<TypePattern>,
+    /// The template `FuncDef`, with type parameters left symbolic: a `T` type is
+    /// `Type::Param`, a nested `Vec<T>` a deferred `Type::Generic`, a body generic call
+    /// an `ExprKind::GenericCall`, and a `:=` a `StmtKind::ShortDecl`.
+    pub def: FuncDef,
 }
 
 /// A captured generic `class`/`union` template.
@@ -73,21 +67,10 @@ pub struct GenericClass {
     /// The type-parameter names, e.g. `["T"]` or `["K", "V"]`.
     pub params: Vec<String>,
     pub base: Option<String>,
-    /// The body `{ ... }` captured as raw tokens (never AST-parsed in generic form, so
-    /// a field may itself nest a generic type, e.g. `HmapEntry<K,V> *next`). Each
-    /// instantiation substitutes the type-parameter tokens and re-parses.
-    pub body_tokens: Vec<Token>,
-}
-
-/// A parameter type with the function's type parameters left symbolic, for inferring
-/// type arguments at an un-annotated call: `T` → `Param("T")`, `Vec<T> *` →
-/// `Ptr(Generic("Vec", [Param("T")]))`, `I64` → `Concrete`.
-#[derive(Clone, Debug)]
-pub enum TypePattern {
-    Param(String),
-    Concrete,
-    Generic(String, Vec<TypePattern>),
-    Ptr(Box<TypePattern>),
+    /// The fields, parsed once with the template's parameters left symbolic — a `T`
+    /// field type is `Type::Param("T")` and a nested `Vec<T>` is `Type::Generic(...)`.
+    /// The [`mono`](crate::mono) pass substitutes the parameters in this AST (no re-parse).
+    pub fields: Vec<Declarator>,
 }
 
 /// A HolyC type. Pointers and arrays wrap a base type.
@@ -116,6 +99,21 @@ pub enum Type {
         ret: Box<Type>,
         params: Vec<Type>,
     },
+    /// A generic **type parameter** (`T`) inside a template body, replaced with a
+    /// concrete type when the template is instantiated. Only ever appears in a generic
+    /// template's AST — the monomorphization pass resolves it away, so sema, layout, and
+    /// the backends never see it.
+    Param(String),
+    /// An **un-instantiated generic application** (`Vec<T>`) inside a template body,
+    /// resolved to a concrete `Named` once its arguments are bound at instantiation.
+    /// Like [`Type::Param`], it never reaches sema/layout/backends.
+    Generic(String, Vec<Type>),
+    /// A **deferred tuple type** `(T0, …, Tn)` inside a template body — its elements may
+    /// be parametric, so it isn't interned into a `$Tup` class until the parameters are
+    /// bound at instantiation (substitution interns the concrete tuple). Outside a
+    /// template, a tuple type is interned immediately to a `Named`, so this never reaches
+    /// sema/layout/backends.
+    Tuple(Vec<Type>),
 }
 
 impl Type {
@@ -314,6 +312,17 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// A **deferred** generic call inside a generic-function template body —
+    /// `VecReserve<T>(v, …)`, or an inferred `VecPush(&v, x)` (`type_args` empty). The
+    /// type parameters aren't bound until the enclosing template is instantiated, so the
+    /// call can't be resolved at parse time; the monomorphization substitution resolves
+    /// it (substituting `type_args`/re-inferring, then rewriting to a concrete `Call`).
+    /// Never reaches sema/layout/backends.
+    GenericCall {
+        name: String,
+        type_args: Vec<Type>,
+        args: Vec<Expr>,
+    },
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
@@ -372,6 +381,15 @@ pub enum StmtKind {
     Block(Vec<Stmt>),
     VarDecl {
         decls: Vec<Declarator>,
+    },
+    /// A **deferred `:=`** inside a generic-function template body — `a, b := rhs;`
+    /// (or `n := rhs;`) whose element/variable types can't be inferred until the
+    /// template's parameters are bound (e.g. `_, ok := HmapGet<K, V>(m, key)`). The
+    /// monomorphization substitution desugars it to a `VarDecl` once `rhs` is concrete.
+    /// A `None` name is a `_` discard. Never reaches sema/layout/backends.
+    ShortDecl {
+        names: Vec<Option<String>>,
+        rhs: Expr,
     },
     If {
         cond: Expr,
@@ -470,6 +488,7 @@ fn stmt_calls(s: &Stmt, names: &[&str]) -> bool {
         | StmtKind::Class(_)
         | StmtKind::Include(_) => false,
         StmtKind::Expr(e) => expr_calls(e, names),
+        StmtKind::ShortDecl { rhs, .. } => expr_calls(rhs, names),
         StmtKind::Block(ss) => ss.iter().any(|s| stmt_calls(s, names)),
         StmtKind::VarDecl { decls } => decls
             .iter()
@@ -519,6 +538,9 @@ fn expr_calls(e: &Expr, names: &[&str]) -> bool {
                 || expr_calls(callee, names)
                 || args.iter().any(|a| expr_calls(a, names))
         }
+        ExprKind::GenericCall { name, args, .. } => {
+            names.contains(&name.as_str()) || args.iter().any(|a| expr_calls(a, names))
+        }
         ExprKind::Unary { expr, .. }
         | ExprKind::Postfix { expr, .. }
         | ExprKind::Cast { expr, .. } => expr_calls(expr, names),
@@ -555,6 +577,7 @@ fn stmt_uses_ident(s: &Stmt, names: &[&str]) -> bool {
         | StmtKind::Class(_)
         | StmtKind::Include(_) => false,
         StmtKind::Expr(e) => expr_uses_ident(e, names),
+        StmtKind::ShortDecl { rhs, .. } => expr_uses_ident(rhs, names),
         StmtKind::Block(ss) => ss.iter().any(|s| stmt_uses_ident(s, names)),
         StmtKind::VarDecl { decls } => decls
             .iter()
@@ -603,6 +626,9 @@ fn expr_uses_ident(e: &Expr, names: &[&str]) -> bool {
         | ExprKind::Offset { .. } => false,
         ExprKind::Call { callee, args } => {
             expr_uses_ident(callee, names) || args.iter().any(|a| expr_uses_ident(a, names))
+        }
+        ExprKind::GenericCall { name, args, .. } => {
+            names.contains(&name.as_str()) || args.iter().any(|a| expr_uses_ident(a, names))
         }
         ExprKind::Unary { expr, .. }
         | ExprKind::Postfix { expr, .. }

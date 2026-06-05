@@ -369,6 +369,7 @@ impl Analyzer {
 
     fn check_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
+            StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached sema"),
             StmtKind::Empty | StmtKind::Label(_) | StmtKind::Include(_) => {}
             StmtKind::Expr(e) => {
                 self.check_expr(e);
@@ -722,6 +723,8 @@ impl Analyzer {
 
     fn infer(&mut self, expr: &Expr) -> Type {
         match &expr.kind {
+            // Deferred generic calls only live in templates, gone before sema.
+            ExprKind::GenericCall { .. } => unreachable!("generic call reached sema"),
             ExprKind::Int(_) | ExprKind::Char(_) => Type::I64,
             ExprKind::Float(_) => Type::F64,
             // String literals are U8*.

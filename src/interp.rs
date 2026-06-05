@@ -583,6 +583,7 @@ impl<W: Write> Interpreter<W> {
 
     fn exec_stmt(&mut self, s: &Stmt, env: &mut Env) -> Result<Flow, CodegenError> {
         match &s.kind {
+            StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached the interpreter"),
             StmtKind::Empty
             | StmtKind::Label(_)
             | StmtKind::Include(_)
@@ -882,6 +883,7 @@ impl<W: Write> Interpreter<W> {
     fn eval(&mut self, e: &Expr, env: &mut Env) -> Result<Value, CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
+            ExprKind::GenericCall { .. } => unreachable!("generic call reached the interpreter"),
             ExprKind::Int(v) | ExprKind::Char(v) => Ok(Value::Int(*v)),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
             ExprKind::Str(s) => Ok(Value::Str(Rc::new(s.clone()))),

@@ -891,6 +891,7 @@ impl Cg {
 
     fn gen_stmt(&mut self, s: &Stmt) -> Result<(), CodegenError> {
         match &s.kind {
+            StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached codegen"),
             StmtKind::Empty | StmtKind::Include(_) => {}
 
             StmtKind::Label(name) => {
@@ -1559,6 +1560,7 @@ impl Cg {
         }
         let pos = e.span.pos;
         match &e.kind {
+            ExprKind::GenericCall { .. } => unreachable!("generic call reached codegen"),
             ExprKind::Int(v) | ExprKind::Char(v) => self.asm.load_imm(RES, *v),
             ExprKind::Float(_) => self.gen_fexpr(e)?,
             ExprKind::Str(s) => {
@@ -5924,6 +5926,7 @@ impl RegAnalysis {
 
     fn scan_stmt(&mut self, s: &Stmt) {
         match &s.kind {
+            StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached register scan"),
             StmtKind::Empty
             | StmtKind::Break
             | StmtKind::Continue
@@ -6018,6 +6021,7 @@ impl RegAnalysis {
 
     fn scan_expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::GenericCall { .. } => unreachable!("generic call reached register scan"),
             ExprKind::Ident(name) => self.touch(name, true),
             ExprKind::Unary {
                 op: UnOp::AddrOf,

@@ -586,10 +586,10 @@ fn generic_function_infers_from_cast_and_call_result() {
 
 #[test]
 fn generic_inference_resolves_member_index_deref_and_arithmetic() {
-    // `arg_type` now types member access, indexing, deref, and arithmetic (using the
-    // recorded class-field types), so none of these need an explicit `<...>`. Each
-    // generic `T` here is inferable *only* from the argument (no receiver to recover it
-    // from), so a missing case would be a hard "cannot infer" error.
+    // The `mono` pass's typer handles member access, indexing, deref, and arithmetic
+    // (using the resolved class-field types), so none of these need an explicit `<...>`.
+    // Each generic `T` here is inferable *only* from the argument (no receiver to recover
+    // it from), so a missing case would be a hard "cannot infer" error.
     let names = |src: &str| -> Vec<String> {
         prog(src)
             .items
@@ -622,8 +622,8 @@ fn generic_inference_resolves_member_index_deref_and_arithmetic() {
 
 #[test]
 fn generic_inference_sees_a_forward_declared_function() {
-    // The hoist pre-pass seeds top-level function return types into `fn_rets`, so a
-    // call-result argument whose function is defined *below* the call site infers fine.
+    // The `mono` pass types the whole (parsed) program, so a call-result argument whose
+    // function is defined *below* the call site infers fine — no special hoisting needed.
     let p = parse("T Id<T>(T x){return x;} I64 a = Id(Later()); I64 Later(){return 4;}").unwrap();
     assert!(
         p.items
@@ -634,23 +634,60 @@ fn generic_inference_sees_a_forward_declared_function() {
 }
 
 #[test]
-fn program_carries_generic_templates() {
-    // Phase 1B: the parser records the generic templates + instance map on
-    // `Program::generics` for a future `mono` pass. It's inert (the parser already
-    // instantiated everything into `items`), but it must be populated.
+fn mono_inference_closes_ternary_inherited_and_fnptr_gaps() {
+    // The `mono` pass's whole-program, scoped typer infers cases the old parse-time
+    // "seen so far" typer could not: a ternary argument, an inherited (base-class)
+    // field, and a function-pointer call result.
+    let names = |src: &str| -> Vec<String> {
+        prog(src)
+            .items
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Func(f) => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // a ternary argument
+    let n = names("T Id<T>(T x){return x;} U0 F(){ I64 c=1; I64 a = Id(c ? 1 : 2); }");
+    assert!(n.contains(&"Id_I64".to_string()), "ternary: {n:?}");
+    // an inherited (base-class) field
+    let n = names(
+        "class Base{I64 v;} class Derived:Base{I64 w;} T Id<T>(T x){return x;} \
+         U0 F(){ Derived d; I64 a = Id(d.v); }",
+    );
+    assert!(n.contains(&"Id_I64".to_string()), "inherited field: {n:?}");
+    // a function-pointer call result
+    let n = names(
+        "I64 G(I64 x){return x;} T Id<T>(T x){return x;} \
+         U0 F(){ I64 (*fp)(I64) = &G; I64 a = Id(fp(3)); }",
+    );
+    assert!(n.contains(&"Id_I64".to_string()), "fnptr result: {n:?}");
+}
+
+#[test]
+fn mono_consumes_templates_and_emits_concrete_instances() {
+    // After parse + the `mono` pass, the program is fully concrete: the generic
+    // templates are consumed (no longer on `Program::generics`) and the instances
+    // appear as ordinary top-level definitions — `Vec<I64>` instantiated and `Id(1)`
+    // inferred + instantiated.
     let p =
         parse("class Vec<T> { T *data; } T Id<T>(T x) { return x; } Vec<I64> v; I64 a = Id(1);")
             .unwrap();
-    assert!(
-        p.generics.classes.contains_key("Vec"),
-        "Vec template recorded"
-    );
-    assert!(p.generics.fns.contains_key("Id"), "Id template recorded");
-    assert_eq!(
-        p.generics.instances.get("Vec_I64"),
-        Some(&("Vec".to_string(), vec![Type::I64])),
-        "Vec<I64> instance map recorded"
-    );
+    assert!(p.generics.classes.is_empty(), "templates consumed by mono");
+    assert!(p.generics.fns.is_empty(), "templates consumed by mono");
+    let has_class = |n: &str| {
+        p.items
+            .iter()
+            .any(|s| matches!(&s.kind, StmtKind::Class(c) if c.name == n))
+    };
+    let has_fn = |n: &str| {
+        p.items
+            .iter()
+            .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == n))
+    };
+    assert!(has_class("Vec_I64"), "Vec<I64> instantiated");
+    assert!(has_fn("Id_I64"), "Id(1) inferred + instantiated");
 }
 
 #[test]
@@ -758,8 +795,8 @@ fn colon_eq_errors() {
     let err = parse("U0 F(){ a, b := 5; }").unwrap_err();
     assert!(err.to_string().contains("cannot infer"), "got: {err}");
 
-    // A single name whose RHS type can't be inferred at parse time (a ternary) errors.
-    let err = parse("U0 F(){ I64 x = 1; a := x ? 1 : 2; }").unwrap_err();
+    // A single name whose RHS type can't be determined (`*` of a non-pointer) errors.
+    let err = parse("U0 F(){ a := *5; }").unwrap_err();
     assert!(err.to_string().contains("cannot infer"), "got: {err}");
 
     // `I64 a, b = 5;` is still an ordinary declaration list, not an unpack.
