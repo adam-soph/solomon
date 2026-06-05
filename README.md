@@ -291,6 +291,7 @@ on each native backend with byte-identical output.
 | `text.hc` | text processing — word counting and `StrFind` search |
 | `args.hc` | the command line via the ambient `ArgC`/`ArgV` globals |
 | `varargs.hc` | variadic functions via the ambient `VargC`/`VargV` locals |
+| `wordcount.hc` | a word-frequency analyzer over the generic `Vec<T>`/`Hmap<K,V>` stdlib (inferred type args) |
 | `hashmap.hc` | a string→`I64` hash map with separate chaining |
 | `shuffle.hc` | a Fisher–Yates shuffle of `0..N-1` driven by `RandU64` |
 | `json.hc` | recursive-descent JSON parser → heap tree → re-serialize with `switch [tag]` |

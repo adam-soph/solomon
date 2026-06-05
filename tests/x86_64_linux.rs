@@ -729,6 +729,7 @@ fn buildable_examples_match_the_interpreter() {
         ("text", include_str!("../examples/text.hc")),
         ("varargs", include_str!("../examples/varargs.hc")),
         ("args", include_str!("../examples/args.hc")),
+        ("wordcount", include_str!("../examples/wordcount.hc")),
         ("shapes", include_str!("../examples/shapes.hc")),
         ("matrix", include_str!("../examples/matrix.hc")),
         ("hello", include_str!("../examples/hello.hc")),

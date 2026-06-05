@@ -31,6 +31,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("exe.hc", include_str!("../examples/exe.hc")),
     ("args.hc", include_str!("../examples/args.hc")),
     ("varargs.hc", include_str!("../examples/varargs.hc")),
+    ("wordcount.hc", include_str!("../examples/wordcount.hc")),
 ];
 
 // ---- container-library edge-case programs ----

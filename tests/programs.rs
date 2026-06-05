@@ -49,6 +49,25 @@ fn varargs_vargc_and_vargv() {
 }
 
 #[test]
+fn wordcount_generic_containers() {
+    // A Vec/Hmap-heavy program with inferred type args throughout: word frequencies
+    // (Hmap<U8*,I64>), a length histogram (Hmap<I64,I64>), sorted keys (Vec<U8*>),
+    // entries sorted by a custom comparator (Vec<HmapKV<U8*,I64>>), and an
+    // order-independent value sum. Deterministic (all output is sorted or summed).
+    let out = run("wordcount.hc", include_str!("../examples/wordcount.hc"));
+    assert_eq!(
+        out,
+        "tokens=25 distinct=12\n\
+         by word:\n\
+         \x20 again 1\n  and 1\n  barks 1\n  brown 1\n  dog 3\n  fox 3\n  jumps 2\n\
+         \x20 lazy 2\n  over 2\n  quick 2\n  runs 1\n  the 6\n\
+         top 3:\n  the x6\n  dog x3\n  fox x3\n\
+         by length:\n  len 3: 4\n  len 4: 3\n  len 5: 5\n\
+         sum=25\n"
+    );
+}
+
+#[test]
 fn args_reads_argc_argv() {
     // `ArgC`/`ArgV` are ambient globals. `run_to_string` supplies one arg (the
     // program name), so `ArgC == 1` and there are no extra args to echo.
