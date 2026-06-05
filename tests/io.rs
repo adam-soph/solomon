@@ -49,12 +49,15 @@ fn compile(src: &str) -> solomon::Program {
     program
 }
 
-/// A process-unique temp path for the host-run (interp / Darwin) cases.
+/// A process-unique temp path for the host-run (interp / Darwin) cases. Backslashes
+/// are normalized to `/` so the path embeds cleanly in a HolyC string literal on
+/// Windows (`C:\Users\…` would otherwise read `\U…` as an escape); Windows file APIs
+/// accept forward slashes.
 fn tmp_path(tag: &str) -> String {
     std::env::temp_dir()
         .join(format!("solomon-io-{tag}-{}.txt", std::process::id()))
         .to_string_lossy()
-        .into_owned()
+        .replace('\\', "/")
 }
 
 #[test]
@@ -69,7 +72,9 @@ fn interp_file_roundtrip() {
 
 /// Reading a nonexistent path fails: the helper returns a negative `-errno`. ENOENT
 /// is 2 on both Linux and macOS, and the interpreter and the Darwin backend both
-/// surface the real errno, so the number is identical across targets.
+/// surface the real errno, so the number is identical across those targets. (Windows
+/// reports a different code — `ERROR_PATH_NOT_FOUND` = 3 — so the value check below is
+/// Unix-only.)
 const ERR_PROGRAM: &str = r#"
     #include <io.hc>
     U0 Main() {
@@ -81,6 +86,9 @@ const ERR_PROGRAM: &str = r#"
     Main;
 "#;
 
+// The exact errno (2/ENOENT) is POSIX-specific — Windows surfaces 3 — so pin the value
+// on Unix only.
+#[cfg(unix)]
 #[test]
 fn interp_error_is_reported() {
     let out = run_to_string(&compile(ERR_PROGRAM)).unwrap_or_else(|e| panic!("interp error: {e}"));
@@ -208,11 +216,13 @@ fn fsops_program(dir: &str) -> String {
 const FSOPS_EXPECTED: &str = "mkdir=0\nwrite=0\nrename=0\nread=3 got=hi\nrm_missing=-2\nrm=0\n";
 
 /// A process-unique directory path for the host-run (interp / Darwin) cases.
+/// Backslashes are normalized to `/` so the path embeds cleanly in a HolyC string
+/// literal on Windows (see [`tmp_path`]).
 fn tmp_dir(tag: &str) -> String {
     std::env::temp_dir()
         .join(format!("solomon-fsops-{tag}-{}", std::process::id()))
         .to_string_lossy()
-        .into_owned()
+        .replace('\\', "/")
 }
 
 #[test]
