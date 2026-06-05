@@ -93,10 +93,12 @@ fn private_dir_protects_types_too() {
         std::env::temp_dir().join(format!("solomon-priv-tyout-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&outside_dir);
     std::fs::create_dir_all(&outside_dir).unwrap();
-    let src = format!(
-        "#include \"{}/_lib/s.hc\"\nU0 Main(){{ Secret v; v.x = 1; }}\nMain;",
-        root.display()
-    );
+    // Forward slashes so the absolute path embeds cleanly in the HolyC `#include`
+    // string on Windows (`C:\…` would read `\U`/`\T`… as escapes); Windows resolves
+    // `/`-separated paths fine.
+    let root_inc = root.display().to_string().replace('\\', "/");
+    let src =
+        format!("#include \"{root_inc}/_lib/s.hc\"\nU0 Main(){{ Secret v; v.x = 1; }}\nMain;");
     let outside = parse_in_dir(&src, &outside_dir).unwrap();
     let errs = errors(&outside);
     let _ = std::fs::remove_dir_all(&root);
@@ -114,11 +116,10 @@ fn private_dir_rejects_callers_outside_the_subtree() {
     let outside = std::env::temp_dir().join(format!("solomon-priv-out-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&outside);
     std::fs::create_dir_all(&outside).unwrap();
-    // A program outside <root>/ reaching into <root>/_secret/ — rejected.
-    let src = format!(
-        "#include \"{}/_secret/util.hc\"\nU0 Main(){{ Secret(); }}\nMain;",
-        root.display()
-    );
+    // A program outside <root>/ reaching into <root>/_secret/ — rejected. Forward
+    // slashes so the absolute path embeds cleanly in the HolyC `#include` on Windows.
+    let root_inc = root.display().to_string().replace('\\', "/");
+    let src = format!("#include \"{root_inc}/_secret/util.hc\"\nU0 Main(){{ Secret(); }}\nMain;");
     let p = parse_in_dir(&src, &outside).unwrap_or_else(|e| panic!("parse: {e}"));
     let errs = errors(&p);
     let _ = std::fs::remove_dir_all(&root);
