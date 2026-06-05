@@ -27,9 +27,10 @@ CARGO_FLAGS ?= --release --locked
 PROFILE_DIR := release
 DIST        := dist
 
-# GitHub release tag. Defaults to v<crate-version> from Cargo.toml; override with
-#   make release TAG=v1.2.3
-TAG ?= v$(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+# Publishing release binaries to GitHub is done by the `Release` GitHub Actions
+# workflow (.github/workflows/release.yml) — push a `v*` tag or run it from the
+# Actions tab. It builds every target on a matching native runner (no local Docker),
+# so there is no `make release` target. The targets below are for local builds.
 
 # Host OS (Darwin/Linux), used to decide native cargo vs Docker-based cross.
 HOST_OS := $(shell uname -s)
@@ -48,7 +49,7 @@ TARGETS ?= \
 # Apple targets used to build the universal (fat) binary.
 MACOS_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
 
-.PHONY: all native targets dist macos-universal release test fmt clean help $(TARGETS)
+.PHONY: all native targets dist macos-universal test fmt clean help $(TARGETS)
 
 .DEFAULT_GOAL := native
 
@@ -102,22 +103,6 @@ dist: all
 		done; \
 	done
 
-# Publish the packaged binaries to a GitHub release (needs the `gh` CLI,
-# authenticated). Builds + collects into $(DIST)/ first, then creates the release
-# for $(TAG) (or appends the assets if it already exists). Override the tag with
-#   make release TAG=v1.2.3
-release: dist
-	@command -v gh >/dev/null 2>&1 || { echo "error: gh CLI not found (https://cli.github.com)"; exit 1; }
-	@assets=$$(ls $(DIST)/* 2>/dev/null); \
-	if [ -z "$$assets" ]; then echo "error: no binaries in $(DIST)/ to upload"; exit 1; fi; \
-	if gh release view "$(TAG)" >/dev/null 2>&1; then \
-		echo "  uploading to existing release $(TAG)"; \
-		gh release upload "$(TAG)" $$assets --clobber; \
-	else \
-		echo "  creating release $(TAG)"; \
-		gh release create "$(TAG)" $$assets --title "$(TAG)" --generate-notes; \
-	fi
-
 # macOS universal binaries (arm64 + x86_64) via lipo. macOS host only.
 macos-universal: $(MACOS_TARGETS)
 	@mkdir -p $(DIST)
@@ -147,8 +132,6 @@ help:
 	@echo "  make all               build every target in TARGETS"
 	@echo "  make <triple>          build one target (e.g. make aarch64-apple-darwin)"
 	@echo "  make dist              build all + collect binaries into $(DIST)/"
-	@echo "  make release           dist + upload binaries to a GitHub release (gh)"
-	@echo "  make release TAG=vX.Y.Z   release under a specific tag"
 	@echo "  make macos-universal   lipo arm64 + x86_64 into one macOS binary"
 	@echo "  make test              run the test suite"
 	@echo "  make clean             cargo clean + remove $(DIST)/"

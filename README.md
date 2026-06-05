@@ -160,6 +160,11 @@ make macos-universal       # arm64 + x86_64 fat binary (macOS host)
 make help                  # list everything
 ```
 
+**Releases** are published by the `Release` GitHub Actions workflow
+(`.github/workflows/release.yml`): push a version tag (`git tag v0.1.0 && git push
+--tags`) or run it from the Actions tab, and it builds every target on a matching
+native runner and uploads the binaries to the GitHub release — no local Docker.
+
 Default targets:
 
 | Platform              | Triple                        |

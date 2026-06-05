@@ -46,7 +46,10 @@ echo 'I64 Sq(I64 x){return x*x;} "%d\n", Sq(9);' | cargo run --bin hci   # reads
 
 `make` wraps cargo for cross-compilation (`make`, `make all`, `make <triple>`,
 `make dist`, `make macos-universal`); use `CARGO=cross` for non-host OSes. See
-the Makefile / README for the target list.
+the Makefile / README for the target list. **Publishing** release binaries is the
+`Release` GitHub Actions workflow (`.github/workflows/release.yml`), not `make` —
+push a `v*` tag (or run it from the Actions tab) and it builds every target on a
+matching native runner and uploads them to the GitHub release.
 
 ### Important testing notes
 
