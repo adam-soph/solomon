@@ -48,6 +48,10 @@ pub(super) struct CodeImage {
     pub(super) text: Vec<u8>,
     /// `(byte offset in __text, symbol, kind)` relocations the linker resolves.
     pub(super) relocs: Vec<(u32, SymRef, RelKind)>,
+    /// Final byte offset of each placed label, indexed by label id (`None` if never
+    /// placed). Read *after* `finish` so it reflects the peephole pass's word removals
+    /// — defined-symbol offsets must come from here, not a pre-`finish` `label_byte`.
+    pub(super) label_bytes: Vec<Option<u64>>,
 }
 
 pub(super) struct Asm {
@@ -133,12 +137,6 @@ impl Asm {
     pub(super) fn place(&mut self, id: usize) {
         self.label_pos[id] = Some(self.words.len());
     }
-    pub(super) fn label_byte(&self, id: usize) -> Result<u64, CodegenError> {
-        self.label_pos[id]
-            .map(|w| (w * 4) as u64)
-            .ok_or_else(|| CodegenError::new("internal: unplaced function label", None))
-    }
-
     pub(super) fn intern_string(&mut self, s: &str) -> usize {
         let mut bytes = s.as_bytes().to_vec();
         bytes.push(0);
@@ -368,7 +366,16 @@ impl Asm {
             .iter()
             .map(|(w, sym, kind)| ((*w * 4) as u32, *sym, *kind))
             .collect();
-        Ok(CodeImage { text, relocs })
+        let label_bytes = self
+            .label_pos
+            .iter()
+            .map(|p| p.map(|w| (w * 4) as u64))
+            .collect();
+        Ok(CodeImage {
+            text,
+            relocs,
+            label_bytes,
+        })
     }
 
     // data processing

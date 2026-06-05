@@ -892,7 +892,10 @@ impl<W: Write> Interpreter<W> {
             // resolving to a cell.
             ExprKind::Unary {
                 op: UnOp::Deref, ..
-            } => self.eval_place(e, env)?.load(pos),
+            } => {
+                let p = self.eval_place(e, env)?;
+                self.load_place(&p, pos)
+            }
             ExprKind::Unary { op, expr } => self.eval_unary(*op, expr, pos, env),
             ExprKind::Postfix { op, expr } => self.eval_postfix(*op, expr, pos, env),
             ExprKind::Binary { op, lhs, rhs } => self.eval_binary(*op, lhs, rhs, pos, env),
@@ -913,9 +916,13 @@ impl<W: Write> Interpreter<W> {
                 if let Some((buf, off, fty)) = self.union_field(base, field, *arrow, pos, env)? {
                     return self.read_union_field(buf, off, &fty, pos);
                 }
-                self.eval_place(e, env)?.load(pos)
+                let p = self.eval_place(e, env)?;
+                self.load_place(&p, pos)
             }
-            ExprKind::Index { .. } => self.eval_place(e, env)?.load(pos),
+            ExprKind::Index { .. } => {
+                let p = self.eval_place(e, env)?;
+                self.load_place(&p, pos)
+            }
             ExprKind::Cast { ty, expr } => {
                 let v = self.eval(expr, env)?;
                 Ok(cast_value(ty, v))
@@ -1291,6 +1298,134 @@ impl<W: Write> Interpreter<W> {
         Ok(Value::Ptr(Some(PtrVal { region, index: 0 })))
     }
 
+    /// Whether `ty` is a class/union type — an *aggregate* that, when stored into or
+    /// read from a raw byte heap buffer, must be (de)serialised field-by-field per the
+    /// layout (a generic `Vec<T>`/`Hmap` whose `T` is a class lives in a `ReAlloc`'d
+    /// byte buffer, so a whole-class element store/load lands here). Scalars/pointers
+    /// keep the direct `Place::Bytes` path.
+    fn ty_is_aggregate(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Named(n) if self.classes.contains_key(n))
+    }
+
+    /// Serialise an aggregate (or scalar) `Value` into the byte buffer at `off`,
+    /// recursing over the type's layout — mirroring the native byte layout so a
+    /// class element round-trips through a heap buffer.
+    fn store_bytes_value(
+        &self,
+        buf: &Rc<RefCell<Vec<u8>>>,
+        off: usize,
+        ty: &Type,
+        v: &Value,
+        pos: Pos,
+    ) -> Result<(), CodegenError> {
+        match v {
+            // A union value is already raw bytes: copy them verbatim.
+            Value::Union(src) => {
+                let src = src.borrow().clone();
+                let mut dst = buf.borrow_mut();
+                let end = (off + src.len()).min(dst.len());
+                if off < end {
+                    dst[off..end].copy_from_slice(&src[..end - off]);
+                }
+                Ok(())
+            }
+            Value::Class(fields) => {
+                let Type::Named(cname) = ty else {
+                    return Err(CodegenError::at(
+                        pos,
+                        "storing a class value as a non-class type",
+                    ));
+                };
+                let layout = self
+                    .layouts
+                    .get(cname)
+                    .ok_or_else(|| CodegenError::at(pos, format!("no layout for `{cname}`")))?;
+                let flds: Vec<(String, Type, u64)> = layout
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone(), f.offset))
+                    .collect();
+                let map = fields.borrow();
+                for (fname, fty, foff) in &flds {
+                    if let Some(c) = map.get(fname) {
+                        let fv = c.borrow().clone();
+                        self.store_bytes_value(buf, off + *foff as usize, fty, &fv, pos)?;
+                    }
+                }
+                Ok(())
+            }
+            // A scalar/pointer: the existing width-aware (and pointer-serialising)
+            // byte store.
+            scalar => {
+                let p = Place::Bytes {
+                    buf: buf.clone(),
+                    off,
+                    ty: ty.clone(),
+                    ptrs: self.ptr_table.clone(),
+                };
+                p.store(scalar.clone(), pos)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Deserialise an aggregate (or scalar) `Value` out of a byte buffer at `off` — the
+    /// inverse of [`store_bytes_value`].
+    fn load_bytes_value(
+        &self,
+        buf: &Rc<RefCell<Vec<u8>>>,
+        off: usize,
+        ty: &Type,
+        pos: Pos,
+    ) -> Result<Value, CodegenError> {
+        if let Type::Named(cname) = ty {
+            if let Some(def) = self.classes.get(cname) {
+                let layout = self
+                    .layouts
+                    .get(cname)
+                    .ok_or_else(|| CodegenError::at(pos, format!("no layout for `{cname}`")))?;
+                if def.is_union {
+                    let size = layout.size as usize;
+                    let bytes = buf.borrow();
+                    let mut out = vec![0u8; size];
+                    let end = (off + size).min(bytes.len());
+                    if off < end {
+                        out[..end - off].copy_from_slice(&bytes[off..end]);
+                    }
+                    return Ok(Value::Union(Rc::new(RefCell::new(out))));
+                }
+                let flds: Vec<(String, Type, u64)> = layout
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone(), f.offset))
+                    .collect();
+                let mut map = HashMap::new();
+                for (fname, fty, foff) in &flds {
+                    let fv = self.load_bytes_value(buf, off + *foff as usize, fty, pos)?;
+                    map.insert(fname.clone(), cell(fv));
+                }
+                return Ok(Value::Class(Rc::new(RefCell::new(map))));
+            }
+        }
+        Place::Bytes {
+            buf: buf.clone(),
+            off,
+            ty: ty.clone(),
+            ptrs: self.ptr_table.clone(),
+        }
+        .load(pos)
+    }
+
+    /// Read a `Place`, deserialising an aggregate that lives in a byte heap buffer.
+    fn load_place(&self, place: &Place, pos: Pos) -> Result<Value, CodegenError> {
+        if let Place::Bytes { buf, off, ty, .. } = place {
+            if self.ty_is_aggregate(ty) {
+                return self.load_bytes_value(buf, *off, ty, pos);
+            }
+        }
+        place.load(pos)
+    }
+
     fn eval_assign(
         &mut self,
         op: AssignOp,
@@ -1322,6 +1457,14 @@ impl<W: Write> Interpreter<W> {
             Some(t) => coerce_to(&t, newv),
             None => newv,
         };
+        // A whole class/union value stored into a byte heap buffer (a `Vec<T>`/`Hmap`
+        // element where `T` is an aggregate) serialises field-by-field per the layout.
+        if let Place::Bytes { buf, off, ty, .. } = &place {
+            if self.ty_is_aggregate(ty) {
+                self.store_bytes_value(buf, *off, ty, &newv, pos)?;
+                return Ok(newv);
+            }
+        }
         place.store(newv, pos)
     }
 

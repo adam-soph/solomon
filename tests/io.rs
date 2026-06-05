@@ -101,10 +101,7 @@ fn native_arm64_error_is_reported() {
         .output()
         .unwrap_or_else(|e| panic!("could not run produced binary: {e}"));
     let _ = std::fs::remove_file(&bin);
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "error: errno=2\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "error: errno=2\n");
 }
 
 /// Whether this host can build *and execute* an arm64 Mach-O binary.
@@ -326,7 +323,10 @@ fn native_arm64_envp_invariants_and_lookup() {
     let out = Command::new(&bin)
         .output()
         .unwrap_or_else(|e| panic!("run: {e}"));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "nonempty=1 all_kv=1\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "nonempty=1 all_kv=1\n"
+    );
 
     // Value lookup: a specific variable, passed to the child's environment (scoped to
     // the spawned process, so no parallel-test race on the shared env).
@@ -367,9 +367,14 @@ fn native_x86_64_freestanding_envp() {
     X64Linux::new(&out)
         .run(&compile(ENV_INVARIANTS))
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let got = Command::new(&out)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&out);
-    assert_eq!(String::from_utf8_lossy(&got.stdout), "nonempty=1 all_kv=1\n");
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout),
+        "nonempty=1 all_kv=1\n"
+    );
 }
 
 // ---- Getenv (os.hc) ----
@@ -463,7 +468,9 @@ fn native_arm64_getpid_is_positive() {
     Arm64Darwin::new(&bin)
         .run(&compile(GETPID_PROG))
         .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
-    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let out = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&bin);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "pos=1\n");
 }
@@ -478,7 +485,9 @@ fn native_x86_64_freestanding_getpid() {
     X64Linux::new(&out)
         .run(&compile(GETPID_PROG))
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let got = Command::new(&out)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&out);
     assert_eq!(String::from_utf8_lossy(&got.stdout), "pos=1\n");
 }
@@ -529,7 +538,9 @@ fn native_arm64_chdir_getcwd() {
     Arm64Darwin::new(&bin)
         .run(&compile(CWD_ROOT))
         .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
-    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let out = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&bin);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "chdir=0\ncwd=/\n");
 }
@@ -544,7 +555,9 @@ fn native_x86_64_freestanding_chdir_getcwd() {
     X64Linux::new(&out)
         .run(&compile(CWD_ROOT))
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let got = Command::new(&out)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&out);
     assert_eq!(String::from_utf8_lossy(&got.stdout), "chdir=0\ncwd=/\n");
 }
@@ -573,7 +586,9 @@ fn native_arm64_getppid_getuid_are_sane() {
     Arm64Darwin::new(&bin)
         .run(&compile(IDS_PROG))
         .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
-    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let out = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&bin);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ppid=1 uid=1 gid=1\n");
 }
@@ -588,7 +603,9 @@ fn native_x86_64_freestanding_getppid_getuid() {
     X64Linux::new(&out)
         .run(&compile(IDS_PROG))
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let got = Command::new(&out)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&out);
     assert_eq!(String::from_utf8_lossy(&got.stdout), "ppid=1 uid=1 gid=1\n");
 }
@@ -599,12 +616,12 @@ const ENVIRON_PROG: &str = r#"
     #include <os.hc>
     #include <cstr.hc>
     U0 Main() {
-      Vec env;
+      Vec<U8 *> env;
       Environ(&env);
       I64 i, all_kv = 1;
-      for (i = 0; i < env.len; i++)
-        if (StrChr(*(U8 **)VecAt(&env, i), '=') == NULL) all_kv = 0;
-      "count>0=%d all_kv=%d\n", env.len > 0, all_kv;
+      for (i = 0; i < VecLen(&env); i++)
+        if (StrChr(VecAt(&env, i), '=') == NULL) all_kv = 0;
+      "count>0=%d all_kv=%d\n", VecLen(&env) > 0, all_kv;
       VecFree(&env);
     }
     Main;
@@ -626,7 +643,9 @@ fn native_arm64_environ_collects_entries() {
     Arm64Darwin::new(&bin)
         .run(&compile(ENVIRON_PROG))
         .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
-    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let out = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&bin);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "count>0=1 all_kv=1\n");
 }
@@ -641,7 +660,9 @@ fn native_x86_64_freestanding_environ() {
     X64Linux::new(&out)
         .run(&compile(ENVIRON_PROG))
         .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
-    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let got = Command::new(&out)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
     let _ = std::fs::remove_file(&out);
     assert_eq!(String::from_utf8_lossy(&got.stdout), "count>0=1 all_kv=1\n");
 }

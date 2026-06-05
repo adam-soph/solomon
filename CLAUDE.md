@@ -152,7 +152,13 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   a byte-wise `MemCpy` still names the same pointer. And `obj->field` through a
   pointer into a byte heap buffer resolves the field as a `Place::Bytes` at its
   layout offset (via `union_field`), so a class laid out in raw bytes — e.g. a `Pt`
-  element of a `Vec`'s data — behaves like the native byte layout. `run_to_string`
+  element of a `Vec`'s data — behaves like the native byte layout. A **whole** class/
+  union value stored into or read from a byte heap buffer (a generic `Vec<T>`/`Hmap`
+  whose `T` is a class — the `ReAlloc`'d buffer is a byte heap, so the element can't be
+  a cell) is (de)serialised field-by-field through the layout
+  (`store_bytes_value`/`load_bytes_value`, gated by `ty_is_aggregate` at the
+  `Place::Bytes` store/`load_place` boundaries), mirroring the native byte layout — so
+  `VecPush(&v, pt)` / `Pt p = VecAt(&v, i)` round-trip a class element. `run_to_string`
   is the safe "check then run" entry. **This interpreter is the conformance oracle
   for the native backends** — when adding native-backend features, match its
   observable output.
@@ -186,7 +192,11 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   stored word-index position (`label_pos` + the `.0` of
   fixups/adr_fixups/relocs; label ids and `TableRel`'s base are label indices, so
   they ride along through `label_pos`). All are behavior-preserving — the
-  interpreter and the all-examples native conformance test are the oracle.
+  interpreter and the all-examples native conformance test are the oracle. Because
+  peephole shifts positions, the Mach-O **defined-symbol offsets are read *after*
+  `finish`** (from `CodeImage::label_bytes`, the post-pass `label_pos`) — a pre-`finish`
+  `label_byte` would put a late function (the stdlib/monomorphized ones at the end of
+  `__text`) past the shrunken section and `ld` would drop the symbol.
   Finally, a per-function **register promotion** pass (`plan_registers`, a light
   register allocator) keeps frequently-used scalar locals/params in callee-saved
   registers instead of frame slots, eliminating per-access load/store traffic (a
@@ -463,40 +473,41 @@ includable on its own:
 - `lib/ctype.hc` — ASCII character classification (`<ctype.h>`): `ToUpper`/`ToLower`
   and the `Is*` predicates (`IsDigit`/`IsAlpha`/`IsSpace`/…, returning 0/1 —
   deliberately not libc's `isdigit`, whose unspecified nonzero would diverge).
-- `lib/vec.hc` — `class Vec`, an owning, growable array of fixed-size elements (a
-  generic dynamic array on `<mem.hc>`'s `ReAlloc`). One `Vec` type holds elements of
-  **any** type — scalars, pointers, or class values — the size chosen at
-  `VecInit(&v, esize)`, with emplace-style pointer access: `*(I64 *)VecPush(&v) = x`,
-  `Pt *p = VecPush(&v); p->x = 1`, `*(F64 *)VecAt(&v, i)`. Working through the heap
-  buffer pointer (never copying a local's bytes) keeps it conformant; pointer and
-  class-value elements work because the interpreter byte-serialises pointers through
-  its `PtrTable` (see below). It `#include`s `<sort.hc>` and owns the sort conveniences
-  `VecSort(&v, cmp)` / `VecBSearch(&v, key, cmp)` (the latter returns an index, or -1).
-  `VecInit`/`VecFree`/`VecClear`/`VecReserve`/`VecPush`/`VecPop`/`VecAt`/`VecClone`/
-  `VecSort`/`VecBSearch`.
-- `lib/hmap.hc` — `class Hmap`, an owning, **generic** hash map (separate chaining over
-  a growing bucket array on `<mem.hc>`). Like `Vec` it's generic over *bytes*:
-  `HmapInit(&m, ksize, vsize, hash, eq, copy)` picks the key/value sizes and the key's
-  behaviour as **three function pointers** — `hash`/`eq` over key slots and `copy` (a
-  *typed* move, not `MemCpy`, because `MemCpy` byte-indexing through a `&local` is out
-  of bounds in the interpreter and a pointer key must keep its `PtrTable` identity).
-  Each entry is a raw `MAlloc`'d byte block `[next ptr | key | value]` chained through
-  its leading pointer; keys/values are emplace-accessed (`*(I64 *)HmapPut(&m, &k) = v`;
-  `HmapGet` returns `(U8 *value, Bool found)` — the flag a sentinel can't express). Two
-  stock key kinds ship: `HmapI64{Hash,Eq,Copy,Cmp}` (8-byte POD keys) and
-  `HmapStr{Hash,Eq,Copy,Cmp}` (`U8 *` keys — stores the **pointer**, `StrCmp`/djb2 via
-  the private `<_impl/strhash.hc>` `Djb2`, so a string key must outlive the map). A
-  program wraps these into a typed facade (e.g. `examples/hmap.hc`'s string→I64 `Si*`).
-  It `#include`s `<vec.hc>` for its sort/iteration: `HmapKeys`/`HmapValues` collect keys
-  or values into a `Vec`, `HmapEntries` collects `[key | value]` blocks (key at offset 0,
-  so the stock comparators sort entries by key directly), and `HmapSortKeys(m, &out, cmp)`
-  (e.g. `&HmapStrCmp`) returns the keys in sorted order.
+- `lib/vec.hc` — `class Vec<T>`, an owning, growable typed array (a generic dynamic
+  array on `<mem.hc>`'s `ReAlloc`), **monomorphized per element type** at compile time.
+  Typed throughout — no casts, no element-size bookkeeping; the type args are inferred
+  from the call: `Vec<I64> v; VecInit(&v); VecPush(&v, 42); I64 x = VecAt(&v, 0);`.
+  Works for scalar, pointer, and **class** element types — the class case stores/loads a
+  *whole element value* (`VecPush(&v, pt)` / `Pt p = VecAt(&v, i)`), which the
+  interpreter (de)serialises field-by-field through the heap byte buffer
+  (`store_bytes_value`/`load_bytes_value` in `interp.rs`, mirroring the native byte
+  layout — the buffer is a `ReAlloc`'d byte heap, so a class element can't be a cell);
+  `VecRef(&v, i)` returns a `T *` for in-place update. It `#include`s `<sort.hc>` and
+  owns `VecSort(&v, cmp)` / `VecBSearch(&v, key, cmp)` (the latter returns an index, or
+  -1). `VecInit`/`VecFree`/`VecClear`/`VecLen`/`VecReserve`/`VecPush`/`VecPop`/`VecAt`/
+  `VecRef`/`VecSet`/`VecClone`/`VecSort`/`VecBSearch`.
+- `lib/hmap.hc` — `class Hmap<K, V>`, an owning **generic** hash map (separate chaining
+  over a growing bucket array on `<mem.hc>`), monomorphized per (key, value) type. Keys
+  and values are typed — no casts. The key's hashing/equality are function pointers given
+  at `HmapInit(&m, hash, eq)` (each taking a `K *`). Entries are a typed
+  `class HmapEntry<K, V> { HmapEntry<K, V> *next; K key; V val; }` (a generic class that
+  **nests its own generic type** — see the generics note below); `HmapGet` returns
+  `(V value, Bool found)` (the flag a sentinel can't express). Two stock key kinds ship:
+  `HmapI64{Hash,Eq}` (I64 keys) and `HmapStr{Hash,Eq}` (`U8 *` keys — stores the
+  **pointer**, `StrCmp`/djb2 via the private `<_impl/strhash.hc>` `Djb2`, so a string key
+  must outlive the map). It `#include`s `<vec.hc>` for iteration: `HmapKeys`/`HmapValues`
+  collect into a `Vec<K>`/`Vec<V>`, `HmapEntries` into a `Vec<HmapKV<K, V>>` (a
+  `{K key; V val;}` pair, key at offset 0 so a stock comparator sorts by key), and
+  `HmapSortKeys(m, &out, cmp)` returns the keys sorted (e.g. `&CmpStr`/`&CmpI64`).
   `HmapInit`/`HmapFree`/`HmapPut`/`HmapGet`/`HmapHas`/`HmapDel`/`HmapLen`/`HmapKeys`/
   `HmapValues`/`HmapEntries`/`HmapSortKeys`.
 - `lib/sort.hc` — generic sorting + binary search (the `qsort`/`bsearch` pair),
   **standalone** (no other library dependency). Element size is a parameter and order is
-  a caller comparator `I64 (*cmp)(U8 *a, U8 *b)` (<0/0/>0, like `StrCmp`).
-  `Sort(base, n, esize, cmp)` is a median-of-three quicksort with an insertion-sort
+  a caller comparator `I64 (*cmp)(U8 *a, U8 *b)` (<0/0/>0, like `StrCmp`) — it receives
+  *pointers to two elements*; stock ones ship: `CmpI64`/`CmpU64`/`CmpF64` here, and
+  `CmpStr` (a `U8 *` string-pointer element, so it dereferences a `U8 **`) in `<cstr.hc>`
+  next to `StrCmp`. `Sort(base, n, esize, cmp)` is a median-of-three quicksort with an
+  insertion-sort
   cutoff (not stable); element moves are a **byte-wise `SortSwap`** (a scalar byte temp,
   no buffer — so it works through the interpreter's heap byte buffers and moves
   serialised pointer/class bytes verbatim). `BSearch(key, base, n, esize, cmp)` returns a

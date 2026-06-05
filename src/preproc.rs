@@ -333,7 +333,14 @@ impl<S: TokenStream> Preprocessor<S> {
         // Splice the generated source as a frame (a public file, privacy-wise).
         self.exe_count += 1;
         let path = PathBuf::from(format!("<exe#{}>", self.exe_count));
-        self.push_frame(path, self.base_dir.clone(), out, "<exe>", pos, FileInfo::root())
+        self.push_frame(
+            path,
+            self.base_dir.clone(),
+            out,
+            "<exe>",
+            pos,
+            FileInfo::root(),
+        )
     }
 
     fn do_define(&mut self, toks: &[Token]) -> LResult<()> {
@@ -737,8 +744,8 @@ fn render_tokens(toks: &[Token]) -> String {
 }
 
 fn render_kind(k: &TokenKind, out: &mut String) {
-    use std::fmt::Write;
     use TokenKind::*;
+    use std::fmt::Write;
     let lit = match k {
         Int(n) => {
             let _ = write!(out, "{n}");
@@ -755,18 +762,56 @@ fn render_kind(k: &TokenKind, out: &mut String) {
         Str(s) => return render_string(s, out),
         Ident(s) => return out.push_str(s),
         Keyword(kw) => return out.push_str(kw.as_str()),
-        Plus => "+", Minus => "-", Star => "*", Slash => "/", Percent => "%",
-        Eq => "=", PlusEq => "+=", MinusEq => "-=", StarEq => "*=", SlashEq => "/=",
-        PercentEq => "%=", AmpEq => "&=", PipeEq => "|=", CaretEq => "^=",
-        ShlEq => "<<=", ShrEq => ">>=",
-        PlusPlus => "++", MinusMinus => "--",
-        EqEq => "==", Ne => "!=", Lt => "<", Gt => ">", Le => "<=", Ge => ">=",
-        AndAnd => "&&", OrOr => "||", Not => "!",
-        Amp => "&", Pipe => "|", Caret => "^", Tilde => "~", Shl => "<<", Shr => ">>",
-        LParen => "(", RParen => ")", LBrace => "{", RBrace => "}",
-        LBracket => "[", RBracket => "]", Comma => ",", Semicolon => ";",
-        Dot => ".", Arrow => "->", Question => "?", Colon => ":", ColonColon => "::",
-        DotDotDot => "...", At => "@", Hash => "#", Backtick => "`",
+        Plus => "+",
+        Minus => "-",
+        Star => "*",
+        Slash => "/",
+        Percent => "%",
+        Eq => "=",
+        PlusEq => "+=",
+        MinusEq => "-=",
+        StarEq => "*=",
+        SlashEq => "/=",
+        PercentEq => "%=",
+        AmpEq => "&=",
+        PipeEq => "|=",
+        CaretEq => "^=",
+        ShlEq => "<<=",
+        ShrEq => ">>=",
+        PlusPlus => "++",
+        MinusMinus => "--",
+        EqEq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Gt => ">",
+        Le => "<=",
+        Ge => ">=",
+        AndAnd => "&&",
+        OrOr => "||",
+        Not => "!",
+        Amp => "&",
+        Pipe => "|",
+        Caret => "^",
+        Tilde => "~",
+        Shl => "<<",
+        Shr => ">>",
+        LParen => "(",
+        RParen => ")",
+        LBrace => "{",
+        RBrace => "}",
+        LBracket => "[",
+        RBracket => "]",
+        Comma => ",",
+        Semicolon => ";",
+        Dot => ".",
+        Arrow => "->",
+        Question => "?",
+        Colon => ":",
+        ColonColon => "::",
+        DotDotDot => "...",
+        At => "@",
+        Hash => "#",
+        Backtick => "`",
         Eof => "",
     };
     out.push_str(lit);

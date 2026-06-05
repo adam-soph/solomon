@@ -329,7 +329,7 @@ struct Cg {
     funcs_va: HashMap<String, bool>, // name -> is variadic (`...`)
     helpers: HashMap<Helper, usize>, // print runtime routine -> code label (on first use)
     rt_routines: HashMap<&'static str, usize>, // builtin runtime routine -> label (on first use)
-    out_ptr_off: Option<i32>,        // BSS slot: the formatted-output sink pointer (0 = stdout)
+    out_ptr_off: Option<i32>, // BSS slot: the formatted-output sink pointer (0 = stdout)
     // Growing-sink globals (set only when a program uses `MStrPrint`): the base of
     // the owned, reallocating buffer and its current capacity end. `out_limit != 0`
     // is what tells the sink it may grow rather than blindly append (the StrPrint
@@ -2386,9 +2386,8 @@ impl Cg {
             // The filesystem mutations and `Getpid` join here: `unlink` 87 / `rename`
             // 82 / `mkdir` 83 / `getpid` 39 take their args (if any) directly in the
             // same arg/syscall registers.
-            "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close"
-            | "Remove" | "Rename" | "Mkdir" | "Getpid" | "Getppid" | "Getuid" | "Getgid"
-            | "Chdir" => {
+            "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" | "Remove"
+            | "Rename" | "Mkdir" | "Getpid" | "Getppid" | "Getuid" | "Getgid" | "Chdir" => {
                 let nr: i32 = match name {
                     "Read" => 0,
                     "Write" => 1,

@@ -83,20 +83,19 @@ Main;
 #[allow(dead_code)]
 pub const LIB_VEC_SEARCH: &str = r#"
 #include <vec.hc>
-I64 Cmp(U8 *a, U8 *b) { I64 x = *(I64 *)a, y = *(I64 *)b; return x < y ? -1 : x > y; }
 U0 Main()
 {
-  Vec v; VecInit(&v, sizeof(I64));
-  *(I64 *)VecPush(&v)=5; *(I64 *)VecPush(&v)=5; *(I64 *)VecPush(&v)=3; *(I64 *)VecPush(&v)=9;
-  *(I64 *)VecPush(&v)=1; *(I64 *)VecPush(&v)=1; *(I64 *)VecPush(&v)=9; *(I64 *)VecPush(&v)=2;
-  VecSort(&v, &Cmp);
-  I64 i; for (i = 0; i < v.len; i++) "%d ", *(I64 *)VecAt(&v, i); "\n";
+  Vec<I64> v; VecInit(&v);
+  VecPush(&v, 5); VecPush(&v, 5); VecPush(&v, 3); VecPush(&v, 9);
+  VecPush(&v, 1); VecPush(&v, 1); VecPush(&v, 9); VecPush(&v, 2);
+  VecSort(&v, &CmpI64);
+  I64 i; for (i = 0; i < VecLen(&v); i++) "%d ", VecAt(&v, i); "\n";
   I64 k;
-  k=1;   "i1=%d ",    VecBSearch(&v, &k, &Cmp);
-  k=9;   "i9=%d ",    VecBSearch(&v, &k, &Cmp);
-  k=4;   "i4=%d ",    VecBSearch(&v, &k, &Cmp);
-  k=0;   "i0=%d ",    VecBSearch(&v, &k, &Cmp);
-  k=100; "i100=%d\n", VecBSearch(&v, &k, &Cmp);
+  k=1;   "i1=%d ",    VecBSearch(&v, &k, &CmpI64);
+  k=9;   "i9=%d ",    VecBSearch(&v, &k, &CmpI64);
+  k=4;   "i4=%d ",    VecBSearch(&v, &k, &CmpI64);
+  k=0;   "i0=%d ",    VecBSearch(&v, &k, &CmpI64);
+  k=100; "i100=%d\n", VecBSearch(&v, &k, &CmpI64);
   VecFree(&v);
 }
 Main;
@@ -107,19 +106,19 @@ pub const LIB_HMAP_I64: &str = r#"
 #include <hmap.hc>
 U0 Main()
 {
-  Hmap m;
-  HmapInit(&m, sizeof(I64), sizeof(I64), &HmapI64Hash, &HmapI64Eq, &HmapI64Copy);
-  I64 i, k;
-  for (i = 0; i < 12; i++) { k = i; *(I64 *)HmapPut(&m, &k) = i * i; }
-  k = 5;  *(I64 *)HmapPut(&m, &k) = 999;
-  k = 0;  HmapDel(&m, &k);
-  k = 11; HmapDel(&m, &k);
+  Hmap<I64, I64> m;
+  HmapInit(&m, &HmapI64Hash, &HmapI64Eq);
+  I64 i;
+  for (i = 0; i < 12; i++) HmapPut(&m, i, i * i);
+  HmapPut(&m, 5, 999);
+  HmapDel(&m, 0);
+  HmapDel(&m, 11);
   "len=%d\n", HmapLen(&m);
-  Vec vals; HmapValues(&m, &vals);
-  I64 s = 0; for (i = 0; i < vals.len; i++) s += *(I64 *)VecAt(&vals, i);
+  Vec<I64> vals; HmapValues(&m, &vals);
+  I64 s = 0; for (i = 0; i < VecLen(&vals); i++) s += VecAt(&vals, i);
   "sum=%d\n", s; VecFree(&vals);
-  Vec e; HmapEntries(&m, &e); VecSort(&e, &HmapI64Cmp);
-  for (i = 0; i < e.len; i++) { U8 *p = VecAt(&e, i); "%d=%d ", *(I64 *)p, *(I64 *)(p + sizeof(I64)); }
+  Vec<HmapKV<I64, I64>> e; HmapEntries(&m, &e); VecSort(&e, &CmpI64);
+  for (i = 0; i < VecLen(&e); i++) { HmapKV<I64, I64> *p = VecRef(&e, i); "%d=%d ", p->key, p->val; }
   "\n";
   VecFree(&e); HmapFree(&m);
 }
@@ -131,13 +130,13 @@ pub const LIB_HMAP_EMPTY: &str = r#"
 #include <hmap.hc>
 U0 Main()
 {
-  Hmap m;
-  HmapInit(&m, sizeof(I64), sizeof(I64), &HmapI64Hash, &HmapI64Eq, &HmapI64Copy);
-  Vec k, v, e;
+  Hmap<I64, I64> m;
+  HmapInit(&m, &HmapI64Hash, &HmapI64Eq);
+  Vec<I64> k, v; Vec<HmapKV<I64, I64>> e;
   HmapKeys(&m, &k); HmapValues(&m, &v); HmapEntries(&m, &e);
-  "len=%d k=%d v=%d e=%d\n", HmapLen(&m), k.len, v.len, e.len;
-  I64 x = 7; (U8 *p, Bool ok) = HmapGet(&m, &x);
-  "get=%d del=%d has=%d\n", ok, HmapDel(&m, &x), HmapHas(&m, &x);
+  "len=%d k=%d v=%d e=%d\n", HmapLen(&m), VecLen(&k), VecLen(&v), VecLen(&e);
+  I64 x = 7; (I64 val, Bool ok) = HmapGet(&m, x);
+  "get=%d del=%d has=%d\n", ok, HmapDel(&m, x), HmapHas(&m, x);
   VecFree(&k); VecFree(&v); VecFree(&e); HmapFree(&m);
 }
 Main;

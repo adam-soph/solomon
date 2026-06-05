@@ -386,9 +386,9 @@ fn type_defined_in_an_include_is_usable() {
 fn angle_include_resolves_from_the_embedded_stdlib() {
     // `parse` carries no filesystem search path, so `#include <...>` of a standard
     // library module must resolve from the copy embedded in the compiler at build
-    // time — and its types (`class Vec`) and functions (`StrLen`) become usable.
+    // time — and its types (generic `Vec<T>`) and functions (`StrLen`) become usable.
     let src = "#include <vec.hc>\n#include <cstr.hc>\n\
-               U0 Main() { Vec v; VecInit(&v, 8); I64 n = StrLen(\"hi\"); }";
+               U0 Main() { Vec<I64> v; VecInit(&v); I64 n = StrLen(\"hi\"); }";
     let program = parse(src).expect("angle include should resolve from the embedded stdlib");
     assert!(
         check_program(&program).is_empty(),

@@ -1,32 +1,22 @@
-// sort.hc — generic `<sort.hc>` over a `<vec.hc>` Vec: one quicksort drives both an
-// I64 vector and a string vector, each ordered by its own comparator, plus a binary
-// search over the sorted result. The comparator `I64 (*cmp)(U8 *, U8 *)` is the only
-// per-type code — the sort itself is element-size agnostic.
+// sort.hc — generic `<sort.hc>` over a `<vec.hc>` `Vec<T>`: one quicksort drives both
+// an `I64` vector and a string vector, each ordered by a stock comparator, plus a
+// binary search over the sorted result. The element type is the only thing that
+// changes — the sort itself is element-size agnostic, monomorphized per `T`.
 
-#include <vec.hc>    // Vec + VecSort/VecBSearch (pulls in <sort.hc>)
-#include <cstr.hc>   // for StrCmp in the string comparator
-
-// Ascending I64 order. The comparator gets pointers to two elements.
-I64 CmpI64(U8 *a, U8 *b)
-{
-  I64 x = *(I64 *)a, y = *(I64 *)b;
-  return x < y ? -1 : x > y;
-}
-
-// Lexicographic string order (elements are `U8 *`, so dereference the slot).
-I64 CmpStr(U8 *a, U8 *b) { return StrCmp(*(U8 **)a, *(U8 **)b); }
+#include <vec.hc>    // Vec<T> + VecSort/VecBSearch (pulls in <sort.hc>)
+#include <cstr.hc>   // CmpStr (the U8 * string comparator)
 
 U0 Main()
 {
   // --- an I64 vector ---
-  Vec v;
-  VecInit(&v, sizeof(I64));
+  Vec<I64> v;
+  VecInit(&v);
   I64 nums[] = {5, 2, 8, 1, 9, 3, 7, 4, 6, 0};
   I64 i;
-  for (i = 0; i < 10; i++) *(I64 *)VecPush(&v) = nums[i];
+  for (i = 0; i < 10; i++) VecPush(&v, nums[i]);
 
-  VecSort(&v, &CmpI64);
-  for (i = 0; i < v.len; i++) "%d ", *(I64 *)VecAt(&v, i);
+  VecSort(&v, &CmpI64);              // CmpI64: stock I64 comparator from <sort.hc>
+  for (i = 0; i < VecLen(&v); i++) "%d ", VecAt(&v, i);
   "\n";
 
   // Binary search the sorted vector (returns an index, or -1).
@@ -37,15 +27,15 @@ U0 Main()
   VecFree(&v);
 
   // --- a string vector, same sort ---
-  Vec s;
-  VecInit(&s, sizeof(U8 *));
-  *(U8 **)VecPush(&s) = "pear";
-  *(U8 **)VecPush(&s) = "apple";
-  *(U8 **)VecPush(&s) = "cherry";
-  *(U8 **)VecPush(&s) = "banana";
+  Vec<U8 *> s;
+  VecInit(&s);
+  VecPush(&s, "pear");
+  VecPush(&s, "apple");
+  VecPush(&s, "cherry");
+  VecPush(&s, "banana");
 
-  VecSort(&s, &CmpStr);
-  for (i = 0; i < s.len; i++) "%s ", *(U8 **)VecAt(&s, i);
+  VecSort(&s, &CmpStr);             // CmpStr: stock U8 * comparator from <cstr.hc>
+  for (i = 0; i < VecLen(&s); i++) "%s ", VecAt(&s, i);
   "\n";
   VecFree(&s);
 }

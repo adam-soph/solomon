@@ -1,135 +1,87 @@
 #ifndef _HMAP_HC
 #define _HMAP_HC
-// hmap.hc — `Hmap`, an owning, generic hash map: keys of `ksize` bytes to values of
-// `vsize` bytes, with the key's hashing and equality supplied as function pointers at
-// `HmapInit`. Separate chaining over a heap bucket array that grows (rehashes) as it
-// fills. Built on <mem.hc> (heap) and <cstr.hc> (the stock string key ops). Pure
-// HolyC, identical on the interpreter and every backend. Include with
-// `#include <hmap.hc>`.
+// hmap.hc — `Hmap<K, V>`, an owning generic hash map (separate chaining over a growing
+// bucket array), monomorphized per (key, value) type. Keys and values are typed — no
+// casts. The key's hashing and equality are function pointers given at `HmapInit` (HolyC
+// can't derive them), each taking a `K *`:
 //
-// Generic like <vec.hc>: one `Hmap` type holds *any* fixed-size key and value, chosen
-// at `HmapInit(&m, ksize, vsize, hash, eq, copy)`. The key's behaviour is supplied as
-// three function pointers — `hash` and `eq` over key slots, and `copy` to move a key
-// into an entry (a typed move, not a raw `MemCpy`, so a pointer key keeps its identity).
-// Values are stored by value in a byte buffer; access is by emplace pointer — `HmapPut`
-// returns a `U8 *` value slot to write through, `HmapGet` returns `(U8 *value, Bool found)`:
+//     Hmap<U8 *, I64> m;
+//     HmapInit(&m, &HmapStrHash, &HmapStrEq);   // string keys
+//     HmapPut(&m, "answer", 42);
+//     (I64 v, Bool ok) = HmapGet(&m, "answer"); // `ok` distinguishes a stored 0 from a miss
 //
-//     Hmap m;
-//     HmapInit(&m, sizeof(I64), sizeof(I64), &HmapI64Hash, &HmapI64Eq, &HmapI64Copy);
-//     I64 k = 7;
-//     *(I64 *)HmapPut(&m, &k) = 42;            // emplace: write into the value slot
-//     (U8 *vp, Bool ok) = HmapGet(&m, &k);
-//     if (ok) "got %d\n", *(I64 *)vp;
+// Stock key ops: `HmapI64Hash`/`HmapI64Eq` (I64 keys) and `HmapStrHash`/`HmapStrEq`
+// (`U8 *` string keys — content-hashed/compared). Built on <mem.hc>, <cstr.hc> (string
+// keys), and <vec.hc> (`HmapKeys`/`HmapValues`). Pure HolyC, identical on the interpreter
+// and every backend. Include with `#include <hmap.hc>`.
 //
-// `HmapPut`/`HmapGet`/`HmapHas`/`HmapDel` take the key **by address** (`&k`) — a pointer
-// to the `ksize` key bytes. `hash`/`eq`/`copy` read that pointer at offset 0, so the
-// key may be a stack local. The `found` flag is what a sentinel can't express (any
-// stored value, incl. 0/-1, is valid).
-//
-// Two stock key kinds are provided so callers rarely hand-roll the trio:
-//   * `HmapI64Hash`/`HmapI64Eq`/`HmapI64Copy` — an `I64` (or any 8-byte POD) key,
-//     compared by value.
-//   * `HmapStrHash`/`HmapStrEq`/`HmapStrCopy` — a `U8 *` string key: the key slot holds
-//     the pointer and the ops dereference it (djb2 hash, `StrCmp`). The map stores the
-//     **pointer**, not a copy, so a string key must outlive the map (string *literals*
-//     do, having a stable address). To map strings, use `ksize = sizeof(U8 *)`.
-//
-// A thin typed facade (see examples/hmap.hc) wraps these into one-liners like
-// `SiPut(&m, "k", v)`. The caller owns the `Hmap` struct; methods take `Hmap *`.
-// `HmapInit` is **required** before use. `Hmap` owns its entries (free with `HmapFree`)
-// but **not** the bytes a key/value pointer may point at.
+// The caller owns the `Hmap`; `HmapInit` is required before use. `Hmap` owns its entries
+// (free with `HmapFree`); a `U8 *` string key stores the pointer, so it must outlive the
+// map (string *literals* do).
 
 #include <cstr.hc>
 #include <mem.hc>
-#include <vec.hc>             // HmapKeys/HmapSortKeys collect into a Vec (pulls in <sort.hc>)
-#include <_impl/strhash.hc>   // private djb2 helper (see the `_impl/` privacy demo)
+#include <vec.hc>
+#include <_impl/strhash.hc>   // private djb2 (the `_impl/` privacy demo)
 
 #define HMAP_INIT_BUCKETS 8
 
-// An `Hmap` owns a heap array of chain heads. Each entry is a raw byte block laid out
-// `[ next pointer (8) | key (ksize) | value (vsize) ]` — chained through the leading
-// pointer, which is byte-serialised like any pointer stored in a heap buffer, so the
-// generic inline key/value storage behaves the same on the interpreter and natively.
-class Hmap {
-  U8 **buckets;             // heap array of `nbuckets` chain heads (each an entry base, or NULL)
-  I64 nbuckets;
-  I64 len;                  // number of key/value pairs
-  I64 ksize;                // key size in bytes
-  I64 vsize;                // value size in bytes
-  I64 (*hash)(U8 *key);          // hash a key slot to a (sign-masked) bucket-able I64
-  Bool (*eq)(U8 *a, U8 *b);      // are two key slots equal?
-  U0 (*copy)(U8 *dst, U8 *src);  // move a key into an entry slot (a typed move)
+class HmapEntry<K, V> {
+  HmapEntry<K, V> *next; // a chain of entries in the same bucket
+  K key;
+  V val;
 }
 
-// ---- entry layout helpers (an entry is a `U8 *` byte block) ----
+class Hmap<K, V> {
+  HmapEntry<K, V> **buckets; // heap array of `nbuckets` chain heads
+  I64 nbuckets;
+  I64 len;
+  I64 (*hash)(K *key);
+  Bool (*eq)(K *a, K *b);
+}
 
-// The next-entry pointer lives in the first 8 bytes.
-U8 *HmapNext(U8 *e)            { return *(U8 **)e; }
-U0 HmapSetNext(U8 *e, U8 *n)  { *(U8 **)e = n; }
-// The key bytes follow the next pointer; the value bytes follow the key.
-U8 *HmapKeyOf(U8 *e)             { return e + sizeof(U8 *); }
-U8 *HmapValOf(Hmap *m, U8 *e)    { return e + sizeof(U8 *) + m->ksize; }
+// ---- stock key hash/eq (passed to HmapInit) ----
 
-// ---- stock key hash/eq ----
-
-// An I64 (or any 8-byte POD) key, hashed/compared/copied by value. `HmapI64Cmp` is the
-// <0/0/>0 ordering for `HmapSortKeys`.
-I64 HmapI64Hash(U8 *k)            { I64 v = *(I64 *)k; return (v ^ (v >> 32)) & 0x7FFFFFFFFFFFFFFF; }
-Bool HmapI64Eq(U8 *a, U8 *b)      { return *(I64 *)a == *(I64 *)b; }
-U0 HmapI64Copy(U8 *dst, U8 *src)  { *(I64 *)dst = *(I64 *)src; }
-I64 HmapI64Cmp(U8 *a, U8 *b)      { I64 x = *(I64 *)a, y = *(I64 *)b; return x < y ? -1 : x > y; }
-
-// A `U8 *` string key: the slot holds the pointer; dereference it (and copy it as a
-// pointer, preserving identity). `HmapStrHash` uses the private `<_impl/strhash.hc>`
-// djb2 — reachable here because hmap.hc is in the standard-library subtree that
-// `_impl/` is private to. `HmapStrCmp` is the lexicographic ordering for `HmapSortKeys`.
-I64 HmapStrHash(U8 *k)            { return Djb2(*(U8 **)k); }
-Bool HmapStrEq(U8 *a, U8 *b)      { return StrCmp(*(U8 **)a, *(U8 **)b) == 0; }
-U0 HmapStrCopy(U8 *dst, U8 *src)  { *(U8 **)dst = *(U8 **)src; }
-I64 HmapStrCmp(U8 *a, U8 *b)      { return StrCmp(*(U8 **)a, *(U8 **)b); }
+I64 HmapI64Hash(I64 *k) { I64 v = *k; return (v ^ (v >> 32)) & 0x7FFFFFFFFFFFFFFF; }
+Bool HmapI64Eq(I64 *a, I64 *b) { return *a == *b; }
+// String keys: the key is a `U8 *`, so the op takes `U8 **` and dereferences it. `Djb2`
+// is the private `<_impl/strhash.hc>` helper, reachable from the stdlib subtree.
+I64 HmapStrHash(U8 **k) { return Djb2(*k); }
+Bool HmapStrEq(U8 **a, U8 **b) { return StrCmp(*a, *b) == 0; }
 
 // ---- core ----
 
-// A heap array of `n` chain heads, all NULL.
-U8 **HmapNewBuckets(I64 n)
+HmapEntry<K, V> **HmapNewBuckets<K, V>(I64 n)
 {
-  U8 **b = MAlloc(n * sizeof(U8 *));
+  HmapEntry<K, V> **b = MAlloc(n * sizeof(HmapEntry<K, V> *));
   I64 i;
   for (i = 0; i < n; i++) b[i] = NULL;
   return b;
 }
 
-// The bucket index for a key slot (the sign mask keeps a user hash that returns a
-// negative I64 in range).
-I64 HmapBucket(Hmap *m, U8 *key, I64 n)
+U0 HmapInit<K, V>(Hmap<K, V> *m, I64 (*hash)(K *), Bool (*eq)(K *, K *))
+{
+  m->nbuckets = HMAP_INIT_BUCKETS;
+  m->buckets = HmapNewBuckets<K, V>(m->nbuckets);
+  m->len = 0;
+  m->hash = hash;
+  m->eq = eq;
+}
+
+// Bucket index for a key (the sign mask keeps a user hash returning a negative I64 in
+// range).
+I64 HmapBucket<K, V>(Hmap<K, V> *m, K *key, I64 n)
 {
   return (m->hash(key) & 0x7FFFFFFFFFFFFFFF) % n;
 }
 
-// Initialise an empty map of `ksize`-byte keys to `vsize`-byte values, with the given
-// key `hash`/`eq`. Required before any other call.
-U0 HmapInit(Hmap *m, I64 ksize, I64 vsize,
-            I64 (*hash)(U8 *), Bool (*eq)(U8 *, U8 *), U0 (*copy)(U8 *, U8 *))
-{
-  m->nbuckets = HMAP_INIT_BUCKETS;
-  m->buckets = HmapNewBuckets(m->nbuckets);
-  m->len = 0;
-  m->ksize = ksize;
-  m->vsize = vsize;
-  m->hash = hash;
-  m->eq = eq;
-  m->copy = copy;
-}
-
-// Free every entry and the bucket array; return to the empty state. The `Hmap` struct
-// is the caller's, as are any bytes a key/value pointer pointed at.
-U0 HmapFree(Hmap *m)
+U0 HmapFree<K, V>(Hmap<K, V> *m)
 {
   I64 i;
   for (i = 0; i < m->nbuckets; i++) {
-    U8 *e = m->buckets[i];
+    HmapEntry<K, V> *e = m->buckets[i];
     while (e != NULL) {
-      U8 *next = HmapNext(e);
+      HmapEntry<K, V> *next = e->next;
       Free(e);
       e = next;
     }
@@ -140,19 +92,17 @@ U0 HmapFree(Hmap *m)
   m->len = 0;
 }
 
-// Double the bucket count and re-link every entry into the new array. The entries are
-// reused — only the chain heads move.
-U0 HmapRehash(Hmap *m)
+U0 HmapRehash<K, V>(Hmap<K, V> *m)
 {
   I64 newn = m->nbuckets * 2;
-  U8 **nb = HmapNewBuckets(newn);
+  HmapEntry<K, V> **nb = HmapNewBuckets<K, V>(newn);
   I64 i;
   for (i = 0; i < m->nbuckets; i++) {
-    U8 *e = m->buckets[i];
+    HmapEntry<K, V> *e = m->buckets[i];
     while (e != NULL) {
-      U8 *next = HmapNext(e);
-      I64 b = HmapBucket(m, HmapKeyOf(e), newn);
-      HmapSetNext(e, nb[b]);
+      HmapEntry<K, V> *next = e->next;
+      I64 b = HmapBucket<K, V>(m, &e->key, newn);
+      e->next = nb[b];
       nb[b] = e;
       e = next;
     }
@@ -162,123 +112,129 @@ U0 HmapRehash(Hmap *m)
   m->nbuckets = newn;
 }
 
-// Insert `key` (its `ksize` bytes are copied in), or find it if already present.
-// Returns a pointer to the value slot — the caller writes the value through it:
-// `*(I64 *)HmapPut(&m, &k) = 42;`. A fresh slot's value bytes are uninitialised.
-U8 *HmapPut(Hmap *m, U8 *key)
+// Insert `key -> val`, or update the value if `key` is already present.
+U0 HmapPut<K, V>(Hmap<K, V> *m, K key, V val)
 {
-  I64 b = HmapBucket(m, key, m->nbuckets);
-  U8 *e = m->buckets[b];
+  I64 b = HmapBucket<K, V>(m, &key, m->nbuckets);
+  HmapEntry<K, V> *e = m->buckets[b];
   while (e != NULL) {
-    if (m->eq(HmapKeyOf(e), key)) return HmapValOf(m, e);
-    e = HmapNext(e);
+    if (m->eq(&e->key, &key)) {
+      e->val = val;
+      return;
+    }
+    e = e->next;
   }
-  U8 *node = MAlloc(sizeof(U8 *) + m->ksize + m->vsize);
-  m->copy(HmapKeyOf(node), key);
-  HmapSetNext(node, m->buckets[b]);
+  HmapEntry<K, V> *node = MAlloc(sizeof(HmapEntry<K, V>));
+  node->key = key;
+  node->val = val;
+  node->next = m->buckets[b];
   m->buckets[b] = node;
   m->len++;
-  if (m->len > m->nbuckets) HmapRehash(m);  // keep the load factor near 1
-  return HmapValOf(m, node);
+  if (m->len > m->nbuckets) HmapRehash<K, V>(m);
 }
 
-// Look up `key`. Returns `(value slot, TRUE)` when present, else `(NULL, FALSE)` — the
-// flag distinguishes a stored value from a miss.
-(U8 *, Bool) HmapGet(Hmap *m, U8 *key)
+// Look up `key`. Returns `(value, TRUE)` when present, else `(zero, FALSE)` — the flag
+// distinguishes a stored value from a miss.
+(V, Bool) HmapGet<K, V>(Hmap<K, V> *m, K key)
 {
-  U8 *e = m->buckets[HmapBucket(m, key, m->nbuckets)];
+  HmapEntry<K, V> *e = m->buckets[HmapBucket<K, V>(m, &key, m->nbuckets)];
   while (e != NULL) {
-    if (m->eq(HmapKeyOf(e), key)) return HmapValOf(m, e), TRUE;
-    e = HmapNext(e);
+    if (m->eq(&e->key, &key)) return e->val, TRUE;
+    e = e->next;
   }
-  return NULL, FALSE;
+  V zero; // a declared-but-uninitialised local is zero-filled
+  return zero, FALSE;
 }
 
-// Is `key` present?
-Bool HmapHas(Hmap *m, U8 *key)
+Bool HmapHas<K, V>(Hmap<K, V> *m, K key)
 {
-  (U8 *_, Bool ok) = HmapGet(m, key);
+  (V _, Bool ok) = HmapGet<K, V>(m, key);
   return ok;
 }
 
 // Remove `key`, freeing its entry. Returns TRUE if it was present.
-Bool HmapDel(Hmap *m, U8 *key)
+Bool HmapDel<K, V>(Hmap<K, V> *m, K key)
 {
-  I64 b = HmapBucket(m, key, m->nbuckets);
-  U8 *e = m->buckets[b];
-  U8 *prev = NULL;
+  I64 b = HmapBucket<K, V>(m, &key, m->nbuckets);
+  HmapEntry<K, V> *e = m->buckets[b];
+  HmapEntry<K, V> *prev = NULL;
   while (e != NULL) {
-    if (m->eq(HmapKeyOf(e), key)) {
-      if (prev == NULL) m->buckets[b] = HmapNext(e);
-      else HmapSetNext(prev, HmapNext(e));
+    if (m->eq(&e->key, &key)) {
+      if (prev == NULL) m->buckets[b] = e->next;
+      else prev->next = e->next;
       Free(e);
       m->len--;
       return TRUE;
     }
     prev = e;
-    e = HmapNext(e);
+    e = e->next;
   }
   return FALSE;
 }
 
-// The number of key/value pairs.
-I64 HmapLen(Hmap *m) { return m->len; }
+I64 HmapLen<K, V>(Hmap<K, V> *m) { return m->len; }
 
-// Collect every key into `out` (initialised here to the map's key size, so the caller
-// just declares `Vec keys;`). Order is unspecified — bucket order. Free with `VecFree`.
-U0 HmapKeys(Hmap *m, Vec *out)
+// Collect all keys / values into `out` (a `Vec<K>` / `Vec<V>`, initialised here). Order
+// is unspecified (bucket order). `HmapSortKeys` sorts the keys by `cmp`. Free `out` with
+// `VecFree`.
+U0 HmapKeys<K, V>(Hmap<K, V> *m, Vec<K> *out)
 {
-  VecInit(out, m->ksize);
+  VecInit<K>(out);
   I64 i;
   for (i = 0; i < m->nbuckets; i++) {
-    U8 *e = m->buckets[i];
+    HmapEntry<K, V> *e = m->buckets[i];
     while (e != NULL) {
-      m->copy(VecPush(out), HmapKeyOf(e));   // type-correct key move into the new slot
-      e = HmapNext(e);
+      VecPush<K>(out, e->key);
+      e = e->next;
     }
   }
 }
 
-// Collect every value into `out` (initialised here to the map's value size). Order is
-// unspecified — bucket order, parallel to `HmapKeys`. Free with `VecFree`.
-U0 HmapValues(Hmap *m, Vec *out)
+U0 HmapValues<K, V>(Hmap<K, V> *m, Vec<V> *out)
 {
-  VecInit(out, m->vsize);
+  VecInit<V>(out);
   I64 i;
   for (i = 0; i < m->nbuckets; i++) {
-    U8 *e = m->buckets[i];
+    HmapEntry<K, V> *e = m->buckets[i];
     while (e != NULL) {
-      MemCpy(VecPush(out), HmapValOf(m, e), m->vsize);   // value bytes (heap to heap)
-      e = HmapNext(e);
+      VecPush<V>(out, e->val);
+      e = e->next;
     }
   }
 }
 
-// Collect every key/value pair into `out` as a `[key | value]` block of `ksize + vsize`
-// bytes (the entry's own contiguous layout) — key at offset 0, value at offset `ksize`.
-// Initialised here; order is bucket order. Because the key sits at offset 0, the stock
-// key comparators sort the entries by key directly: `VecSort(&out, &HmapStrCmp)`. Free
-// with `VecFree`.
-U0 HmapEntries(Hmap *m, Vec *out)
+// Collect the keys (as `HmapKeys`) and sort them by `cmp` — a comparator over *key
+// element pointers* (`K *`), e.g. `&CmpStr` for `U8 *` keys or `&CmpI64` for `I64`.
+U0 HmapSortKeys<K, V>(Hmap<K, V> *m, Vec<K> *out, I64 (*cmp)(U8 *, U8 *))
 {
-  VecInit(out, m->ksize + m->vsize);
-  I64 i;
-  for (i = 0; i < m->nbuckets; i++) {
-    U8 *e = m->buckets[i];
-    while (e != NULL) {
-      MemCpy(VecPush(out), HmapKeyOf(e), m->ksize + m->vsize);   // key+value, contiguous
-      e = HmapNext(e);
-    }
-  }
+  HmapKeys<K, V>(m, out);
+  VecSort<K>(out, cmp);
 }
 
-// Collect every key into `out` and sort it by `cmp` (a key-slot comparator, e.g.
-// `&HmapStrCmp`/`&HmapI64Cmp`) — the map's contents in sorted key order. Look the value
-// up per key with `HmapGet`. Free `out` with `VecFree`.
-U0 HmapSortKeys(Hmap *m, Vec *out, I64 (*cmp)(U8 *, U8 *))
+// A key/value pair, the element type `HmapEntries` collects (a copy, detached from the
+// map's internal chain — no `next` link). `key` sits at offset 0, so a `Vec<HmapKV>`
+// can be `VecSort`ed by a key comparator (`&CmpStr` / `&CmpI64`).
+class HmapKV<K, V> {
+  K key;
+  V val;
+}
+
+// Collect every entry as a `(key, val)` pair into `out` (a `Vec<HmapKV<K, V>>`,
+// initialised here), in unspecified (bucket) order. Free `out` with `VecFree`.
+U0 HmapEntries<K, V>(Hmap<K, V> *m, Vec<HmapKV<K, V>> *out)
 {
-  HmapKeys(m, out);
-  VecSort(out, cmp);
+  VecInit<HmapKV<K, V>>(out);
+  I64 i;
+  for (i = 0; i < m->nbuckets; i++) {
+    HmapEntry<K, V> *e = m->buckets[i];
+    while (e != NULL) {
+      HmapKV<K, V> kv;
+      kv.key = e->key;
+      kv.val = e->val;
+      VecPush<HmapKV<K, V>>(out, kv);
+      e = e->next;
+    }
+  }
 }
 
 #endif

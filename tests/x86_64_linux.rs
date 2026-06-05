@@ -988,36 +988,38 @@ fn msize_matches_the_interpreter() {
 
 #[test]
 fn vec_object_matches_the_interpreter() {
-    // The owning, growable generic `Vec` from lib/vec.hc (heap buffer via ReAlloc,
-    // reallocation on growth) over I64, pointer, and class-value elements — held
-    // byte-for-byte to the interpreter, including the interp's pointer serialisation.
+    // The owning, growable generic `Vec<T>` from lib/vec.hc (heap buffer via ReAlloc,
+    // reallocation on growth), monomorphized over I64, pointer, and class-value
+    // elements — held byte-for-byte to the interpreter, including the interp's pointer
+    // serialisation and whole-class element (de)serialisation through the byte buffer.
     let src = r#"
         #include <vec.hc>
         class Pt { I64 x; I64 y; }
         U0 Main() {
-          Vec v; VecInit(&v, sizeof(I64));
+          Vec<I64> v; VecInit(&v);
           I64 i;
-          for (i = 0; i < 200; i++) *(I64 *)VecPush(&v) = i * 3 - 7;
-          "len=%d head=%d tail=%d\n", v.len, *(I64 *)VecAt(&v, 0), *(I64 *)VecAt(&v, v.len - 1);
+          for (i = 0; i < 200; i++) VecPush(&v, i * 3 - 7);
+          "len=%d head=%d tail=%d\n", VecLen(&v), VecAt(&v, 0), VecAt(&v, VecLen(&v) - 1);
           I64 sum = 0;
-          while (v.len > 0) sum += *(I64 *)VecPop(&v);
-          "sum=%d empty=%d\n", sum, v.len;
+          while (VecLen(&v) > 0) sum += VecPop(&v);
+          "sum=%d empty=%d\n", sum, VecLen(&v);
 
-          Vec a; VecInit(&a, sizeof(I64));
-          *(I64 *)VecPush(&a) = 1; *(I64 *)VecPush(&a) = 2;
-          Vec b; VecClone(&b, &a); *(I64 *)VecAt(&b, 0) = 9;
-          "a0=%d b0=%d\n", *(I64 *)VecAt(&a, 0), *(I64 *)VecAt(&b, 0);
+          Vec<I64> a; VecInit(&a);
+          VecPush(&a, 1); VecPush(&a, 2);
+          Vec<I64> b; VecClone(&b, &a); VecSet(&b, 0, 9);
+          "a0=%d b0=%d\n", VecAt(&a, 0), VecAt(&b, 0);
 
-          Vec s; VecInit(&s, sizeof(U8 *));
-          *(U8 **)VecPush(&s) = "x"; *(U8 **)VecPush(&s) = "yz";
-          Vec sc; VecClone(&sc, &s);
-          "%s %s\n", *(U8 **)VecAt(&sc, 0), *(U8 **)VecAt(&sc, 1);
+          Vec<U8 *> s; VecInit(&s);
+          VecPush(&s, "x"); VecPush(&s, "yz");
+          Vec<U8 *> sc; VecClone(&sc, &s);
+          "%s %s\n", VecAt(&sc, 0), VecAt(&sc, 1);
 
-          Vec p; VecInit(&p, sizeof(Pt));
+          Vec<Pt> p; VecInit(&p);
           I64 k;
-          for (k = 0; k < 50; k++) { Pt *e = VecPush(&p); e->x = k; e->y = k * k; }
-          Pt *g = VecAt(&p, 49);
-          "class %d %d len=%d\n", g->x, g->y, p.len;
+          Pt e;
+          for (k = 0; k < 50; k++) { e.x = k; e.y = k * k; VecPush(&p, e); }
+          Pt g = VecAt(&p, 49);
+          "class %d %d len=%d\n", g.x, g.y, VecLen(&p);
 
           VecFree(&v); VecFree(&a); VecFree(&b); VecFree(&s); VecFree(&sc); VecFree(&p);
         }

@@ -320,13 +320,15 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
         return Ok(target.write_executable(&image.text, cg.bss_size));
     }
 
-    // Symbol table: defined (`_main` + funcs, in __text) then common globals.
-    let mut defined = vec![("_main".to_string(), cg.asm.label_byte(main_label)?)];
+    // Symbol table: defined (`_main` + funcs, in __text) then common globals. The
+    // *label ids* are collected now; their byte offsets are read from the finished
+    // image (post-peephole), since `finish` removes dead words and shifts positions —
+    // a pre-`finish` offset would land past the shrunken `__text` and ld would warn.
+    let mut defined_labels = vec![("_main".to_string(), main_label)];
     for item in &program.items {
         if let StmtKind::Func(f) = &item.kind {
             if f.body.is_some() {
-                let off = cg.asm.label_byte(cg.funcs[&f.name].label)?;
-                defined.push((format!("_{}", f.name), off));
+                defined_labels.push((format!("_{}", f.name), cg.funcs[&f.name].label));
             }
         }
     }
@@ -342,6 +344,18 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
         .collect();
 
     let image = cg.asm.finish()?;
+    let defined: Vec<(String, u64)> = defined_labels
+        .into_iter()
+        .map(|(name, id)| {
+            let off = image
+                .label_bytes
+                .get(id)
+                .copied()
+                .flatten()
+                .ok_or_else(|| CodegenError::new("internal: unplaced function label", None))?;
+            Ok((name, off))
+        })
+        .collect::<Result<_, CodegenError>>()?;
     // Hand the machine code + symbolic relocations to the target's object
     // writer, which lowers the relocations and packages the relocatable object.
     Ok(target.write_object(&image, &defined, &commons, ndefined))

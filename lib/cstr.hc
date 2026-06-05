@@ -25,6 +25,11 @@ I64 StrCmp(U8 *a, U8 *b)
   return 0;
 }
 
+// Stock comparator for a `U8 *` (string-pointer) element: a `Sort`/`VecSort`/
+// `HmapSortKeys` over a `Vec<U8 *>` hands the comparator *pointers to elements*, i.e.
+// `U8 **`, so dereference once before comparing the strings.
+I64 CmpStr(U8 *a, U8 *b) { return StrCmp(*(U8 **)a, *(U8 **)b); }
+
 I64 StrNCmp(U8 *a, U8 *b, I64 n)
 {
   while (n > 0 && *a && *a == *b) { a++; b++; n--; }

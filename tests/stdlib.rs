@@ -285,41 +285,42 @@ fn msize_reports_the_requested_allocation_size() {
 
 #[test]
 fn vec_object_grows_and_clones() {
-    // The owning, growable generic `Vec`: emplace-push across reallocations, at/pop,
-    // deep clone (independent buffer), and the *same* `Vec` type over every kind of
-    // element — I64, F64, a pointer, and a class value — chosen by `VecInit(esize)`.
+    // The owning, growable generic `Vec<T>`: push across reallocations, at/ref/pop,
+    // deep clone (independent buffer), monomorphized over every kind of element — I64,
+    // F64, a pointer, and a class value (the class case round-trips a whole value
+    // through the byte heap buffer, both on store `VecPush` and load `VecAt`).
     let out = run_with_stdlib(
         r#"
         #include <vec.hc>
         class Pt { I64 x; I64 y; }
         U0 Main() {
-          Vec v; VecInit(&v, sizeof(I64));
+          Vec<I64> v; VecInit(&v);
           I64 i;
-          for (i = 0; i < 10; i++) *(I64 *)VecPush(&v) = i * i;
-          "len=%d capok=%d at5=%d\n", v.len, v.cap >= v.len, *(I64 *)VecAt(&v, 5);
-          "pop=%d pop=%d len=%d\n", *(I64 *)VecPop(&v), *(I64 *)VecPop(&v), v.len;
+          for (i = 0; i < 10; i++) VecPush(&v, i * i);
+          "len=%d capok=%d at5=%d\n", VecLen(&v), v.cap >= v.len, VecAt(&v, 5);
+          "pop=%d pop=%d len=%d\n", VecPop(&v), VecPop(&v), VecLen(&v);
 
-          *(I64 *)VecAt(&v, 0) = 99;
-          Vec c; VecClone(&c, &v);
-          *(I64 *)VecPush(&c) = 7;
-          "clone0=%d clen=%d vlen=%d\n", *(I64 *)VecAt(&c, 0), c.len, v.len;
+          VecSet(&v, 0, 99);
+          Vec<I64> c; VecClone(&c, &v);
+          VecPush(&c, 7);
+          "clone0=%d clen=%d vlen=%d\n", VecAt(&c, 0), VecLen(&c), VecLen(&v);
 
-          Vec f; VecInit(&f, sizeof(F64));   // F64 elements
-          *(F64 *)VecPush(&f) = 1.5;
-          *(F64 *)VecPush(&f) = 2.5;
-          "f64 %.1f %.1f\n", *(F64 *)VecAt(&f, 0), *(F64 *)VecAt(&f, 1);
+          Vec<F64> f; VecInit(&f);            // F64 elements
+          VecPush(&f, 1.5);
+          VecPush(&f, 2.5);
+          "f64 %.1f %.1f\n", VecAt(&f, 0), VecAt(&f, 1);
 
-          Vec s; VecInit(&s, sizeof(U8 *));  // pointer elements
-          *(U8 **)VecPush(&s) = "a";
-          *(U8 **)VecPush(&s) = "b";
-          Vec sc; VecClone(&sc, &s);         // clone keeps the pointers valid
-          "ptr %s %s\n", *(U8 **)VecAt(&s, 0), *(U8 **)VecAt(&sc, 1);
+          Vec<U8 *> s; VecInit(&s);           // pointer elements
+          VecPush(&s, "a");
+          VecPush(&s, "b");
+          Vec<U8 *> sc; VecClone(&sc, &s);    // clone keeps the pointers valid
+          "ptr %s %s\n", VecAt(&s, 0), VecAt(&sc, 1);
 
-          Vec p; VecInit(&p, sizeof(Pt));    // class values
-          Pt *e = VecPush(&p); e->x = 1; e->y = 2;
-          e = VecPush(&p); e->x = 3; e->y = 4;
-          Pt *g = VecAt(&p, 1);
-          "class %d %d\n", g->x, g->y;
+          Vec<Pt> p; VecInit(&p);             // class values
+          Pt e; e.x = 1; e.y = 2; VecPush(&p, e);
+          e.x = 3; e.y = 4; VecPush(&p, e);
+          Pt g = VecAt(&p, 1);                // load a whole class by value
+          "class %d %d\n", g.x, g.y;
 
           VecFree(&v); VecFree(&c); VecFree(&f); VecFree(&s); VecFree(&sc); VecFree(&p);
         }

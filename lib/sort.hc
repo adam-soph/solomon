@@ -31,6 +31,13 @@
 
 #define SORT_CUTOFF 16   // ranges this small are insertion-sorted
 
+// Stock scalar element comparators (the `cmp` argument to `Sort`/`BSearch`/`VecSort`/
+// `HmapSortKeys`). Each receives *pointers to two elements* — cast and dereference.
+// (`CmpStr`, for a `U8 *` string-pointer element, lives in <cstr.hc> next to `StrCmp`.)
+I64 CmpI64(U8 *a, U8 *b) { I64 x = *(I64 *)a, y = *(I64 *)b; return x < y ? -1 : x > y; }
+I64 CmpU64(U8 *a, U8 *b) { U64 x = *(U64 *)a, y = *(U64 *)b; return x < y ? -1 : x > y; }
+I64 CmpF64(U8 *a, U8 *b) { F64 x = *(F64 *)a, y = *(F64 *)b; return x < y ? -1 : x > y; }
+
 // Pointer to element `i` of an `esize`-stride array.
 U8 *SortAt(U8 *base, I64 i, I64 esize) { return base + i * esize; }
 

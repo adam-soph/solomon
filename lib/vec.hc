@@ -1,54 +1,34 @@
 #ifndef _VEC_HC
 #define _VEC_HC
-// vec.hc — `Vec`, an owning, growable array of fixed-size elements (a generic
-// dynamic array / "vector").
+// vec.hc — `Vec<T>`, an owning, growable typed array (a generic dynamic array),
+// monomorphized per element type at compile time. Typed throughout — no casts, no
+// element-size bookkeeping. Type arguments are inferred from the call:
 //
-// Elements are stored by value in a byte buffer, so one `Vec` type holds elements of
-// *any* type — scalars, pointers, or class values — with the size chosen at `VecInit`
-// (`sizeof(I64)`, `sizeof(F64)`, `sizeof(U8 *)`, `sizeof(SomeClass)`, …). Access is by
-// pointer: `VecPush`/`VecPop`/`VecAt` return a `U8 *` into the buffer that you cast to
-// the element type and read or write through:
+//     Vec<I64> v;
+//     VecInit(&v);
+//     VecPush(&v, 42);             // T = I64 inferred from &v
+//     I64 x = VecAt(&v, 0);
+//     VecFree(&v);
 //
-//     Vec v; VecInit(&v, sizeof(I64));
-//     *(I64 *)VecPush(&v) = 42;          // emplace: write into the new slot
-//     I64 x = *(I64 *)VecAt(&v, 0);      // read element 0
+// Works for scalar, pointer, and class element types. Built on <mem.hc>'s `ReAlloc`
+// (so a push loop grows in place) and <sort.hc> (for `VecSort`/`VecBSearch`). Pure
+// HolyC, identical on the interpreter and every backend. Include with `#include <vec.hc>`.
 //
-//     Vec w; VecInit(&w, sizeof(Pt));    // a class element
-//     Pt *p = VecPush(&w); p->x = 1;     // write fields straight into the slot
-//
-// Writing through the buffer pointer (rather than copying a local in) is what keeps
-// it portable across the interpreter and every backend.
-//
-// Built on the heap primitives in <mem.hc> (`ReAlloc`), so a push loop grows the
-// buffer in place — no copy, no leak — when it is the heap's last allocation. Pure
-// HolyC, identical on the interpreter and every backend. Include with
-// `#include <vec.hc>`.
-//
-// The caller owns the `Vec` struct; methods take `Vec *`. `VecInit(&v, esize)` is
-// **required** before use — it records the element size. `Vec` owns its buffer: copy
-// with `VecClone` (not `=`), free with `VecFree`.
+// The caller owns the `Vec` struct; `VecInit(&v)` is required before use. `Vec` owns its
+// buffer: copy with `VecClone` (not `=`), free with `VecFree`.
 
 #include <mem.hc>
-#include <sort.hc>   // VecSort/VecBSearch wrap the generic Sort/BSearch
+#include <sort.hc>
 
-class Vec {
-  U8 *data;    // heap buffer of `cap * esize` bytes, or NULL before first allocation
-  I64 len;     // number of elements in use
-  I64 cap;     // allocated capacity, in elements
-  I64 esize;   // element size in bytes
+class Vec<T> {
+  T  *data;   // heap buffer of `cap` elements, or NULL before the first allocation
+  I64 len;    // elements in use
+  I64 cap;    // allocated capacity, in elements
 }
 
-// Initialise an empty `Vec` whose elements are `esize` bytes each.
-U0 VecInit(Vec *v, I64 esize)
-{
-  v->data = NULL;
-  v->len = 0;
-  v->cap = 0;
-  v->esize = esize;
-}
+U0 VecInit<T>(Vec<T> *v) { v->data = NULL; v->len = 0; v->cap = 0; }
 
-// Release the buffer and return to the empty state (keeps the element size).
-U0 VecFree(Vec *v)
+U0 VecFree<T>(Vec<T> *v)
 {
   if (v->data) Free(v->data);
   v->data = NULL;
@@ -56,65 +36,60 @@ U0 VecFree(Vec *v)
   v->cap = 0;
 }
 
-// Drop all elements but keep the buffer (so refilling won't reallocate).
-U0 VecClear(Vec *v) { v->len = 0; }
+U0 VecClear<T>(Vec<T> *v) { v->len = 0; }
+I64 VecLen<T>(Vec<T> *v) { return v->len; }
 
 // Ensure room for at least `need` elements, growing geometrically. `ReAlloc` extends
 // in place when the buffer is the heap's last allocation.
-U0 VecReserve(Vec *v, I64 need)
+U0 VecReserve<T>(Vec<T> *v, I64 need)
 {
   if (v->cap >= need) return;
   I64 cap = v->cap;
   if (cap < 4) cap = 4;
   while (cap < need) cap *= 2;
-  v->data = ReAlloc(v->data, v->cap * v->esize, cap * v->esize);
+  v->data = ReAlloc(v->data, v->cap * sizeof(T), cap * sizeof(T));
   v->cap = cap;
 }
 
-// Pointer to element `i` (no bounds check — caller keeps 0 <= i < len). Cast it to
-// the element type to read or write: `*(I64 *)VecAt(&v, i)`.
-U8 *VecAt(Vec *v, I64 i) { return &v->data[i * v->esize]; }
-
-// Append one element and return a pointer to its new (uninitialised) slot; the caller
-// writes the value through it: `*(I64 *)VecPush(&v) = 42;`.
-U8 *VecPush(Vec *v)
+// Append a value.
+U0 VecPush<T>(Vec<T> *v, T x)
 {
-  VecReserve(v, v->len + 1);
-  U8 *slot = &v->data[v->len * v->esize];
+  VecReserve<T>(v, v->len + 1);
+  v->data[v->len] = x;
   v->len++;
-  return slot;
 }
 
-// Remove the last element and return a pointer to it (valid until the next push;
-// caller ensures the Vec is non-empty).
-U8 *VecPop(Vec *v)
-{
-  v->len--;
-  return &v->data[v->len * v->esize];
-}
+// Element `i` by value; `VecRef` returns a pointer for in-place update; `VecSet` writes.
+T VecAt<T>(Vec<T> *v, I64 i) { return v->data[i]; }
+T *VecRef<T>(Vec<T> *v, I64 i) { return &v->data[i]; }
+U0 VecSet<T>(Vec<T> *v, I64 i, T x) { v->data[i] = x; }
+
+// Remove and return the last element (caller ensures the Vec is non-empty).
+T VecPop<T>(Vec<T> *v) { v->len--; return v->data[v->len]; }
 
 // Deep-copy `src` into a fresh `dst` (the correct way to duplicate a `Vec`).
-U0 VecClone(Vec *dst, Vec *src)
+U0 VecClone<T>(Vec<T> *dst, Vec<T> *src)
 {
-  VecInit(dst, src->esize);
-  VecReserve(dst, src->len);
-  MemCpy(dst->data, src->data, src->len * src->esize);
+  VecInit<T>(dst);
+  VecReserve<T>(dst, src->len);
+  MemCpy(dst->data, src->data, src->len * sizeof(T));
   dst->len = src->len;
 }
 
-// Sort the elements in place by `cmp` (a `<sort.hc>` comparator over element pointers).
-U0 VecSort(Vec *v, I64 (*cmp)(U8 *, U8 *))
+// Sort the elements in place by `cmp` (a `<sort.hc>` comparator over element pointers
+// — cast them to `T *`).
+U0 VecSort<T>(Vec<T> *v, I64 (*cmp)(U8 *, U8 *))
 {
-  Sort(v->data, v->len, v->esize, cmp);
+  Sort(v->data, v->len, sizeof(T), cmp);
 }
 
-// Binary-search a sorted `Vec` for `key` (a pointer to a key element). Returns the
-// element index, or -1 if absent.
-I64 VecBSearch(Vec *v, U8 *key, I64 (*cmp)(U8 *, U8 *))
+// Binary-search a sorted `Vec` for `key` (a pointer to a key value). Returns the
+// element index, or -1.
+I64 VecBSearch<T>(Vec<T> *v, T *key, I64 (*cmp)(U8 *, U8 *))
 {
-  U8 *p = BSearch(key, v->data, v->len, v->esize, cmp);
+  U8 *p = BSearch(key, v->data, v->len, sizeof(T), cmp);
   if (p == NULL) return -1;
-  return (p - v->data) / v->esize;
+  return (p - (U8 *)v->data) / sizeof(T);
 }
 
 #endif

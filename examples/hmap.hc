@@ -1,88 +1,68 @@
-// hmap.hc — the generic `<hmap.hc>` byte map, plus the thin typed facade you build on
-// it and the tuple lookup it exists to show off: `(value, found)`, where `found` is
-// what a sentinel can't express (a stored 0 looks identical to a miss otherwise).
-//
-// The map is generic over key/value *bytes* with key hashing/equality passed in, so a
-// program wraps it once into the concrete type it wants. Here that's a string -> I64
-// map (`Si*`): `HmapInit` with the stock `HmapStrHash`/`HmapStrEq`, then emplace-style
-// `HmapPut`/`HmapGet` taking the key by address.
+// hmap.hc — the generic `<hmap.hc>` `Hmap<K, V>`, monomorphized here as a
+// string -> I64 map, and the tuple lookup it exists to show off: `(value, found)`,
+// where `found` is what a sentinel can't express (a stored 0 looks identical to a
+// miss otherwise). Keys and values are typed — no casts, no element-size bookkeeping.
 
 #include <hmap.hc>
 
-// --- a string -> I64 facade over the generic byte map ---
-
-U0 SiInit(Hmap *m)
-{
-  HmapInit(m, sizeof(U8 *), sizeof(I64), &HmapStrHash, &HmapStrEq, &HmapStrCopy);
-}
-U0 SiPut(Hmap *m, U8 *key, I64 v) { *(I64 *)HmapPut(m, &key) = v; }
-
-(I64, Bool) SiGet(Hmap *m, U8 *key)
-{
-  (U8 *p, Bool found) = HmapGet(m, &key);
-  if (found) return *(I64 *)p, TRUE;
-  return 0, FALSE;
-}
-
-Bool SiHas(Hmap *m, U8 *key) { return HmapHas(m, &key); }
-Bool SiDel(Hmap *m, U8 *key) { return HmapDel(m, &key); }
-
 U0 Main()
 {
-  Hmap m;
-  SiInit(&m);
+  Hmap<U8 *, I64> m;
+  HmapInit(&m, &HmapStrHash, &HmapStrEq);   // stock string-key hash/eq
 
-  SiPut(&m, "zero", 0);      // a stored 0 — the case a sentinel can't distinguish
-  SiPut(&m, "one", 1);
-  SiPut(&m, "two", 2);
-  SiPut(&m, "two", 22);      // update in place
+  HmapPut(&m, "zero", 0);    // a stored 0 — the case a sentinel can't distinguish
+  HmapPut(&m, "one", 1);
+  HmapPut(&m, "two", 2);
+  HmapPut(&m, "two", 22);    // update in place
   // Enough keys to force a rehash (load factor > 1 over 8 buckets).
-  SiPut(&m, "a", 10);  SiPut(&m, "b", 11);  SiPut(&m, "c", 12);
-  SiPut(&m, "d", 13);  SiPut(&m, "e", 14);  SiPut(&m, "f", 15);
+  HmapPut(&m, "a", 10);  HmapPut(&m, "b", 11);  HmapPut(&m, "c", 12);
+  HmapPut(&m, "d", 13);  HmapPut(&m, "e", 14);  HmapPut(&m, "f", 15);
 
   "len=%d\n", HmapLen(&m);
 
   // The tuple lookup: `found` separates "present, value 0" from "absent".
-  (I64 z, Bool zf) = SiGet(&m, "zero");
+  (I64 z, Bool zf) = HmapGet(&m, "zero");
   "zero: found=%d value=%d\n", zf, z;
-  (I64 mv, Bool mf) = SiGet(&m, "missing");
+  (I64 mv, Bool mf) = HmapGet(&m, "missing");
   "missing: found=%d value=%d\n", mf, mv;
 
-  "two=%d one=%d f=%d\n",
-      SiGet(&m, "two")[0], SiGet(&m, "one")[0], SiGet(&m, "f")[0];
+  (I64 tv, Bool _t) = HmapGet(&m, "two");
+  (I64 ov, Bool _o) = HmapGet(&m, "one");
+  (I64 fv, Bool _f) = HmapGet(&m, "f");
+  "two=%d one=%d f=%d\n", tv, ov, fv;
 
-  "has(a)=%d del(a)=%d has(a)=%d\n", SiHas(&m, "a"), SiDel(&m, "a"), SiHas(&m, "a");
-  "del(missing)=%d len=%d\n", SiDel(&m, "missing"), HmapLen(&m);
+  "has(a)=%d del(a)=%d has(a)=%d\n", HmapHas(&m, "a"), HmapDel(&m, "a"), HmapHas(&m, "a");
+  "del(missing)=%d len=%d\n", HmapDel(&m, "missing"), HmapLen(&m);
 
-  // The map is unordered; `HmapSortKeys` dumps the surviving entries in sorted key
-  // order (collect the keys into a Vec, sort, look each value back up).
-  Vec keys;
-  HmapSortKeys(&m, &keys, &HmapStrCmp);
+  // The map is unordered; `HmapSortKeys` dumps the surviving keys in sorted order
+  // (collect into a Vec, sort by the stock string comparator, look each value back up).
+  Vec<U8 *> keys;
+  HmapSortKeys(&m, &keys, &CmpStr);
   I64 i;
-  for (i = 0; i < keys.len; i++) {
-    U8 *kk = *(U8 **)VecAt(&keys, i);
-    (I64 vv, Bool ok) = SiGet(&m, kk);
+  for (i = 0; i < VecLen(&keys); i++) {
+    U8 *kk = VecAt(&keys, i);
+    (I64 vv, Bool ok) = HmapGet(&m, kk);
     "%s=%d ", kk, vv;
   }
   "\n";
   VecFree(&keys);
 
   // `HmapValues` — an order-independent aggregate over the values.
-  Vec vals;
+  Vec<I64> vals;
   HmapValues(&m, &vals);
   I64 sum = 0;
-  for (i = 0; i < vals.len; i++) sum += *(I64 *)VecAt(&vals, i);
-  "sum=%d count=%d\n", sum, vals.len;
+  for (i = 0; i < VecLen(&vals); i++) sum += VecAt(&vals, i);
+  "sum=%d count=%d\n", sum, VecLen(&vals);
   VecFree(&vals);
 
-  // `HmapEntries` — each element is a `[key U8* | value I64]` block; sort by key (which
-  // sits at offset 0) and read both straight from the block, no second lookup.
-  Vec ents;
+  // `HmapEntries` — each element is a `(key, val)` pair; sort by key (offset 0) and
+  // read both straight from the pair, no second lookup.
+  Vec<HmapKV<U8 *, I64>> ents;
   HmapEntries(&m, &ents);
-  VecSort(&ents, &HmapStrCmp);
-  for (i = 0; i < ents.len; i++) {
-    U8 *slot = VecAt(&ents, i);
-    "%s:%d ", *(U8 **)slot, *(I64 *)(slot + sizeof(U8 *));
+  VecSort(&ents, &CmpStr);
+  for (i = 0; i < VecLen(&ents); i++) {
+    HmapKV<U8 *, I64> *kv = VecRef(&ents, i);
+    "%s:%d ", kv->key, kv->val;
   }
   "\n";
   VecFree(&ents);

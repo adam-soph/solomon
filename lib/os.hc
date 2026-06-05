@@ -52,17 +52,17 @@ U8 *Getenv(U8 *name)
   return NULL;
 }
 
-// Collect every environment entry ("KEY=VALUE", a `U8 *`) into `out`, initialised here
-// to hold `U8 *` elements, in the OS's order. Read an entry with `*(U8 **)VecAt(&out, i)`.
-// The entries point into the process environment (read-only); `VecFree(&out)` frees the
-// Vec's own buffer, not them.
-U0 Environ(Vec *out)
+// Collect every environment entry ("KEY=VALUE", a `U8 *`) into `out` (a `Vec<U8 *>`,
+// initialised here) in the OS's order. Read an entry with `VecAt(&out, i)`. The entries
+// point into the process environment (read-only); `VecFree(&out)` frees the Vec's own
+// buffer, not them.
+U0 Environ(Vec<U8 *> *out)
 {
-  VecInit(out, sizeof(U8 *));
+  VecInit(out);
   if (EnvP == NULL) return;   // no environment (e.g. Windows, for now)
   I64 i = 0;
   while (EnvP[i] != NULL) {
-    *(U8 **)VecPush(out) = EnvP[i];
+    VecPush(out, EnvP[i]);
     i++;
   }
 }
