@@ -648,3 +648,60 @@ fn program_carries_generic_templates() {
         "Vec<I64> instance map recorded"
     );
 }
+
+#[test]
+fn unparenthesized_typed_tuple_unpack() {
+    // `T0 a, T1 b = e;` (a type before each name) is a tuple unpack — it desugars to a
+    // hidden tuple temp plus one declarator per slot (3 declarators here).
+    let p = prog("(I64, I64) Mk() { return 1, 2; } I64 a, I64 b = Mk();");
+    let decls = p
+        .items
+        .iter()
+        .find_map(|s| match &s.kind {
+            StmtKind::VarDecl { decls } => Some(decls),
+            _ => None,
+        })
+        .expect("a VarDecl from the unpack");
+    assert_eq!(decls.len(), 3, "tuple temp + a + b: {decls:?}");
+    assert_eq!(decls[1].name, "a");
+    assert_eq!(decls[1].ty, Type::I64);
+    assert_eq!(decls[2].name, "b");
+
+    // No type after the comma => an ordinary declaration list (`b` shares `I64`), which
+    // must NOT be mistaken for an unpack.
+    match stmt("I64 a, b = 5;") {
+        StmtKind::VarDecl { decls } => assert_eq!(decls.len(), 2, "plain decl list"),
+        other => panic!("expected a decl list, got {other:?}"),
+    }
+}
+
+#[test]
+fn same_type_bare_unpack_inferred_from_tuple_rhs() {
+    // `I64 a, b = <tuple>` (same type, no repeat) is reinterpreted as an unpack because
+    // the RHS types to a tuple — the decl-list reading would assign a tuple to a scalar.
+    let p = prog("(I64, I64) Mk() { return 1, 2; } I64 a, b = Mk();");
+    let decls = p
+        .items
+        .iter()
+        .find_map(|s| match &s.kind {
+            StmtKind::VarDecl { decls } => Some(decls),
+            _ => None,
+        })
+        .expect("a VarDecl from the unpack");
+    assert_eq!(decls.len(), 3, "tuple temp + a + b: {decls:?}");
+    assert_eq!(decls[1].name, "a");
+    assert_eq!(decls[2].name, "b");
+
+    // A scalar RHS keeps the ordinary decl-list meaning (b = 5, a uninitialised).
+    match stmt("I64 a, b = 5;") {
+        StmtKind::VarDecl { decls } => {
+            assert_eq!(decls.len(), 2);
+            assert_eq!(decls[1].init, Some(e(ExprKind::Int(5))));
+        }
+        other => panic!("expected a decl list, got {other:?}"),
+    }
+
+    // A name/tuple-arity mismatch is a clear error, not a silent drop.
+    let err = parse("(I64, I64, I64) Mk(){return 1,2,3;} I64 a, b = Mk();").unwrap_err();
+    assert!(err.to_string().contains("tuple has 3"), "got: {err}");
+}

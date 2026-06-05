@@ -456,6 +456,16 @@ impl<S: TokenStream> Parser<S> {
     fn intern_tuple_type(&mut self, elems: &[Type], m: Mark) -> String {
         let name = tuple_type_name(elems);
         if self.tuple_types.insert(name.clone()) {
+            // Record the slot types for inference (`arg_type` member access) and so the
+            // bare same-type unpack can read the tuple's arity from `class_fields`.
+            self.generics.class_fields.insert(
+                name.clone(),
+                elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (format!("_{i}"), t.clone()))
+                    .collect(),
+            );
             let fields = elems
                 .iter()
                 .enumerate()
@@ -539,7 +549,38 @@ impl<S: TokenStream> Parser<S> {
         self.expect(&TokenKind::Eq, "`=`")?;
         let rhs = self.parse_assign()?;
         self.expect(&TokenKind::Semicolon, "`;`")?;
+        self.desugar_destructure(slots, rhs, m)
+    }
 
+    /// Parse the unparenthesized typed-binding destructure `T0 n0, T1 n1, … = rhs;`
+    /// (a tuple unpack written like a multi-type declaration). The first binding's type
+    /// and name are already parsed; we're positioned at the `,` before the second. A
+    /// `, <type>` (rather than `, <name>`) is what distinguishes this from an ordinary
+    /// declaration list, which shares a single base type. Always the typed form.
+    fn parse_typed_unpack(&mut self, first: (String, Type), m: Mark) -> PResult<Stmt> {
+        let (name, ty) = first;
+        let mut slots: Vec<(Option<Type>, Option<String>)> =
+            vec![(Some(ty), if name == "_" { None } else { Some(name) })];
+        while self.eat(&TokenKind::Comma)? {
+            let bty = self.parse_type_no_name()?;
+            let bname = self.expect_ident()?;
+            slots.push((Some(bty), if bname == "_" { None } else { Some(bname) }));
+        }
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let rhs = self.parse_assign()?;
+        self.expect(&TokenKind::Semicolon, "`;`")?;
+        self.desugar_destructure(slots, rhs, m)
+    }
+
+    /// Lower a collected destructuring pattern (typed bindings or untyped assignment
+    /// targets) plus its `rhs` source into the existing tuple-struct machinery — shared
+    /// by the parenthesized `(…) = e` and the bare `T0 a, T1 b = e` forms.
+    fn desugar_destructure(
+        &mut self,
+        slots: Vec<(Option<Type>, Option<String>)>,
+        rhs: Expr,
+        m: Mark,
+    ) -> PResult<Stmt> {
         let typed = slots.iter().any(|(t, _)| t.is_some());
         if typed && slots.iter().any(|(t, _)| t.is_none()) {
             return self.err_at(
@@ -1021,10 +1062,70 @@ impl<S: TokenStream> Parser<S> {
                 m,
             ))
         } else {
+            // Unparenthesized tuple unpack `T0 a, T1 b = e;`: a `,` followed by a *type*
+            // (not a bare name) is the signal — an ordinary declaration list shares one
+            // base type, so `T a, b` has a name, not a type, after the comma.
+            if self.at(&TokenKind::Comma)? {
+                let after = self.peek_n(1)?.kind.clone();
+                if self.kind_is_type_start(&after) {
+                    return self.parse_typed_unpack((name, ty), m);
+                }
+            }
             let decls = self.parse_var_decls(&base, (name, ty), dm)?;
             self.expect(&TokenKind::Semicolon, "`;`")?;
+            // A same-type bare unpack `I64 a, b = pair;` parses as an ordinary decl list
+            // (only the last declarator initialised). If that init's static type is a
+            // tuple, reinterpret it as an unpack — the decl-list reading would assign a
+            // tuple to a scalar, always a type error, so no valid program changes meaning.
+            if let Some(unpack) = self.try_bare_tuple_unpack(&decls, m)? {
+                return Ok(unpack);
+            }
             Ok(self.st(StmtKind::VarDecl { decls }, m))
         }
+    }
+
+    /// Reinterpret a parsed declaration list as a tuple unpack when it has the shape
+    /// `T a, b, … = e;` (≥2 declarators, only the last initialised) and `e`'s inferred
+    /// static type is a tuple. Returns `None` when it isn't such a case (stay a decl
+    /// list), or an error when it clearly *is* one but the slot count ≠ tuple arity.
+    fn try_bare_tuple_unpack(&mut self, decls: &[Declarator], m: Mark) -> PResult<Option<Stmt>> {
+        if decls.len() < 2 || decls[..decls.len() - 1].iter().any(|d| d.init.is_some()) {
+            return Ok(None);
+        }
+        let Some(rhs) = decls.last().and_then(|d| d.init.clone()) else {
+            return Ok(None);
+        };
+        // The init's static type must be a known tuple type for this to be an unpack.
+        let Some(Type::Named(tup)) = self.arg_type(&rhs) else {
+            return Ok(None);
+        };
+        if !self.tuple_types.contains(&tup) {
+            return Ok(None);
+        }
+        let arity = self.generics.class_fields.get(&tup).map_or(0, |f| f.len());
+        if arity != decls.len() {
+            return self.err_at(
+                m.pos,
+                format!(
+                    "tuple unpack binds {} name(s) but the tuple has {arity} element(s)",
+                    decls.len()
+                ),
+            );
+        }
+        let slots: Vec<(Option<Type>, Option<String>)> = decls
+            .iter()
+            .map(|d| {
+                (
+                    Some(d.ty.clone()),
+                    if d.name == "_" {
+                        None
+                    } else {
+                        Some(d.name.clone())
+                    },
+                )
+            })
+            .collect();
+        Ok(Some(self.desugar_destructure(slots, rhs, m)?))
     }
 
     /// Finish a variable declaration list whose first declarator is already

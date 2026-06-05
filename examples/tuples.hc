@@ -30,6 +30,16 @@ U0 Main()
   (I64 q, I64 r) = DivMod(17, 5);
   "17 / 5 = %d rem %d\n", q, r;
 
+  // The parentheses are optional when every slot is typed — a type before each name
+  // distinguishes this from an ordinary `I64 a, b` declaration list.
+  I64 q2, I64 r2 = DivMod(23, 4);
+  "23 / 4 = %d rem %d\n", q2, r2;
+
+  // For same-typed slots the repeated type is optional too: `I64 a, b = <tuple>` is an
+  // unpack (the right-hand side being a tuple is what tells it apart from a decl list).
+  I64 q3, r3 = DivMod(30, 7);
+  "30 / 7 = %d rem %d\n", q3, r3;
+
   // `T _` discards a slot.
   (I64 only, I64 _) = DivMod(20, 3);
   "20 / 3 = %d\n", only;
