@@ -4,12 +4,12 @@
 
 **A from-scratch reimplementation of [HolyC](https://templeos.org) — Terry A. Davis's TempleOS language — in Rust.**
 
-A full compiler front end, a tree-walking interpreter, and three hand-rolled native code generators. No LLVM, no Cranelift, no assembler.
+A full compiler front end, a tree-walking interpreter, and four hand-rolled native code generators. No LLVM, no Cranelift, no assembler.
 
 [![Test](https://github.com/adam-soph/solomon/actions/workflows/test.yml/badge.svg)](https://github.com/adam-soph/solomon/actions/workflows/test.yml)
 ![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-CE412B?logo=rust&logoColor=white)
 ![Codegen](https://img.shields.io/badge/codegen-hand--rolled-success)
-![Native targets](https://img.shields.io/badge/native_targets-3-blue)
+![Native targets](https://img.shields.io/badge/native_targets-4-blue)
 ![Linux](https://img.shields.io/badge/Linux-freestanding_static_ELF-orange)
 ![Conformance](https://img.shields.io/badge/examples-18%2F18_byte--identical-brightgreen)
 
@@ -28,13 +28,17 @@ named for its target:
 | `aarch64-apple-darwin` | Mach-O object | links with `cc` |
 | `x86_64-unknown-linux` | freestanding static ELF | none — raw syscalls |
 | `aarch64-unknown-linux` | freestanding static ELF | none — raw syscalls |
+| `x86_64-pc-windows` | self-contained PE | none — `kernel32` imports |
 
 A backend is an (architecture, OS) pair, since the object format, syscalls, and
 ABI depend on the OS, not just the CPU. Both Linux targets are **freestanding** —
-no libc, no linker, raw syscalls — with their own `_start`. (Darwin is the one
-hosted target: macOS has no stable syscall ABI, so it links libSystem via `cc`.)
-The interpreter is the conformance oracle, which the native backends match
-byte-for-byte on all 18 example programs.
+no libc, no linker, raw syscalls — with their own `_start`; the Windows target
+likewise emits a self-contained PE with hand-built `kernel32` imports and no
+linker. (Darwin is the one hosted target: macOS has no stable syscall ABI, so it
+links libSystem via `cc`.)
+The interpreter is the conformance oracle, which the three executable backends
+match byte-for-byte on all 18 example programs (the Windows PE is verified by
+byte-scanning its emitted code, since it can't run on the test host).
 
 ```holyc
 U0 Main()
@@ -88,6 +92,10 @@ x=42 y=255
   relocations) covering the same subset, including printf with correctly-rounded
   bignum `%f`/`%e`/`%g`, an `mmap` bump allocator, and the core-library built-ins.
   The AArch64 one shares its entire emitter with the Darwin backend.
+- **`x86_64-pc-windows`** — hand-writes a **self-contained PE** with `kernel32`
+  imports (`WriteFile`/`GetStdHandle`/`VirtualAlloc`/…) resolved through a
+  hand-built import address table, no linker. Shares the x86-64 emitter with the
+  Linux backend behind an `OsTarget` seam that swaps syscalls for the OS calls.
 
 **Not yet implemented:** most of the TempleOS core/standard library and DolDoc.
 
@@ -158,9 +166,10 @@ front-end tools:
 | `hcc ast`    | parse and dump the AST                                      |
 | `hcc tokens` | run the lexer only and dump the token stream               |
 
-`--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`, and
-`aarch64-unknown-linux`. The Linux targets are freestanding (no libc), so the
-`-gnu`/`-musl` libc suffixes are not accepted — use the bare triple.
+`--target` accepts `aarch64-apple-darwin`, `x86_64-unknown-linux`,
+`aarch64-unknown-linux`, and `x86_64-pc-windows`. The Linux targets are
+freestanding (no libc), so the `-gnu`/`-musl` libc suffixes are not accepted — use
+the bare triple.
 
 ```console
 $ hcc check broken.hc

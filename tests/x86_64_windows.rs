@@ -15,6 +15,8 @@ use solomon::parser::parse_with;
 use solomon::sema::check_program;
 use solomon::x86_64::X64Windows;
 
+mod common;
+
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 fn temp_out() -> std::path::PathBuf {
@@ -283,20 +285,19 @@ fn run_stdouts(paths: &[std::path::PathBuf]) -> Option<Vec<String>> {
         .collect()
 }
 
-/// For each `(name, src)`: capture the interpreter's stdout, build the PE, then (on a
-/// Windows host) run it and assert the stdout matches byte-for-byte.
-fn assert_pe_matches_interp(cases: &[(&str, &str)]) {
+/// For each `(name, program)`: capture the interpreter's stdout, build the PE, then (on
+/// a Windows host) run it and assert the stdout matches byte-for-byte.
+fn run_pe_conformance(cases: Vec<(String, solomon::Program)>) {
     let mut paths = Vec::new();
     let mut wants = Vec::new();
-    for (name, src) in cases {
-        let program = compile(src);
-        let want = run_to_string(&program).unwrap_or_else(|e| panic!("{name}: interp error: {e}"));
+    for (name, program) in &cases {
+        let want = run_to_string(program).unwrap_or_else(|e| panic!("{name}: interp error: {e}"));
         let out = temp_out();
         X64Windows::new(&out)
-            .run(&program)
+            .run(program)
             .unwrap_or_else(|e| panic!("{name}: windows build failed: {e}"));
         paths.push(out);
-        wants.push((*name, want));
+        wants.push((name.clone(), want));
     }
     let got = run_stdouts(&paths);
     for p in &paths {
@@ -312,73 +313,51 @@ fn assert_pe_matches_interp(cases: &[(&str, &str)]) {
 }
 
 #[test]
+fn pe_examples_match_the_interpreter() {
+    // The whole shared example set (`common::EXAMPLES`) compiles to a PE and prints
+    // exactly what the interpreter does — the *same* catch-all the arm64 and freestanding
+    // backends enforce, now executed natively on Windows.
+    let cases = common::EXAMPLES
+        .iter()
+        .map(|(name, src)| {
+            let program =
+                common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+            assert!(
+                check_program(&program).is_empty(),
+                "{name}: semantic errors"
+            );
+            (name.to_string(), program)
+        })
+        .collect();
+    run_pe_conformance(cases);
+}
+
+#[test]
 fn pe_printing_matches_the_interpreter() {
-    // Printing/formatting, signedness-directed ops, recursion, arrays, the string/mem
-    // and sprintf library, RNG, and F64 math — the pure-compute surface the PE backend
-    // shares with the x86-64 Linux backend.
-    assert_pe_matches_interp(&[
-        ("hello", r#"U0 Main(){ "Hello, World!\n"; } Main;"#),
-        ("ints", r#"U0 Main(){ "%d %u %x\n", -5, -1, 255; } Main;"#),
+    // A few targeted format edge cases beyond what the examples cover (signedness on
+    // `>>`/`/`/`%`, `*` width/precision, `#` flags).
+    let cases: &[(&str, &str)] = &[
         (
             "width",
-            r#"U0 Main(){ "[%5d][%-5d][%05d][%+d][%#x]\n", 42, 42, 42, 7, 255; } Main;"#,
+            r#"U0 Main(){ "[%5d][%-5d][%05d][%+d][%#x][%#o]\n", 42, 42, 42, 7, 255, 64; } Main;"#,
         ),
         (
             "starwp",
             r#"U0 Main(){ "[%*d][%.*d][%-10s][%.3s]\n", 6, 42, 4, 42, "hi", "hello"; } Main;"#,
         ),
         (
-            "fib",
-            r#"I64 Fib(I64 n){ if(n<2) return n; return Fib(n-1)+Fib(n-2); } U0 Main(){ I64 i; for(i=0;i<12;i++) "%d ", Fib(i); "\n"; } Main;"#,
-        ),
-        (
-            "array",
-            r#"U0 Main(){ I64 a[5]; I64 i; for(i=0;i<5;i++) a[i]=i*i; for(i=0;i<5;i++) "%d ", a[i]; "\n"; } Main;"#,
-        ),
-        (
             "signed",
             r#"U0 Main(){ I64 a=-8; U64 b=0x8000000000000000; "%d %x %d %d\n", a>>1, b>>4, a/2, a%3; } Main;"#,
         ),
         (
-            "str",
-            "#include <cstr.hc>\nU0 Main(){ U8 b[32]; StrCpy(b,\"Hello, \"); StrCat(b,\"World\"); StrToUpper(b); \"%s (%d)\\n\", b, StrLen(b); } Main;",
-        ),
-        (
-            "mem",
-            "#include <mem.hc>\nU0 Main(){ U8 *p=MAlloc(256); I64 i; for(i=0;i<10;i++) p[i]='A'+i; p[10]=0; \"%s\\n\", p; Free(p); } Main;",
-        ),
-        (
-            "sprintf",
-            "#include <cstr.hc>\nU0 Main(){ U8 b[64]; StrPrint(b, \"x=%d [%05d] %s\", 3, 42, \"ok\"); \"%s\\n\", b; } Main;",
-        ),
-        (
-            "rng",
-            "#include <rand.hc>\nU0 Main(){ I64 i; for(i=0;i<8;i++) \"%d \", RandU64()%100; \"\\n\"; } Main;",
-        ),
-        (
             "floatfmt",
-            r#"U0 Main(){ F64 x=3.5; "%.3f %.2e %g\n", x*2.0, 12345.678, 0.000123; } Main;"#,
+            r#"U0 Main(){ "%.3f %.2e %g %g\n", 7.0, 12345.678, 0.000123, 42.5; } Main;"#,
         ),
-    ]);
-}
-
-#[test]
-fn pe_examples_match_the_interpreter() {
-    // Whole example programs within the PE backend's implemented subset compile and
-    // print exactly what the interpreter does — the same conformance the other backends
-    // enforce over the shared example set.
-    assert_pe_matches_interp(&[
-        ("fib", include_str!("../examples/fib.hc")),
-        ("classes", include_str!("../examples/classes.hc")),
-        ("control", include_str!("../examples/control.hc")),
-        ("linklist", include_str!("../examples/linklist.hc")),
-        ("vm", include_str!("../examples/vm.hc")),
-        ("shapes", include_str!("../examples/shapes.hc")),
-        ("matrix", include_str!("../examples/matrix.hc")),
-        ("hashmap", include_str!("../examples/hashmap.hc")),
-        ("wordcount", include_str!("../examples/wordcount.hc")),
-        ("hello", include_str!("../examples/hello.hc")),
-        ("report", include_str!("../examples/report.hc")),
-        ("gallery", include_str!("../examples/gallery.hc")),
-    ]);
+    ];
+    run_pe_conformance(
+        cases
+            .iter()
+            .map(|(n, s)| (n.to_string(), compile(s)))
+            .collect(),
+    );
 }
