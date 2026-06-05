@@ -231,10 +231,11 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
     // `MSize` makes `MAlloc` prepend an 8-byte size header; gate it so size-agnostic
     // programs keep the lean, header-free heap byte-for-byte.
     cg.uses_msize = crate::ast::program_calls_any(program, &["MSize"]);
-    // When the program reads command-line args, reserve two hidden common
-    // symbols (argc and the argv array pointer) that `_main` populates from
-    // x0/x1; arg-free programs are left untouched.
-    if crate::ast::program_calls_any(program, &["ArgC", "ArgV"]) {
+    // The command line is exposed as the implicit globals `ArgC`/`ArgV` (`_main`
+    // captures x0/x1 into the two hidden symbols below; a `...` function's `VargC`/
+    // `VargV` varargs locals are distinct names). Only when the program references
+    // them, so arg-free programs stay byte-for-byte unchanged.
+    if crate::ast::program_uses_ident(program, &["ArgC", "ArgV"]) {
         cg.uses_args = true;
         for name in [ARGC_GLOBAL, ARGV_GLOBAL] {
             let sym = ndefined + cg.global_order.len() as u32;
@@ -242,6 +243,16 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
                 .insert(name.to_string(), GlobalInfo { sym, ty: Type::U64 });
             cg.global_order.push(name.to_string());
         }
+    }
+    // The environment is the implicit global `U8 **EnvP` (`_main` captures the `main`
+    // 3rd arg, x2, into the hidden symbol below). Gated independently of the command
+    // line so an `EnvP`-free program is byte-for-byte unchanged.
+    if crate::ast::program_uses_ident(program, &["EnvP"]) {
+        cg.uses_env = true;
+        let sym = ndefined + cg.global_order.len() as u32;
+        cg.globals
+            .insert(ENVP_GLOBAL.to_string(), GlobalInfo { sym, ty: Type::U64 });
+        cg.global_order.push(ENVP_GLOBAL.to_string());
     }
 
     // Freestanding: lay out the globals in BSS (no linker to allocate commons), in
@@ -426,12 +437,12 @@ struct Cg {
     /// incoming value is spilled, as `(reg, frame_off)` — saved in the prologue
     /// and restored in every epilogue.
     cs_saves: Vec<(u32, u32)>,
-    /// For a variadic (`...`) function: the frame offsets of the two hidden params
-    /// the caller appends — `(va_ptr_off, va_cnt_off)` — that `VarArg*` read.
-    cur_va: Option<(u32, u32)>,
     /// Whether the program calls `ArgC`/`ArgV`. When set, the `_main` entry
     /// captures the incoming argc/argv (x0/x1) into the hidden globals below.
     uses_args: bool,
+    /// Whether the program references `EnvP`. When set, `_main` captures the
+    /// environment pointer (the `main` 3rd arg, x2) into `ENVP_GLOBAL`.
+    uses_env: bool,
     /// Whether the program calls `MSize` ⇒ `MAlloc` prepends a size header.
     uses_msize: bool,
     /// Whether variadic args go in registers (AAPCS64) vs the stack (Apple).
@@ -465,6 +476,7 @@ struct Cg {
 /// program uses `ArgC`/`ArgV`). Common symbols, like the RNG state word.
 const ARGC_GLOBAL: &str = "__solomon_holyc_argc";
 const ARGV_GLOBAL: &str = "__solomon_holyc_argv";
+const ENVP_GLOBAL: &str = "__solomon_holyc_envp";
 
 impl Cg {
     fn new(layouts: Layouts) -> Self {
@@ -483,8 +495,8 @@ impl Cg {
             sret_off: None,
             promote: HashMap::new(),
             cs_saves: Vec::new(),
-            cur_va: None,
             uses_args: false,
+            uses_env: false,
             uses_msize: false,
             variadic_regs: false,
             freestanding: false,
@@ -621,7 +633,6 @@ impl Cg {
         self.labels.clear();
         self.cur_ret = ret.clone();
         self.sret_off = None;
-        self.cur_va = None;
         self.promote = plan_registers(params, body);
         self.cs_saves.clear();
 
@@ -760,8 +771,9 @@ impl Cg {
         }
 
         // A variadic function receives two hidden integer params after the named
-        // ones (in x{igr}, x{igr+1}): a pointer to the caller's vararg buffer and
-        // the count. Spill them to frame slots for `VarArg*` to read.
+        // ones (in x{igr}, x{igr+1}): a pointer to the caller's vararg buffer and the
+        // count. Spill them to frame slots and expose them as the implicit HolyC
+        // varargs locals `I64 *VargV` (the buffer) and `I64 VargC` (the count).
         if varargs {
             if igr + 1 > 7 {
                 return Err(CodegenError::at(
@@ -771,11 +783,12 @@ impl Cg {
             }
             let ptr_off = self.alloc(8, 8);
             self.asm.sub_imm(T2, FP, ptr_off);
-            self.asm.store_mem(igr, T2, 8); // va_ptr
+            self.asm.store_mem(igr, T2, 8); // VargV = va buffer pointer
             let cnt_off = self.alloc(8, 8);
             self.asm.sub_imm(T2, FP, cnt_off);
-            self.asm.store_mem(igr + 1, T2, 8); // va_cnt
-            self.cur_va = Some((ptr_off, cnt_off));
+            self.asm.store_mem(igr + 1, T2, 8); // VargC = count
+            self.declare("VargV", ptr_off, Type::Ptr(Box::new(Type::I64)));
+            self.declare("VargC", cnt_off, Type::I64);
         }
 
         // At the entry, AArch64/AAPCS hands `_main` argc in x0 and argv in x1.
@@ -788,6 +801,12 @@ impl Cg {
             let vsym = self.globals[ARGV_GLOBAL].sym;
             self.addr_global(SCRATCH, vsym);
             self.asm.store_mem(1, SCRATCH, 8); // __argv = x1
+        }
+        // The environment pointer is `main`'s 3rd arg (x2), untouched by the prologue.
+        if is_main && self.uses_env {
+            let esym = self.globals[ENVP_GLOBAL].sym;
+            self.addr_global(SCRATCH, esym);
+            self.asm.store_mem(2, SCRATCH, 8); // __envp = x2
         }
 
         for &s in body {
@@ -1597,6 +1616,19 @@ impl Cg {
             "TRUE" => return Ok(self.asm.load_imm(RES, 1)),
             _ => {}
         }
+        // The command line `ArgC` (count) / `ArgV` (the `U8 **` base) are implicit
+        // globals captured at the entry — unless a user variable shadows them.
+        if self.lookup(name).is_none() && matches!(name, "ArgC" | "ArgV" | "EnvP") {
+            let g = match name {
+                "ArgC" => ARGC_GLOBAL,
+                "ArgV" => ARGV_GLOBAL,
+                _ => ENVP_GLOBAL,
+            };
+            let sym = self.globals[g].sym;
+            self.addr_global(T2, sym);
+            self.asm.load_mem(RES, T2, 8, false);
+            return Ok(());
+        }
         if self.lookup(name).is_some() || self.globals.contains_key(name) {
             let ty = self.var_type(name).unwrap();
             if is_aggregate(&ty) {
@@ -2405,37 +2437,6 @@ impl Cg {
         {
             return self.emit_user_call(name, args, pos);
         }
-        // `ArgC()` / `ArgV(i)` — read the command line captured at the entry.
-        if name == "ArgC" {
-            let sym = self.globals[ARGC_GLOBAL].sym;
-            self.addr_global(T2, sym);
-            self.asm.load_mem(RES, T2, 8, false); // RES = argc
-            return Ok(());
-        }
-        if name == "ArgV" {
-            self.gen_expr(&args[0])?; // RES = i
-            self.asm.mov_reg(T2, RES); // T2 = i (saved across the loads below)
-            let l_null = self.asm.new_label();
-            let l_done = self.asm.new_label();
-            // Out of range (including negative i, via the unsigned compare) -> NULL.
-            let csym = self.globals[ARGC_GLOBAL].sym;
-            self.addr_global(SCRATCH, csym);
-            self.asm.load_mem(SCRATCH, SCRATCH, 8, false); // SCRATCH = argc
-            self.asm.cmp_reg(T2, SCRATCH);
-            self.asm.b_cond(COND_HS, l_null); // unsigned i >= argc
-            // RES = argv[i] = *(argv_base + i*8)
-            let vsym = self.globals[ARGV_GLOBAL].sym;
-            self.addr_global(RES, vsym);
-            self.asm.load_mem(RES, RES, 8, false); // RES = argv base pointer
-            self.asm.lsl_imm(SCRATCH, T2, 3); // SCRATCH = i*8
-            self.asm.add(RES, RES, SCRATCH);
-            self.asm.load_mem(RES, RES, 8, false); // RES = argv[i]
-            self.asm.b(l_done);
-            self.asm.place(l_null);
-            self.asm.load_imm(RES, 0); // NULL
-            self.asm.place(l_done);
-            return Ok(());
-        }
         // Clock/time primitives. UnixNS = CLOCK_REALTIME, NanoNS = CLOCK_MONOTONIC.
         if name == "UnixNS" || name == "NanoNS" {
             return self.gen_clock(name == "NanoNS", pos);
@@ -2447,6 +2448,49 @@ impl Cg {
         // Darwin calls libc. `Open` needs per-target massaging (an `openat` AT_FDCWD
         // prepend freestanding, a Linux→macOS flag translation on Darwin); the rest
         // map their args straight to the syscall/libc registers.
+        if name == "Exit" {
+            self.gen_expr(&args[0])?; // RES = code
+            self.asm.mov_reg(0, RES); // x0 = code
+            if self.freestanding {
+                self.asm.load_imm(8, 94); // x8 = SYS_exit_group
+                self.asm.svc();
+            } else {
+                self.asm.bl_extern("_exit"); // libc exit(code) — never returns
+            }
+            return Ok(());
+        }
+        if matches!(name, "Getpid" | "Getppid" | "Getuid" | "Getgid") {
+            if self.freestanding {
+                let nr = match name {
+                    "Getpid" => 172,  // SYS_getpid
+                    "Getppid" => 173, // SYS_getppid
+                    "Getuid" => 174,  // SYS_getuid
+                    _ => 176,         // SYS_getgid
+                };
+                self.asm.load_imm(8, nr);
+                self.asm.svc();
+                self.asm.mov_reg(RES, 0); // id in x0
+            } else {
+                let sym = match name {
+                    "Getpid" => "_getpid",
+                    "Getppid" => "_getppid",
+                    "Getuid" => "_getuid",
+                    _ => "_getgid",
+                };
+                self.asm.bl_extern(sym);
+                self.asm.mov_reg(RES, 0);
+                // `pid_t` is a signed int; `uid_t`/`gid_t` are unsigned — but every real
+                // id is a small non-negative value, so a 32-bit extend (either
+                // signedness) yields the same result.
+                let ty = if matches!(name, "Getuid" | "Getgid") {
+                    Type::U32
+                } else {
+                    Type::I32
+                };
+                self.gen_cast(&ty);
+            }
+            return Ok(());
+        }
         if name == "Open" {
             return self.gen_open(args, pos);
         }
@@ -2455,6 +2499,12 @@ impl Cg {
             "Socket" | "Connect" | "LSeek" | "Read" | "Write" | "Close"
         ) {
             return self.gen_socket(name, args, pos);
+        }
+        if matches!(name, "Remove" | "Rename" | "Mkdir" | "Chdir") {
+            return self.gen_fsop(name, args, pos);
+        }
+        if name == "Getcwd" {
+            return self.gen_getcwd(args, pos);
         }
         // POSIX-style threads: `pthread_create`/`pthread_join` on Darwin, raw `clone`
         // freestanding.
@@ -2477,29 +2527,6 @@ impl Cg {
         }
         if matches!(name, "FutexWait" | "FutexWake") {
             return self.gen_futex(name, args, pos);
-        }
-        // Variadic-argument access: read the hidden va buffer the prologue saved.
-        if let Some(name) = name
-            .strip_prefix("VarArg")
-            .filter(|_| matches!(name, "VarArgCnt" | "VarArgI64" | "VarArgF64" | "VarArg"))
-        {
-            let (ptr_off, cnt_off) = self.cur_va.ok_or_else(|| {
-                CodegenError::at(pos, "arm64 backend: VarArg* outside a variadic function")
-            })?;
-            if name == "Cnt" {
-                self.load_local(RES, cnt_off, &Type::I64);
-                return Ok(());
-            }
-            // addr = va_ptr + i*8, then load the 8-byte slot.
-            self.gen_expr(&args[0])?; // RES = i
-            self.asm.lsl_imm(RES, RES, 3); // i*8
-            self.load_local(T2, ptr_off, &Type::I64); // T2 = va_ptr
-            self.asm.add(T2, T2, RES);
-            self.asm.load_mem(RES, T2, 8, false); // RES = slot bits
-            if name == "F64" {
-                self.asm.fmov_from_gpr(FRES, RES); // reinterpret as a double
-            }
-            return Ok(());
         }
         // `HeapExtend`: the in-place bump-grow primitive. Freestanding has a real
         // implementation; the hosted libc heap exposes no in-place API, so it returns
@@ -2688,6 +2715,123 @@ impl Cg {
             self.asm.ldr_w(0, 0); // w0 = errno
             self.asm.neg(RES, 0); // RES = -errno
             self.asm.place(ok);
+        }
+        Ok(())
+    }
+
+    /// After a libc call whose `int` result is already in `RES`: convert the `-1`
+    /// failure to the `-errno` the freestanding syscalls return — `if (RES < 0) RES =
+    /// -*___error();` (`___error()` returns errno's address on Darwin).
+    fn darwin_errno_neg(&mut self) {
+        let ok = self.asm.new_label();
+        self.asm.cmp_imm(RES, 0);
+        self.asm.b_cond(COND_GE, ok);
+        self.asm.bl_extern("___error");
+        self.asm.ldr_w(0, 0); // w0 = errno
+        self.asm.neg(RES, 0); // RES = -errno
+        self.asm.place(ok);
+    }
+
+    /// Lower the filesystem/working-directory ops `Remove`/`Rename`/`Mkdir`/`Chdir`,
+    /// which all return 0 or `-errno`. Freestanding uses the aarch64 `*at` syscalls (no
+    /// bare `unlink`/`rename`/`mkdir`) with an `AT_FDCWD` prepend — `chdir` is a bare
+    /// syscall; Darwin calls libc and converts the `-1`/errno failure to `-errno`. Args
+    /// are evaluated onto the stack, then popped into the syscall/ABI registers.
+    fn gen_fsop(&mut self, name: &str, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
+        for a in args {
+            self.gen_expr(a)?;
+            self.asm.push(RES);
+        }
+        if self.freestanding {
+            match name {
+                "Remove" => {
+                    self.asm.pop(1); // x1 = path
+                    self.asm.load_imm(0, -100); // x0 = AT_FDCWD
+                    self.asm.load_imm(2, 0); // x2 = flags
+                    self.asm.load_imm(8, 35); // SYS_unlinkat
+                }
+                "Chdir" => {
+                    self.asm.pop(0); // x0 = path
+                    self.asm.load_imm(8, 49); // SYS_chdir (bare)
+                }
+                "Rename" => {
+                    self.asm.pop(3); // x3 = newpath
+                    self.asm.pop(1); // x1 = oldpath
+                    self.asm.load_imm(0, -100); // x0 = AT_FDCWD (old)
+                    self.asm.load_imm(2, -100); // x2 = AT_FDCWD (new)
+                    self.asm.load_imm(8, 38); // SYS_renameat
+                }
+                "Mkdir" => {
+                    self.asm.pop(2); // x2 = mode
+                    self.asm.pop(1); // x1 = path
+                    self.asm.load_imm(0, -100); // x0 = AT_FDCWD
+                    self.asm.load_imm(8, 34); // SYS_mkdirat
+                }
+                _ => unreachable!(),
+            }
+            self.asm.svc();
+            self.asm.mov_reg(RES, 0); // result (0 / -errno) in x0
+        } else {
+            let sym = match name {
+                "Remove" => "_unlink",
+                "Rename" => "_rename",
+                "Mkdir" => "_mkdir",
+                "Chdir" => "_chdir",
+                _ => unreachable!(),
+            };
+            match name {
+                "Remove" | "Chdir" => {
+                    self.asm.pop(0); // x0 = path
+                }
+                _ => {
+                    self.asm.pop(1); // x1 = newpath / mode
+                    self.asm.pop(0); // x0 = oldpath / path
+                }
+            }
+            self.asm.bl_extern(sym);
+            self.asm.mov_reg(RES, 0);
+            self.gen_cast(&Type::I32); // sign-extend the libc `int` return
+            self.darwin_errno_neg(); // -1 → -errno, matching the freestanding path
+        }
+        Ok(())
+    }
+
+    /// Lower `Getcwd(buf, size)` → 0 on success / `-errno`. Freestanding `getcwd`
+    /// returns the byte length (incl NUL) on success, so a non-negative result is
+    /// normalised to 0; Darwin libc `getcwd` returns `buf` (non-NULL) or NULL, so a
+    /// non-NULL result is 0 and NULL becomes `-errno`.
+    fn gen_getcwd(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
+        self.gen_expr(&args[0])?; // buf
+        self.asm.push(RES);
+        self.gen_expr(&args[1])?; // size
+        self.asm.push(RES);
+        self.asm.pop(1); // x1 = size
+        self.asm.pop(0); // x0 = buf
+        if self.freestanding {
+            self.asm.load_imm(8, 17); // SYS_getcwd
+            self.asm.svc(); // x0 = len(>0) or -errno
+            self.asm.mov_reg(RES, 0);
+            // if RES >= 0 (a length) → 0; a negative -errno passes through.
+            let neg = self.asm.new_label();
+            self.asm.cmp_imm(RES, 0);
+            self.asm.b_cond(COND_LT, neg);
+            self.asm.load_imm(RES, 0);
+            self.asm.place(neg);
+        } else {
+            self.asm.bl_extern("_getcwd"); // x0 = buf or NULL
+            self.asm.mov_reg(RES, 0);
+            // non-NULL → 0; NULL → -errno.
+            let done = self.asm.new_label();
+            let fail = self.asm.new_label();
+            self.asm.cmp_imm(RES, 0);
+            self.asm.b_cond(COND_EQ, fail);
+            self.asm.load_imm(RES, 0);
+            self.asm.b(done);
+            self.asm.place(fail);
+            self.asm.bl_extern("___error");
+            self.asm.ldr_w(0, 0); // w0 = errno
+            self.asm.neg(RES, 0); // RES = -errno
+            self.asm.place(done);
         }
         Ok(())
     }

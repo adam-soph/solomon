@@ -23,10 +23,10 @@ fn file_program(path: &str) -> String {
         U0 Main() {{
           U8 *msg = "solomon\n";
           I64 wr = WriteFile("{path}", msg, StrLen(msg));
-          if (wr < 0) {{ "write: %s\n", StrError(-wr); return; }}
+          if (wr < 0) {{ "write failed: %d\n", -wr; return; }}
           U8 buf[64];
           I64 n = ReadFile("{path}", buf, 64);
-          if (n < 0) {{ "read: %s\n", StrError(-n); return; }}
+          if (n < 0) {{ "read failed: %d\n", -n; return; }}
           buf[n] = 0;
           "got: %s", buf;
           "size=%d\n", FileSize("{path}");
@@ -67,16 +67,15 @@ fn interp_file_roundtrip() {
     assert_eq!(out, EXPECTED);
 }
 
-/// Reading a nonexistent path fails: the helper returns a negative `-errno`, which
-/// `StrError` renders. ENOENT is 2 on both Linux and macOS, and the interpreter and
-/// the Darwin backend now both surface the real errno, so the message is identical
-/// across targets.
+/// Reading a nonexistent path fails: the helper returns a negative `-errno`. ENOENT
+/// is 2 on both Linux and macOS, and the interpreter and the Darwin backend both
+/// surface the real errno, so the number is identical across targets.
 const ERR_PROGRAM: &str = r#"
     #include <io.hc>
     U0 Main() {
       U8 buf[16];
       I64 n = ReadFile("/no/such/solomon/path", buf, 16);
-      if (n < 0) "error: %s\n", StrError(-n);
+      if (n < 0) "error: errno=%d\n", -n;
       else "unexpected success\n";
     }
     Main;
@@ -85,7 +84,7 @@ const ERR_PROGRAM: &str = r#"
 #[test]
 fn interp_error_is_reported() {
     let out = run_to_string(&compile(ERR_PROGRAM)).unwrap_or_else(|e| panic!("interp error: {e}"));
-    assert_eq!(out, "error: No such file or directory\n");
+    assert_eq!(out, "error: errno=2\n");
 }
 
 #[test]
@@ -104,7 +103,7 @@ fn native_arm64_error_is_reported() {
     let _ = std::fs::remove_file(&bin);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "error: No such file or directory\n"
+        "error: errno=2\n"
     );
 }
 
@@ -181,4 +180,468 @@ fn native_arm64_freestanding_file() {
     let out = std::env::temp_dir().join(format!("solomon-arm-io-{}", std::process::id()));
     let got = freestanding_file_stdout(&out, Arm64Linux::new(&out));
     assert_eq!(got, EXPECTED, "arm64 freestanding");
+}
+
+// ---- filesystem mutation: Mkdir / Rename / Remove ----
+
+/// A program that creates a directory, writes a file in it, renames it, reads it back,
+/// then removes it (the missing-source remove yields -ENOENT = -2 on every target).
+fn fsops_program(dir: &str) -> String {
+    format!(
+        r#"
+        #include <io.hc>
+        #include <os.hc>
+        U0 Main() {{
+          "mkdir=%d\n", Mkdir("{dir}", 0700);
+          U8 *msg = "hi\n";
+          "write=%d\n", WriteFile("{dir}/a.txt", msg, StrLen(msg));
+          "rename=%d\n", Rename("{dir}/a.txt", "{dir}/b.txt");
+          U8 buf[16];
+          I64 n = ReadFile("{dir}/b.txt", buf, 16);
+          buf[n] = 0;
+          "read=%d got=%s", n, buf;
+          "rm_missing=%d\n", Remove("{dir}/a.txt");
+          "rm=%d\n", Remove("{dir}/b.txt");
+        }}
+        Main;
+    "#
+    )
+}
+
+const FSOPS_EXPECTED: &str = "mkdir=0\nwrite=0\nrename=0\nread=3 got=hi\nrm_missing=-2\nrm=0\n";
+
+/// A process-unique directory path for the host-run (interp / Darwin) cases.
+fn tmp_dir(tag: &str) -> String {
+    std::env::temp_dir()
+        .join(format!("solomon-fsops-{tag}-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[test]
+fn interp_fsops_roundtrip() {
+    let dir = tmp_dir("interp");
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = run_to_string(&compile(&fsops_program(&dir)))
+        .unwrap_or_else(|e| panic!("interp error: {e}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out, FSOPS_EXPECTED);
+}
+
+/// Native arm64 Darwin: Mkdir/Rename/Remove lower to libc `mkdir`/`rename`/`unlink`,
+/// with the `-1`→`-errno` conversion. Self-skips off an Apple-silicon host.
+#[test]
+fn native_arm64_fsops() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native fsops test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let dir = tmp_dir("darwin");
+    let _ = std::fs::remove_dir_all(&dir);
+    let bin = std::env::temp_dir().join(format!("solomon-fsops-bin-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(&fsops_program(&dir)))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let output = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run produced binary: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), FSOPS_EXPECTED);
+}
+
+/// Build the fsops program with `backend` to a temp ELF and run it natively (a clean
+/// fixed dir). Only called on a matching Linux host. Returns stdout.
+fn freestanding_fsops_stdout(out: &std::path::Path, mut backend: impl Codegen) -> String {
+    let dir = "/tmp/solomon_fsops_test";
+    let _ = std::fs::remove_dir_all(dir);
+    backend
+        .run(&compile(&fsops_program(dir)))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let output = Command::new(out)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run produced ELF: {e}"));
+    let _ = std::fs::remove_file(out);
+    let _ = std::fs::remove_dir_all(dir);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn native_x86_64_freestanding_fsops() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 fsops test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-fsops-{}", std::process::id()));
+    let got = freestanding_fsops_stdout(&out, X64Linux::new(&out));
+    assert_eq!(got, FSOPS_EXPECTED, "x86_64 freestanding");
+}
+
+#[test]
+fn native_arm64_freestanding_fsops() {
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        eprintln!("skipping: freestanding aarch64 fsops test needs a linux/aarch64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-arm-fsops-{}", std::process::id()));
+    let got = freestanding_fsops_stdout(&out, Arm64Linux::new(&out));
+    assert_eq!(got, FSOPS_EXPECTED, "arm64 freestanding");
+}
+
+// ---- the environment: EnvP ----
+
+/// `EnvP` is a NULL-terminated `U8 **` of "KEY=VALUE" strings. Structural invariants
+/// that hold for any real process environment (non-empty; every entry has a '='), so
+/// the check is deterministic without depending on a specific variable.
+const ENV_INVARIANTS: &str = r#"
+    #include <cstr.hc>
+    U0 Main() {
+      I64 i = 0, all_kv = 1;
+      while (EnvP[i] != NULL) {
+        if (StrChr(EnvP[i], '=') == NULL) all_kv = 0;
+        i++;
+      }
+      "nonempty=%d all_kv=%d\n", i > 0, all_kv;
+    }
+    Main;
+"#;
+
+#[test]
+fn interp_envp_invariants() {
+    let out = run_to_string(&compile(ENV_INVARIANTS)).unwrap_or_else(|e| panic!("interp: {e}"));
+    assert_eq!(out, "nonempty=1 all_kv=1\n");
+}
+
+#[test]
+fn native_arm64_envp_invariants_and_lookup() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native EnvP test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Same invariants, captured natively from `main`'s envp (x2).
+    let bin = std::env::temp_dir().join(format!("solomon-env-inv-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(ENV_INVARIANTS))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let out = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nonempty=1 all_kv=1\n");
+
+    // Value lookup: a specific variable, passed to the child's environment (scoped to
+    // the spawned process, so no parallel-test race on the shared env).
+    let lookup = r#"
+        #include <cstr.hc>
+        U0 Main() {
+          I64 i = 0;
+          while (EnvP[i] != NULL) {
+            if (StrNCmp(EnvP[i], "SOLOMON_ENV=", 12) == 0) { "got=%s\n", EnvP[i] + 12; return; }
+            i++;
+          }
+          "missing\n";
+        }
+        Main;
+    "#;
+    let bin2 = std::env::temp_dir().join(format!("solomon-env-look-{}", std::process::id()));
+    Arm64Darwin::new(&bin2)
+        .run(&compile(lookup))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let out2 = Command::new(&bin2)
+        .env("SOLOMON_ENV", "hi")
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    let _ = std::fs::remove_file(&bin2);
+    assert_eq!(String::from_utf8_lossy(&out2.stdout), "got=hi\n");
+}
+
+/// EnvP invariants through the **freestanding x86-64** backend (envp read off the
+/// initial stack, just past argv's NULL). Linux/x86_64 host only.
+#[test]
+fn native_x86_64_freestanding_envp() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 EnvP test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-env-{}", std::process::id()));
+    X64Linux::new(&out)
+        .run(&compile(ENV_INVARIANTS))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&got.stdout), "nonempty=1 all_kv=1\n");
+}
+
+// ---- Getenv (os.hc) ----
+
+const GETENV_UNSET: &str = r#"
+    #include <os.hc>
+    U0 Main() { "unset=%d\n", Getenv("SOLOMON_UNSET_XYZ") == NULL; }
+    Main;
+"#;
+
+const GETENV_LOOKUP: &str = r#"
+    #include <os.hc>
+    U0 Main() {
+      U8 *v = Getenv("SOLOMON_ENV");
+      if (v != NULL) "got=%s\n", v; else "missing\n";
+    }
+    Main;
+"#;
+
+#[test]
+fn interp_getenv_unset_is_null() {
+    // Race-free: an unset name is NULL regardless of the ambient environment.
+    let out = run_to_string(&compile(GETENV_UNSET)).unwrap_or_else(|e| panic!("interp: {e}"));
+    assert_eq!(out, "unset=1\n");
+}
+
+#[test]
+fn native_arm64_getenv_lookup() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native Getenv test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let bin = std::env::temp_dir().join(format!("solomon-getenv-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(GETENV_LOOKUP))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    // Found (value scoped to the child — no parallel-test env race).
+    let hit = Command::new(&bin)
+        .env("SOLOMON_ENV", "world")
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
+    assert_eq!(String::from_utf8_lossy(&hit.stdout), "got=world\n");
+    // Missing.
+    let miss = Command::new(&bin)
+        .env_remove("SOLOMON_ENV")
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    assert_eq!(String::from_utf8_lossy(&miss.stdout), "missing\n");
+}
+
+#[test]
+fn native_x86_64_freestanding_getenv() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 Getenv test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-getenv-{}", std::process::id()));
+    X64Linux::new(&out)
+        .run(&compile(GETENV_LOOKUP))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = Command::new(&out)
+        .env("SOLOMON_ENV", "world")
+        .output()
+        .unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&got.stdout), "got=world\n");
+}
+
+// ---- Getpid (os.hc) ----
+
+const GETPID_PROG: &str = r#"
+    #include <os.hc>
+    U0 Main() { "pos=%d\n", Getpid() > 0; }
+    Main;
+"#;
+
+#[test]
+fn interp_getpid_is_positive() {
+    let out = run_to_string(&compile(GETPID_PROG)).unwrap_or_else(|e| panic!("interp: {e}"));
+    assert_eq!(out, "pos=1\n");
+}
+
+#[test]
+fn native_arm64_getpid_is_positive() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native Getpid test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let bin = std::env::temp_dir().join(format!("solomon-getpid-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(GETPID_PROG))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "pos=1\n");
+}
+
+#[test]
+fn native_x86_64_freestanding_getpid() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 Getpid test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-getpid-{}", std::process::id()));
+    X64Linux::new(&out)
+        .run(&compile(GETPID_PROG))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&got.stdout), "pos=1\n");
+}
+
+// ---- Chdir / Getcwd (os.hc) ----
+
+// Read-only invariants (no successful Chdir, so the interpreter's process cwd is not
+// mutated — race-free under parallel tests): Getcwd succeeds into an absolute path and
+// a bad Chdir fails.
+const CWD_INVARIANTS: &str = r#"
+    #include <os.hc>
+    U0 Main() {
+      U8 buf[256];
+      I64 r = Getcwd(buf, 256);
+      I64 abs = buf[0] == '/';
+      I64 bad = Chdir("/no/such/solomon/dir/xyz") < 0;
+      "getcwd=%d abs=%d badchdir=%d\n", r, abs, bad;
+    }
+    Main;
+"#;
+
+// Deterministic value check (run in an isolated child so the cwd change can't leak):
+// Chdir to root, then Getcwd reports exactly "/".
+const CWD_ROOT: &str = r#"
+    #include <os.hc>
+    U0 Main() {
+      U8 buf[256];
+      "chdir=%d\n", Chdir("/");
+      Getcwd(buf, 256);
+      "cwd=%s\n", buf;
+    }
+    Main;
+"#;
+
+#[test]
+fn interp_getcwd_invariants() {
+    let out = run_to_string(&compile(CWD_INVARIANTS)).unwrap_or_else(|e| panic!("interp: {e}"));
+    assert_eq!(out, "getcwd=0 abs=1 badchdir=1\n");
+}
+
+#[test]
+fn native_arm64_chdir_getcwd() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native Chdir/Getcwd test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let bin = std::env::temp_dir().join(format!("solomon-cwd-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(CWD_ROOT))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "chdir=0\ncwd=/\n");
+}
+
+#[test]
+fn native_x86_64_freestanding_chdir_getcwd() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 Chdir/Getcwd test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-cwd-{}", std::process::id()));
+    X64Linux::new(&out)
+        .run(&compile(CWD_ROOT))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&got.stdout), "chdir=0\ncwd=/\n");
+}
+
+// ---- Getppid / Getuid (os.hc) ----
+
+const IDS_PROG: &str = r#"
+    #include <os.hc>
+    U0 Main() { "ppid=%d uid=%d gid=%d\n", Getppid() > 0, Getuid() >= 0, Getgid() >= 0; }
+    Main;
+"#;
+
+#[test]
+fn interp_getppid_getuid_are_sane() {
+    let out = run_to_string(&compile(IDS_PROG)).unwrap_or_else(|e| panic!("interp: {e}"));
+    assert_eq!(out, "ppid=1 uid=1 gid=1\n");
+}
+
+#[test]
+fn native_arm64_getppid_getuid_are_sane() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native id test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let bin = std::env::temp_dir().join(format!("solomon-ids-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(IDS_PROG))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ppid=1 uid=1 gid=1\n");
+}
+
+#[test]
+fn native_x86_64_freestanding_getppid_getuid() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 id test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-ids-{}", std::process::id()));
+    X64Linux::new(&out)
+        .run(&compile(IDS_PROG))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&got.stdout), "ppid=1 uid=1 gid=1\n");
+}
+
+// ---- Environ (os.hc) ----
+
+const ENVIRON_PROG: &str = r#"
+    #include <os.hc>
+    #include <cstr.hc>
+    U0 Main() {
+      Vec env;
+      Environ(&env);
+      I64 i, all_kv = 1;
+      for (i = 0; i < env.len; i++)
+        if (StrChr(*(U8 **)VecAt(&env, i), '=') == NULL) all_kv = 0;
+      "count>0=%d all_kv=%d\n", env.len > 0, all_kv;
+      VecFree(&env);
+    }
+    Main;
+"#;
+
+#[test]
+fn interp_environ_collects_entries() {
+    let out = run_to_string(&compile(ENVIRON_PROG)).unwrap_or_else(|e| panic!("interp: {e}"));
+    assert_eq!(out, "count>0=1 all_kv=1\n");
+}
+
+#[test]
+fn native_arm64_environ_collects_entries() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native Environ test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let bin = std::env::temp_dir().join(format!("solomon-environ-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(ENVIRON_PROG))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let out = Command::new(&bin).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "count>0=1 all_kv=1\n");
+}
+
+#[test]
+fn native_x86_64_freestanding_environ() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 Environ test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-environ-{}", std::process::id()));
+    X64Linux::new(&out)
+        .run(&compile(ENVIRON_PROG))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let got = Command::new(&out).output().unwrap_or_else(|e| panic!("run: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&got.stdout), "count>0=1 all_kv=1\n");
 }

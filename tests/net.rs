@@ -43,7 +43,7 @@ fn echo_program(port: u16) -> String {
         #include <net.hc>
         U0 Main() {{
           I64 fd = TcpConnect(ParseIPv4("127.0.0.1"), {port});
-          if (fd < 0) {{ "connect: %s\n", StrError(-fd); return; }}
+          if (fd < 0) {{ "connect failed: %d\n", -fd; return; }}
           Write(fd, "ping", 4);
           U8 buf[64];
           I64 n = Read(fd, buf, 64);

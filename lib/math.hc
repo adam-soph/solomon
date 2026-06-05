@@ -9,7 +9,7 @@
 // classification ops are split into `<bits.hc>` (included below); the bulky special
 // functions (Erf/Gamma/Bessel) into `<special.hc>`. Include with `#include <math.hc>`.
 
-#include <bits.hc>   // __F64Bits, Float64bits/frombits, IsNaN/IsInf/Inf/NaN/Signbit/Copysign
+#include <bits.hc>   // _F64Bits, Float64bits/frombits, IsNaN/IsInf/Inf/NaN/Signbit/Copysign
 
 #define PI      3.14159265358979311600
 #define HALF_PI 1.57079632679489655800
@@ -53,12 +53,12 @@ F64 FMin(F64 a, F64 b) { if (a < b) return a; return b; }
 F64 FMax(F64 a, F64 b) { if (a > b) return a; return b; }
 F64 Clamp(F64 x, F64 lo, F64 hi) { return FMax(lo, FMin(x, hi)); }
 
-// Absolute value: clear the IEEE-754 sign bit (`__F64Bits` from <bits.hc> puns the
+// Absolute value: clear the IEEE-754 sign bit (`_F64Bits` from <bits.hc> puns the
 // double to its pattern). Exact libm semantics — `Fabs(-0.0)` is `+0.0`, NaN is made
 // positive — unlike a `x < 0 ? -x : x` test.
 F64 Fabs(F64 x)
 {
-  __F64Bits v;
+  _F64Bits v;
   v.f = x;
   v.u = v.u & 0x7FFFFFFFFFFFFFFF;
   return v.f;
@@ -73,11 +73,11 @@ F64 Fabs(F64 x)
 // equivalent; a later compiler pass may recognise this and emit `fsqrt`/`sqrtsd`.)
 F64 Sqrt(F64 x)
 {
-  __F64Bits b;
+  _F64Bits b;
   b.f = x;
   U64 bits = b.u;
   if ((bits & 0x7FFFFFFFFFFFFFFF) == 0) return x;                 // ±0
-  if (bits & 0x8000000000000000) { __F64Bits n; n.u = 0x7FF8000000000000; return n.f; } // x<0 → NaN
+  if (bits & 0x8000000000000000) { _F64Bits n; n.u = 0x7FF8000000000000; return n.f; } // x<0 → NaN
   if ((bits >> 52) == 0x7FF) return x;                            // +inf or NaN
 
   // Normalise a subnormal into the normal range (√ of a subnormal is normal).
@@ -93,7 +93,7 @@ F64 Sqrt(F64 x)
   I64 e = (I64)((bits >> 52) & 0x7FF) - 1023;
   I64 k = e >> 1;
   I64 e2 = e - (k << 1);
-  __F64Bits fb;
+  _F64Bits fb;
   fb.u = (bits & 0x000FFFFFFFFFFFFF) | (((U64)(e2 + 1023)) << 52);
   F64 f = fb.f;
 
@@ -117,7 +117,7 @@ F64 Sqrt(F64 x)
   y = y + r / (y + y);
 
   // result = y·2^k (exact: add k to the exponent field).
-  __F64Bits rb;
+  _F64Bits rb;
   rb.f = y;
   I64 yexp = (I64)((rb.u >> 52) & 0x7FF);
   rb.u = (rb.u & 0x800FFFFFFFFFFFFF) | (((U64)(yexp + k)) << 52);
@@ -301,7 +301,7 @@ I64 Ilogb(F64 x)
 {
   if (x == 0.0) return -2147483648;
   if (x != x || IsInf(x, 0)) return 2147483647;
-  __F64Bits v;
+  _F64Bits v;
   v.f = x;
   I64 e = (v.u >> 52) & 0x7FF;
   if (e == 0) { v.f = x * 18446744073709551616.0; e = ((v.u >> 52) & 0x7FF) - 64; } // subnormal
@@ -319,7 +319,7 @@ F64 Logb(F64 x)
 F64 Frexp(F64 f, I64 *exp)
 {
   if (f == 0.0 || f != f || IsInf(f, 0)) { *exp = 0; return f; }
-  __F64Bits v;
+  _F64Bits v;
   v.f = f;
   I64 e = (v.u >> 52) & 0x7FF;
   if (e == 0) { v.f = f * 18446744073709551616.0; e = ((v.u >> 52) & 0x7FF) - 64; } // subnormal
@@ -428,7 +428,7 @@ F64 Nextafter(F64 x, F64 y)
 {
   if (x != x || y != y) return NaN();
   if (x == y) return y;
-  __F64Bits v;
+  _F64Bits v;
   if (x == 0.0) { v.u = 1; if (y < 0.0) v.u = 0x8000000000000001; return v.f; }
   v.f = x;
   if ((y > x) == (x > 0.0)) v.u = v.u + 1; else v.u = v.u - 1;

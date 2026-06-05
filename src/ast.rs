@@ -10,13 +10,23 @@
 
 use std::cell::RefCell;
 
-use crate::token::{Keyword, Span};
+use crate::token::{FileInfo, Keyword, Span};
 
 /// A whole translation unit. HolyC is script-like: the top level is just a
 /// sequence of statements, which may include function and class definitions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Program {
     pub items: Vec<Stmt>,
+    /// The source files seen during parsing, indexed by `Span::file`. Carries each
+    /// file's directory for `_`-directory privacy checks in sema. Provenance
+    /// metadata, so — like spans — it is ignored by `PartialEq`.
+    pub files: Vec<FileInfo>,
+}
+
+impl PartialEq for Program {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
 }
 
 /// A HolyC type. Pointers and arrays wrap a base type.
@@ -462,6 +472,99 @@ fn expr_calls(e: &Expr, names: &[&str]) -> bool {
         ExprKind::Member { base, .. } => expr_calls(base, names),
         ExprKind::InitList(es) | ExprKind::Comma(es) => es.iter().any(|e| expr_calls(e, names)),
         ExprKind::DesignatedInit(fs) => fs.iter().any(|(_, e)| expr_calls(e, names)),
+    }
+}
+
+/// Whether the program references any of `names` as a bare identifier (used to decide
+/// whether to capture the command line for the implicit `argc`/`argv`).
+pub fn program_uses_ident(program: &Program, names: &[&str]) -> bool {
+    program.items.iter().any(|s| stmt_uses_ident(s, names))
+}
+
+fn stmt_uses_ident(s: &Stmt, names: &[&str]) -> bool {
+    match &s.kind {
+        StmtKind::Empty
+        | StmtKind::Default
+        | StmtKind::SwitchStart
+        | StmtKind::SwitchEnd
+        | StmtKind::Break
+        | StmtKind::Continue
+        | StmtKind::Goto(_)
+        | StmtKind::Label(_)
+        | StmtKind::Class(_)
+        | StmtKind::Include(_) => false,
+        StmtKind::Expr(e) => expr_uses_ident(e, names),
+        StmtKind::Block(ss) => ss.iter().any(|s| stmt_uses_ident(s, names)),
+        StmtKind::VarDecl { decls } => decls
+            .iter()
+            .any(|d| d.init.as_ref().is_some_and(|e| expr_uses_ident(e, names))),
+        StmtKind::If { cond, then, else_ } => {
+            expr_uses_ident(cond, names)
+                || stmt_uses_ident(then, names)
+                || else_.as_ref().is_some_and(|s| stmt_uses_ident(s, names))
+        }
+        StmtKind::While { cond, body } | StmtKind::Switch { cond, body } => {
+            expr_uses_ident(cond, names) || stmt_uses_ident(body, names)
+        }
+        StmtKind::DoWhile { body, cond } => {
+            stmt_uses_ident(body, names) || expr_uses_ident(cond, names)
+        }
+        StmtKind::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.as_ref().is_some_and(|s| stmt_uses_ident(s, names))
+                || cond.as_ref().is_some_and(|e| expr_uses_ident(e, names))
+                || step.as_ref().is_some_and(|e| expr_uses_ident(e, names))
+                || stmt_uses_ident(body, names)
+        }
+        StmtKind::Case { lo, hi } => {
+            expr_uses_ident(lo, names) || hi.as_ref().is_some_and(|e| expr_uses_ident(e, names))
+        }
+        StmtKind::Return(e) => e.as_ref().is_some_and(|e| expr_uses_ident(e, names)),
+        StmtKind::Func(f) => f
+            .body
+            .as_ref()
+            .is_some_and(|b| b.iter().any(|s| stmt_uses_ident(s, names))),
+    }
+}
+
+fn expr_uses_ident(e: &Expr, names: &[&str]) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => names.contains(&n.as_str()),
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Sizeof(_)
+        | ExprKind::Offset { .. } => false,
+        ExprKind::Call { callee, args } => {
+            expr_uses_ident(callee, names) || args.iter().any(|a| expr_uses_ident(a, names))
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Postfix { expr, .. }
+        | ExprKind::Cast { expr, .. } => expr_uses_ident(expr, names),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_uses_ident(lhs, names) || expr_uses_ident(rhs, names)
+        }
+        ExprKind::Assign { target, value, .. } => {
+            expr_uses_ident(target, names) || expr_uses_ident(value, names)
+        }
+        ExprKind::Ternary { cond, then, else_ } => {
+            expr_uses_ident(cond, names)
+                || expr_uses_ident(then, names)
+                || expr_uses_ident(else_, names)
+        }
+        ExprKind::Index { base, index } => {
+            expr_uses_ident(base, names) || expr_uses_ident(index, names)
+        }
+        ExprKind::Member { base, .. } => expr_uses_ident(base, names),
+        ExprKind::InitList(es) | ExprKind::Comma(es) => {
+            es.iter().any(|e| expr_uses_ident(e, names))
+        }
+        ExprKind::DesignatedInit(fs) => fs.iter().any(|(_, e)| expr_uses_ident(e, names)),
     }
 }
 

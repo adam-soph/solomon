@@ -4,6 +4,8 @@
 use solomon::interp::run_to_string;
 use solomon::parser::parse_with;
 
+mod common;
+
 /// Parse and run a sample, returning everything it printed. Examples carry their
 /// own `#include <string.hc>`, resolved against the repo `lib/`.
 fn run(name: &str, src: &str) -> String {
@@ -42,7 +44,90 @@ fn hmap_lookup_returns_value_and_found() {
          missing: found=0 value=0\n\
          two=22 one=1 f=15\n\
          has(a)=1 del(a)=1 has(a)=0\n\
-         del(missing)=0 len=8\n"
+         del(missing)=0 len=8\n\
+         b=11 c=12 d=13 e=14 f=15 one=1 two=22 zero=0 \n\
+         sum=88 count=8\n\
+         b:11 c:12 d:13 e:14 f:15 one:1 two:22 zero:0 \n"
+    );
+}
+
+// ---- container-library edge cases (interpreter-pinned; the source is shared with the
+// arm64-Darwin native-parity tests in tests/arm64_darwin.rs) ----
+
+#[test]
+fn sort_handles_edge_inputs_and_bsearch() {
+    // single/reverse/duplicate inputs over a heap buffer, the insertion- and
+    // quicksort paths, and BSearch hit/miss.
+    let out = run("sort_edges", common::LIB_SORT_EDGES);
+    assert_eq!(
+        out,
+        "42 \n\
+         1 2 3 4 5 6 \n\
+         1 1 1 2 3 3 3 \n\
+         f2=1 f9=0 f0=0\n\
+         sorted50=1\n"
+    );
+}
+
+#[test]
+fn vec_sort_and_bsearch_indices() {
+    let out = run("vec_search", common::LIB_VEC_SEARCH);
+    assert_eq!(
+        out,
+        "1 1 2 3 5 5 9 9 \n\
+         i1=1 i9=6 i4=-1 i0=-1 i100=-1\n"
+    );
+}
+
+#[test]
+fn hmap_i64_keys_values_entries() {
+    // I64 keys, update + delete, rehash (12 inserts over 8 buckets), then HmapValues
+    // (order-independent sum) and HmapEntries sorted by key.
+    let out = run("hmap_i64", common::LIB_HMAP_I64);
+    assert_eq!(
+        out,
+        "len=10\n\
+         sum=1359\n\
+         1=1 2=4 3=9 4=16 5=999 6=36 7=49 8=64 9=81 10=100 \n"
+    );
+}
+
+#[test]
+fn generic_classes_monomorphize() {
+    let out = run("generic.hc", include_str!("../examples/generic.hc"));
+    assert_eq!(
+        out,
+        "ints: len=3 max=30\n\
+         flts: 1.5 + 2.5 = 4.0\n"
+    );
+}
+
+#[test]
+fn hmap_enumeration_on_empty_map() {
+    let out = run("hmap_empty", common::LIB_HMAP_EMPTY);
+    assert_eq!(out, "len=0 k=0 v=0 e=0\nget=0 del=0 has=0\n");
+}
+
+#[test]
+fn exit_halts_execution() {
+    // `Exit` (the ambient builtin) stops the program at the call — output before it is
+    // flushed, nothing after runs.
+    let out = run(
+        "exit",
+        "#include <os.hc>\nU0 Main() { \"a\\n\"; Exit(3); \"b\\n\"; } Main;",
+    );
+    assert_eq!(out, "a\n");
+}
+
+#[test]
+fn sort_orders_ints_and_strings_generically() {
+    let out = run("sort.hc", include_str!("../examples/sort.hc"));
+    assert_eq!(
+        out,
+        "0 1 2 3 4 5 6 7 8 9 \n\
+         find 7 -> 7\n\
+         find 100 -> -1\n\
+         apple banana cherry pear \n"
     );
 }
 

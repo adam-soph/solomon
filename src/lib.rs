@@ -65,11 +65,14 @@ pub fn stdlib_dirs() -> Vec<std::path::PathBuf> {
 /// and needs no `lib/` on disk. Editing a `lib/*.hc` file triggers a recompile
 /// (Cargo tracks `include_str!` inputs), keeping the embedded copy in sync.
 pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
+    ("builtin.hc", include_str!("../lib/builtin.hc")),
     ("cstr.hc", include_str!("../lib/cstr.hc")),
     ("ctype.hc", include_str!("../lib/ctype.hc")),
     ("mem.hc", include_str!("../lib/mem.hc")),
     ("vec.hc", include_str!("../lib/vec.hc")),
+    ("sort.hc", include_str!("../lib/sort.hc")),
     ("hmap.hc", include_str!("../lib/hmap.hc")),
+    ("_impl/strhash.hc", include_str!("../lib/_impl/strhash.hc")),
     ("fmt.hc", include_str!("../lib/fmt.hc")),
     ("bignum.hc", include_str!("../lib/bignum.hc")),
     ("strconv.hc", include_str!("../lib/strconv.hc")),
@@ -79,6 +82,7 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("rand.hc", include_str!("../lib/rand.hc")),
     ("time.hc", include_str!("../lib/time.hc")),
     ("io.hc", include_str!("../lib/io.hc")),
+    ("os.hc", include_str!("../lib/os.hc")),
     ("net.hc", include_str!("../lib/net.hc")),
     ("thread.hc", include_str!("../lib/thread.hc")),
     ("sync.hc", include_str!("../lib/sync.hc")),

@@ -29,6 +29,7 @@
 // with `VecClone` (not `=`), free with `VecFree`.
 
 #include <mem.hc>
+#include <sort.hc>   // VecSort/VecBSearch wrap the generic Sort/BSearch
 
 class Vec {
   U8 *data;    // heap buffer of `cap * esize` bytes, or NULL before first allocation
@@ -99,6 +100,21 @@ U0 VecClone(Vec *dst, Vec *src)
   VecReserve(dst, src->len);
   MemCpy(dst->data, src->data, src->len * src->esize);
   dst->len = src->len;
+}
+
+// Sort the elements in place by `cmp` (a `<sort.hc>` comparator over element pointers).
+U0 VecSort(Vec *v, I64 (*cmp)(U8 *, U8 *))
+{
+  Sort(v->data, v->len, v->esize, cmp);
+}
+
+// Binary-search a sorted `Vec` for `key` (a pointer to a key element). Returns the
+// element index, or -1 if absent.
+I64 VecBSearch(Vec *v, U8 *key, I64 (*cmp)(U8 *, U8 *))
+{
+  U8 *p = BSearch(key, v->data, v->len, v->esize, cmp);
+  if (p == NULL) return -1;
+  return (p - v->data) / v->esize;
 }
 
 #endif

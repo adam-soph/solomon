@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::codegen::Codegen;
-use solomon::parser::parse;
+use solomon::parser::parse_with;
 use solomon::sema::check_program;
 use solomon::x86_64::X64Windows;
 
@@ -23,7 +23,9 @@ fn temp_out() -> std::path::PathBuf {
 
 /// Compile `src` to a PE image (written to a temp file, then read back).
 fn build_pe(src: &str) -> Vec<u8> {
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    // `parse_with` so the implicit `builtin.hc` prelude (ArgC/ArgV/…) is in scope.
+    let program = parse_with(src, std::path::Path::new("."), &[])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
     let out = temp_out();
@@ -192,7 +194,7 @@ fn printing_lowers_to_getstdhandle_then_writefile() {
 fn args_capture_calls_getcommandline() {
     // A program using ArgC/ArgV captures the command line at the entry: the first
     // `call [rip]` after the frame prologue is `GetCommandLineA`.
-    let pe = build_pe("\"%d\\n\", ArgC();");
+    let pe = build_pe("\"%d\\n\", ArgC;");
     // The capture opens with `sub rsp, 32; call [rip]` (shadow space + the call).
     let at = find_code(&pe, &[0x48, 0x83, 0xEC, 0x20, 0xFF, 0x15]);
     assert_eq!(call_target(&pe, at + 4), "GetCommandLineA");

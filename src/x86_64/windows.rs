@@ -158,6 +158,15 @@ impl OsTarget for WindowsTarget {
         self.call_aligned(asm, "Sleep");
     }
 
+    fn emit_capture_env(&mut self, asm: &mut Asm, envp_off: i32) {
+        // Windows has no `envp` array (its environment is a NUL-separated block from
+        // GetEnvironmentStringsA, a different shape). Until that's parsed, expose
+        // `EnvP` as NULL — `Environ` is then empty and a future `Getenv` returns NULL.
+        asm.xor_rr(RAX, RAX);
+        asm.lea_global(RCX, envp_off);
+        asm.store_qword_at(RCX, RAX);
+    }
+
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {
         // Windows hands the entry no argv, so build one from GetCommandLineA: get
         // the command line, allocate a page for the argv pointer array, then split

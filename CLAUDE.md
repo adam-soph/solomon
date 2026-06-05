@@ -379,10 +379,13 @@ interpreter dispatches behaviour, and the arm64 backend lowers via `libc_symbol(
 The registry is now **just `ArgC`/`ArgV` and the `VarArg*` accessors** — the
 primitives that can't be library functions at all (they read hidden globals / need
 ABI support, with no `#include`). Everything else became a lib function or
-`Primitive` intrinsic: the printf family → `lib/fmt.hc`; the heap
-`MAlloc`/`Free`/`HeapExtend`/`MSize` → `lib/mem.hc`; the clock `UnixNS`/`NanoNS`/
-`Sleep` → `lib/time.hc`; the fd I/O primitives `Open`/`LSeek`/`Read`/`Write`/`Close`
-→ `lib/io.hc` (files) and the socket pair `Socket`/`Connect` → `lib/net.hc`; the
+`Primitive` intrinsic: the printf family → `lib/fmt.hc`; the heap — the universal
+`MAlloc`/`Free` pair → the implicit prelude `lib/builtin.hc` (ambient, no `#include`),
+the advanced `HeapExtend`/`MSize` → `lib/mem.hc`; the clock
+`UnixNS`/`NanoNS`/`Sleep` → `lib/time.hc`; the fd I/O primitives
+`Open`/`LSeek`/`Read`/`Write`/`Close` → `lib/io.hc` (files), the socket pair
+`Socket`/`Connect` → `lib/net.hc`; the process/OS group `Exit`/`Getpid` and the
+filesystem mutations `Remove`/`Rename`/`Mkdir` → `lib/os.hc`; the
 thread primitives `Thread`/`Join` → `lib/thread.hc`; the atomics
 `AtomicLoad`/`AtomicStore`/`AtomicAdd`/`AtomicSwap`/`AtomicCas` → `lib/sync.hc`;
 `Sqrt`/`Fabs` + rounding/transcendentals → `lib/math.hc`; `StrToF64`/`F64ToStr` →
@@ -413,7 +416,11 @@ table, Darwin wraps libc `malloc`/`free` with the header); **no algebraic float
 ops** — `Sqrt` (a correctly-rounded Newton + Dekker-residual implementation) and
 `Fabs` (a `union` sign-bit clear) are both pure HolyC in `lib/math.hc` now, so a
 program with no special needs links no math builtin at all; the
-captured command line `ArgC`/`ArgV`; the variadic-argument accessors
+captured command line `ArgC`/`ArgV` and the environment `EnvP` (a NULL-terminated
+`U8 **` of "KEY=VALUE" strings — captured at the entry like the command line: from
+`main`'s 3rd arg on Darwin/x2, off the initial stack past argv freestanding, NULL on
+Windows; the interpreter builds it from the real `std::env`); the variadic-argument
+accessors
 `VarArgCnt`/`VarArgI64`/`VarArgF64`/`VarArg` (need ABI support); and the impure
 clock primitives `UnixNS`/`NanoNS`/`Sleep` (below). `NULL`/`TRUE`/`FALSE` are const
 builtins. **Everything reducible now lives in `lib/*.hc`** as pure HolyC built on
@@ -431,9 +438,10 @@ includable on its own:
   `StrChr`/`StrLastChr`/`StrSpn`/`StrCSpn`/`StrToUpper`/`StrToLower`/`StrRev`, and
   number conversion (`StrToI64`/`I64ToStr`, and `F64ToStr` = `StrPrint("%g")`). (The
   `Abs`/`Sign` integer helpers moved to `<math.hc>`, next to the float ops.)
-- `lib/mem.hc` — raw memory + the **heap intrinsics** (`MAlloc`/`Free`/`HeapExtend`/
-  `MSize` prototypes — the compiler is their implementation), the `mem*` family
-  (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`), and `ReAlloc` over
+- `lib/mem.hc` — raw memory + the **advanced heap intrinsics** (`HeapExtend`/`MSize`
+  prototypes — the compiler is their implementation; the universal `MAlloc`/`Free` pair
+  is in the prelude `lib/builtin.hc` instead, ambient with no `#include`), the `mem*`
+  family (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`), and `ReAlloc` over
   `HeapExtend`.
 - `lib/fmt.hc` — the **printf-family intrinsics**: `Print`/`StrPrint`/`CatPrint`/
   `MStrPrint` prototypes (the backends render them; bare strings and the `"fmt", args`
@@ -461,12 +469,44 @@ includable on its own:
   `Pt *p = VecPush(&v); p->x = 1`, `*(F64 *)VecAt(&v, i)`. Working through the heap
   buffer pointer (never copying a local's bytes) keeps it conformant; pointer and
   class-value elements work because the interpreter byte-serialises pointers through
-  its `PtrTable` (see below).
-  `VecInit`/`VecFree`/`VecClear`/`VecReserve`/`VecPush`/`VecPop`/`VecAt`/`VecClone`.
+  its `PtrTable` (see below). It `#include`s `<sort.hc>` and owns the sort conveniences
+  `VecSort(&v, cmp)` / `VecBSearch(&v, key, cmp)` (the latter returns an index, or -1).
+  `VecInit`/`VecFree`/`VecClear`/`VecReserve`/`VecPush`/`VecPop`/`VecAt`/`VecClone`/
+  `VecSort`/`VecBSearch`.
+- `lib/hmap.hc` — `class Hmap`, an owning, **generic** hash map (separate chaining over
+  a growing bucket array on `<mem.hc>`). Like `Vec` it's generic over *bytes*:
+  `HmapInit(&m, ksize, vsize, hash, eq, copy)` picks the key/value sizes and the key's
+  behaviour as **three function pointers** — `hash`/`eq` over key slots and `copy` (a
+  *typed* move, not `MemCpy`, because `MemCpy` byte-indexing through a `&local` is out
+  of bounds in the interpreter and a pointer key must keep its `PtrTable` identity).
+  Each entry is a raw `MAlloc`'d byte block `[next ptr | key | value]` chained through
+  its leading pointer; keys/values are emplace-accessed (`*(I64 *)HmapPut(&m, &k) = v`;
+  `HmapGet` returns `(U8 *value, Bool found)` — the flag a sentinel can't express). Two
+  stock key kinds ship: `HmapI64{Hash,Eq,Copy,Cmp}` (8-byte POD keys) and
+  `HmapStr{Hash,Eq,Copy,Cmp}` (`U8 *` keys — stores the **pointer**, `StrCmp`/djb2 via
+  the private `<_impl/strhash.hc>` `Djb2`, so a string key must outlive the map). A
+  program wraps these into a typed facade (e.g. `examples/hmap.hc`'s string→I64 `Si*`).
+  It `#include`s `<vec.hc>` for its sort/iteration: `HmapKeys`/`HmapValues` collect keys
+  or values into a `Vec`, `HmapEntries` collects `[key | value]` blocks (key at offset 0,
+  so the stock comparators sort entries by key directly), and `HmapSortKeys(m, &out, cmp)`
+  (e.g. `&HmapStrCmp`) returns the keys in sorted order.
+  `HmapInit`/`HmapFree`/`HmapPut`/`HmapGet`/`HmapHas`/`HmapDel`/`HmapLen`/`HmapKeys`/
+  `HmapValues`/`HmapEntries`/`HmapSortKeys`.
+- `lib/sort.hc` — generic sorting + binary search (the `qsort`/`bsearch` pair),
+  **standalone** (no other library dependency). Element size is a parameter and order is
+  a caller comparator `I64 (*cmp)(U8 *a, U8 *b)` (<0/0/>0, like `StrCmp`).
+  `Sort(base, n, esize, cmp)` is a median-of-three quicksort with an insertion-sort
+  cutoff (not stable); element moves are a **byte-wise `SortSwap`** (a scalar byte temp,
+  no buffer — so it works through the interpreter's heap byte buffers and moves
+  serialised pointer/class bytes verbatim). `BSearch(key, base, n, esize, cmp)` returns a
+  matching element pointer or NULL. The container conveniences live in the containers
+  that `#include` this — `<vec.hc>`'s `VecSort`/`VecBSearch` and `<hmap.hc>`'s
+  `HmapSortKeys` — one quicksort serving every element type (see `examples/sort.hc`: I64
+  and string vectors).
 
 The math library is layered into four modules (each includes the one below):
 
-- `lib/bits.hc` — the lowest layer: the `__F64Bits` union and the IEEE bit/
+- `lib/bits.hc` — the lowest layer: the `_F64Bits` union and the IEEE bit/
   classification ops (`Float64bits`/`Float64frombits`/`NaN`/`Inf`/`IsNaN`/`IsInf`/
   `Signbit`/`Copysign`), pure bit manipulation with no other dependency.
 - `lib/math.hc` — elementary functions (includes `<bits.hc>`): `Fabs` (a `union`
@@ -485,7 +525,7 @@ The math library is layered into four modules (each includes the one below):
   function / gamma families (`Erf`/`Erfc`/`Erfinv`/`Erfcinv`/`Gamma`/`Lgamma`) and
   Bessel (`J0`/`J1`/`Jn`/`Y0`/`Y1`/`Yn` — series for small x, asymptotic beyond,
   Miller recurrence). Split out because they're rarely used.
-- `lib/rand.hc` — the deterministic `RandU64` splitmix64 over a `__rand_state`
+- `lib/rand.hc` — the deterministic `RandU64` splitmix64 over a `_rand_state`
   global (fixed zero seed), plus `SeedRand(seed)` to start a different deterministic
   stream. Standalone (no math dependency).
 - `lib/io.hc` — file-descriptor I/O. The raw `Open`/`LSeek`/`Read`/`Write`/`Close`
@@ -501,9 +541,10 @@ The math library is layered into four modules (each includes the one below):
   (Darwin + the interpreter translate); the mode is `MODE_0644 = 0644` (octal). On top
   it builds `WriteAll`/`ReadFile`/`WriteFile`/
   `AppendFile`/`FileSize`. Impure, so property-tested (`tests/io.rs`: write→read a
-  temp file, same stdout on the interpreter, arm64 Darwin, and both freestanding ELFs
-  under `docker`). The interpreter emulates fds over `std::fs`/`std::net` in a unified
-  `fds` table (`FdObj::{PendingSocket,Tcp,File}`).
+  temp file, same stdout on the interpreter, arm64 Darwin, and both freestanding ELFs).
+  The interpreter emulates fds over `std::fs`/`std::net` in a unified `fds` table
+  (`FdObj::{PendingSocket,Tcp,File}`). (Filesystem *mutation* — `Remove`/`Rename`/`Mkdir`
+  — lives in `<os.hc>`.)
 - `lib/net.hc` — TCP networking; `#include <io.hc>` for the shared
   `Read`/`Write`/`Close`/`WriteAll`. The socket-specific `Socket`/`Connect`
   `Primitive` intrinsics lower to libc on Darwin and raw socket **syscalls**
@@ -512,6 +553,28 @@ The math library is layered into four modules (each includes the one below):
   `sockaddr_in` in a `U8[16]`), `TcpConnect`, and a minimal `HttpGet`. Property-tested
   (`tests/net.rs`: an echo round-trip on the interpreter, arm64 Darwin, and both
   freestanding ELFs under `docker` with an in-container `socat` echo).
+- `lib/os.hc` — process and OS helpers. Process control: `Exit(code)` (freestanding
+  `exit_group` 94/231, Darwin libc `exit`, Windows `ExitProcess` via the OsTarget
+  `emit_exit` seam; the interpreter halts the run via an `exit_code` field) and the id
+  reads `Getpid`/`Getppid`/`Getuid`/`Getgid` (no-arg syscalls 172/173/174/176 arm64,
+  39/110/102/104 x86-64, Darwin libc `_getpid`/`_getppid`/`_getuid`/`_getgid`; the
+  interpreter uses `std::process::id`/`parent_id` and libc `getuid`/`getgid` FFI; impure
+  → property-tested).
+  Filesystem mutation `Remove`/`Rename`/`Mkdir` and `Chdir` (`gen_fsop`, all 0/-errno):
+  freestanding aarch64 `*at` syscalls (`unlinkat`/`renameat`/`mkdirat` + AT_FDCWD, no
+  bare form; `chdir` 49 is bare) or x86-64 bare `unlink` 87/`rename` 82/`mkdir` 83/`chdir`
+  80, Darwin libc with the `-1`→`-errno` conversion (`darwin_errno_neg`, shared with
+  `Open`); interp over `std::fs`/`std::env`. `Getcwd(buf, size)` (`gen_getcwd`) is the
+  one with a return to normalise — the `getcwd` syscall (arm64 17/x86-64 79) returns a
+  length, Darwin libc returns the buffer pointer, both mapped to 0-on-success/`-errno`.
+  And the environment accessors `Getenv(name)`/`Environ(&out)` are
+  **pure HolyC** over the implicit `EnvP` array (the irreducible bit is the entry-time
+  env capture; the search/collection is reducible, so library functions not builtins) —
+  `Getenv` returns a pointer to the value after `name=` or NULL; `Environ` collects every
+  "KEY=VALUE" entry into a `<vec.hc>` Vec (so `os.hc` `#include`s `<vec.hc>`). Both guard
+  `EnvP == NULL` (the Windows case). All property-tested in `tests/io.rs` (interp + arm64
+  Darwin local, freestanding on CI), with looked-up env values scoped to the child via
+  `Command::env`.
 - `lib/thread.hc` — POSIX-style threads: `Thread(fn, arg)` / `Join(handle)`
   (`Primitive` intrinsics). Darwin lowers to libc `pthread_create`/`pthread_join` (the
   HolyC `I64 Fn(I64)` matches the `void *(*)(void *)` start-routine ABI exactly, so the
@@ -616,6 +679,20 @@ from one `keywords!` table to avoid drift.
   is a call (`Main;` runs `Main()`).
 - **Calls must resolve** to a defined function or a registered builtin — an
   unknown call is a compile-time error (no implicit-extern fallback).
+- **`_`-directory privacy** (Go's `internal/`, generalized to *any* directory
+  whose name begins with `_`, and applied to all code — stdlib and user programs
+  alike): a function or `class`/`union` defined in a file under a `_`-prefixed
+  directory may be referenced only from files in that directory's **parent**
+  subtree; anyone else gets a compile-time error. It's a **sema-only** check (no
+  effect on the interpreter or backends): the preprocessor stamps each token's
+  `Span::file` with an index into a per-program file table (`Program::files`,
+  `FileInfo` — each file's directory components + computed privacy root), the
+  parser carries that file id onto AST-node spans via `Mark`, and sema's
+  `check_private_access` gates `check_call` (functions) and `resolve_type`
+  (types) by `FileInfo::visible_to`. The embedded stdlib is its own root
+  namespace (`<stdlib>`), so e.g. `lib/_impl/strhash.hc`'s `Djb2` is private to
+  the rest of the library (used by `lib/hmap.hc`'s `HmapStrHash`) but a compile error
+  from user code. (Globals are not yet gated.) Tested in `tests/privacy.rs`.
 - **`switch`** takes `switch (x)` or the bracketed `switch [x]` (parsed
   identically). A body may carry `start:` / `end:` sub-labels (the `Start`/`End`
   keywords, `StmtKind::SwitchStart`/`SwitchEnd`): `start:` is a **prologue** run
@@ -789,8 +866,48 @@ returning a function pointer" form usable (`BinOp Pick(){...}`). Aliases are
 resolved at parse time (`Parser::type_aliases`, in `parse_base_type`), so they
 never reach the AST as `Named` types and must be defined before use; they are
 not hoisted (the C rule). The bracketed `switch [x]` form and `start:` / `end:`
-sub-labels (prologue/epilogue) are lowered in both backends. Still genuinely
-absent: most of the TempleOS core/standard library and DolDoc.
+sub-labels (prologue/epilogue) are lowered in both backends.
+
+**Generic classes (monomorphization).** `class Vec<T> { T *data; … }` declares a
+generic `class`/`union` template; each use in **type position** (`Vec<I64>`,
+`Pair<I64, F64>`, nested `Vec<Vec<I64>>`) is monomorphized at **parse time** into a
+concrete synthetic class with the parameters substituted — `Vec_I64`, `Pair_I64_F64`
+(mangled via `mangle_generic`/`mangle_type`, pointer args as `PU8` etc.). The parser
+records templates in `Parser::generic_classes` (define-before-use, like `typedef`),
+`parse_base_type` detects `Name<args>` and calls `instantiate_generic` (substitute via
+`subst_type`, dedup by mangled name in `generic_done`, inject the concrete `ClassDef`
+through the existing `pending_types` path). So sema/layout/all backends only ever see
+ordinary concrete classes — **no downstream changes**. Arg type-args parse recursively,
+giving nesting/fixpoint for free; nested `Vec<Vec<I64>>` works because `expect_generic_gt`
+splits the `>>` (`Shr`) token.
+
+**Generic functions (monomorphization).** `T VecPush<T>(Vec<T> *v, T x) { … }` declares a
+generic function; a call `VecPush<I64>(&v, x)` monomorphizes it to a concrete
+`VecPush_I64`. Because a function body can mention `T`/`Vec<T>` in many positions
+(params, casts, `sizeof`, locals, return), the template is captured as **raw tokens**
+(never AST-parsed in generic form): `looks_like_generic_fn` detects `Ret Name<…>(` at
+statement level (so it's recognised even when the return type is a bare type param like
+`T`), `capture_generic_fn` grabs the tokens through the body `}` and records the name +
+type-param list. A call site (`parse_postfix`) rewrites `Name<args>(…)` to a call to the
+mangled `Name_I64` and queues `(name, type-args)`. After the main parse, `parse_program`
+drains the queue: `instantiate_generic_fn` substitutes the type-param **tokens** with the
+argument's tokens (`type_to_tokens`), drops the `<T>` list, renames to the mangled name,
+and **re-parses** the result through the same parser (so `Vec<I64>` in the body
+instantiates the class and nested generic calls re-queue) — to a fixpoint, deduped by
+`generic_fn_done`. The generated concrete functions/classes are appended as top-level
+items, so again **nothing downstream changes**.
+
+Calls may give the type args **explicitly** (`VecPush<I64>(…)`) or have them
+**inferred** (`VecPush(&v, x)`). Inference is parse-time: the parser records declared
+variable/parameter types (`var_types`, recording-only so non-generic code is unaffected)
+and, for each generic function, the per-parameter [`TypePattern`]s
+(`param_type_patterns` — `T` → `Param`, `Vec<T>*` → `Ptr(Generic("Vec",[Param]))`). At an
+un-annotated call it computes each argument's static type (`arg_type`: a variable,
+`&variable`, or a literal) and unifies it against the patterns (`unify_pattern`), using
+the `generic_instances` reverse map (`Vec_I64` → `("Vec",[I64])`) so a `Vec<T>*`
+parameter matched against a `Vec_I64*` argument binds `T=I64`. If a parameter can't be
+inferred it's a clear error suggesting the explicit form. See `examples/generic.hc`.
+Still genuinely absent: most of the TempleOS core/standard library and DolDoc.
 
 The worked HolyC programs live in `examples/*.hc` (top-level), listed once in
 `tests/common/mod.rs` (`common::EXAMPLES`) and exercised by `tests/examples.rs`

@@ -1,12 +1,15 @@
 //! Tests for semantic analysis: name resolution, type checks, context rules.
 
 use solomon::ast::{StmtKind, Type};
-use solomon::parser::parse;
+use solomon::parser::{parse, parse_with};
 use solomon::sema::{SemaError, check_program};
 
-/// Parse and analyze `src`, returning the semantic errors.
+/// Parse and analyze `src`, returning the semantic errors. Uses `parse_with` so the
+/// implicit `builtin.hc` prelude (NULL/TRUE/FALSE) is in scope,
+/// and angle includes still resolve against the embedded stdlib.
 fn errs(src: &str) -> Vec<SemaError> {
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let program = parse_with(src, std::path::Path::new("."), &[])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
     check_program(&program)
 }
 
@@ -36,8 +39,9 @@ fn well_typed_program() {
 fn analysis_annotates_expression_types() {
     // After analysis the AST is typed: each expression carries its inferred
     // type, which backends (and sizeof) consume.
-    let program = parse("F64 g = 1 + 2;").unwrap();
+    let mut program = parse("F64 g = 1 + 2;").unwrap();
     assert!(check_program(&program).is_empty());
+    program.items.retain(|s| s.span.file == 0); // drop the builtin.hc prelude items
     let StmtKind::VarDecl { decls } = &program.items[0].kind else {
         panic!("expected a var decl");
     };
@@ -102,18 +106,24 @@ fn print_intrinsic_needs_its_lib_header() {
 }
 
 #[test]
-fn stdlib_builtins_are_known() {
-    // The registry is now just `ArgC`/`ArgV`/`VarArg*` — the few primitives that
-    // can't be library functions at all; they type-check with no `#include`. (The
+fn implicit_argc_argv_are_in_scope() {
+    // The command line is the implicit globals `I64 ArgC` / `U8 **ArgV`, in scope
+    // everywhere with no `#include`. A `...` function's `VargC`/`VargV` varargs locals
+    // are distinct names, so the command line stays reachable inside one too. (The
     // printf family, heap, clock, and algebraic/string/etc. ops are lib functions /
-    // intrinsics now, covered by `tests/stdlib.rs` and the conformance suites.)
-    ok("U0 F() { I64 c = ArgC(); U8 *a = ArgV(0); }");
-    ok("U0 V(I64 n, ...) { I64 k = VarArgCnt(); I64 x = VarArgI64(0); F64 f = VarArgF64(1); }");
+    // intrinsics now.)
+    ok("U0 F() { I64 c = ArgC; U8 *a = ArgV[0]; }");
+    ok("U0 V(I64 n, ...) { I64 k = VargC; I64 x = VargV[0]; F64 f = *(F64 *)&VargV[1]; }");
+    // Both namespaces coexist in a `...` function — no shadowing collision.
+    ok("U0 V(...) { I64 c = ArgC; U8 *a = ArgV[0]; I64 k = VargC; I64 x = VargV[0]; }");
 }
 
 #[test]
-fn stdlib_builtin_arity_is_checked() {
-    has("U0 F() { ArgV(); }", "expects 1 argument(s), got 0");
+fn lowercase_argc_argv_are_not_in_scope() {
+    // The command line is `ArgC`/`ArgV` (varargs `VargC`/`VargV`); the lowercase
+    // spellings are nothing special.
+    has("U0 F() { I64 c = argc; }", "undeclared");
+    has("I64 F(...) { return argv[0]; }", "undeclared");
 }
 
 // ---- name resolution ----
@@ -540,7 +550,8 @@ fn errors_carry_positions() {
 }
 
 #[test]
-fn vararg_accessors_require_a_variadic_function() {
-    has("U0 F() { VarArgI64(0); }", "only valid inside a variadic");
-    ok("I64 F(...) { return VarArgCnt() + VarArgI64(0); }");
+fn varargs_use_vargc_vargv() {
+    // Inside a `...` function `VargC`/`VargV` are the varargs (distinct from the
+    // global command-line `ArgC`/`ArgV`).
+    ok("I64 F(...) { return VargC + VargV[0]; }");
 }

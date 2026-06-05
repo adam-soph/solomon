@@ -7,15 +7,13 @@
 // so it computes identically on the interpreter and every native backend. Include
 // with `#include <mem.hc>` (idempotent via the guard above).
 //
-// The heap primitives themselves are **intrinsics**: declared here as prototypes, the
-// compiler is their implementation — an `mmap` bump allocator (freestanding) or libc
-// `malloc`/`free` (hosted). `MAlloc(n)` returns `n` uninitialised bytes; `Free(p)`
-// releases them (a no-op on the bump allocators); `HeapExtend(ptr, old, new)` grows
-// the last block in place or returns NULL; `MSize(ptr)` is the block's requested size
-// (the allocator prepends an 8-byte header when a program uses `MSize`).
+// `MAlloc`/`Free` are the universal allocator pair, so they live in the implicit
+// prelude (<builtin.hc>) and need no `#include`. The advanced heap primitives below
+// are **intrinsics** declared here — the compiler is their implementation:
+// `HeapExtend(ptr, old, new)` grows the last block in place or returns NULL; `MSize(ptr)`
+// is the block's requested size (the allocator prepends an 8-byte header when a program
+// uses `MSize`).
 
-U8 *MAlloc(I64 n);
-U0 Free(U8 *ptr);
 U8 *HeapExtend(U8 *ptr, I64 old, I64 newsz);
 I64 MSize(U8 *ptr);
 

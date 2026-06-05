@@ -61,6 +61,19 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // general fd ops shared by files and sockets; `Socket`/`Connect` are the
         // socket-specific pair. (The libs build `ReadFile`/`TcpConnect`/… on top.)
         "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" => Primitive,
+        // Filesystem mutation — `lib/os.hc` prototypes; impure, like the fd ops above.
+        // Freestanding uses the aarch64 `*at` syscalls / x86-64 bare syscalls, Darwin
+        // libc; the interpreter emulates over `std::fs`. Return 0, or `-errno`.
+        "Remove" | "Rename" | "Mkdir" => Primitive,
+        // Process control — `lib/os.hc` prototypes. `Exit(code)` terminates the process
+        // (freestanding `exit_group`, Darwin libc `exit`, Windows `ExitProcess`; the
+        // interpreter halts the run). `Getpid`/`Getppid`/`Getuid` read process ids (impure,
+        // so property-tested). All lower to a syscall / libc call.
+        "Exit" | "Getpid" | "Getppid" | "Getuid" | "Getgid" => Primitive,
+        // Working directory — `lib/os.hc` prototypes. `Chdir(path)` (chdir) and
+        // `Getcwd(buf, size)` (getcwd, return normalised to 0/-errno) over the syscall /
+        // libc; the interpreter uses `std::env`. Impure, property-tested.
+        "Chdir" | "Getcwd" => Primitive,
         // POSIX-style threads — `lib/thread.hc` prototypes; impure/concurrent (libc
         // `pthread_create`/`pthread_join` on Darwin, raw `clone(2)` freestanding), so
         // non-reproducible by value. The interpreter runs the body synchronously.

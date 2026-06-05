@@ -125,6 +125,13 @@ trait OsTarget {
     /// off the initial stack; Windows builds them from `GetCommandLineA`.
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32);
 
+    /// Capture the environment pointer (`U8 **envp`) into the BSS slot `envp_off`.
+    /// Runs just after the entry frame is set up (so `rbp` is valid), only when the
+    /// program references `EnvP`. Linux computes `&envp[0]` from the initial stack
+    /// (just past the argv NULL terminator); Windows has no `envp` array, so it
+    /// stores a NULL (env access there is unsupported for now).
+    fn emit_capture_env(&mut self, asm: &mut Asm, envp_off: i32);
+
     /// Package the emitted program into a runnable executable. Takes ownership of
     /// the `Asm` so a policy can read its layout (and, on Windows, append an import
     /// table) before calling [`Asm::finish`]; `bss` is the zero-filled BSS that
@@ -170,12 +177,20 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
     // `MSize` makes `MAlloc` prepend an 8-byte size header; gate it so programs that
     // never call `MSize` keep the lean, header-free heap byte-for-byte.
     cg.uses_msize = crate::ast::program_calls_any(program, &["MSize"]);
-    // If the program reads command-line args, reserve the argc/argv BSS slots the
-    // entry will populate; arg-free programs are left byte-for-byte unchanged.
-    if crate::ast::program_calls_any(program, &["ArgC", "ArgV"]) {
+    // The command line is exposed as the implicit globals `ArgC`/`ArgV` (the entry
+    // captures them into these BSS slots; a `...` function's `VargC`/`VargV` varargs
+    // locals are distinct names). Only when the program references them, so arg-free
+    // programs stay byte-for-byte unchanged.
+    if crate::ast::program_uses_ident(program, &["ArgC", "ArgV"]) {
         cg.uses_args = true;
         cg.argc_off = Some(cg.alloc_bss(8, 8));
         cg.argv_off = Some(cg.alloc_bss(8, 8));
+    }
+    // The environment `U8 **EnvP`, captured at the entry. Gated independently of the
+    // command line so an `EnvP`-free program is byte-for-byte unchanged.
+    if crate::ast::program_uses_ident(program, &["EnvP"]) {
+        cg.uses_env = true;
+        cg.envp_off = Some(cg.alloc_bss(8, 8));
     }
 
     // The entry runs the top-level statements; a top-level `return` exits with it.
@@ -312,9 +327,6 @@ struct Cg {
     labels: HashMap<String, usize>, // named `goto` labels in the current function
     funcs_sig: HashMap<String, (Vec<Type>, Type)>, // name -> (param types, return type)
     funcs_va: HashMap<String, bool>, // name -> is variadic (`...`)
-    /// For a variadic function being emitted: frame offsets of the two hidden
-    /// params the caller appends — `(va_ptr_off, va_cnt_off)` — read by `VarArg*`.
-    cur_va: Option<(i32, i32)>,
     helpers: HashMap<Helper, usize>, // print runtime routine -> code label (on first use)
     rt_routines: HashMap<&'static str, usize>, // builtin runtime routine -> label (on first use)
     out_ptr_off: Option<i32>,        // BSS slot: the formatted-output sink pointer (0 = stdout)
@@ -331,6 +343,11 @@ struct Cg {
     argc_off: Option<i32>,
     argv_off: Option<i32>,
     uses_args: bool,
+    // Environment: a BSS slot holding the `U8 **envp` pointer, set when the program
+    // references `EnvP` (the entry captures it). `None` otherwise, so an env-free
+    // program is byte-for-byte unchanged.
+    envp_off: Option<i32>,
+    uses_env: bool,
     uses_msize: bool, // program calls `MSize` ⇒ `MAlloc` prepends a size header
 }
 
@@ -354,7 +371,6 @@ impl Cg {
             ret_label: 0,
             cur_ret: Type::I64,
             funcs_va: HashMap::new(),
-            cur_va: None,
             sret_off: None,
             labels: HashMap::new(),
             funcs_sig: HashMap::new(),
@@ -367,6 +383,8 @@ impl Cg {
             argc_off: None,
             argv_off: None,
             uses_args: false,
+            envp_off: None,
+            uses_env: false,
             uses_msize: false,
         }
     }
@@ -525,6 +543,11 @@ impl Cg {
             let (c, v) = (self.argc_off.unwrap(), self.argv_off.unwrap());
             self.os.emit_capture_args(&mut self.asm, c, v);
         }
+        // Capture the environment pointer for `EnvP` (independent of the command line).
+        if self.uses_env {
+            let e = self.envp_off.unwrap();
+            self.os.emit_capture_env(&mut self.asm, e);
+        }
         for item in items {
             match &item.kind {
                 // Function/type definitions aren't statements that run here.
@@ -558,7 +581,6 @@ impl Cg {
     ) -> Result<(), CodegenError> {
         self.begin_function();
         self.cur_ret = ret.clone();
-        self.cur_va = None;
         self.collect_labels(body);
         self.asm.place(label);
         let frame = self.asm.prologue();
@@ -635,8 +657,9 @@ impl Cg {
             self.asm.rep_movsb();
         }
         // A variadic function takes two hidden integer params after the named ones
-        // (in argreg[gpr], argreg[gpr+1]): the caller's vararg buffer pointer and
-        // the count. Spill them to slots for `VarArg*` to read.
+        // (in argreg[gpr], argreg[gpr+1]): the caller's vararg buffer pointer and the
+        // count. Spill them to slots and expose them as the implicit HolyC varargs
+        // locals `I64 *VargV` (the buffer) and `I64 VargC` (the count).
         if varargs {
             if gpr + 1 >= ARG_REGS {
                 return Err(CodegenError::at(
@@ -650,7 +673,23 @@ impl Cg {
             let cnt_off = self.alloc(8, 8);
             self.asm.mov_rax_argreg(gpr + 1);
             self.asm.store_local(cnt_off, 8);
-            self.cur_va = Some((ptr_off, cnt_off));
+            let scope = self.scopes.last_mut().unwrap();
+            scope.insert(
+                "VargV".to_string(),
+                VarLoc {
+                    off: ptr_off,
+                    ty: Type::Ptr(Box::new(Type::I64)),
+                    indirect: false,
+                },
+            );
+            scope.insert(
+                "VargC".to_string(),
+                VarLoc {
+                    off: cnt_off,
+                    ty: Type::I64,
+                    indirect: false,
+                },
+            );
         }
         for s in body {
             self.gen_stmt(s)?;
@@ -1163,6 +1202,18 @@ impl Cg {
             ExprKind::Ident(name) => match name.as_str() {
                 "NULL" | "FALSE" => self.asm.mov_rax_imm(0),
                 "TRUE" => self.asm.mov_rax_imm(1),
+                // The command line `ArgC` (count) / `ArgV` (the `U8 **` base) are
+                // implicit globals captured at the entry — unless a user variable
+                // shadows them with a local of the same name.
+                "ArgC" | "ArgV" | "EnvP" if self.lookup(name).is_none() => {
+                    let off = match name.as_str() {
+                        "ArgC" => self.argc_off.expect("ArgC slot reserved"),
+                        "ArgV" => self.argv_off.expect("ArgV slot reserved"),
+                        _ => self.envp_off.expect("EnvP slot reserved"),
+                    };
+                    self.asm.lea_rax_global(off);
+                    self.asm.load_through(8, false); // rax = ArgC / ArgV / EnvP base
+                }
                 _ => {
                     if let Some(v) = self.lookup(name) {
                         if v.indirect {
@@ -2322,58 +2373,6 @@ impl Cg {
                 self.os.emit_sleep(&mut self.asm, scratch);
                 Ok(())
             }
-            // Variadic-argument access: read the hidden va buffer the prologue saved.
-            "VarArgCnt" => {
-                let (_, cnt_off) = self.cur_va.ok_or_else(|| {
-                    CodegenError::at(pos, "x86_64 backend: VarArg* outside a variadic function")
-                })?;
-                self.asm.load_local(cnt_off, 8, false); // rax = va_cnt
-                Ok(())
-            }
-            "VarArgI64" | "VarArg" | "VarArgF64" => {
-                let (ptr_off, _) = self.cur_va.ok_or_else(|| {
-                    CodegenError::at(pos, "x86_64 backend: VarArg* outside a variadic function")
-                })?;
-                self.gen_expr(&args[0])?; // rax = i
-                self.asm.imul_rax_imm32(8); // rax = i*8
-                self.asm.mov_rr(RCX, RAX); // rcx = i*8
-                self.asm.load_local(ptr_off, 8, false); // rax = va_ptr
-                self.asm.add_rr(RAX, RCX); // rax = va_ptr + i*8
-                self.asm.load_qword_at(RAX, RAX); // rax = slot bits
-                if name == "VarArgF64" {
-                    self.asm.movq_xmm_from_r(0, RAX); // reinterpret as a double in xmm0
-                }
-                Ok(())
-            }
-            // `ArgC()` / `ArgV(i)` — read the command line captured at the entry
-            // into the argc/argv BSS slots.
-            "ArgC" => {
-                let off = self
-                    .argc_off
-                    .expect("argc slot reserved when args are used");
-                self.asm.lea_global(RAX, off);
-                self.asm.load_qword_at(RAX, RAX); // rax = argc
-                Ok(())
-            }
-            "ArgV" => {
-                let (cv, av) = (self.argc_off.unwrap(), self.argv_off.unwrap());
-                self.gen_expr(&args[0])?; // rax = i
-                self.asm.mov_rr(RCX, RAX); // rcx = i
-                self.asm.lea_global(RDX, cv);
-                self.asm.load_qword_at(RDX, RDX); // rdx = argc
-                let null = self.asm.new_label();
-                let done = self.asm.new_label();
-                self.asm.cmp_reg_reg(RCX, RDX);
-                self.asm.jae(null); // unsigned i >= argc (also catches i < 0)
-                self.asm.lea_global(RAX, av);
-                self.asm.load_qword_at(RAX, RAX); // rax = argv base pointer
-                self.asm.load_qword_idx8(RAX, RAX, RCX); // rax = argv[i]
-                self.asm.jmp(done);
-                self.asm.place(null);
-                self.asm.mov_ri(RAX, 0); // NULL
-                self.asm.place(done);
-                Ok(())
-            }
             // printf-into-a-buffer (the sprintf family)
             "StrPrint" => self.gen_strprint(args, false, pos),
             "CatPrint" => self.gen_strprint(args, true, pos),
@@ -2384,13 +2383,26 @@ impl Cg {
             // syscall registers; the `io.hc` open flags are Linux's, so they pass
             // straight through. The result (an fd, byte count, offset, or -errno) is
             // in rax.
-            "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" => {
+            // The filesystem mutations and `Getpid` join here: `unlink` 87 / `rename`
+            // 82 / `mkdir` 83 / `getpid` 39 take their args (if any) directly in the
+            // same arg/syscall registers.
+            "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close"
+            | "Remove" | "Rename" | "Mkdir" | "Getpid" | "Getppid" | "Getuid" | "Getgid"
+            | "Chdir" => {
                 let nr: i32 = match name {
                     "Read" => 0,
                     "Write" => 1,
                     "Open" => 2,
                     "Close" => 3,
                     "LSeek" => 8,
+                    "Getpid" => 39,
+                    "Chdir" => 80,
+                    "Rename" => 82,
+                    "Mkdir" => 83,
+                    "Remove" => 87,
+                    "Getuid" => 102,
+                    "Getgid" => 104,
+                    "Getppid" => 110,
                     "Socket" => 41,
                     "Connect" => 42,
                     _ => unreachable!(),
@@ -2399,6 +2411,28 @@ impl Cg {
                 self.gen_int_args(&arg_refs)?;
                 self.asm.mov_ri(RAX, nr);
                 self.asm.syscall();
+                Ok(())
+            }
+            // `Getcwd(buf, size)` — `getcwd` 79 returns the byte length on success or
+            // `-errno`; normalise a non-negative result to 0 (matching the 0/-errno
+            // contract of the other working-dir ops).
+            "Getcwd" => {
+                let arg_refs: Vec<&Expr> = args.iter().collect();
+                self.gen_int_args(&arg_refs)?; // rdi = buf, rsi = size
+                self.asm.mov_ri(RAX, 79);
+                self.asm.syscall(); // rax = len(>0) or -errno
+                let neg = self.asm.new_label();
+                self.asm.cmp_ri(RAX, 0);
+                self.asm.js(neg); // negative -errno passes through
+                self.asm.xor_rr(RAX, RAX); // a length → 0
+                self.asm.place(neg);
+                Ok(())
+            }
+            // Terminate the process with `code` (rax); the OS seam emits the Linux
+            // `exit`/`exit_group` syscall or Windows `ExitProcess`.
+            "Exit" => {
+                self.gen_expr(&args[0])?; // rax = code
+                self.os.emit_exit(&mut self.asm);
                 Ok(())
             }
             "Thread" => self.gen_thread(args),

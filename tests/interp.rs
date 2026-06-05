@@ -1477,23 +1477,14 @@ fn goto_to_label_in_enclosing_block() {
 
 #[test]
 fn argc_and_argv_expose_the_command_line() {
-    let src = r#"I64 i; for (i = 0; i < ArgC(); i++) "%d=%s\n", i, ArgV(i);"#;
+    // `ArgC`/`ArgV` are the implicit command-line globals; `ArgV[i]` is a `U8 *`.
+    let src = r#"I64 i; for (i = 0; i < ArgC; i++) "%d=%s\n", i, ArgV[i];"#;
     let program = parse(src).unwrap();
     let mut interp = Interpreter::new(Vec::<u8>::new());
     interp.set_args(vec!["prog".into(), "alpha".into(), "beta".into()]);
     interp.run(&program).unwrap();
     let out = String::from_utf8(interp.into_output()).unwrap();
     assert_eq!(out, "0=prog\n1=alpha\n2=beta\n");
-}
-
-#[test]
-fn argv_out_of_range_is_null() {
-    let src = r#"if (ArgV(99) == NULL) "null\n"; else "no\n";"#;
-    let program = parse(src).unwrap();
-    let mut interp = Interpreter::new(Vec::<u8>::new());
-    interp.set_args(vec!["prog".into()]);
-    interp.run(&program).unwrap();
-    assert_eq!(String::from_utf8(interp.into_output()).unwrap(), "null\n");
 }
 
 // ---- error reporting ----
@@ -1521,29 +1512,30 @@ fn extreme_field_width_and_precision_are_clamped() {
 
 #[test]
 fn variadic_functions_read_their_varargs() {
-    // VarArgCnt + the typed accessors (I64/F64/Ptr) read the trailing `...` args.
+    // The implicit `VargC`/`VargV` locals read the trailing `...` args: `VargV[i]` is
+    // the i-th raw slot, punned for F64/pointers.
     let out = run(r#"
         I64 SumI(...) {
-          I64 s = 0, i = 0, n = VarArgCnt();
-          while (i < n) { s += VarArgI64(i); i++; }
+          I64 s = 0, i = 0;
+          while (i < VargC) { s += VargV[i]; i++; }
           return s;
         }
         F64 AvgF(...) {
-          F64 s = 0.0; I64 i = 0, n = VarArgCnt();
-          while (i < n) { s += VarArgF64(i); i++; }
-          return s / n;
+          F64 s = 0.0; I64 i = 0;
+          while (i < VargC) { s += *(F64 *)&VargV[i]; i++; }
+          return s / VargC;
         }
         U0 Join(U8 *sep, ...) {
-          I64 i = 0, n = VarArgCnt();
-          while (i < n) { if (i) "%s", sep; "%s", VarArg(i); i++; }
+          I64 i = 0;
+          while (i < VargC) { if (i) "%s", sep; "%s", *(U8 **)&VargV[i]; i++; }
           "\n";
         }
         U0 Main() {
-          "%d %d %d\n", SumI(10, 20, 30), SumI(5), VarArgCntZero();
+          "%d %d %d\n", SumI(10, 20, 30), SumI(5), ArgcZero();
           "%.2f\n", AvgF(1.0, 2.0, 3.0, 4.0);
           Join(", ", "a", "b", "c");
         }
-        I64 VarArgCntZero(...) { return VarArgCnt(); }
+        I64 ArgcZero(...) { return VargC; }
         Main;
     "#);
     assert_eq!(out, "60 5 0\n2.50\na, b, c\n");

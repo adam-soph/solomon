@@ -23,10 +23,10 @@
 //! C-standard).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::lexer::{LexError, Lexer, TokenStream};
-use crate::token::{Keyword, Pos, Token, TokenKind};
+use crate::token::{FileInfo, Keyword, Pos, Token, TokenKind};
 
 type LResult<T> = Result<T, LexError>;
 
@@ -47,6 +47,9 @@ struct IncludeFrame {
     /// Conditional-nesting depth when this file was entered, so an unterminated
     /// `#ifdef` inside it is caught rather than leaking into the parent.
     cond_depth: usize,
+    /// Index into `Preprocessor::files`, stamped onto every token this frame emits
+    /// so `_`-directory privacy can be checked in sema.
+    file_id: u32,
 }
 
 #[derive(Clone)]
@@ -99,6 +102,10 @@ pub struct Preprocessor<S: TokenStream> {
     /// The stack of currently-open `#include`d files (innermost last). Tokens are
     /// pulled from the top of this stack before the base `inner` stream.
     includes: Vec<IncludeFrame>,
+    /// Append-only table of every source file seen, indexed by `Span::file`
+    /// (entry 0 is the base/top-level source). Carries each file's directory for
+    /// `_`-directory privacy. Never shrinks, so ids stay valid for the whole parse.
+    files: Vec<FileInfo>,
 }
 
 impl<S: TokenStream> Preprocessor<S> {
@@ -112,10 +119,34 @@ impl<S: TokenStream> Preprocessor<S> {
         Self::with_base_dir_and_search(inner, base_dir, Vec::new())
     }
 
+    /// Stream a synthetic prelude ahead of the base source, so its declarations are
+    /// in scope without an explicit `#include` (used for `builtin.hc`). The prelude
+    /// is the first frame on the include stack — its tokens come first and carry
+    /// their own line numbers — and is a **public** file (privacy-wise), so its
+    /// builtins are callable from user code.
+    pub fn with_prelude(mut self, contents: &str) -> Self {
+        let file_id = self.files.len() as u32;
+        self.files.push(FileInfo::root());
+        self.includes.push(IncludeFrame {
+            lexer: Lexer::new(contents),
+            resume: None,
+            dir: self.base_dir.clone(),
+            path: PathBuf::from("<builtin>"),
+            cond_depth: self.conds.len(),
+            file_id,
+        });
+        self
+    }
+
     /// As [`with_base_dir`](Self::with_base_dir), plus a list of search
     /// directories for **angle** includes (`#include <name>`) — the standard
     /// library. Each is tried in order; the first that holds the file wins.
     pub fn with_base_dir_and_search(inner: S, base_dir: PathBuf, search: Vec<PathBuf>) -> Self {
+        // File 0 is the base/top-level source; its privacy comes from `base_dir`.
+        // Canonicalize it so its directory components line up with the canonicalized
+        // paths of `#include`d files (otherwise `/tmp` vs `/private/tmp` mismatch).
+        let canon_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
+        let base_info = FileInfo::from_dir(dir_components(&canon_base));
         Preprocessor {
             inner,
             lookahead: None,
@@ -126,6 +157,7 @@ impl<S: TokenStream> Preprocessor<S> {
             base_dir,
             search,
             includes: Vec::new(),
+            files: vec![base_info],
         }
     }
 
@@ -145,9 +177,14 @@ impl<S: TokenStream> Preprocessor<S> {
             return Ok(t);
         }
         // Tokens come from the innermost open `#include` first, then the base
-        // source. A frame's Eof is surfaced to `pull`, which pops the frame.
+        // source. A frame's Eof is surfaced to `pull`, which pops the frame. Each
+        // frame stamps its origin onto the tokens it emits (the base source is the
+        // user program, so its lexer's default `User` is correct).
         if let Some(frame) = self.includes.last_mut() {
-            return frame.lexer.next_token();
+            let file_id = frame.file_id;
+            let mut t = frame.lexer.next_token()?;
+            t.span.file = file_id;
+            return Ok(t);
         }
         self.inner.next_token()
     }
@@ -299,6 +336,8 @@ impl<S: TokenStream> Preprocessor<S> {
         // Two forms: `#include "file"` (a single string token, resolved relative
         // to the including file) and `#include <name>` (an angle path spelled as
         // separate tokens, resolved against the standard-library search path).
+        // Each file's `_`-directory privacy comes from its *own* path (Go-style: no
+        // inheritance), computed where the path is resolved below.
         match toks.get(1).map(|t| &t.kind) {
             Some(TokenKind::Str(p)) => {
                 let path_str = p.clone();
@@ -310,7 +349,8 @@ impl<S: TokenStream> Preprocessor<S> {
                 let canon = cur_dir.join(&path_str).canonicalize().map_err(|e| {
                     self.err(pos, format!("cannot open #include \"{path_str}\": {e}"))
                 })?;
-                self.open_include(canon, &format!("\"{path_str}\""), pos)
+                let info = file_info_for_disk(&canon);
+                self.open_include(canon, &format!("\"{path_str}\""), pos, info)
             }
             Some(TokenKind::Lt) => {
                 let path_str = angle_path(&toks[1..])
@@ -323,18 +363,21 @@ impl<S: TokenStream> Preprocessor<S> {
                     .iter()
                     .find_map(|d| d.join(&path_str).canonicalize().ok())
                 {
-                    return self.open_include(canon, &display, pos);
+                    let info = file_info_for_disk(&canon);
+                    return self.open_include(canon, &display, pos, info);
                 }
                 // 2. Otherwise the standard library embedded in the compiler at build
                 //    time (so no `lib/` on disk is required).
                 if let Some(src) = crate::embedded_stdlib(&path_str) {
                     let path = PathBuf::from(format!("<stdlib:{path_str}>"));
+                    let info = file_info_for_embedded(&path_str);
                     return self.push_frame(
                         path,
                         self.base_dir.clone(),
                         src.to_string(),
                         &display,
                         pos,
+                        info,
                     );
                 }
                 Err(self.err(
@@ -352,14 +395,20 @@ impl<S: TokenStream> Preprocessor<S> {
     /// Push the already-resolved canonical include path onto the source stack
     /// (after the cycle and depth checks). `display` is the original spelling, for
     /// error messages.
-    fn open_include(&mut self, canon: PathBuf, display: &str, pos: Pos) -> LResult<()> {
+    fn open_include(
+        &mut self,
+        canon: PathBuf,
+        display: &str,
+        pos: Pos,
+        info: FileInfo,
+    ) -> LResult<()> {
         let contents = std::fs::read_to_string(&canon)
             .map_err(|e| self.err(pos, format!("cannot read #include {display}: {e}")))?;
         let dir = canon
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        self.push_frame(canon, dir, contents, display, pos)
+        self.push_frame(canon, dir, contents, display, pos, info)
     }
 
     /// Push an include source (read from disk or supplied from the embedded stdlib)
@@ -373,6 +422,7 @@ impl<S: TokenStream> Preprocessor<S> {
         contents: String,
         display: &str,
         pos: Pos,
+        info: FileInfo,
     ) -> LResult<()> {
         if self.includes.iter().any(|f| f.path == path) {
             return Err(self.err(pos, format!("recursive #include of {display}")));
@@ -383,12 +433,18 @@ impl<S: TokenStream> Preprocessor<S> {
         // The token already read past the `#include` line resumes the parent once the
         // included file is exhausted.
         let resume = self.lookahead.take();
+        // Register this file in the (append-only) table; its id is stamped onto the
+        // frame's tokens. The table never shrinks when frames pop, so ids stay valid
+        // for the whole parse.
+        let file_id = self.files.len() as u32;
+        self.files.push(info);
         self.includes.push(IncludeFrame {
             lexer: Lexer::new(&contents),
             resume,
             dir,
             path,
             cond_depth: self.conds.len(),
+            file_id,
         });
         Ok(())
     }
@@ -580,6 +636,10 @@ impl<S: TokenStream> TokenStream for Preprocessor<S> {
     fn next_token(&mut self) -> LResult<Token> {
         self.next_expanded()
     }
+
+    fn source_files(&self) -> Vec<FileInfo> {
+        self.files.clone()
+    }
 }
 
 /// The directive keyword after `#`. Most directive names lex as identifiers;
@@ -590,6 +650,35 @@ fn directive_name(tok: &Token) -> Option<String> {
         TokenKind::Keyword(Keyword::Else) => Some("else".to_string()),
         _ => None,
     }
+}
+
+/// The `Normal` path components of a directory, as strings (skipping the root,
+/// `.`, and `..`). Used to give each source file a directory for `_`-privacy.
+fn dir_components(dir: &Path) -> Vec<String> {
+    dir.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The [`FileInfo`] of a file on disk — its privacy comes from its parent directory.
+fn file_info_for_disk(file: &Path) -> FileInfo {
+    let dir = file.parent().map(dir_components).unwrap_or_default();
+    FileInfo::from_dir(dir)
+}
+
+/// The [`FileInfo`] of an embedded-stdlib file, named by its angle-include path
+/// (e.g. `_impl/strhash.hc`). The embedded library is its own root namespace
+/// (`<stdlib>`), so e.g. `_impl/strhash.hc` lives in dir `["<stdlib>", "_impl"]`.
+fn file_info_for_embedded(angle_path: &str) -> FileInfo {
+    let mut dir = vec!["<stdlib>".to_string()];
+    let parts: Vec<&str> = angle_path.split('/').collect();
+    for p in &parts[..parts.len().saturating_sub(1)] {
+        dir.push((*p).to_string());
+    }
+    FileInfo::from_dir(dir)
 }
 
 /// Reconstruct an angle-include path from the tokens of `#include <name>` (passed

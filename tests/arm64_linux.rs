@@ -328,9 +328,9 @@ fn time_builtins_run_natively() {
 fn variadic_functions_match_the_interpreter() {
     // The freestanding vararg ABI held byte-for-byte to the interpreter.
     let src = r#"
-        I64 SumI(...) { I64 s=0,i=0,n=VarArgCnt(); while(i<n){s+=VarArgI64(i);i++;} return s; }
-        F64 AvgF(...) { F64 s=0.0; I64 i=0,n=VarArgCnt(); while(i<n){s+=VarArgF64(i);i++;} return s/n; }
-        U0 Join(U8 *sep, ...) { I64 i=0,n=VarArgCnt(); while(i<n){ if(i)"%s",sep; "%s",VarArg(i); i++; } "\n"; }
+        I64 SumI(...) { I64 s=0,i=0; while(i<VargC){s+=VargV[i];i++;} return s; }
+        F64 AvgF(...) { F64 s=0.0; I64 i=0; while(i<VargC){s+=*(F64*)&VargV[i];i++;} return s/VargC; }
+        U0 Join(U8 *sep, ...) { I64 i=0; while(i<VargC){ if(i)"%s",sep; "%s",*(U8**)&VargV[i]; i++; } "\n"; }
         U0 Main() {
           "%d %d\n", SumI(10,20,30,40), SumI(7);
           "%.3f\n", AvgF(1.0,2.0,6.0);
@@ -338,7 +338,9 @@ fn variadic_functions_match_the_interpreter() {
         }
         Main;
     "#;
-    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    // `parse_with` so the implicit `builtin.hc` prelude (NULL/TRUE/FALSE) is in scope.
+    let program = parse_with(src, std::path::Path::new("."), &[])
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(check_program(&program).is_empty(), "sema errors");
     let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
     let dir = temp_dir();

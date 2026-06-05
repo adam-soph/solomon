@@ -28,6 +28,57 @@ impl fmt::Debug for Pos {
     }
 }
 
+/// Per-source-file metadata, used to enforce **`_`-directory privacy** (Go's
+/// `internal/`, but any directory whose name begins with `_` is private). A file's
+/// symbols defined under a `_`-prefixed directory are visible only to files in that
+/// directory's *parent* subtree.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct FileInfo {
+    /// The file's directory components (not the filename).
+    pub dir: Vec<String>,
+    /// If the file sits under a `_`-prefixed directory, the directory subtree its
+    /// symbols are visible from — the parent of the deepest such `_` component.
+    /// `None` for a public file (visible everywhere). `privacy_dir` names the `_`
+    /// component itself, for diagnostics.
+    pub privacy_root: Option<Vec<String>>,
+    pub privacy_dir: Option<String>,
+}
+
+impl FileInfo {
+    /// The implicit root file (the top-level program, or a bare lexer): no
+    /// directory, public.
+    pub fn root() -> Self {
+        FileInfo::default()
+    }
+
+    /// Build from a file's directory components, computing its privacy from the
+    /// deepest `_`-prefixed component (if any).
+    pub fn from_dir(dir: Vec<String>) -> Self {
+        match dir.iter().rposition(|c| c.starts_with('_')) {
+            Some(i) => FileInfo {
+                privacy_root: Some(dir[..i].to_vec()),
+                privacy_dir: Some(dir[i].clone()),
+                dir,
+            },
+            None => FileInfo {
+                dir,
+                privacy_root: None,
+                privacy_dir: None,
+            },
+        }
+    }
+
+    /// Whether a reference in file `from` may see a symbol defined in `self`: always,
+    /// unless `self` is private, in which case `from` must be within the privacy
+    /// subtree.
+    pub fn visible_to(&self, from: &FileInfo) -> bool {
+        match &self.privacy_root {
+            None => true,
+            Some(root) => from.dir.starts_with(root),
+        }
+    }
+}
+
 /// A half-open span `[start, end)` of byte offsets into the source, paired with
 /// the start position for diagnostics.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,11 +86,20 @@ pub struct Span {
     pub start: usize,
     pub end: usize,
     pub pos: Pos,
+    /// Index into the program's file table (`Program::files`) — which source file
+    /// this token came from. The preprocessor stamps it per include frame; the
+    /// lexer leaves the default `0` (the base/top-level file).
+    pub file: u32,
 }
 
 impl Span {
     pub fn new(start: usize, end: usize, pos: Pos) -> Self {
-        Span { start, end, pos }
+        Span {
+            start,
+            end,
+            pos,
+            file: 0,
+        }
     }
 
     /// A placeholder span (all zeroes). Useful in tests that build AST nodes by

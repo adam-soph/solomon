@@ -27,46 +27,15 @@ pub struct BuiltinSig {
     pub varargs: bool,
 }
 
-/// Every builtin and its signature.
+/// Every builtin and its signature. The registry is now **empty**: everything that
+/// once lived here is either a `lib/*.hc` library function, a `Primitive` intrinsic
+/// (the printf family, heap, clock — see [`crate::intrinsics`]), or an implicit local
+/// the compiler injects. Specifically, the command line is the implicit globals
+/// `I64 ArgC` / `U8 **ArgV`, and a `...` function's varargs are the implicit locals
+/// `I64 VargC` / `I64 *VargV` — neither is a callable builtin. The struct/functions are
+/// kept so a future irreducible builtin has a home.
 pub fn all() -> Vec<BuiltinSig> {
-    let u8p = || Type::Ptr(Box::new(Type::U8));
-    let i64 = || Type::I64;
-    let f64 = || Type::F64;
-    // (name, ret, params, varargs)
-    let sig = |name, ret, params: Vec<Type>, varargs| BuiltinSig {
-        name,
-        ret,
-        params,
-        varargs,
-    };
-    let sigs = vec![
-        // The printf family is *not* here: `Print`/`StrPrint`/`CatPrint`/`MStrPrint`
-        // are **primitive intrinsics** declared in `lib/fmt.hc` (prototypes), lowered
-        // by the backends via the shared `fmt` machinery — see `crate::intrinsics`.
-        // Float conversion is *not* here: both directions are pure HolyC in
-        // `lib/strconv.hc`/`lib/cstr.hc`. `StrToF64` is a correctly-rounded bignum
-        // `atof` (no host libc), and its inverse `F64ToStr` is a `StrPrint("%g")`
-        // wrapper — so neither needs to be a primitive.
-        // The impure clock primitives are *not* here either: `UnixNS`/`NanoNS`/`Sleep`
-        // are **primitive intrinsics** declared in `lib/time.hc`, lowered to syscalls
-        // (freestanding) / libc / the Windows `OsTarget` seam — see `crate::intrinsics`.
-        // The heap is *not* here: `MAlloc`/`Free`/`HeapExtend`/`MSize` are **primitive
-        // intrinsics** declared in `lib/mem.hc`, lowered to an `mmap` bump allocator
-        // (freestanding) or libc `malloc`/`free` (hosted) — see `crate::intrinsics`.
-        // Nor are the algebraic floats: `Sqrt` (a Newton + Dekker-residual sqrt) and
-        // `Fabs` (a `union` sign-bit clear) are HolyC in `lib/math.hc`.
-        // The captured command line.
-        sig("ArgC", i64(), vec![], false),
-        sig("ArgV", u8p(), vec![i64()], false),
-        // Variadic-argument access, valid only inside a `...` function. Varargs are
-        // raw 64-bit slots; the accessor picks the type (as in C's `va_arg` — read
-        // back the type you passed). `VarArgCnt()` is the number passed.
-        sig("VarArgCnt", i64(), vec![], false),
-        sig("VarArgI64", i64(), vec![i64()], false),
-        sig("VarArgF64", f64(), vec![i64()], false),
-        sig("VarArg", u8p(), vec![i64()], false),
-    ];
-    sigs
+    Vec::new()
 }
 
 /// The C library symbol the **heap intrinsics** lower to on the hosted (Darwin)

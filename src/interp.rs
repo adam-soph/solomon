@@ -395,10 +395,6 @@ pub struct Interpreter<W: Write> {
     /// Command-line arguments exposed via `ArgC`/`ArgV`. `args[0]` is the program
     /// (or script) name, mirroring a native binary's argv, so the count is ≥ 1.
     args: Vec<String>,
-    /// A stack of variadic-argument lists, one frame per active `...` function
-    /// call. `VarArgCnt`/`VarArg{I64,F64,Ptr}` read the top frame (sema restricts
-    /// them to `...` bodies, so the top is always the current function's varargs).
-    va_stack: Vec<Vec<Value>>,
     /// Requested byte size of each `MAlloc`'d heap region, keyed by region identity,
     /// for `MSize` (the native backends use a size header instead).
     heap_sizes: HashMap<usize, i64>,
@@ -419,6 +415,10 @@ pub struct Interpreter<W: Write> {
     thread_results: HashMap<i64, i64>,
     /// The next `Thread` handle (a namespace distinct from fds).
     next_thread: i64,
+    /// Set by `Exit(code)` to halt the run: the call returns an error that unwinds
+    /// all execution, and `run` recognises this field and returns cleanly (the code
+    /// itself isn't observable through `run_to_string`, which yields the output).
+    exit_code: Option<i64>,
 }
 
 /// An interpreter file descriptor: a reserved-but-unconnected socket, a live TCP
@@ -444,13 +444,13 @@ impl<W: Write> Interpreter<W> {
             classes: HashMap::new(),
             layouts: Layouts::empty(),
             args: vec!["hcc".to_string()],
-            va_stack: Vec::new(),
             heap_sizes: HashMap::new(),
             ptr_table: Rc::new(RefCell::new(Vec::new())),
             fds: HashMap::new(),
             next_fd: 3,
             thread_results: HashMap::new(),
             next_thread: 1,
+            exit_code: None,
         }
     }
 
@@ -503,6 +503,53 @@ impl<W: Write> Interpreter<W> {
         // Compute type layouts up front so `sizeof` reports real sizes.
         self.layouts = crate::layout::compute(program).0;
 
+        // Expose the command line as the implicit globals `I64 ArgC` / `U8 **ArgV`
+        // (a `...` function's `VargC`/`VargV` varargs locals are distinct names, so
+        // both stay in scope). `ArgV` is an array of `U8 *`, each pointing at an
+        // argument's NUL-terminated bytes.
+        let argv_cells: Vec<Cell> = self
+            .args
+            .iter()
+            .map(|s| {
+                cell(Value::Ptr(Some(PtrVal {
+                    region: Region::Heap(intern_str_buf(s)),
+                    index: 0,
+                })))
+            })
+            .collect();
+        self.globals
+            .insert("ArgC".to_string(), cell(Value::Int(self.args.len() as i64)));
+        self.globals.insert(
+            "ArgV".to_string(),
+            cell(Value::Ptr(Some(PtrVal {
+                region: Region::Array(Rc::new(RefCell::new(argv_cells))),
+                index: 0,
+            }))),
+        );
+
+        // Expose the environment as `U8 **EnvP`: a **NULL-terminated** array of the
+        // process's "KEY=VALUE" strings (mirroring the native `envp`, so a HolyC walk
+        // to the NULL sentinel works the same). Impure, like the command line / clock.
+        let mut env_cells: Vec<Cell> = std::env::vars_os()
+            .map(|(k, v)| {
+                let mut s = k.into_encoded_bytes();
+                s.push(b'=');
+                s.extend_from_slice(&v.into_encoded_bytes());
+                cell(Value::Ptr(Some(PtrVal {
+                    region: Region::Heap(Rc::new(RefCell::new(s))),
+                    index: 0,
+                })))
+            })
+            .collect();
+        env_cells.push(cell(Value::Ptr(None))); // NULL terminator
+        self.globals.insert(
+            "EnvP".to_string(),
+            cell(Value::Ptr(Some(PtrVal {
+                region: Region::Array(Rc::new(RefCell::new(env_cells))),
+                index: 0,
+            }))),
+        );
+
         // Register all functions and classes first, so calls can resolve
         // regardless of definition order (and top-level `Main;` works).
         for item in &program.items {
@@ -521,7 +568,13 @@ impl<W: Write> Interpreter<W> {
         // no-ops here, already registered). Using exec_stmts gives top-level
         // `goto`/labels the same resume behaviour as any block.
         let mut env = Env::top_level();
-        self.exec_stmts(&program.items, &mut env)?;
+        // `Exit(code)` unwinds execution as an error; recognise it and finish cleanly
+        // (flushing whatever was printed before the exit).
+        if let Err(e) = self.exec_stmts(&program.items, &mut env) {
+            if self.exit_code.is_none() {
+                return Err(e);
+            }
+        }
         self.out.flush().map_err(|e| self.io(e))?;
         Ok(())
     }
@@ -1349,17 +1402,39 @@ impl<W: Write> Interpreter<W> {
                 CodegenError::at(pos, format!("call to `{name}`, which has no body"))
             })?;
             // A `...` function exposes the trailing arguments (those past the named
-            // params) to `VarArg*` for the duration of its body.
+            // params) as the implicit HolyC locals `I64 VargC` (the count) and
+            // `I64 *VargV` — a buffer of their raw 8-byte slots (F64 by bit pattern,
+            // pointers/strings as a serialised handle), so `VargV[i]` reads slot `i`
+            // and `*(F64 *)&VargV[i]` / `*(U8 **)&VargV[i]` read other types.
             if f.varargs {
-                let varargs = args.get(f.params.len()..).unwrap_or(&[]).to_vec();
-                self.va_stack.push(varargs);
+                let varargs = args.get(f.params.len()..).unwrap_or(&[]);
+                let mut bytes = vec![0u8; varargs.len() * 8];
+                for (i, v) in varargs.iter().enumerate() {
+                    let v = if matches!(v, Value::Str(_)) {
+                        coerce_to(&Type::Ptr(Box::new(Type::U8)), v.clone())
+                    } else {
+                        v.clone()
+                    };
+                    let le = match &v {
+                        Value::Float(_) => v.as_f64().unwrap_or(0.0).to_le_bytes(),
+                        Value::Ptr(_) => serialize_ptr(&v, &self.ptr_table).to_le_bytes(),
+                        _ => v.as_i64().unwrap_or(0).to_le_bytes(),
+                    };
+                    bytes[i * 8..i * 8 + 8].copy_from_slice(&le);
+                }
+                let buf = Region::Heap(Rc::new(RefCell::new(bytes)));
+                env.scopes[0].insert("VargC".to_string(), cell(Value::Int(varargs.len() as i64)));
+                env.scopes[0].insert(
+                    "VargV".to_string(),
+                    cell(Value::Ptr(Some(PtrVal {
+                        region: buf,
+                        index: 0,
+                    }))),
+                );
             }
             // Narrow the result to the declared return width (C truncates the
             // return value to the return type), matching the native backend.
             let result = self.exec_func_body(body, &mut env);
-            if f.varargs {
-                self.va_stack.pop();
-            }
             return Ok(coerce_to(&f.ret, result?));
         }
 
@@ -1533,7 +1608,7 @@ impl<W: Write> Interpreter<W> {
                     }
                     // Mirror the syscall contract: a negative `-errno` (the common
                     // POSIX codes — ENOENT=2, EACCES=13, … — agree across Linux and
-                    // macOS, so `StrError` renders the same on every target).
+                    // macOS, so the number is the same on every target).
                     Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
                 }
             }
@@ -1588,6 +1663,89 @@ impl<W: Write> Interpreter<W> {
                 self.fds.remove(&fd); // dropping the stream/file closes it
                 Ok(Value::Int(0))
             }
+            // Filesystem mutation over `std::fs`. Like the fd ops, a failure is the
+            // negative `-errno` (the common POSIX codes agree across Linux/macOS).
+            "Remove" => {
+                use std::os::unix::ffi::OsStrExt;
+                let pb = self.cstr_bytes(&args[0], pos)?;
+                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&pb));
+                match std::fs::remove_file(path) {
+                    Ok(()) => Ok(Value::Int(0)),
+                    Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
+                }
+            }
+            "Rename" => {
+                use std::os::unix::ffi::OsStrExt;
+                let ob = self.cstr_bytes(&args[0], pos)?;
+                let nb = self.cstr_bytes(&args[1], pos)?;
+                let old = std::path::Path::new(std::ffi::OsStr::from_bytes(&ob));
+                let new = std::path::Path::new(std::ffi::OsStr::from_bytes(&nb));
+                match std::fs::rename(old, new) {
+                    Ok(()) => Ok(Value::Int(0)),
+                    Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
+                }
+            }
+            "Mkdir" => {
+                use std::os::unix::ffi::OsStrExt;
+                use std::os::unix::fs::DirBuilderExt;
+                let pb = self.cstr_bytes(&args[0], pos)?;
+                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&pb));
+                let mode = self.to_i64(args[1].clone(), pos)? as u32;
+                match std::fs::DirBuilder::new().mode(mode).create(path) {
+                    Ok(()) => Ok(Value::Int(0)),
+                    Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
+                }
+            }
+            // Halt the program with an exit status. Sets `exit_code` and unwinds via
+            // an error that `run` recognises and turns into a clean finish.
+            "Exit" => {
+                self.exit_code = Some(self.to_i64(args[0].clone(), pos)?);
+                Err(CodegenError::new("program called Exit", None))
+            }
+            // Process / user ids (impure — differ from a native run, so property-tested).
+            "Getpid" => Ok(Value::Int(std::process::id() as i64)),
+            "Getppid" => Ok(Value::Int(std::os::unix::process::parent_id() as i64)),
+            "Getuid" => {
+                // No std accessor for the uid; the interpreter is already unix-only
+                // (it uses `std::os::unix` throughout), so call libc directly.
+                unsafe extern "C" {
+                    fn getuid() -> u32;
+                }
+                Ok(Value::Int(unsafe { getuid() } as i64))
+            }
+            "Getgid" => {
+                unsafe extern "C" {
+                    fn getgid() -> u32;
+                }
+                Ok(Value::Int(unsafe { getgid() } as i64))
+            }
+            // Working directory, over `std::env` (impure).
+            "Chdir" => {
+                use std::os::unix::ffi::OsStrExt;
+                let pb = self.cstr_bytes(&args[0], pos)?;
+                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&pb));
+                match std::env::set_current_dir(path) {
+                    Ok(()) => Ok(Value::Int(0)),
+                    Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
+                }
+            }
+            "Getcwd" => {
+                use std::os::unix::ffi::OsStrExt;
+                let cap = self.to_i64(args[1].clone(), pos)?.max(0) as usize;
+                match std::env::current_dir() {
+                    Ok(dir) => {
+                        let mut bytes = dir.as_os_str().as_bytes().to_vec();
+                        bytes.push(0); // NUL-terminate
+                        if bytes.len() > cap {
+                            Ok(Value::Int(-34)) // -ERANGE: buffer too small
+                        } else {
+                            self.write_bytes(&args[0], &bytes, pos)?;
+                            Ok(Value::Int(0))
+                        }
+                    }
+                    Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
+                }
+            }
             // Threads, emulated synchronously (see the `thread_results` note): run the
             // function body now, save its return for `Join`. `fn` is a function pointer
             // (`&Fn`), i.e. a `Value::Func(name)`.
@@ -1619,34 +1777,6 @@ impl<W: Write> Interpreter<W> {
             // fence and the futex wait/wake are no-ops (a thread never actually blocks).
             "AtomicFence" => Ok(Value::Void),
             "FutexWait" | "FutexWake" => Ok(Value::Int(0)),
-            "ArgC" => Ok(Value::Int(self.args.len() as i64)),
-            "ArgV" => {
-                let i = self.to_i64(args[0].clone(), pos)?;
-                match usize::try_from(i).ok().and_then(|i| self.args.get(i)) {
-                    Some(s) => Ok(Value::Str(Rc::new(s.clone()))),
-                    None => Ok(Value::Ptr(None)), // out of range -> NULL
-                }
-            }
-            // Variadic-argument access (current `...` frame on the va stack). An
-            // out-of-range index yields 0 / 0.0 / NULL.
-            "VarArgCnt" => Ok(Value::Int(
-                self.va_stack.last().map(|v| v.len()).unwrap_or(0) as i64,
-            )),
-            "VarArgI64" | "VarArgF64" | "VarArg" => {
-                let i = self.to_i64(args[0].clone(), pos)?;
-                let slot = usize::try_from(i)
-                    .ok()
-                    .and_then(|i| self.va_stack.last().and_then(|v| v.get(i)))
-                    .cloned();
-                Ok(match (name, slot) {
-                    ("VarArgF64", Some(v)) => Value::Float(value_as_f64(&v)),
-                    ("VarArgF64", None) => Value::Float(0.0),
-                    ("VarArg", Some(v)) => v,
-                    ("VarArg", None) => Value::Ptr(None),
-                    (_, Some(v)) => Value::Int(value_as_i64(&v)),
-                    (_, None) => Value::Int(0),
-                })
-            }
             // The two irreducible algebraic F64 primitives — exactly reproducible in
             // every backend (hardware `sqrt`, a sign-bit clear). Rounding and the
             // transcendentals are reducible and live in `lib/math.hc`.
@@ -2901,6 +3031,10 @@ fn coerce_to(ty: &Type, v: Value) -> Value {
                 region: Region::Heap(intern_str_buf(&s)),
                 index: 0,
             })),
+            // Integer 0 stored into a pointer is the null pointer (C semantics) — the
+            // path `NULL` takes now that it's the macro `0` from <builtin.hc> rather
+            // than a predefined null-pointer constant.
+            Value::Int(0) => Value::Ptr(None),
             other => other,
         },
         _ => v,

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use solomon::arm64::Arm64Darwin;
 use solomon::codegen::Codegen;
 use solomon::interp::run_to_string;
-use solomon::parser::parse;
+use solomon::parser::{parse, parse_with};
 use solomon::sema::check_program;
 
 mod common;
@@ -211,14 +211,17 @@ fn native_command_line_args() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // Echo argv[1..] (argv[0] is the binary path, which varies) and check that an
-    // out-of-range index is NULL. ArgC/ArgV are captured from x0/x1 at the entry.
+    // Echo ArgV[1..] (ArgV[0] is the binary path, which varies) and check that
+    // `ArgC`/`ArgV` are the implicit command-line globals, captured from x0/x1 at the
+    // entry; `ArgV[i]` is a `U8 *`. The binary is run with two args (ArgV[0] is the
+    // path), so `ArgC == 3`.
     let src = r#"
         I64 i;
-        for (i = 1; i < ArgC(); i++) "%s\n", ArgV(i);
-        if (ArgV(99) == NULL) "ok\n";
+        for (i = 1; i < ArgC; i++) "%s\n", ArgV[i];
+        if (ArgC == 3) "ok\n";
     "#;
-    let program = parse(src).unwrap();
+    // `parse_with` so the implicit `builtin.hc` prelude (NULL/TRUE/FALSE) is in scope.
+    let program = parse_with(src, std::path::Path::new("."), &[]).unwrap();
     assert!(check_program(&program).is_empty());
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let out = std::env::temp_dir().join(format!("solomon-arm64-args-{}-{id}", std::process::id()));
@@ -2310,4 +2313,62 @@ fn unsupported_constructs_are_rejected() {
             "for `{src}` got: {err}"
         );
     }
+}
+
+// ---- container library: native execution matches the interpreter (the source is
+// shared with the interpreter-pinned tests in tests/programs.rs) ----
+
+#[test]
+fn native_sort_edges_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    assert_native_matches_interp(common::LIB_SORT_EDGES);
+}
+
+#[test]
+fn native_vec_search_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    assert_native_matches_interp(common::LIB_VEC_SEARCH);
+}
+
+#[test]
+fn native_hmap_i64_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    assert_native_matches_interp(common::LIB_HMAP_I64);
+}
+
+#[test]
+fn native_hmap_empty_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    assert_native_matches_interp(common::LIB_HMAP_EMPTY);
+}
+
+#[test]
+fn native_exit_sets_status_and_halts() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `Exit(code)` lowers to libc `exit` (Darwin): the process status is the code and
+    // statements after it don't run. `build_and_run` returns the exit status.
+    assert_eq!(
+        build_and_run("#include <os.hc>\nU0 Main() { Exit(42); } Main;"),
+        42
+    );
+    // Output before the exit is produced; code after the exit is skipped.
+    assert_eq!(
+        build_and_capture("#include <os.hc>\nU0 Main() { \"x\\n\"; Exit(0); \"y\\n\"; } Main;"),
+        "x\n"
+    );
 }

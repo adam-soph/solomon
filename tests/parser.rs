@@ -8,9 +8,12 @@ use solomon::lexer::Lexer;
 use solomon::parser::{Parser, parse};
 use solomon::token::Span;
 
-/// Parse a program, unwrapping the result.
+/// Parse a program, unwrapping the result. Drops the implicit `builtin.hc` prelude
+/// items (`Span::file != 0`) so structural assertions see only the user source.
 fn prog(src: &str) -> Program {
-    parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    let mut p = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    p.items.retain(|s| s.span.file == 0);
+    p
 }
 
 /// Parse `src` (must be exactly one statement) and return that statement's kind.
@@ -460,4 +463,100 @@ fn deeply_nested_input_is_an_error_not_a_stack_overflow() {
         })
         .unwrap();
     handle.join().unwrap();
+}
+
+// ---- generic classes (monomorphization) ----
+
+#[test]
+fn generic_class_monomorphizes() {
+    // `class Vec<T>` + a use `Vec<I64>` stamps out a concrete `Vec_I64` with `T`
+    // substituted; the template itself emits no class.
+    let p = prog("class Vec<T> { T *data; I64 len; } Vec<I64> x;");
+    let classes: Vec<&ClassDef> = p
+        .items
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StmtKind::Class(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let vi = classes
+        .iter()
+        .find(|c| c.name == "Vec_I64")
+        .expect("Vec_I64 should be generated");
+    assert_eq!(vi.fields[0].name, "data");
+    assert_eq!(vi.fields[0].ty, Type::Ptr(Box::new(Type::I64)));
+    assert_eq!(vi.fields[1].ty, Type::I64);
+    assert!(!classes.iter().any(|c| c.name == "Vec")); // template emits nothing
+}
+
+#[test]
+fn generic_dedups_repeated_instantiations() {
+    let p = prog("class Vec<T> { T *d; } Vec<I64> a; Vec<I64> b;");
+    let n = p
+        .items
+        .iter()
+        .filter(|s| matches!(&s.kind, StmtKind::Class(c) if c.name == "Vec_I64"))
+        .count();
+    assert_eq!(n, 1, "Vec<I64> used twice should mint one class");
+}
+
+#[test]
+fn generic_arity_mismatch_is_an_error() {
+    let err = parse("class Pair<K, V> { K k; V v; } Pair<I64> p;").unwrap_err();
+    assert!(
+        err.to_string().contains("expects 2 type argument"),
+        "got: {err}"
+    );
+}
+
+// ---- generic functions (monomorphization) ----
+
+#[test]
+fn generic_function_monomorphizes_by_type_arg() {
+    // `T Id<T>(T x){...}` + calls `Id<I64>(..)` / `Id<F64>(..)` generate concrete
+    // `Id_I64` / `Id_F64`, and the call sites resolve to those mangled names.
+    let p = prog("T Id<T>(T x) { return x; } I64 a = Id<I64>(1); F64 b = Id<F64>(2.0);");
+    let funcs: Vec<&FuncDef> = p
+        .items
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StmtKind::Func(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert!(funcs.iter().any(|f| f.name == "Id_I64"));
+    assert!(funcs.iter().any(|f| f.name == "Id_F64"));
+    assert!(!funcs.iter().any(|f| f.name == "Id")); // template emits no function
+    // the I64 instance has a concrete I64 parameter and return type
+    let id_i64 = funcs.iter().find(|f| f.name == "Id_I64").unwrap();
+    assert_eq!(id_i64.ret, Type::I64);
+    assert_eq!(id_i64.params[0].ty, Type::I64);
+}
+
+#[test]
+fn generic_function_dedups() {
+    let p = prog("T Id<T>(T x){return x;} I64 a=Id<I64>(1); I64 b=Id<I64>(2);");
+    let n = p
+        .items
+        .iter()
+        .filter(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == "Id_I64"))
+        .count();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn generic_function_infers_type_args() {
+    // `Id<T>(T)` called as `Id(1)` infers `T=I64`, generating `Id_I64` and resolving
+    // the (un-annotated) call to it.
+    let p = prog("T Id<T>(T x){return x;} I64 a = Id(1);");
+    let funcs: Vec<&FuncDef> = p
+        .items
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StmtKind::Func(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert!(funcs.iter().any(|f| f.name == "Id_I64"));
 }

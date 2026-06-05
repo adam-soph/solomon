@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::token::Pos;
+use crate::token::{FileInfo, Pos};
 
 /// A semantic error with the source position where it was detected.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +61,8 @@ struct TypeDef {
     base: Option<String>,
     /// Position of the definition, used to locate base-class errors.
     base_pos: Pos,
+    /// The file this type was defined in (`Span::file`), for `_`-directory privacy.
+    file: u32,
 }
 
 /// A function signature.
@@ -75,6 +77,9 @@ struct FuncSig {
     varargs: bool,
     /// Whether a definition (not just a prototype) has been seen.
     defined: bool,
+    /// The file this function was first declared in (`Span::file`), for
+    /// `_`-directory privacy.
+    file: u32,
 }
 
 struct Analyzer {
@@ -85,15 +90,18 @@ struct Analyzer {
     scopes: Vec<HashMap<String, Type>>,
     /// Return type of the function currently being checked, if any.
     cur_ret: Option<Type>,
-    /// Whether the function currently being checked is variadic (`...`) — gates
-    /// the `VarArg*` accessors, which are meaningless outside a `...` body.
-    cur_varargs: bool,
     loop_depth: u32,
     switch_depth: u32,
     /// Stack of label scopes: the labels declared directly in the current block
     /// and each enclosing block. A `goto` is valid iff its target is in one of
     /// these — the same reachability rule the interpreter resolves gotos by.
     label_scopes: Vec<HashSet<String>>,
+    /// The program's source-file table (indexed by `Span::file`), for
+    /// `_`-directory privacy. Empty until `run` copies it from the program.
+    files: Vec<FileInfo>,
+    /// The file (`Span::file`) of the top-level item currently being checked — the
+    /// reference site for `_`-directory privacy of *type* references.
+    cur_file: u32,
 }
 
 impl Analyzer {
@@ -104,19 +112,32 @@ impl Analyzer {
             funcs: HashMap::new(),
             scopes: Vec::new(),
             cur_ret: None,
-            cur_varargs: false,
             loop_depth: 0,
             switch_depth: 0,
             label_scopes: Vec::new(),
+            files: Vec::new(),
+            cur_file: 0,
         }
     }
 
     fn run(&mut self, program: &Program) {
+        self.files = program.files.clone();
         self.scopes.push(HashMap::new()); // global scope
-        self.seed_builtins();
+        // The command line is exposed as two implicit globals — `I64 ArgC` and
+        // `U8 **ArgV` — captured at the entry. (A `...` function's `VargC`/`VargV`
+        // varargs locals are distinct names, so both remain in scope there.)
+        self.scopes[0].insert("ArgC".to_string(), Type::I64);
+        self.scopes[0].insert(
+            "ArgV".to_string(),
+            Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
+        );
+        // The environment: `U8 **EnvP`, a NULL-terminated array of "KEY=VALUE" strings.
+        self.scopes[0].insert(
+            "EnvP".to_string(),
+            Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
+        );
         self.collect_types(program);
         self.collect_funcs(program);
-        self.seed_builtin_funcs();
         self.validate_type_refs();
         self.check_layouts(program);
         // Top-level statements form an implicit body with their own label scope,
@@ -127,30 +148,6 @@ impl Analyzer {
         }
         self.label_scopes.pop();
         self.scopes.pop();
-    }
-
-    /// HolyC predefines a few constants that any program may reference.
-    fn seed_builtins(&mut self) {
-        for name in ["NULL", "TRUE", "FALSE"] {
-            self.scopes[0].insert(name.to_string(), Type::I64);
-        }
-    }
-
-    /// Register the intrinsic functions (from the shared `builtins` registry) so
-    /// calls to them aren't flagged as undeclared. User definitions of the same
-    /// name win (hence `or_insert`).
-    fn seed_builtin_funcs(&mut self) {
-        for b in crate::builtins::all() {
-            let n = b.params.len();
-            self.funcs.entry(b.name.to_string()).or_insert(FuncSig {
-                ret: b.ret,
-                params: b.params,
-                required: n,
-                total: n,
-                varargs: b.varargs,
-                defined: true,
-            });
-        }
     }
 
     fn error(&mut self, pos: Pos, msg: impl Into<String>) {
@@ -180,6 +177,7 @@ impl Analyzer {
                         fields,
                         base: c.base.clone(),
                         base_pos: item.span.pos,
+                        file: item.span.file,
                     },
                 );
             }
@@ -213,6 +211,7 @@ impl Analyzer {
                             total: f.params.len(),
                             varargs: f.varargs,
                             defined: has_body,
+                            file: item.span.file,
                         },
                     );
                 }
@@ -234,19 +233,22 @@ impl Analyzer {
     fn validate_type_refs(&mut self) {
         // Collect the work first to avoid borrowing `self.types` while pushing
         // errors.
-        let mut refs: Vec<(Type, Pos)> = Vec::new();
+        // Each field/base reference is checked (existence + `_`-privacy) against the
+        // file of the class that declares it.
+        let mut refs: Vec<(Type, Pos, u32)> = Vec::new();
         let mut base_refs: Vec<(String, Pos)> = Vec::new();
         let names: Vec<String> = self.types.keys().cloned().collect();
         for name in &names {
             let def = &self.types[name];
             for (_, ty, pos) in &def.fields {
-                refs.push((ty.clone(), *pos));
+                refs.push((ty.clone(), *pos, def.file));
             }
             if let Some(b) = &def.base {
                 base_refs.push((b.clone(), def.base_pos));
             }
         }
-        for (ty, pos) in refs {
+        for (ty, pos, file) in refs {
+            self.cur_file = file;
             self.resolve_type(&ty, pos);
         }
         for (b, pos) in base_refs {
@@ -286,11 +288,14 @@ impl Analyzer {
     /// Confirm a type's named parts exist; report and continue otherwise.
     fn resolve_type(&mut self, ty: &Type, pos: Pos) {
         match ty {
-            Type::Named(n) => {
-                if !self.types.contains_key(n) {
-                    self.error(pos, format!("unknown type `{n}`"));
+            Type::Named(n) => match self.types.get(n) {
+                None => self.error(pos, format!("unknown type `{n}`")),
+                // A type under a `_`-prefixed directory is private to that subtree.
+                Some(td) => {
+                    let def_file = td.file;
+                    self.check_private_access(def_file, self.cur_file, n, pos);
                 }
-            }
+            },
             Type::Ptr(inner) => self.resolve_type(inner, pos),
             Type::Array(inner, dim) => {
                 self.resolve_type(inner, pos);
@@ -316,6 +321,9 @@ impl Analyzer {
     // ---- top-level & statements ----
 
     fn check_top_item(&mut self, item: &Stmt) {
+        // Type references inside this item are checked for `_`-directory privacy
+        // against this item's file.
+        self.cur_file = item.span.file;
         match &item.kind {
             StmtKind::Func(f) => self.check_function(f),
             StmtKind::Class(_) | StmtKind::Include(_) => {}
@@ -329,7 +337,6 @@ impl Analyzer {
         };
         self.resolve_type(&f.ret, Pos::new(0, 0));
         self.cur_ret = Some(f.ret.clone());
-        self.cur_varargs = f.varargs;
 
         self.label_scopes.push(direct_labels(body));
         self.push_scope();
@@ -345,13 +352,19 @@ impl Analyzer {
                 self.declare(name, Self::decay(p.ty.clone()), p.span.pos);
             }
         }
+        // A `...` function gets the implicit HolyC varargs locals: `I64 VargC` (count)
+        // and `I64 *VargV` (the raw 8-byte slots; pun the address for other types).
+        if f.varargs {
+            let pos = f.params.first().map_or(Pos::new(0, 0), |p| p.span.pos);
+            self.declare("VargC", Type::I64, pos);
+            self.declare("VargV", Type::Ptr(Box::new(Type::I64)), pos);
+        }
         for stmt in body {
             self.check_stmt(stmt);
         }
         self.pop_scope();
         self.label_scopes.pop();
         self.cur_ret = None;
-        self.cur_varargs = false;
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) {
@@ -909,6 +922,34 @@ impl Analyzer {
         tt
     }
 
+    /// Enforce `_`-directory privacy: a symbol defined in a file under a
+    /// `_`-prefixed directory may only be referenced from within that directory's
+    /// *parent* subtree (Go's `internal/`, generalized to any `_`-named directory).
+    fn check_private_access(&mut self, def_file: u32, ref_file: u32, name: &str, pos: Pos) {
+        let msg = {
+            let (Some(def), Some(refr)) = (
+                self.files.get(def_file as usize),
+                self.files.get(ref_file as usize),
+            ) else {
+                return; // missing file info — don't gate
+            };
+            if def.visible_to(refr) {
+                return;
+            }
+            let dir = def.privacy_dir.clone().unwrap_or_default();
+            let root = match &def.privacy_root {
+                Some(r) if r.is_empty() => ".".to_string(),
+                Some(r) => r.join("/"),
+                None => return,
+            };
+            format!(
+                "`{name}` is private to the `{dir}/` directory and can only be used \
+                 from within `{root}/`"
+            )
+        };
+        self.error(pos, msg);
+    }
+
     fn check_call(&mut self, callee: &Expr, args: &[Expr]) -> Type {
         // Resolve argument types first (always check them).
         let argc = args.len();
@@ -919,22 +960,10 @@ impl Analyzer {
         // of the same name shadows it (then it's a function-pointer call).
         if let ExprKind::Ident(name) = &callee.kind {
             if self.lookup_var(name).is_none() {
-                // The `VarArg*` accessors only make sense inside a `...` function
-                // (there are no variadic arguments otherwise, and the native
-                // backends have no va frame to read).
-                if matches!(
-                    name.as_str(),
-                    "VarArgCnt" | "VarArgI64" | "VarArgF64" | "VarArg"
-                ) && !self.cur_varargs
-                {
-                    self.error(
-                        callee.span.pos,
-                        format!("`{name}` is only valid inside a variadic (`...`) function"),
-                    );
-                }
                 if let Some(sig) = self.funcs.get(name) {
                     let (required, total, varargs, ret) =
                         (sig.required, sig.total, sig.varargs, sig.ret.clone());
+                    self.check_private_access(sig.file, callee.span.file, name, callee.span.pos);
                     let ok = if varargs {
                         argc >= required
                     } else {

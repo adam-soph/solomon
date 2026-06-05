@@ -151,6 +151,15 @@ impl OsTarget for LinuxTarget {
         asm.store_qword_at(RCX, RAX); // argv slot = &argv[0]
     }
 
+    fn emit_capture_env(&mut self, asm: &mut Asm, envp_off: i32) {
+        // The env array follows argv's NULL terminator on the initial stack:
+        // `&envp[0] = &argv[0] + (argc+1)*8 = rbp + 16 + (argc+1)*8 = rbp + 24 + argc*8`.
+        asm.emit(&[0x48, 0x8B, 0x45, 0x08]); // mov rax, [rbp+8]          (argc)
+        asm.emit(&[0x48, 0x8D, 0x44, 0xC5, 0x18]); // lea rax, [rbp+rax*8+24] (&envp[0])
+        asm.lea_global(RCX, envp_off);
+        asm.store_qword_at(RCX, RAX); // envp slot = &envp[0]
+    }
+
     fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError> {
         // No imports on Linux: finish with an empty import region (byte-identical
         // to the former `[code | strings | bss]` layout), then wrap in an ELF.

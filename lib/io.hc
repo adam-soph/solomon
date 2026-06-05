@@ -11,11 +11,10 @@
 //
 // **Errors are the return value**, Unix-style: a successful call returns a
 // non-negative result (an fd, a byte count, an offset); a failure returns a negative
-// `-errno`. There is no out-parameter and no error object — you test the sign and, if
-// you want a message, render the code with `StrError(-ret)`:
+// `-errno`. There is no out-parameter and no error object — you test the sign:
 //
 //     I64 n = ReadFile("/cfg", buf, sizeof(buf));
-//     if (n < 0) { "read: %s\n", StrError(-n); return; }
+//     if (n < 0) { "read failed (errno %d)\n", -n; return; }
 
 #include <cstr.hc>   // StrLen
 
@@ -44,29 +43,8 @@ I64 Read(I64 fd, U8 *buf, I64 n);          // bytes read (0 = EOF), or -errno
 I64 Write(I64 fd, U8 *buf, I64 n);         // bytes written, or -errno
 I64 Close(I64 fd);                         // 0, or -errno
 
-// --- errno → message ----------------------------------------------------------
-
-// A human-readable name for an `errno` (the magnitude of a primitive's negative
-// return). The handful of codes below have the same numeric value on Linux and macOS,
-// so the message is identical on every target; anything else renders as "I/O error".
-U8 *StrError(I64 errno)
-{
-  switch (errno) {
-    case 0:  return "OK";
-    case 1:  return "Operation not permitted";   // EPERM
-    case 2:  return "No such file or directory";  // ENOENT
-    case 5:  return "Input/output error";         // EIO
-    case 9:  return "Bad file descriptor";        // EBADF
-    case 13: return "Permission denied";          // EACCES
-    case 17: return "File exists";                // EEXIST
-    case 20: return "Not a directory";            // ENOTDIR
-    case 21: return "Is a directory";             // EISDIR
-    case 22: return "Invalid argument";           // EINVAL
-    case 24: return "Too many open files";        // EMFILE
-    case 28: return "No space left on device";    // ENOSPC
-  }
-  return "I/O error";
-}
+// (Filesystem mutation — `Remove`/`Rename`/`Mkdir` — and process control live in
+// `<os.hc>`.)
 
 // --- fd helpers ---------------------------------------------------------------
 

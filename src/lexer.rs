@@ -5,7 +5,7 @@
 //! inside string/char literals and comments, where we pass them through
 //! untouched so the resulting strings stay UTF-8 valid.
 
-use crate::token::{Keyword, Pos, Span, Token, TokenKind};
+use crate::token::{FileInfo, Keyword, Pos, Span, Token, TokenKind};
 use std::fmt;
 
 /// A lexical error with the location at which it occurred.
@@ -30,6 +30,13 @@ type LResult<T> = Result<T, LexError>;
 /// either while still pulling tokens lazily, one at a time.
 pub trait TokenStream {
     fn next_token(&mut self) -> LResult<Token>;
+
+    /// The source files seen (indexed by `Span::file`), for `_`-directory privacy.
+    /// A bare lexer is a single anonymous root file; the preprocessor overrides this
+    /// with its real include table.
+    fn source_files(&self) -> Vec<FileInfo> {
+        vec![FileInfo::root()]
+    }
 }
 
 impl TokenStream for Lexer {
