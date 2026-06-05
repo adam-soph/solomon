@@ -496,7 +496,8 @@ fn native_x86_64_freestanding_getpid() {
 
 // Read-only invariants (no successful Chdir, so the interpreter's process cwd is not
 // mutated — race-free under parallel tests): Getcwd succeeds into an absolute path and
-// a bad Chdir fails.
+// a bad Chdir fails. Used only by the Unix-only invariants test (the `/`-prefix check).
+#[cfg(unix)]
 const CWD_INVARIANTS: &str = r#"
     #include <os.hc>
     U0 Main() {
@@ -522,6 +523,9 @@ const CWD_ROOT: &str = r#"
     Main;
 "#;
 
+// The `abs` check is `buf[0] == '/'` — a POSIX absolute path. On Windows the cwd is
+// absolute but drive-rooted (`C:\…`), so this invariant is Unix-only.
+#[cfg(unix)]
 #[test]
 fn interp_getcwd_invariants() {
     let out = run_to_string(&compile(CWD_INVARIANTS)).unwrap_or_else(|e| panic!("interp: {e}"));
@@ -570,6 +574,9 @@ const IDS_PROG: &str = r#"
     Main;
 "#;
 
+// Asserts POSIX id semantics (a real parent pid `> 0`); on Windows the interpreter
+// has no POSIX ppid/uid/gid (they report 0), so this is a Unix-only check.
+#[cfg(unix)]
 #[test]
 fn interp_getppid_getuid_are_sane() {
     let out = run_to_string(&compile(IDS_PROG)).unwrap_or_else(|e| panic!("interp: {e}"));
