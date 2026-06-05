@@ -174,18 +174,19 @@ Default targets:
 | Linux x86-64          | `x86_64-unknown-linux-gnu`    |
 | Linux ARM64           | `aarch64-unknown-linux-gnu`   |
 | Linux x86-64 (static) | `x86_64-unknown-linux-musl`   |
+| Windows x86-64        | `x86_64-pc-windows-msvc`      |
+| Windows x86           | `i686-pc-windows-msvc`        |
 
-These triples are what the **`hcc`/`hci` binaries themselves** are compiled for.
-The tools are **POSIX-only** — the interpreter emulates fds/files/process ids via
-`std::os::unix` — so they build for Unix (macOS/Linux) hosts; there are no Windows
-*host* binaries. Native code *generation* (`hcc`) is a separate axis, and four
-targets have a backend: `aarch64-apple-darwin`, `x86_64-unknown-linux`,
-`aarch64-unknown-linux` (both freestanding static ELFs), and `x86_64-pc-windows` —
-so `hcc` (run on a Unix host) can still *emit* a Windows PE, even though it doesn't
-run on Windows itself. The Linux targets link no libc, so there are no `-gnu`/
-`-musl` codegen variants — those suffixes are only meaningful as the *Rust* build
-triples above (how `hcc` itself is compiled). On any other platform `hci`
-interprets HolyC but `hcc` cannot emit a native executable yet.
+These triples are what the **`hcc`/`hci` binaries themselves** are compiled for —
+every one can interpret HolyC (`hci`). The interpreter's POSIX-flavoured
+fds/files/process-ids are emulated cross-platform, so the tools run on Windows too
+(Unix mode bits and uid/gid are simply ignored there). Native code *generation*
+(`hcc`) is a separate axis, and four targets have a backend: `aarch64-apple-darwin`,
+`x86_64-unknown-linux`, `aarch64-unknown-linux` (both freestanding static ELFs), and
+`x86_64-pc-windows`. The Linux targets link no libc, so there are no `-gnu`/`-musl`
+codegen variants — those suffixes are only meaningful as the *Rust* build triples
+above (how `hcc` itself is compiled). On any other platform `hci` interprets HolyC
+but `hcc` cannot emit a native executable yet.
 
 Building for an OS other than the host needs a cross linker/toolchain. The
 Makefile uses the [`cross`](https://github.com/cross-rs/cross) tool (Docker-based)

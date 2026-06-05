@@ -24,7 +24,95 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+// ---- cross-platform OS shims ----
+//
+// The interpreter emulates HolyC's POSIX-flavoured fd/file/process primitives over
+// `std`. HolyC paths arrive as raw NUL-terminated byte strings and file ops carry
+// Unix mode bits; the few places that needs Unix-only `std` APIs are funneled through
+// these shims so the tools also build (and run) on non-Unix hosts (Windows), where the
+// mode bits are ignored and there is no POSIX uid/gid.
+
+/// Build a filesystem path from HolyC's raw path bytes. On Unix the bytes pass
+/// straight through (`OsStr::from_bytes`); elsewhere they are read as UTF-8 (HolyC
+/// paths are ASCII in practice).
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(bytes)).to_path_buf()
+}
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The raw bytes of a path (the inverse of [`path_from_bytes`]).
+#[cfg(unix)]
+fn path_to_bytes(p: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes().to_vec()
+}
+#[cfg(not(unix))]
+fn path_to_bytes(p: &Path) -> Vec<u8> {
+    p.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Apply a Unix permission `mode` to a file being created; a no-op where there are no
+/// Unix mode bits (Windows).
+#[cfg(unix)]
+fn set_open_mode(opts: &mut std::fs::OpenOptions, mode: u32) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(mode);
+}
+#[cfg(not(unix))]
+fn set_open_mode(_opts: &mut std::fs::OpenOptions, _mode: u32) {}
+
+/// `mkdir(path, mode)` — the `mode` is applied on Unix and ignored elsewhere.
+#[cfg(unix)]
+fn mkdir_with_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(mode).create(path)
+}
+#[cfg(not(unix))]
+fn mkdir_with_mode(path: &Path, _mode: u32) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().create(path)
+}
+
+/// The parent process id, or 0 where `std` can't report it portably (Windows).
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    0
+}
+
+/// The real user/group id (via libc on Unix), or 0 where there is no POSIX uid/gid.
+#[cfg(unix)]
+fn get_uid() -> u32 {
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+#[cfg(unix)]
+fn get_gid() -> u32 {
+    unsafe extern "C" {
+        fn getgid() -> u32;
+    }
+    unsafe { getgid() }
+}
+#[cfg(not(unix))]
+fn get_uid() -> u32 {
+    0
+}
+#[cfg(not(unix))]
+fn get_gid() -> u32 {
+    0
+}
 
 use crate::ast::*;
 use crate::codegen::CodegenError;
@@ -1718,9 +1806,8 @@ impl<W: Write> Interpreter<W> {
             // `lib/io.hc`); map them to `OpenOptions` (`O_RDONLY`/`O_WRONLY`/`O_RDWR`
             // plus `O_CREAT`/`O_TRUNC`/`O_APPEND`).
             "Open" => {
-                use std::os::unix::ffi::OsStrExt;
                 let path_bytes = self.cstr_bytes(&args[0], pos)?;
-                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&path_bytes));
+                let path = path_from_bytes(&path_bytes);
                 let flags = self.to_i64(args[1].clone(), pos)?;
                 let mut opts = std::fs::OpenOptions::new();
                 match flags & 0b11 {
@@ -1739,10 +1826,10 @@ impl<W: Write> Interpreter<W> {
                 }
                 if flags & 0x40 != 0 {
                     // O_CREAT: honour the requested permission bits (like the native
-                    // `open(2)`), so a created file is readable/writable as asked.
-                    use std::os::unix::fs::OpenOptionsExt;
+                    // `open(2)`), so a created file is readable/writable as asked. A
+                    // no-op on platforms without Unix mode bits (Windows).
                     let mode = self.to_i64(args[2].clone(), pos)?;
-                    opts.mode(mode as u32);
+                    set_open_mode(&mut opts, mode as u32);
                 }
                 match opts.open(path) {
                     Ok(file) => {
@@ -1811,32 +1898,28 @@ impl<W: Write> Interpreter<W> {
             // Filesystem mutation over `std::fs`. Like the fd ops, a failure is the
             // negative `-errno` (the common POSIX codes agree across Linux/macOS).
             "Remove" => {
-                use std::os::unix::ffi::OsStrExt;
                 let pb = self.cstr_bytes(&args[0], pos)?;
-                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&pb));
-                match std::fs::remove_file(path) {
+                let path = path_from_bytes(&pb);
+                match std::fs::remove_file(&path) {
                     Ok(()) => Ok(Value::Int(0)),
                     Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
                 }
             }
             "Rename" => {
-                use std::os::unix::ffi::OsStrExt;
                 let ob = self.cstr_bytes(&args[0], pos)?;
                 let nb = self.cstr_bytes(&args[1], pos)?;
-                let old = std::path::Path::new(std::ffi::OsStr::from_bytes(&ob));
-                let new = std::path::Path::new(std::ffi::OsStr::from_bytes(&nb));
-                match std::fs::rename(old, new) {
+                let old = path_from_bytes(&ob);
+                let new = path_from_bytes(&nb);
+                match std::fs::rename(&old, &new) {
                     Ok(()) => Ok(Value::Int(0)),
                     Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
                 }
             }
             "Mkdir" => {
-                use std::os::unix::ffi::OsStrExt;
-                use std::os::unix::fs::DirBuilderExt;
                 let pb = self.cstr_bytes(&args[0], pos)?;
-                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&pb));
+                let path = path_from_bytes(&pb);
                 let mode = self.to_i64(args[1].clone(), pos)? as u32;
-                match std::fs::DirBuilder::new().mode(mode).create(path) {
+                match mkdir_with_mode(&path, mode) {
                     Ok(()) => Ok(Value::Int(0)),
                     Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
                 }
@@ -1849,37 +1932,25 @@ impl<W: Write> Interpreter<W> {
             }
             // Process / user ids (impure — differ from a native run, so property-tested).
             "Getpid" => Ok(Value::Int(std::process::id() as i64)),
-            "Getppid" => Ok(Value::Int(std::os::unix::process::parent_id() as i64)),
-            "Getuid" => {
-                // No std accessor for the uid; the interpreter is already unix-only
-                // (it uses `std::os::unix` throughout), so call libc directly.
-                unsafe extern "C" {
-                    fn getuid() -> u32;
-                }
-                Ok(Value::Int(unsafe { getuid() } as i64))
-            }
-            "Getgid" => {
-                unsafe extern "C" {
-                    fn getgid() -> u32;
-                }
-                Ok(Value::Int(unsafe { getgid() } as i64))
-            }
+            "Getppid" => Ok(Value::Int(parent_pid() as i64)),
+            // No std accessor for the uid/gid; on Unix call libc, on Windows report 0
+            // (Windows has no POSIX uid/gid). Impure → property-tested, not value-pinned.
+            "Getuid" => Ok(Value::Int(get_uid() as i64)),
+            "Getgid" => Ok(Value::Int(get_gid() as i64)),
             // Working directory, over `std::env` (impure).
             "Chdir" => {
-                use std::os::unix::ffi::OsStrExt;
                 let pb = self.cstr_bytes(&args[0], pos)?;
-                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&pb));
-                match std::env::set_current_dir(path) {
+                let path = path_from_bytes(&pb);
+                match std::env::set_current_dir(&path) {
                     Ok(()) => Ok(Value::Int(0)),
                     Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
                 }
             }
             "Getcwd" => {
-                use std::os::unix::ffi::OsStrExt;
                 let cap = self.to_i64(args[1].clone(), pos)?.max(0) as usize;
                 match std::env::current_dir() {
                     Ok(dir) => {
-                        let mut bytes = dir.as_os_str().as_bytes().to_vec();
+                        let mut bytes = path_to_bytes(&dir);
                         bytes.push(0); // NUL-terminate
                         if bytes.len() > cap {
                             Ok(Value::Int(-34)) // -ERANGE: buffer too small
