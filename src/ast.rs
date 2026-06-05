@@ -9,8 +9,9 @@
 //! [`Span::dummy`].
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
-use crate::token::{FileInfo, Keyword, Span};
+use crate::token::{FileInfo, Keyword, Span, Token};
 
 /// A whole translation unit. HolyC is script-like: the top level is just a
 /// sequence of statements, which may include function and class definitions.
@@ -21,12 +22,72 @@ pub struct Program {
     /// file's directory for `_`-directory privacy checks in sema. Provenance
     /// metadata, so — like spans — it is ignored by `PartialEq`.
     pub files: Vec<FileInfo>,
+    /// The generic-template registry captured during parsing. Phase 1 monomorphization
+    /// happens in the parser (call sites are already rewritten to concrete mangled
+    /// names, so `items` is fully concrete), and this is **inert** — nothing reads it
+    /// yet. It is carried so a future type-directed `mono` pass can take the templates
+    /// post-parse. Like `files`, it is ignored by `PartialEq`.
+    pub generics: GenericTemplates,
 }
 
 impl PartialEq for Program {
     fn eq(&self, other: &Self) -> bool {
         self.items == other.items
     }
+}
+
+/// The generic `class`/function templates and instance map captured during parsing,
+/// carried on the [`Program`] for a future monomorphization pass. (Today the parser
+/// instantiates everything, so this is recorded but unused.)
+#[derive(Clone, Debug, Default)]
+pub struct GenericTemplates {
+    /// Generic `class`/`union` templates, by name.
+    pub classes: HashMap<String, GenericClass>,
+    /// Generic function templates, by name.
+    pub fns: HashMap<String, GenericFn>,
+    /// A generic class instance's mangled name → `(template name, type args)`, so a
+    /// `Vec<T>` parameter can be matched against a `Vec_I64` argument to bind `T`.
+    pub instances: HashMap<String, (String, Vec<Type>)>,
+}
+
+/// A captured generic-function template: its raw tokens plus the metadata an
+/// instantiation needs. The signature is never AST-parsed in generic form (so `T` /
+/// `Vec<T>` never mis-resolve); each call substitutes the type-parameter tokens,
+/// drops the `<T>` list, renames, and re-parses into a concrete function.
+#[derive(Clone, Debug)]
+pub struct GenericFn {
+    pub type_params: Vec<String>,
+    pub tokens: Vec<Token>,
+    /// Index of the function-name token in `tokens`.
+    pub name_index: usize,
+    /// Index of the type-parameter list's closing `>` (the `<` is `name_index + 1`).
+    pub gt_index: usize,
+    /// One pattern per value parameter, for call-site type-argument inference.
+    pub param_patterns: Vec<TypePattern>,
+}
+
+/// A captured generic `class`/`union` template.
+#[derive(Clone, Debug)]
+pub struct GenericClass {
+    pub is_union: bool,
+    /// The type-parameter names, e.g. `["T"]` or `["K", "V"]`.
+    pub params: Vec<String>,
+    pub base: Option<String>,
+    /// The body `{ ... }` captured as raw tokens (never AST-parsed in generic form, so
+    /// a field may itself nest a generic type, e.g. `HmapEntry<K,V> *next`). Each
+    /// instantiation substitutes the type-parameter tokens and re-parses.
+    pub body_tokens: Vec<Token>,
+}
+
+/// A parameter type with the function's type parameters left symbolic, for inferring
+/// type arguments at an un-annotated call: `T` → `Param("T")`, `Vec<T> *` →
+/// `Ptr(Generic("Vec", [Param("T")]))`, `I64` → `Concrete`.
+#[derive(Clone, Debug)]
+pub enum TypePattern {
+    Param(String),
+    Concrete,
+    Generic(String, Vec<TypePattern>),
+    Ptr(Box<TypePattern>),
 }
 
 /// A HolyC type. Pointers and arrays wrap a base type.

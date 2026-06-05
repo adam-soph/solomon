@@ -19,6 +19,8 @@ use crate::lexer::{LexError, Lexer, TokenStream};
 use crate::preproc::Preprocessor;
 use crate::token::{Keyword, Pos, Span, Token, TokenKind};
 
+mod generics;
+
 /// A parse error: a message plus the source position where it was detected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
@@ -56,47 +58,54 @@ struct Mark {
     file: u32,
 }
 
-/// A generic `class`/`union` template — `class Vec(T) { ... }` — captured at its
-/// declaration. Each use in type position (`Vec(I8)`) is **monomorphized** into a
-/// concrete synthetic class (`Vec_I8`) at parse time, reusing the `pending_types`
-/// injection (so sema/layout/backends only ever see ordinary concrete classes).
-/// A generic function template — `U0 VecPush<T>(Vec<T> *v, T x) { … }` — captured as
-/// its raw tokens (the signature is never AST-parsed, so `T`/`Vec<T>` never mis-resolve).
-/// Each call `VecPush<I64>(…)` monomorphizes it: substitute the type-parameter tokens,
-/// drop the `<T>` list, rename to `VecPush_I64`, and re-parse into a concrete function.
-/// A parameter type with the function's type parameters left symbolic, for inferring
-/// type arguments at an un-annotated call: `T` → `Param("T")`, `Vec<T> *` →
-/// `Ptr(Generic("Vec", [Param("T")]))`, `I64` → `Concrete(I64)`.
-#[derive(Clone)]
-enum TypePattern {
-    Param(String),
-    Concrete,
-    Generic(String, Vec<TypePattern>),
-    Ptr(Box<TypePattern>),
+// The generic-template types (`GenericFn`, `GenericClass`, `TypePattern`) live in
+// `ast.rs` now — they ride along on `Program::generics` for a future `mono` pass. The
+// parser uses them via the `use crate::ast::*` glob above.
+
+/// All generic-monomorphization state, grouped so it travels as one unit. Held by the
+/// [`Parser`] as `self.generics`; the methods that operate on it live in the `generics`
+/// submodule. (Phase 1 of decoupling inference from parsing — see the `generics` module.)
+#[derive(Default)]
+struct Generics {
+    /// Generic `class`/`union` templates, by name, registered at their declaration
+    /// (define-before-use, like `typedef` aliases).
+    classes: HashMap<String, GenericClass>,
+    /// Mangled names of generic class instantiations already injected, so each distinct
+    /// `(template, type-args)` mints exactly one synthetic class.
+    class_done: HashSet<String>,
+    /// Generic function templates, by name (define-before-use).
+    fns: HashMap<String, GenericFn>,
+    /// Mangled names of generic-function instances already generated.
+    fn_done: HashSet<String>,
+    /// Pending `(fn-name, type-args)` instantiations discovered at call sites, drained
+    /// after the main parse into concrete functions.
+    pending_fns: Vec<(String, Vec<Type>)>,
+    /// Pending `(class-name, type-args)` instantiations discovered at type uses, drained
+    /// after the main parse into concrete classes.
+    pending_classes: Vec<(String, Vec<Type>)>,
+    /// Declared variable/parameter types seen so far, for inferring a generic call's
+    /// type arguments from its argument expressions. Recording-only — it never affects
+    /// any other parse decision (so non-generic code is unchanged).
+    var_types: HashMap<String, Type>,
+    /// A generic class instance's mangled name → (template name, type args), so a
+    /// `Vec<T>` parameter can be matched against a `Vec_I64` argument to bind `T`.
+    instances: HashMap<String, (String, Vec<Type>)>,
+    /// Declared function/prototype return types seen so far, so a generic call's type
+    /// arguments can be inferred from a *call-result* argument (`Id(Mk())`). Like
+    /// `var_types` it is recording-only and "seen so far" — a function defined after the
+    /// call site won't be found (fall back to explicit `<...>` then).
+    fn_rets: HashMap<String, Type>,
+    /// Direct field types of each class/union seen so far (`name` → `[(field, type)]`),
+    /// so a generic call's type can be inferred from a *member-access* argument
+    /// (`Id(p.field)`). Recording-only and "seen so far"; inherited (base-class) fields
+    /// aren't recorded, so a member access of one falls back to explicit `<...>`.
+    class_fields: HashMap<String, Vec<(String, Type)>>,
 }
 
-#[derive(Clone)]
-struct GenericFn {
-    type_params: Vec<String>,
-    tokens: Vec<Token>,
-    /// Index of the function-name token in `tokens`.
-    name_index: usize,
-    /// Index of the type-parameter list's closing `>` (the `<` is `name_index + 1`).
-    gt_index: usize,
-    /// One pattern per value parameter, for call-site type-argument inference.
-    param_patterns: Vec<TypePattern>,
-}
-
-#[derive(Clone)]
-struct GenericClass {
-    is_union: bool,
-    /// The type-parameter names, e.g. `["T"]` or `["K", "V"]`.
-    params: Vec<String>,
-    base: Option<String>,
-    /// The body `{ ... }` captured as raw tokens (never AST-parsed in generic form, so
-    /// a field may itself nest a generic type, e.g. `HmapEntry<K,V> *next`). Each
-    /// instantiation substitutes the type-parameter tokens and re-parses.
-    body_tokens: Vec<Token>,
+impl Generics {
+    fn new() -> Self {
+        Generics::default()
+    }
 }
 
 pub struct Parser<S: TokenStream> {
@@ -125,34 +134,11 @@ pub struct Parser<S: TokenStream> {
     /// Canonical names of tuple types `(T1, …, Tn)` already injected as synthetic
     /// structs, so each distinct element-list mints exactly one `$Tup…` class.
     tuple_types: HashSet<String>,
-    /// Generic `class`/`union` templates, by name, registered at their declaration
-    /// (define-before-use, like `typedef` aliases).
-    generic_classes: HashMap<String, GenericClass>,
-    /// Mangled names of generic instantiations already injected, so each distinct
-    /// `(template, type-args)` mints exactly one synthetic class.
-    generic_done: HashSet<String>,
-    /// Generic function templates, by name (define-before-use).
-    generic_fns: HashMap<String, GenericFn>,
-    /// Mangled names of generic-function instances already generated.
-    generic_fn_done: HashSet<String>,
-    /// Pending `(fn-name, type-args)` instantiations discovered at call sites, drained
-    /// after the main parse into concrete functions.
-    pending_generic_fns: Vec<(String, Vec<Type>)>,
-    /// Pending `(class-name, type-args)` instantiations discovered at type uses, drained
-    /// after the main parse into concrete classes.
-    pending_generic_classes: Vec<(String, Vec<Type>)>,
-    /// Declared variable/parameter types seen so far, for inferring a generic call's
-    /// type arguments from its argument expressions. Recording-only — it never affects
-    /// any other parse decision (so non-generic code is unchanged).
-    var_types: HashMap<String, Type>,
-    /// A generic class instance's mangled name → (template name, type args), so a
-    /// `Vec<T>` parameter can be matched against a `Vec_I64` argument to bind `T`.
-    generic_instances: HashMap<String, (String, Vec<Type>)>,
-    /// Declared function/prototype return types seen so far, so a generic call's type
-    /// arguments can be inferred from a *call-result* argument (`Id(Mk())`). Like
-    /// `var_types` it is recording-only and "seen so far" — a function defined after the
-    /// call site won't be found (fall back to explicit `<...>` then).
-    fn_rets: HashMap<String, Type>,
+    /// All generic-monomorphization state — templates, instantiation worklists, dedup
+    /// sets, and the recording-only type maps used for call-site inference. Grouped so
+    /// the whole unit travels together (and can be lifted into a later pass). See
+    /// [`Generics`] and the `generics` submodule.
+    generics: Generics,
     /// Current recursion depth through `parse_unary`/`parse_stmt` (the funnels every
     /// nested expression/statement passes through), so pathologically deep input
     /// fails with a `ParseError` instead of overflowing the stack and aborting.
@@ -181,15 +167,7 @@ impl<S: TokenStream> Parser<S> {
             pending_types: Vec::new(),
             anon_counter: 0,
             tuple_types: HashSet::new(),
-            generic_classes: HashMap::new(),
-            generic_done: HashSet::new(),
-            generic_fns: HashMap::new(),
-            generic_fn_done: HashSet::new(),
-            pending_generic_fns: Vec::new(),
-            pending_generic_classes: Vec::new(),
-            var_types: HashMap::new(),
-            generic_instances: HashMap::new(),
-            fn_rets: HashMap::new(),
+            generics: Generics::new(),
             depth: 0,
         }
     }
@@ -215,37 +193,24 @@ impl<S: TokenStream> Parser<S> {
             items.append(&mut self.pending_types);
             items.push(stmt);
         }
-        // Drain generic instantiations discovered during parsing — classes (type uses)
-        // and functions (call sites) — to a fixpoint, since generating one may request
-        // more of either. The synthetic concrete definitions are appended as top-level
-        // items (sema collects all types/functions regardless of order).
-        let mut guard = 0usize;
-        loop {
-            guard += 1;
-            if guard > 1_000_000 {
-                return self.err("generic instantiation did not terminate");
-            }
-            if let Some((name, type_args)) = self.pending_generic_classes.pop() {
-                let mangled = mangle_generic(&name, &type_args);
-                let cls = self.instantiate_generic_class(&name, &type_args, &mangled)?;
-                items.append(&mut self.pending_types);
-                items.push(cls);
-            } else if let Some((name, type_args)) = self.pending_generic_fns.pop() {
-                let mangled = mangle_generic(&name, &type_args);
-                if !self.generic_fn_done.insert(mangled.clone()) {
-                    continue; // already generated
-                }
-                let func = self.instantiate_generic_fn(&name, &type_args, &mangled)?;
-                items.append(&mut self.pending_types);
-                items.push(func);
-            } else {
-                break;
-            }
-        }
+        // Drain generic instantiations discovered during parsing to a fixpoint, appending
+        // the synthetic concrete definitions as top-level items.
+        self.drain_generics(&mut items)?;
         // The accumulated include table (indexed by `Span::file`) rides along for
         // `_`-directory privacy checks in sema.
         let files = self.stream.source_files();
-        Ok(Program { items, files })
+        // Carry the generic templates + instance map for a future `mono` pass. Inert
+        // today (the parser already instantiated everything; `items` is concrete).
+        let generics = GenericTemplates {
+            classes: std::mem::take(&mut self.generics.classes),
+            fns: std::mem::take(&mut self.generics.fns),
+            instances: std::mem::take(&mut self.generics.instances),
+        };
+        Ok(Program {
+            items,
+            files,
+            generics,
+        })
     }
 
     // ---- token buffer / look-ahead ----
@@ -299,26 +264,6 @@ impl<S: TokenStream> Parser<S> {
     fn cur_pos(&mut self) -> Pos {
         // The buffer always has at least the Eof token available.
         self.peek().map(|t| t.span.pos).unwrap_or(Pos::new(0, 0))
-    }
-
-    /// Consume a generic-closing `>`. A `>>` (`Shr`) token is split into two `>` —
-    /// the first closes this level, the second is pushed back for the enclosing one —
-    /// so nested `Vec<Vec<I8>>` parses (the classic angle-bracket problem).
-    fn expect_generic_gt(&mut self) -> PResult<()> {
-        match self.peek_kind()? {
-            TokenKind::Gt => {
-                self.advance()?;
-                Ok(())
-            }
-            TokenKind::Shr => {
-                let t = self.advance()?;
-                let mut sp = t.span;
-                sp.start += 1; // the leftover second `>`
-                self.buf.push_front(Token::new(TokenKind::Gt, sp));
-                Ok(())
-            }
-            _ => self.err("expected `>` to close generic type arguments"),
-        }
     }
 
     /// Capture the start of a node at the current token.
@@ -462,7 +407,7 @@ impl<S: TokenStream> Parser<S> {
                 if let Some(ty) = self.type_aliases.get(&s) {
                     return Ok(ty.clone());
                 }
-                if self.generic_classes.contains_key(&s) && self.at(&TokenKind::Lt)? {
+                if self.generics.classes.contains_key(&s) && self.at(&TokenKind::Lt)? {
                     return self.instantiate_generic(&s, t.span.pos);
                 }
                 Ok(Type::Named(s))
@@ -1049,202 +994,6 @@ impl<S: TokenStream> Parser<S> {
         Ok(self.st(StmtKind::Empty, m))
     }
 
-    /// Skip a balanced `<…>` starting at peek index `start` (which must be `<`),
-    /// returning the index just past the matching `>` (or `>>`). Returns 0 if
-    /// unbalanced (run off the end). Used only for non-consuming look-ahead.
-    fn skip_angle(&mut self, start: usize) -> PResult<usize> {
-        let mut depth = 0i32;
-        let mut i = start;
-        loop {
-            match self.peek_n(i)?.kind {
-                TokenKind::Lt => depth += 1,
-                TokenKind::Gt => {
-                    depth -= 1;
-                    if depth <= 0 {
-                        return Ok(i + 1);
-                    }
-                }
-                TokenKind::Shr => {
-                    depth -= 2;
-                    if depth <= 0 {
-                        return Ok(i + 1);
-                    }
-                }
-                TokenKind::Eof => return Ok(0),
-                _ => {}
-            }
-            i += 1;
-        }
-    }
-
-    /// Skip a balanced `(…)` group starting at look-ahead offset `start` (which must
-    /// be the `(`), returning the offset just past the matching `)`, or 0 on EOF.
-    fn skip_parens(&mut self, start: usize) -> PResult<usize> {
-        let mut depth = 0i32;
-        let mut i = start;
-        loop {
-            match self.peek_n(i)?.kind {
-                TokenKind::LParen => depth += 1,
-                TokenKind::RParen => {
-                    depth -= 1;
-                    if depth <= 0 {
-                        return Ok(i + 1);
-                    }
-                }
-                TokenKind::Eof => return Ok(0),
-                _ => {}
-            }
-            i += 1;
-        }
-    }
-
-    /// Non-consuming look-ahead: does the statement begin with a generic function
-    /// definition `Ret Name<…>(`? (A `<` immediately after the function name is the
-    /// signal — no existing declaration has that shape, so this never misfires.)
-    fn looks_like_generic_fn(&mut self) -> PResult<bool> {
-        let mut i = 0;
-        // Return type: a type keyword, or any identifier (a class name, or one of the
-        // function's own type parameters like `T`), with an optional `<…>` when it
-        // names a generic class; or a `(…)` tuple type. Then any pointer stars.
-        match self.peek_n(i)?.kind.clone() {
-            TokenKind::Keyword(k) if Type::from_keyword(k).is_some() => i += 1,
-            TokenKind::Ident(s) => {
-                i += 1;
-                if self.generic_classes.contains_key(&s) && self.peek_n(i)?.kind == TokenKind::Lt {
-                    i = self.skip_angle(i)?;
-                    if i == 0 {
-                        return Ok(false);
-                    }
-                }
-            }
-            TokenKind::LParen => {
-                // A tuple return type `(T0, …, Tn)`: skip the balanced parens.
-                i = self.skip_parens(i)?;
-                if i == 0 {
-                    return Ok(false);
-                }
-            }
-            _ => return Ok(false),
-        }
-        while self.peek_n(i)?.kind == TokenKind::Star {
-            i += 1;
-        }
-        // The function name, then `<` (the type-parameter list) then eventually `(`.
-        if !matches!(self.peek_n(i)?.kind, TokenKind::Ident(_)) {
-            return Ok(false);
-        }
-        i += 1;
-        if self.peek_n(i)?.kind != TokenKind::Lt {
-            return Ok(false);
-        }
-        let after = self.skip_angle(i)?;
-        if after == 0 {
-            return Ok(false);
-        }
-        Ok(self.peek_n(after)?.kind == TokenKind::LParen)
-    }
-
-    /// Capture a generic function template's raw tokens (through the body's closing
-    /// `}`), register it, and emit nothing. Locates the name token and the
-    /// type-parameter list within the captured tokens.
-    fn capture_generic_fn(&mut self, m: Mark) -> PResult<Stmt> {
-        let mut toks = Vec::new();
-        let mut brace = 0i32;
-        let mut started = false;
-        loop {
-            let t = self.advance()?;
-            match t.kind {
-                TokenKind::LBrace => {
-                    brace += 1;
-                    started = true;
-                }
-                TokenKind::RBrace => brace -= 1,
-                TokenKind::Eof => {
-                    return self.err("unterminated generic function (missing `}`)");
-                }
-                _ => {}
-            }
-            let done = started && brace == 0 && matches!(t.kind, TokenKind::RBrace);
-            toks.push(t);
-            if done {
-                break;
-            }
-        }
-        // The value-parameter list's `(` is the first one preceded by the `>` that
-        // closes the type-parameter list (not, say, a `(…)` tuple *return* type, whose
-        // `(` comes first); the matching `<` follows the function name.
-        let lp = match toks.iter().enumerate().position(|(idx, t)| {
-            t.kind == TokenKind::LParen && idx > 0 && toks[idx - 1].kind == TokenKind::Gt
-        }) {
-            Some(p) => p,
-            None => return self.err_at(m.pos, "generic function: missing `(`"),
-        };
-        let gt_index = lp - 1;
-        // Walk back to the matching `<`.
-        let mut depth = 0i32;
-        let mut k = gt_index;
-        loop {
-            match toks[k].kind {
-                TokenKind::Gt => depth += 1,
-                TokenKind::Lt => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            if k == 0 {
-                return self.err_at(m.pos, "generic function: malformed type-parameter list");
-            }
-            k -= 1;
-        }
-        let lt_index = k;
-        if lt_index == 0 {
-            return self.err_at(m.pos, "generic function: missing name");
-        }
-        let name_index = lt_index - 1;
-        let name = match &toks[name_index].kind {
-            TokenKind::Ident(s) => s.clone(),
-            _ => return self.err_at(m.pos, "generic function: name must be an identifier"),
-        };
-        let mut type_params = Vec::new();
-        for t in &toks[lt_index + 1..gt_index] {
-            if let TokenKind::Ident(s) = &t.kind {
-                type_params.push(s.clone());
-            }
-        }
-        // Extract one type pattern per value parameter (for call-site inference): the
-        // value-parameter list runs from `lp` to its matching `)`.
-        let mut depth = 0i32;
-        let mut rp = lp;
-        for (off, t) in toks[lp..].iter().enumerate() {
-            match t.kind {
-                TokenKind::LParen => depth += 1,
-                TokenKind::RParen => {
-                    depth -= 1;
-                    if depth == 0 {
-                        rp = lp + off;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let param_patterns = param_type_patterns(&toks[lp + 1..rp], &type_params);
-        self.generic_fns.insert(
-            name,
-            GenericFn {
-                type_params,
-                tokens: toks,
-                name_index,
-                gt_index,
-                param_patterns,
-            },
-        );
-        Ok(self.st(StmtKind::Empty, m))
-    }
-
     fn parse_declaration(&mut self, m: Mark) -> PResult<Stmt> {
         let base = self.parse_base_type()?;
         let dm = self.mark()?;
@@ -1254,7 +1003,7 @@ impl<S: TokenStream> Parser<S> {
             let (params, varargs) = self.parse_params()?;
             // Record the return type for call-result type inference (`Id(Mk())`), before
             // the body so a recursive call's result is inferable too. Recording-only.
-            self.fn_rets.insert(name.clone(), ty.clone());
+            self.generics.fn_rets.insert(name.clone(), ty.clone());
             let body = if self.at(&TokenKind::LBrace)? {
                 Some(self.parse_block()?)
             } else {
@@ -1310,7 +1059,7 @@ impl<S: TokenStream> Parser<S> {
             }
         }
         // Record the variable's type for generic-call type-argument inference.
-        self.var_types.insert(name.clone(), ty.clone());
+        self.generics.var_types.insert(name.clone(), ty.clone());
         Ok(Declarator {
             name,
             ty,
@@ -1405,7 +1154,7 @@ impl<S: TokenStream> Parser<S> {
                 };
                 if let Some(n) = &name {
                     // Record the parameter type for generic-call inference.
-                    self.var_types.insert(n.clone(), ty.clone());
+                    self.generics.var_types.insert(n.clone(), ty.clone());
                 }
                 params.push(Param {
                     ty,
@@ -1444,6 +1193,17 @@ impl<S: TokenStream> Parser<S> {
         let fields = self.parse_class_fields()?;
         self.eat(&TokenKind::Semicolon)?; // optional trailing `;`
 
+        // Record the direct field types for member-access type inference (`Id(p.x)`).
+        // Recording-only; covers user classes and (since instances re-parse through
+        // here) monomorphized generic classes.
+        self.generics.class_fields.insert(
+            name.clone(),
+            fields
+                .iter()
+                .map(|d| (d.name.clone(), d.ty.clone()))
+                .collect(),
+        );
+
         Ok(self.st(
             StmtKind::Class(ClassDef {
                 is_union,
@@ -1453,308 +1213,6 @@ impl<S: TokenStream> Parser<S> {
             }),
             m,
         ))
-    }
-
-    /// Parse a generic template `class Name<T, …> { … }` (the leading `<` has been
-    /// peeked). Records the template for later monomorphization and emits no item.
-    fn parse_generic_class(&mut self, is_union: bool, name: String, m: Mark) -> PResult<Stmt> {
-        self.advance()?; // `<`
-        let mut params = Vec::new();
-        loop {
-            params.push(self.expect_ident()?);
-            if !self.eat(&TokenKind::Comma)? {
-                break;
-            }
-        }
-        self.expect(&TokenKind::Gt, "`>` to close the type-parameter list")?;
-        let base = if self.eat(&TokenKind::Colon)? {
-            Some(self.expect_ident()?)
-        } else {
-            None
-        };
-        // Capture the body `{ ... }` as raw tokens (so a field may nest a generic type
-        // with this template's parameters); substituted + re-parsed at each instantiation.
-        let lb = self.advance()?;
-        if !matches!(lb.kind, TokenKind::LBrace) {
-            return self.err("expected `{` to begin a generic class body");
-        }
-        let mut body_tokens = vec![lb];
-        let mut depth = 1i32;
-        loop {
-            let t = self.advance()?;
-            match t.kind {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => depth -= 1,
-                TokenKind::Eof => return self.err("unterminated generic class (missing `}`)"),
-                _ => {}
-            }
-            let close = depth == 0;
-            body_tokens.push(t);
-            if close {
-                break;
-            }
-        }
-        self.eat(&TokenKind::Semicolon)?;
-        self.generic_classes.insert(
-            name,
-            GenericClass {
-                is_union,
-                params,
-                base,
-                body_tokens,
-            },
-        );
-        Ok(self.st(StmtKind::Empty, m)) // the template itself produces no code
-    }
-
-    /// Use of generic `name` in type position: parse `<arg, …>`, return the concrete
-    /// type name now, and queue the instance for generation after the main parse
-    /// (deduped by its mangled name).
-    fn instantiate_generic(&mut self, name: &str, pos: Pos) -> PResult<Type> {
-        self.expect(&TokenKind::Lt, "`<` for generic type arguments")?;
-        let mut args = Vec::new();
-        loop {
-            // A nested generic argument (`Vec<Vec<I8>>`) instantiates first, naturally.
-            args.push(self.parse_type_no_name()?);
-            if !self.eat(&TokenKind::Comma)? {
-                break;
-            }
-        }
-        self.expect_generic_gt()?; // closes `>`, splitting a `>>` for nesting
-        let tmpl = self
-            .generic_classes
-            .get(name)
-            .expect("generic exists")
-            .clone();
-        if args.len() != tmpl.params.len() {
-            return Err(ParseError {
-                message: format!(
-                    "generic `{name}` expects {} type argument(s), got {}",
-                    tmpl.params.len(),
-                    args.len()
-                ),
-                pos,
-            });
-        }
-        let mangled = mangle_generic(name, &args);
-        self.generic_instances
-            .insert(mangled.clone(), (name.to_string(), args.clone()));
-        // Return the concrete type name now; generate the class definition after the main
-        // parse (so a nested generic field re-types correctly and self-reference dedups).
-        if self.generic_done.insert(mangled.clone()) {
-            self.known_types.insert(mangled.clone());
-            self.pending_generic_classes.push((name.to_string(), args));
-        }
-        Ok(Type::Named(mangled))
-    }
-
-    /// Generate a concrete class from a generic class template: substitute the
-    /// type-parameter tokens, name it `mangled`, and re-parse the body (so nested
-    /// generic fields instantiate concretely and re-queue).
-    fn instantiate_generic_class(
-        &mut self,
-        name: &str,
-        type_args: &[Type],
-        mangled: &str,
-    ) -> PResult<Stmt> {
-        let tmpl = self
-            .generic_classes
-            .get(name)
-            .expect("generic class")
-            .clone();
-        let kw = if tmpl.is_union {
-            Keyword::Union
-        } else {
-            Keyword::Class
-        };
-        let mut out = vec![
-            Token::new(TokenKind::Keyword(kw), Span::dummy()),
-            Token::new(TokenKind::Ident(mangled.to_string()), Span::dummy()),
-        ];
-        if let Some(base) = &tmpl.base {
-            out.push(Token::new(TokenKind::Colon, Span::dummy()));
-            out.push(Token::new(TokenKind::Ident(base.clone()), Span::dummy()));
-        }
-        let subst: HashMap<&str, Vec<Token>> = tmpl
-            .params
-            .iter()
-            .zip(type_args.iter())
-            .map(|(p, a)| (p.as_str(), type_to_tokens(a)))
-            .collect();
-        for t in &tmpl.body_tokens {
-            if let TokenKind::Ident(s) = &t.kind {
-                if let Some(rep) = subst.get(s.as_str()) {
-                    out.extend(rep.iter().cloned());
-                    continue;
-                }
-            }
-            out.push(t.clone());
-        }
-        let saved = std::mem::take(&mut self.buf);
-        self.buf = out.into();
-        let cm = self.mark()?;
-        let cls = self.parse_class(cm);
-        self.buf = saved;
-        cls
-    }
-
-    /// Parse a `<T1, …>` type-argument list (for a generic call).
-    fn parse_type_args(&mut self) -> PResult<Vec<Type>> {
-        self.expect(&TokenKind::Lt, "`<` for type arguments")?;
-        let mut args = Vec::new();
-        loop {
-            args.push(self.parse_type_no_name()?);
-            if !self.eat(&TokenKind::Comma)? {
-                break;
-            }
-        }
-        self.expect_generic_gt()?;
-        Ok(args)
-    }
-
-    /// Monomorphize a generic function: substitute the type-parameter tokens with the
-    /// argument tokens, drop the `<T>` list, rename to `mangled`, and re-parse the
-    /// result into a concrete function definition (sharing this parser's tables, so
-    /// generic types/calls in the body resolve and re-queue).
-    fn instantiate_generic_fn(
-        &mut self,
-        name: &str,
-        type_args: &[Type],
-        mangled: &str,
-    ) -> PResult<Stmt> {
-        let tmpl = self
-            .generic_fns
-            .get(name)
-            .expect("generic fn exists")
-            .clone();
-        if type_args.len() != tmpl.type_params.len() {
-            return self.err_at(
-                tmpl.tokens[tmpl.name_index].span.pos,
-                format!(
-                    "generic function `{name}` expects {} type argument(s), got {}",
-                    tmpl.type_params.len(),
-                    type_args.len()
-                ),
-            );
-        }
-        let subst: HashMap<&str, Vec<Token>> = tmpl
-            .type_params
-            .iter()
-            .zip(type_args.iter())
-            .map(|(p, a)| (p.as_str(), type_to_tokens(a)))
-            .collect();
-        let name_tok = Token::new(TokenKind::Ident(mangled.to_string()), Span::dummy());
-        let mut out: Vec<Token> = Vec::new();
-        for (i, t) in tmpl.tokens.iter().enumerate() {
-            // Drop the type-parameter list `<T, …>` (from `<` to its `>`).
-            if i > tmpl.name_index && i <= tmpl.gt_index {
-                continue;
-            }
-            if i == tmpl.name_index {
-                out.push(name_tok.clone());
-                continue;
-            }
-            if let TokenKind::Ident(s) = &t.kind {
-                if let Some(rep) = subst.get(s.as_str()) {
-                    out.extend(rep.iter().cloned());
-                    continue;
-                }
-            }
-            out.push(t.clone());
-        }
-        // Re-parse `out` as a concrete function through this same parser (so its body's
-        // generic types/calls resolve and contribute to the pending queues).
-        let saved = std::mem::take(&mut self.buf);
-        self.buf = out.into();
-        let dm = self.mark()?;
-        let func = self.parse_declaration(dm);
-        self.buf = saved;
-        func
-    }
-
-    /// Infer a generic function's type arguments from a call's argument types, queue
-    /// the instance, and return its mangled name. Errors if any type parameter can't
-    /// be inferred (the caller should then use explicit `Name<...>(...)`).
-    fn infer_generic_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> PResult<String> {
-        let tmpl = self.generic_fns.get(name).expect("generic fn").clone();
-        let mut binds: HashMap<String, Type> = HashMap::new();
-        for (i, pat) in tmpl.param_patterns.iter().enumerate() {
-            if let Some(arg) = args.get(i) {
-                if let Some(aty) = self.arg_type(arg) {
-                    self.unify_pattern(pat, &aty, &mut binds);
-                }
-            }
-        }
-        let mut type_args = Vec::new();
-        for p in &tmpl.type_params {
-            match binds.get(p) {
-                Some(t) => type_args.push(t.clone()),
-                None => {
-                    return self.err_at(
-                        pos,
-                        format!(
-                            "cannot infer type argument `{p}` for generic `{name}`; \
-                             call it as `{name}<...>(...)`"
-                        ),
-                    );
-                }
-            }
-        }
-        let mangled = mangle_generic(name, &type_args);
-        self.pending_generic_fns.push((name.to_string(), type_args));
-        Ok(mangled)
-    }
-
-    /// Best-effort static type of a generic call's argument expression — enough for
-    /// the common forms (a literal, a variable, `&variable`, an explicit cast, or a
-    /// call whose callee's return type has been seen). `None` ⇒ can't infer (the call
-    /// must then give explicit `<...>` type arguments).
-    fn arg_type(&self, e: &Expr) -> Option<Type> {
-        match &e.kind {
-            ExprKind::Int(_) | ExprKind::Char(_) => Some(Type::I64),
-            ExprKind::Float(_) => Some(Type::F64),
-            ExprKind::Str(_) => Some(Type::Ptr(Box::new(Type::U8))),
-            ExprKind::Ident(n) => self.var_types.get(n).cloned(),
-            ExprKind::Unary {
-                op: UnOp::AddrOf,
-                expr,
-            } => Some(Type::Ptr(Box::new(self.arg_type(expr)?))),
-            // An explicit cast names its own type.
-            ExprKind::Cast { ty, .. } => Some(ty.clone()),
-            // A call result: the callee's recorded return type (a plain named call only —
-            // a function pointer or a not-yet-seen function isn't resolvable here).
-            ExprKind::Call { callee, .. } => match &callee.kind {
-                ExprKind::Ident(n) => self.fn_rets.get(n).cloned(),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// Match a parameter pattern against an argument type, binding type parameters.
-    fn unify_pattern(&self, pat: &TypePattern, ty: &Type, out: &mut HashMap<String, Type>) {
-        match pat {
-            TypePattern::Param(p) => {
-                out.entry(p.clone()).or_insert_with(|| ty.clone());
-            }
-            TypePattern::Ptr(inner) => {
-                if let Type::Ptr(t) = ty {
-                    self.unify_pattern(inner, t, out);
-                }
-            }
-            TypePattern::Generic(g, pats) => {
-                if let Type::Named(n) = ty {
-                    if let Some((gname, targs)) = self.generic_instances.get(n) {
-                        if gname == g {
-                            for (pa, ta) in pats.iter().zip(targs.iter()) {
-                                self.unify_pattern(pa, ta, out);
-                            }
-                        }
-                    }
-                }
-            }
-            TypePattern::Concrete => {}
-        }
     }
 
     /// Parse a `{ field; field; … }` aggregate body into its declarators. An
@@ -2097,14 +1555,14 @@ impl<S: TokenStream> Parser<S> {
         // A generic function call `Name<TypeArgs>(...)`: rewrite the callee to the
         // mangled instance name and queue it for monomorphization.
         let gen_name = match &e.kind {
-            ExprKind::Ident(n) if self.generic_fns.contains_key(n) => Some(n.clone()),
+            ExprKind::Ident(n) if self.generics.fns.contains_key(n) => Some(n.clone()),
             _ => None,
         };
         if let Some(name) = gen_name {
             if self.at(&TokenKind::Lt)? {
                 let type_args = self.parse_type_args()?;
                 let mangled = mangle_generic(&name, &type_args);
-                self.pending_generic_fns.push((name, type_args));
+                self.generics.pending_fns.push((name, type_args));
                 e = self.ex(ExprKind::Ident(mangled), m);
             }
         }
@@ -2118,7 +1576,7 @@ impl<S: TokenStream> Parser<S> {
                     // An un-annotated call to a generic function — infer its type
                     // arguments from the argument types and resolve to the instance.
                     if let ExprKind::Ident(n) = &e.kind {
-                        if self.generic_fns.contains_key(n) {
+                        if self.generics.fns.contains_key(n) {
                             let name = n.clone();
                             let mangled = self.infer_generic_call(&name, &args, m.pos)?;
                             e = self.ex(ExprKind::Ident(mangled), m);

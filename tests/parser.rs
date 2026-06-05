@@ -585,13 +585,39 @@ fn generic_function_infers_from_cast_and_call_result() {
 }
 
 #[test]
-fn generic_inference_still_needs_explicit_for_member_access() {
-    // The documented boundary: `arg_type` doesn't type a member access (it would need
-    // class-field resolution at parse time), so it falls back to a clear error that
-    // points at the explicit form.
-    let err =
-        parse("class Box{I64 v;} T Id<T>(T x){return x;} Box b; I64 a = Id(b.v);").unwrap_err();
-    assert!(err.to_string().contains("cannot infer"), "got: {err}");
+fn generic_inference_resolves_member_index_deref_and_arithmetic() {
+    // `arg_type` now types member access, indexing, deref, and arithmetic (using the
+    // recorded class-field types), so none of these need an explicit `<...>`. Each
+    // generic `T` here is inferable *only* from the argument (no receiver to recover it
+    // from), so a missing case would be a hard "cannot infer" error.
+    let names = |src: &str| -> Vec<String> {
+        prog(src)
+            .items
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Func(f) => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // member access (I64 field) and a pointer-to-class arrow access
+    let n = names(
+        "class Box{I64 v; F64 f;} T Id<T>(T x){return x;} \
+         Box b; I64 a = Id(b.v); Box *p = &b; I64 c = Id(p->v);",
+    );
+    assert!(n.contains(&"Id_I64".to_string()), "member access: {n:?}");
+    // member access of an F64 field binds T=F64
+    let n = names("class Box{F64 f;} T Id<T>(T x){return x;} Box b; F64 a = Id(b.f);");
+    assert!(n.contains(&"Id_F64".to_string()), "F64 member: {n:?}");
+    // indexing, deref, and arithmetic
+    let n = names(
+        "T Id<T>(T x){return x;} I64 arr[3]; I64 a = Id(arr[0]); \
+         I64 q = 1; I64 *pp = &q; I64 b = Id(*pp); I64 c = Id(q + a);",
+    );
+    assert!(
+        n.contains(&"Id_I64".to_string()),
+        "index/deref/arith: {n:?}"
+    );
 }
 
 #[test]
@@ -601,4 +627,24 @@ fn generic_inference_does_not_see_a_later_function() {
     let err =
         parse("T Id<T>(T x){return x;} I64 a = Id(Later()); I64 Later(){return 4;}").unwrap_err();
     assert!(err.to_string().contains("cannot infer"), "got: {err}");
+}
+
+#[test]
+fn program_carries_generic_templates() {
+    // Phase 1B: the parser records the generic templates + instance map on
+    // `Program::generics` for a future `mono` pass. It's inert (the parser already
+    // instantiated everything into `items`), but it must be populated.
+    let p =
+        parse("class Vec<T> { T *data; } T Id<T>(T x) { return x; } Vec<I64> v; I64 a = Id(1);")
+            .unwrap();
+    assert!(
+        p.generics.classes.contains_key("Vec"),
+        "Vec template recorded"
+    );
+    assert!(p.generics.fns.contains_key("Id"), "Id template recorded");
+    assert_eq!(
+        p.generics.instances.get("Vec_I64"),
+        Some(&("Vec".to_string(), vec![Type::I64])),
+        "Vec<I64> instance map recorded"
+    );
 }
