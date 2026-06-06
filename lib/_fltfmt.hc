@@ -1,13 +1,13 @@
-#ifndef _IMPL_FLTFMT_HC
-#define _IMPL_FLTFMT_HC
-// _impl/fltfmt.hc — the private internals of the correctly-rounded `F64` formatter.
+#ifndef _FLTFMT_HC
+#define _FLTFMT_HC
+// _fltfmt.hc — the private internals of the correctly-rounded `F64` formatter.
 //
 // A formatter-sized base-2^32 big integer plus the per-conversion *magnitude*
-// formatters (`%f`/`%e`/`%g`, no sign/width/flags). The public entry that assembles
-// the complete field is `_FmtFloat` in `<fltfmt.hc>`; these are an implementation
-// detail, private to the standard library (Go-`internal/`-style). The algorithm is
-// the portable replacement for the hand-emitted bignum in the native backends, run
-// by the interpreter so it is byte-for-byte the conformance oracle (Rust's `{:.P}`).
+// formatters (`%f`/`%e`/`%g`, no sign/width/flags), and the public entry `_FmtFloat`
+// (below) that assembles the complete field. Private to the standard library via this
+// file's `_`-prefixed name. The algorithm is the portable replacement for the
+// hand-emitted bignum in the native backends, run by the interpreter so it is
+// byte-for-byte the conformance oracle (Rust's `{:.P}`).
 //
 // The big integer is little-endian base-2^32 (each limb < 2^32 so `limb * small`
 // fits in 64 bits), sized for the worst case `%.512f` of `1.8e308` (~820 digits).

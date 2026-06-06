@@ -88,6 +88,9 @@ struct Analyzer {
     funcs: HashMap<String, FuncSig>,
     /// Lexical variable scopes; `scopes[0]` is the global scope.
     scopes: Vec<HashMap<String, Type>>,
+    /// The defining file (`Span::file`) of each global, for `_`-directory privacy —
+    /// a global declared under a `_`-prefixed dir/file is gated like a function.
+    global_files: HashMap<String, u32>,
     /// Return type of the function currently being checked, if any.
     cur_ret: Option<Type>,
     loop_depth: u32,
@@ -111,6 +114,7 @@ impl Analyzer {
             types: HashMap::new(),
             funcs: HashMap::new(),
             scopes: Vec::new(),
+            global_files: HashMap::new(),
             cur_ret: None,
             loop_depth: 0,
             switch_depth: 0,
@@ -271,11 +275,17 @@ impl Analyzer {
     /// Declare a variable in the current scope, reporting a redeclaration if the
     /// name already exists at this level.
     fn declare(&mut self, name: &str, ty: Type, pos: Pos) {
+        // A declaration at the global scope (only `scopes[0]` present) records its
+        // defining file, so a global under a `_`-private dir/file is gated on use.
+        let is_global = self.scopes.len() == 1;
         let scope = self.scopes.last_mut().unwrap();
         if scope.contains_key(name) {
             self.error(pos, format!("redeclaration of `{name}`"));
         } else {
             scope.insert(name.to_string(), ty);
+            if is_global {
+                self.global_files.insert(name.to_string(), self.cur_file);
+            }
         }
     }
 
@@ -806,7 +816,20 @@ impl Analyzer {
             // accurate — e.g. `sizeof(arr)` sees the array, not a pointer. Use
             // sites (arithmetic, indexing, assignment) apply array-to-pointer
             // decay themselves.
-            return t.clone();
+            let t = t.clone();
+            // If the name resolves to a global (not shadowed by a local in an inner
+            // scope) defined in a `_`-private file, enforce that privacy — like a
+            // function or type reference.
+            let shadowed = self.scopes[1..].iter().any(|s| s.contains_key(name));
+            let def_file = if shadowed {
+                None
+            } else {
+                self.global_files.get(name).copied()
+            };
+            if let Some(df) = def_file {
+                self.check_private_access(df, self.cur_file, name, pos);
+            }
+            return t;
         }
         // A bare function name acts like a call in HolyC; give it the return
         // type.
@@ -922,9 +945,9 @@ impl Analyzer {
         tt
     }
 
-    /// Enforce `_`-directory privacy: a symbol defined in a file under a
-    /// `_`-prefixed directory may only be referenced from within that directory's
-    /// *parent* subtree (Go's `internal/`, generalized to any `_`-named directory).
+    /// Enforce `_`-privacy: a symbol defined in a file under a `_`-prefixed directory
+    /// (or in a `_`-prefixed file) may only be referenced from within that subtree
+    /// (Go's `internal/`, generalized to any `_`-named directory *or* file).
     fn check_private_access(&mut self, def_file: u32, ref_file: u32, name: &str, pos: Pos) {
         let msg = {
             let (Some(def), Some(refr)) = (
@@ -936,16 +959,20 @@ impl Analyzer {
             if def.visible_to(refr) {
                 return;
             }
-            let dir = def.privacy_dir.clone().unwrap_or_default();
+            let elem = def.privacy_dir.clone().unwrap_or_default();
             let root = match &def.privacy_root {
                 Some(r) if r.is_empty() => ".".to_string(),
                 Some(r) => r.join("/"),
                 None => return,
             };
-            format!(
-                "`{name}` is private to the `{dir}/` directory and can only be used \
-                 from within `{root}/`"
-            )
+            // A `_`-file's privacy root is its own directory (so it equals `def.dir`); a
+            // `_`-dir's root is a strict prefix. Word the diagnostic for each.
+            let what = if def.privacy_root.as_ref() == Some(&def.dir) {
+                format!("the `{elem}` file")
+            } else {
+                format!("the `{elem}/` directory")
+            };
+            format!("`{name}` is private to {what} and can only be used from within `{root}/`")
         };
         self.error(pos, msg);
     }

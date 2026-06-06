@@ -9,9 +9,9 @@ use solomon::sema::check_program;
 
 /// Parse `src` with the repository's `lib/` on the angle-include search path, then
 /// type-check and run it, returning captured output. The base directory is `lib/`
-/// itself, so a test may exercise private `_impl/` helpers (the `_`-directory
-/// privacy is keyed on the file's directory — a program rooted in `lib/` is inside
-/// the `_impl/` parent subtree).
+/// itself, so a test may exercise private `_`-prefixed helpers (`_`-file/dir privacy
+/// is keyed on the file's path — a program rooted in `lib/` is inside the subtree the
+/// stdlib's private modules are visible from).
 fn run_with_stdlib(src: &str) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let program = parse_with(src, &lib, std::slice::from_ref(&lib))
@@ -290,7 +290,7 @@ fn holyc_float_f_formatter_matches_rust() {
     ];
     let precs: &[usize] = &[0, 1, 2, 3, 6, 10, 15, 17, 20];
 
-    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
     let mut expected = String::new();
     for &v in values {
         for &p in precs {
@@ -363,7 +363,7 @@ fn holyc_float_e_g_formatter_matches_rust() {
     ];
     let precs: &[usize] = &[0, 1, 3, 6, 17];
 
-    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
     let mut expected = String::new();
     let emit = |src: &mut String, expected: &mut String, call: String, want: String| {
         src.push_str(&call);
@@ -449,7 +449,7 @@ fn holyc_float_field_matches_interp() {
     let values: &[f64] = &[
         3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1e6, -0.001, 42.0, 0.5,
     ];
-    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
     for &(spec, conv, flags, width, prec) in cases {
         for &v in values {
             let bits = v.to_bits();

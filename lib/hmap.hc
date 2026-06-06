@@ -22,7 +22,7 @@
 #include <cstr.hc>
 #include <mem.hc>
 #include <vec.hc>
-#include <_impl/strhash.hc>   // private djb2 (the `_impl/` privacy demo)
+#include <_strhash.hc>   // private djb2 (the `_`-file privacy demo)
 
 #define HMAP_INIT_BUCKETS 8
 
@@ -45,7 +45,7 @@ class Hmap<K, V> {
 I64 HmapI64Hash(I64 *k) { I64 v = *k; return (v ^ (v >> 32)) & 0x7FFFFFFFFFFFFFFF; }
 Bool HmapI64Eq(I64 *a, I64 *b) { return *a == *b; }
 // String keys: the key is a `U8 *`, so the op takes `U8 **` and dereferences it. `Djb2`
-// is the private `<_impl/strhash.hc>` helper, reachable from the stdlib subtree.
+// is the private `<_strhash.hc>` helper, reachable from the stdlib subtree.
 I64 HmapStrHash(U8 **k) { return Djb2(*k); }
 Bool HmapStrEq(U8 **a, U8 **b) { return StrCmp(*a, *b) == 0; }
 

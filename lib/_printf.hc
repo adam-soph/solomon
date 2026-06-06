@@ -1,6 +1,6 @@
-#ifndef _IMPL_PRINTF_HC
-#define _IMPL_PRINTF_HC
-// _impl/printf.hc — the private core of the printf family (`Print`/`StrPrint`/
+#ifndef _PRINTF_HC
+#define _PRINTF_HC
+// _printf.hc — the private core of the printf family (`Print`/`StrPrint`/
 // `CatPrint`/`MStrPrint`, declared in `<fmt.hc>`). `_VFmt` walks the format string,
 // pulls the variadic slots, and renders each conversion into a sink (a fd via
 // `StdWrite`, or a buffer). Integers and strings are laid out here, mirroring
@@ -8,15 +8,15 @@
 // `_FmtFloat`. The interpreter renders the printf family via `crate::fmt` (its
 // independent conformance oracle) and never runs this, so the two cross-check.
 //
-// Private (`_impl/`): user code prints via `Print` / `"%f", …`, never by calling
-// these directly.
+// Private (the `_`-prefixed filename): user code prints via `Print` / `"%f", …`,
+// never by calling these directly.
 
 #include <stdio.hc>         // StdWrite (the fd sink) — NOT <io.hc>, to avoid compiling
                             // its file helpers (gated on unsupported targets) into every
                             // printing program (there is no dead-code elimination)
 #include <mem.hc>           // ReAlloc (MStrPrint growth)
 #include <cstr.hc>          // StrLen
-#include <_impl/fltfmt.hc>  // _FmtFloat + the _FLT_* flag bits
+#include <_fltfmt.hc>  // _FmtFloat + the _FLT_* flag bits
 
 // Width/precision caps matching `crate::fmt::{MAX_WIDTH, MAX_PRECISION}`.
 #define _PF_MAX_WIDTH 1024

@@ -14,7 +14,7 @@ fn errors(program: &solomon::Program) -> Vec<String> {
 }
 
 /// A program that pulls in `<hmap.hc>` (embedded stdlib) and a body. The stdlib's
-/// `hmap.hc` privately uses `Djb2` from `<_impl/strhash.hc>`.
+/// `hmap.hc` privately uses `Djb2` from `<_strhash.hc>`.
 fn stdlib_program(body: &str) -> solomon::Program {
     parse(&format!(
         "#include <hmap.hc>\nU0 Main() {{ {body} }}\nMain;"
@@ -32,8 +32,8 @@ fn public_stdlib_symbol_is_callable() {
 
 #[test]
 fn private_stdlib_symbol_is_rejected_from_user_code() {
-    // `Djb2` lives under the stdlib's `_impl/` directory, so a user program may not
-    // call it even though `<hmap.hc>` pulled it in transitively.
+    // `Djb2` lives in the stdlib's `_`-prefixed `_strhash.hc`, so a user program may
+    // not call it even though `<hmap.hc>` pulled it in transitively.
     let p = stdlib_program("Djb2(\"k\");");
     let errs = errors(&p);
     assert!(
@@ -128,5 +128,78 @@ fn private_dir_rejects_callers_outside_the_subtree() {
         errs.iter()
             .any(|m| m.contains("Secret") && m.contains("private")),
         "outside caller should be rejected, got: {errs:?}"
+    );
+}
+
+#[test]
+fn private_dir_protects_globals_too() {
+    // A global declared under a `_` directory is private just like a function or type.
+    let root = std::env::temp_dir().join(format!("solomon-priv-g-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("_secret")).unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    std::fs::write(root.join("_secret/g.hc"), "I64 SecretG = 7;\n").unwrap();
+
+    // In-subtree (app/ under <root>/, which _secret/ is private to) — allowed.
+    let inside = parse_in_dir(
+        "#include \"../_secret/g.hc\"\nU0 Main(){ I64 x = SecretG; }\nMain;",
+        &root.join("app"),
+    )
+    .unwrap();
+    assert!(
+        errors(&inside).is_empty(),
+        "in-subtree global use should be allowed: {:?}",
+        errors(&inside)
+    );
+
+    // Outside <root>/ — rejected.
+    let outside = std::env::temp_dir().join(format!("solomon-priv-gout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let root_inc = root.display().to_string().replace('\\', "/");
+    let src =
+        format!("#include \"{root_inc}/_secret/g.hc\"\nU0 Main(){{ I64 x = SecretG; }}\nMain;");
+    let out = parse_in_dir(&src, &outside).unwrap();
+    let errs = errors(&out);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("SecretG") && m.contains("private")),
+        "outside global use should be rejected, got: {errs:?}"
+    );
+}
+
+#[test]
+fn private_file_is_visible_only_within_its_directory() {
+    // A `_`-prefixed *file* (not just a `_` directory) is private to its own
+    // directory's subtree.
+    let root = std::env::temp_dir().join(format!("solomon-priv-f-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("lib/_priv.hc"), "I64 Helper(){ return 9; }\n").unwrap();
+
+    // Same directory as `_priv.hc` — allowed.
+    let inside = parse_in_dir(
+        "#include \"_priv.hc\"\nU0 Main(){ Helper(); }\nMain;",
+        &root.join("lib"),
+    )
+    .unwrap();
+    assert!(
+        errors(&inside).is_empty(),
+        "same-dir use of a `_` file should be allowed: {:?}",
+        errors(&inside)
+    );
+
+    // The parent directory <root>/ is outside the `_` file's subtree — rejected.
+    let root_inc = root.display().to_string().replace('\\', "/");
+    let src = format!("#include \"{root_inc}/lib/_priv.hc\"\nU0 Main(){{ Helper(); }}\nMain;");
+    let outside = parse_in_dir(&src, &root).unwrap();
+    let errs = errors(&outside);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("Helper") && m.contains("private")),
+        "use of a `_` file from outside its directory should be rejected, got: {errs:?}"
     );
 }

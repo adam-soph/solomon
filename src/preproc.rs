@@ -153,7 +153,10 @@ impl<S: TokenStream> Preprocessor<S> {
         // Canonicalize it so its directory components line up with the canonicalized
         // paths of `#include`d files (otherwise `/tmp` vs `/private/tmp` mismatch).
         let canon_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
-        let base_info = FileInfo::from_dir(dir_components(&canon_base));
+        // The top-level file's own name isn't known here (the lexer wraps a source
+        // string), so it gets no filename-based privacy — only its directory's. (A
+        // root file is never `#include`d by others, so its own privacy is moot.)
+        let base_info = FileInfo::from_dir(dir_components(&canon_base), "");
         Preprocessor {
             inner,
             lookahead: None,
@@ -975,22 +978,28 @@ fn dir_components(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The [`FileInfo`] of a file on disk — its privacy comes from its parent directory.
+/// The [`FileInfo`] of a file on disk — its privacy comes from its parent directory
+/// and its own filename (a `_`-prefixed file is private to its directory's subtree).
 fn file_info_for_disk(file: &Path) -> FileInfo {
     let dir = file.parent().map(dir_components).unwrap_or_default();
-    FileInfo::from_dir(dir)
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    FileInfo::from_dir(dir, &name)
 }
 
 /// The [`FileInfo`] of an embedded-stdlib file, named by its angle-include path
-/// (e.g. `_impl/strhash.hc`). The embedded library is its own root namespace
-/// (`<stdlib>`), so e.g. `_impl/strhash.hc` lives in dir `["<stdlib>", "_impl"]`.
+/// (e.g. `_strhash.hc`). The embedded library is its own root namespace (`<stdlib>`),
+/// so a `_`-prefixed file like `_strhash.hc` is private to that `<stdlib>` subtree.
 fn file_info_for_embedded(angle_path: &str) -> FileInfo {
     let mut dir = vec!["<stdlib>".to_string()];
     let parts: Vec<&str> = angle_path.split('/').collect();
     for p in &parts[..parts.len().saturating_sub(1)] {
         dir.push((*p).to_string());
     }
-    FileInfo::from_dir(dir)
+    let name = parts.last().copied().unwrap_or_default();
+    FileInfo::from_dir(dir, name)
 }
 
 /// Reconstruct an angle-include path from the tokens of `#include <name>` (passed

@@ -2,7 +2,7 @@
 #define _FMT_HC
 // fmt.hc — formatted output (the printf family).
 //
-// These are ordinary HolyC now, built on the private core in `<_impl/printf.hc>`
+// These are ordinary HolyC now, built on the private core in `<_printf.hc>`
 // (which walks the format string and renders each conversion) over a sink that is
 // either a fd (`StdWrite`) or a buffer. The **interpreter** renders them via its own
 // `crate::fmt` module — its independent conformance oracle — and never runs these
@@ -19,7 +19,7 @@
 //   CatPrint(dst, fmt, ...)      — sprintf appended at `dst + StrLen(dst)`; returns `dst`.
 //   MStrPrint(fmt, ...)          — asprintf into a fresh, growing heap buffer.
 
-#include <_impl/printf.hc>
+#include <_printf.hc>
 
 U0 Print(U8 *fmt, ...)
 {

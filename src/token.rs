@@ -51,9 +51,22 @@ impl FileInfo {
         FileInfo::default()
     }
 
-    /// Build from a file's directory components, computing its privacy from the
-    /// deepest `_`-prefixed component (if any).
-    pub fn from_dir(dir: Vec<String>) -> Self {
+    /// Build from a file's directory components and filename, computing its privacy
+    /// from the **deepest `_`-prefixed path element** — a directory *or* the filename
+    /// itself. A `_`-prefixed file is private to its own directory's subtree; a
+    /// `_`-prefixed directory is private to that directory's parent subtree (the file
+    /// being deeper, it wins when both are present).
+    pub fn from_dir(dir: Vec<String>, file: &str) -> Self {
+        // The filename, if `_`-prefixed, is the deepest possible element: the symbols
+        // are private to the file's own directory subtree.
+        if file.starts_with('_') {
+            return FileInfo {
+                privacy_root: Some(dir.clone()),
+                privacy_dir: Some(file.to_string()),
+                dir,
+            };
+        }
+        // Otherwise the deepest `_`-prefixed directory component (if any).
         match dir.iter().rposition(|c| c.starts_with('_')) {
             Some(i) => FileInfo {
                 privacy_root: Some(dir[..i].to_vec()),

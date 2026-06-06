@@ -322,7 +322,7 @@ fn native_holyc_float_formatter_matches_interp() {
     let values: &[f64] = &[
         3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1000000.0, -0.001, 1e300,
     ];
-    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){ U8 b[2048];\n");
+    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){ U8 b[2048];\n");
     for &(conv, flags, width, prec) in cases {
         for &v in values {
             src.push_str(&format!(
@@ -332,8 +332,8 @@ fn native_holyc_float_formatter_matches_interp() {
         }
     }
     src.push_str("}\nMain;\n");
-    // `_FmtFloat` is private to the stdlib's `_impl/`, so root the parse in `lib/`
-    // (a program inside the `_impl/` parent subtree may call it).
+    // `_FmtFloat` is private (it lives in the `_`-prefixed `_fltfmt.hc`), so root the
+    // parse in `lib/` — a program inside the stdlib subtree may call it.
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let program = parse_with(&src, &lib, std::slice::from_ref(&lib)).expect("parse failed");
     assert!(check_program(&program).is_empty(), "semantic errors");

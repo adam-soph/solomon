@@ -85,13 +85,13 @@ generic construct into concrete AST (see "Monomorphization is its own pass" belo
 everything downstream sees an ordinary, fully-concrete `Program`.
 
 **Auto-availability of the float formatter.** Float printing is a pure-HolyC library
-function (`lib/_impl/fltfmt.hc`'s `_FmtFloat`) the backends *call* rather than emit, so
+function (`lib/_fltfmt.hc`'s `_FmtFloat`) the backends *call* rather than emit, so
 it must be in scope whenever a program prints a float — but with no dead-code
 elimination it can't simply be linked unconditionally. So `hoist_type_names` also
 returns a `uses_float` flag: as it streams the tokens it inspects each string literal
 with `format_str_has_float_conv` (the same `crate::fmt::parse` the backends lower with),
 set when any conversion is `%f`/`%e`/`%E`/`%g`/`%G`. When set, `parse_core` prepends
-`#include <_impl/fltfmt.hc>` to the real-parse prelude, so `_FmtFloat` and its bignum
+`#include <_fltfmt.hc>` to the real-parse prelude, so `_FmtFloat` and its bignum
 helpers compile into the program. The check is shared by every target: the interpreter
 ignores the include (it renders floats via `fmt.rs`), Darwin carries it (it prints
 floats via libc `printf`, so the function is compiled but unused there), and the
@@ -272,7 +272,7 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   `MAlloc` over `mmap`, the sprintf family (and the lone `StrLen` routine its
   `CatPrint` append calls), and the FP algebraic op `Sqrt` (a single AArch64
   `fsqrt`). **Float printing (`%f`/`%e`/`%g`) is no longer emitted runtime**: the
-  correctly-rounded formatters are pure HolyC in `lib/_impl/fltfmt.hc` (`_FmtFloat`,
+  correctly-rounded formatters are pure HolyC in `lib/_fltfmt.hc` (`_FmtFloat`,
   over a formatter-sized base-2³² bignum `_Fbn`), auto-included when a format string
   carries a float conversion (see "auto-availability" below). `gen_print_fs`'s float
   case evaluates the value, marshals `_FmtFloat(out, v, conv, flags, width, prec)`
@@ -333,7 +333,7 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   `- 0 + space #`, `*` width/precision from args) for `%d %i %u %x %X %o %c %s
   %f %e %g %%` — the float forms are **correctly-rounded** (matching Rust's
   `{:.P}`/`{:.Pe}` byte-for-byte, incl. round-half-to-even ties) by the **pure-HolyC**
-  `_FmtFloat` (`lib/_impl/fltfmt.hc`), shared with the freestanding arm64 backend and
+  `_FmtFloat` (`lib/_fltfmt.hc`), shared with the freestanding arm64 backend and
   auto-included when a format string carries a float conversion (see "auto-availability"
   below). `gen_print`'s float case evaluates the value into `xmm0`, marshals
   `_FmtFloat(out, v, conv, flags, width, prec)` into a BSS `outbuf`, then hands the
@@ -482,7 +482,7 @@ includable on its own:
 - `lib/fmt.hc` — the **printf-family intrinsics**: `Print`/`StrPrint`/`CatPrint`/
   `MStrPrint` prototypes (the backends render them; bare strings and the `"fmt", args`
   comma form need no include).
-- `lib/_impl/fltfmt.hc` — the **correctly-rounded float formatter** the backends call
+- `lib/_fltfmt.hc` — the **correctly-rounded float formatter** the backends call
   to render `%f`/`%e`/`%g` (so the bignum lives once, in HolyC, instead of being
   hand-emitted per backend). `_FmtFloat(out, v, conv, flags, width, prec)` writes the
   complete field (sign from the IEEE bit, so `-0.0` keeps its `-`; zero-pad after the
@@ -490,7 +490,7 @@ includable on its own:
   layout byte-for-byte. Built on a formatter-sized base-2³² bignum `_Fbn` and the
   magnitude renderers `_FmtFMag`/`_FmtEMag`/`_FmtGMag` (the `%f` path builds
   `J = round(m·5^P·2^(E+P))` with round-half-even; `%e`/`%g` work from the value's exact
-  decimal expansion). **Private** (`_impl/`): it's compiler-internal print machinery, so
+  decimal expansion). **Private** (the `_`-prefixed filename): it's compiler-internal print machinery, so
   user code prints floats via `Print`/`"%f", …` — calling `_FmtFloat`/`_Fbn`/`_FmtFMag`
   directly is a privacy error. Auto-included when a format string carries a float
   conversion (see "Auto-availability of the float formatter" above); the interpreter
@@ -533,7 +533,7 @@ includable on its own:
   **nests its own generic type** — see the generics note below); `HmapGet` returns
   `(V value, Bool found)` (the flag a sentinel can't express). Two stock key kinds ship:
   `HmapI64{Hash,Eq}` (I64 keys) and `HmapStr{Hash,Eq}` (`U8 *` keys — stores the
-  **pointer**, `StrCmp`/djb2 via the private `<_impl/strhash.hc>` `Djb2`, so a string key
+  **pointer**, `StrCmp`/djb2 via the private `<_strhash.hc>` `Djb2`, so a string key
   must outlive the map). It `#include`s `<vec.hc>` for iteration: `HmapKeys`/`HmapValues`
   collect into a `Vec<K>`/`Vec<V>`, `HmapEntries` into a `Vec<HmapKV<K, V>>` (a
   `{K key; V val;}` pair, key at offset 0 so a stock comparator sorts by key), and
@@ -730,20 +730,23 @@ from one `keywords!` table to avoid drift.
   is a call (`Main;` runs `Main()`).
 - **Calls must resolve** to a defined function or a registered builtin — an
   unknown call is a compile-time error (no implicit-extern fallback).
-- **`_`-directory privacy** (Go's `internal/`, generalized to *any* directory
+- **`_`-privacy** (Go's `internal/`, generalized to *any* directory **or file**
   whose name begins with `_`, and applied to all code — stdlib and user programs
-  alike): a function or `class`/`union` defined in a file under a `_`-prefixed
-  directory may be referenced only from files in that directory's **parent**
+  alike): a function, `class`/`union`, **or global** defined under a `_`-prefixed
+  *directory* (private to that directory's **parent** subtree) or in a `_`-prefixed
+  *file* (private to that file's **own directory** subtree — the file is the deepest
+  `_` element, so it wins when both apply) may be referenced only from within that
   subtree; anyone else gets a compile-time error. It's a **sema-only** check (no
   effect on the interpreter or backends): the preprocessor stamps each token's
   `Span::file` with an index into a per-program file table (`Program::files`,
-  `FileInfo` — each file's directory components + computed privacy root), the
-  parser carries that file id onto AST-node spans via `Mark`, and sema's
-  `check_private_access` gates `check_call` (functions) and `resolve_type`
-  (types) by `FileInfo::visible_to`. The embedded stdlib is its own root
-  namespace (`<stdlib>`), so e.g. `lib/_impl/strhash.hc`'s `Djb2` is private to
+  `FileInfo` — each file's directory components + filename + computed privacy root,
+  via `FileInfo::from_dir(dir, file)`), the parser carries that file id onto AST-node
+  spans via `Mark`, and sema's `check_private_access` gates `check_call` (functions),
+  `resolve_type` (types), and `check_ident` (globals, by their recorded def file in
+  `global_files`) by `FileInfo::visible_to`. The embedded stdlib is its own root
+  namespace (`<stdlib>`), so e.g. `lib/_strhash.hc`'s `Djb2` is private to
   the rest of the library (used by `lib/hmap.hc`'s `HmapStrHash`) but a compile error
-  from user code. (Globals are not yet gated.) Tested in `tests/privacy.rs`.
+  from user code. Tested in `tests/privacy.rs`.
 - **`switch`** takes `switch (x)` or the bracketed `switch [x]` (parsed
   identically). A body may carry `start:` / `end:` sub-labels (the `Start`/`End`
   keywords, `StmtKind::SwitchStart`/`SwitchEnd`): `start:` is a **prologue** run
