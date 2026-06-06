@@ -469,8 +469,9 @@ fn deeply_nested_input_is_an_error_not_a_stack_overflow() {
 
 #[test]
 fn generic_class_monomorphizes() {
-    // `class Vec<T>` + a use `Vec<I64>` stamps out a concrete `Vec_I64` with `T`
-    // substituted; the template itself emits no class.
+    // `class Vec<T>` + a use `Vec<I64>` stamps out a concrete `3VecI64` (the
+    // injective mangling of `Vec<I64>`) with `T` substituted; the template itself
+    // emits no class.
     let p = prog("class Vec<T> { T *data; I64 len; } Vec<I64> x;");
     let classes: Vec<&ClassDef> = p
         .items
@@ -482,8 +483,8 @@ fn generic_class_monomorphizes() {
         .collect();
     let vi = classes
         .iter()
-        .find(|c| c.name == "Vec_I64")
-        .expect("Vec_I64 should be generated");
+        .find(|c| c.name == "3VecI64")
+        .expect("Vec<I64> instance should be generated");
     assert_eq!(vi.fields[0].name, "data");
     assert_eq!(vi.fields[0].ty, Type::Ptr(Box::new(Type::I64)));
     assert_eq!(vi.fields[1].ty, Type::I64);
@@ -496,7 +497,7 @@ fn generic_dedups_repeated_instantiations() {
     let n = p
         .items
         .iter()
-        .filter(|s| matches!(&s.kind, StmtKind::Class(c) if c.name == "Vec_I64"))
+        .filter(|s| matches!(&s.kind, StmtKind::Class(c) if c.name == "3VecI64"))
         .count();
     assert_eq!(n, 1, "Vec<I64> used twice should mint one class");
 }
@@ -515,7 +516,7 @@ fn generic_arity_mismatch_is_an_error() {
 #[test]
 fn generic_function_monomorphizes_by_type_arg() {
     // `T Id<T>(T x){...}` + calls `Id<I64>(..)` / `Id<F64>(..)` generate concrete
-    // `Id_I64` / `Id_F64`, and the call sites resolve to those mangled names.
+    // `2IdI64` / `2IdF64`, and the call sites resolve to those mangled names.
     let p = prog("T Id<T>(T x) { return x; } I64 a = Id<I64>(1); F64 b = Id<F64>(2.0);");
     let funcs: Vec<&FuncDef> = p
         .items
@@ -525,11 +526,11 @@ fn generic_function_monomorphizes_by_type_arg() {
             _ => None,
         })
         .collect();
-    assert!(funcs.iter().any(|f| f.name == "Id_I64"));
-    assert!(funcs.iter().any(|f| f.name == "Id_F64"));
+    assert!(funcs.iter().any(|f| f.name == "2IdI64"));
+    assert!(funcs.iter().any(|f| f.name == "2IdF64"));
     assert!(!funcs.iter().any(|f| f.name == "Id")); // template emits no function
     // the I64 instance has a concrete I64 parameter and return type
-    let id_i64 = funcs.iter().find(|f| f.name == "Id_I64").unwrap();
+    let id_i64 = funcs.iter().find(|f| f.name == "2IdI64").unwrap();
     assert_eq!(id_i64.ret, Type::I64);
     assert_eq!(id_i64.params[0].ty, Type::I64);
 }
@@ -540,14 +541,14 @@ fn generic_function_dedups() {
     let n = p
         .items
         .iter()
-        .filter(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == "Id_I64"))
+        .filter(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == "2IdI64"))
         .count();
     assert_eq!(n, 1);
 }
 
 #[test]
 fn generic_function_infers_type_args() {
-    // `Id<T>(T)` called as `Id(1)` infers `T=I64`, generating `Id_I64` and resolving
+    // `Id<T>(T)` called as `Id(1)` infers `T=I64`, generating `2IdI64` and resolving
     // the (un-annotated) call to it.
     let p = prog("T Id<T>(T x){return x;} I64 a = Id(1);");
     let funcs: Vec<&FuncDef> = p
@@ -558,7 +559,7 @@ fn generic_function_infers_type_args() {
             _ => None,
         })
         .collect();
-    assert!(funcs.iter().any(|f| f.name == "Id_I64"));
+    assert!(funcs.iter().any(|f| f.name == "2IdI64"));
 }
 
 #[test]
@@ -577,9 +578,9 @@ fn generic_function_infers_from_cast_and_call_result() {
             _ => None,
         })
         .collect();
-    assert!(names.contains(&"Id_I64"), "call-result I64: {names:?}");
+    assert!(names.contains(&"2IdI64"), "call-result I64: {names:?}");
     assert!(
-        names.contains(&"Id_F64"),
+        names.contains(&"2IdF64"),
         "call-result F64 + cast F64: {names:?}"
     );
 }
@@ -605,17 +606,17 @@ fn generic_inference_resolves_member_index_deref_and_arithmetic() {
         "class Box{I64 v; F64 f;} T Id<T>(T x){return x;} \
          Box b; I64 a = Id(b.v); Box *p = &b; I64 c = Id(p->v);",
     );
-    assert!(n.contains(&"Id_I64".to_string()), "member access: {n:?}");
+    assert!(n.contains(&"2IdI64".to_string()), "member access: {n:?}");
     // member access of an F64 field binds T=F64
     let n = names("class Box{F64 f;} T Id<T>(T x){return x;} Box b; F64 a = Id(b.f);");
-    assert!(n.contains(&"Id_F64".to_string()), "F64 member: {n:?}");
+    assert!(n.contains(&"2IdF64".to_string()), "F64 member: {n:?}");
     // indexing, deref, and arithmetic
     let n = names(
         "T Id<T>(T x){return x;} I64 arr[3]; I64 a = Id(arr[0]); \
          I64 q = 1; I64 *pp = &q; I64 b = Id(*pp); I64 c = Id(q + a);",
     );
     assert!(
-        n.contains(&"Id_I64".to_string()),
+        n.contains(&"2IdI64".to_string()),
         "index/deref/arith: {n:?}"
     );
 }
@@ -628,7 +629,7 @@ fn generic_inference_sees_a_forward_declared_function() {
     assert!(
         p.items
             .iter()
-            .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == "Id_I64")),
+            .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == "2IdI64")),
         "Id<I64> should be instantiated from the forward-declared Later's return type"
     );
 }
@@ -650,19 +651,19 @@ fn mono_inference_closes_ternary_inherited_and_fnptr_gaps() {
     };
     // a ternary argument
     let n = names("T Id<T>(T x){return x;} U0 F(){ I64 c=1; I64 a = Id(c ? 1 : 2); }");
-    assert!(n.contains(&"Id_I64".to_string()), "ternary: {n:?}");
+    assert!(n.contains(&"2IdI64".to_string()), "ternary: {n:?}");
     // an inherited (base-class) field
     let n = names(
         "class Base{I64 v;} class Derived:Base{I64 w;} T Id<T>(T x){return x;} \
          U0 F(){ Derived d; I64 a = Id(d.v); }",
     );
-    assert!(n.contains(&"Id_I64".to_string()), "inherited field: {n:?}");
+    assert!(n.contains(&"2IdI64".to_string()), "inherited field: {n:?}");
     // a function-pointer call result
     let n = names(
         "I64 G(I64 x){return x;} T Id<T>(T x){return x;} \
          U0 F(){ I64 (*fp)(I64) = &G; I64 a = Id(fp(3)); }",
     );
-    assert!(n.contains(&"Id_I64".to_string()), "fnptr result: {n:?}");
+    assert!(n.contains(&"2IdI64".to_string()), "fnptr result: {n:?}");
 }
 
 #[test]
@@ -686,8 +687,8 @@ fn mono_consumes_templates_and_emits_concrete_instances() {
             .iter()
             .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name == n))
     };
-    assert!(has_class("Vec_I64"), "Vec<I64> instantiated");
-    assert!(has_fn("Id_I64"), "Id(1) inferred + instantiated");
+    assert!(has_class("3VecI64"), "Vec<I64> instantiated");
+    assert!(has_fn("2IdI64"), "Id(1) inferred + instantiated");
 }
 
 #[test]
@@ -769,7 +770,7 @@ fn colon_eq_through_generic_calls() {
         parse(src).is_ok_and(|p| {
             p.items
                 .iter()
-                .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name.starts_with("Pick_")))
+                .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name.contains("Pick")))
         })
     };
     let prog = "(T, Bool) Pick<T>(T x) { return x, 1; } ";

@@ -655,7 +655,7 @@ fn expr_uses_ident(e: &Expr, names: &[&str]) -> bool {
     }
 }
 
-/// Whether `name` is a compiler-synthesized tuple struct (`$Tup$…`) — a tuple type
+/// Whether `name` is a compiler-synthesized tuple struct (`$Tup…`) — a tuple type
 /// `(T1, …, Tn)` lowered to a positional struct with fields `_0`, `_1`, ….
 pub fn is_tuple_name(name: &str) -> bool {
     name.starts_with("$Tup")

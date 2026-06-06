@@ -69,14 +69,9 @@ const FP: u32 = 29;
 const LR: u32 = 30;
 const SP: u32 = 31;
 
-// printf flag bits for the freestanding formatter (mirror the x86-64 backend).
-const F_SIGNED: i64 = 1; // a signed conversion (`%d`/`%i`)
-const F_UPPER: i64 = 2; // uppercase hex (`%X`) / `0X`
-const F_MINUS: i64 = 4; // left-justify
-const F_ZERO: i64 = 8; // zero-pad
-const F_PLUS: i64 = 16; // always show a sign
-const F_SPACE: i64 = 32; // space before a non-negative
-const F_HASH: i64 = 64; // alternate form (`0x`/leading `0`)
+// printf flag bits for the freestanding formatter — the shared runtime ABI, defined
+// once in `crate::backend` (the x86-64 backend tests the same bits).
+use crate::backend::{F_HASH, F_MINUS, F_PLUS, F_SIGNED, F_SPACE, F_UPPER, F_ZERO};
 const NLIMBS: i64 = 48; // limbs in the float-formatting BIGNUM (matches x86-64)
 
 // Freestanding printf scratch buffer sizes, large enough for the clamped
@@ -960,7 +955,7 @@ impl Cg {
                             // the slot, then store the provided elements/fields
                             // (recursing for nested aggregates).
                             self.gen_zero_slot(off, size);
-                            self.gen_init_into(&Place::Local(off), &d.ty, 0, init)?;
+                            self.gen_init_into(Place::Local(off), &d.ty, 0, init)?;
                         }
                         Some(init) if matches!(d.ty, Type::Named(_)) => {
                             // Copy-initialise a class from another class value.
@@ -1000,51 +995,12 @@ impl Cg {
             }
 
             StmtKind::If { cond, then, else_ } => {
-                self.gen_expr(cond)?;
-                let l_else = self.asm.new_label();
-                self.asm.cbz(RES, l_else);
-                self.gen_stmt(then)?;
-                if let Some(else_branch) = else_ {
-                    let l_end = self.asm.new_label();
-                    self.asm.b(l_end);
-                    self.asm.place(l_else);
-                    self.gen_stmt(else_branch)?;
-                    self.asm.place(l_end);
-                } else {
-                    self.asm.place(l_else);
-                }
+                crate::backend::gen_if(self, cond, then, else_.as_deref())?
             }
 
-            StmtKind::While { cond, body } => {
-                let l_top = self.asm.new_label();
-                let l_end = self.asm.new_label();
-                self.asm.place(l_top);
-                self.gen_expr(cond)?;
-                self.asm.cbz(RES, l_end);
-                self.break_targets.push(l_end);
-                self.continue_targets.push(l_top);
-                self.gen_stmt(body)?;
-                self.break_targets.pop();
-                self.continue_targets.pop();
-                self.asm.b(l_top);
-                self.asm.place(l_end);
-            }
+            StmtKind::While { cond, body } => crate::backend::gen_while(self, cond, body)?,
 
-            StmtKind::DoWhile { body, cond } => {
-                let l_top = self.asm.new_label();
-                let l_cont = self.asm.new_label();
-                let l_end = self.asm.new_label();
-                self.asm.place(l_top);
-                self.break_targets.push(l_end);
-                self.continue_targets.push(l_cont);
-                self.gen_stmt(body)?;
-                self.break_targets.pop();
-                self.continue_targets.pop();
-                self.asm.place(l_cont);
-                self.gen_expr(cond)?;
-                self.asm.cbnz(RES, l_top);
-                self.asm.place(l_end);
-            }
+            StmtKind::DoWhile { body, cond } => crate::backend::gen_do_while(self, body, cond)?,
 
             StmtKind::For {
                 init,
@@ -1052,30 +1008,7 @@ impl Cg {
                 step,
                 body,
             } => {
-                self.scopes.push(HashMap::new());
-                if let Some(init) = init {
-                    self.gen_stmt(init)?;
-                }
-                let l_top = self.asm.new_label();
-                let l_cont = self.asm.new_label();
-                let l_end = self.asm.new_label();
-                self.asm.place(l_top);
-                if let Some(cond) = cond {
-                    self.gen_expr(cond)?;
-                    self.asm.cbz(RES, l_end);
-                }
-                self.break_targets.push(l_end);
-                self.continue_targets.push(l_cont);
-                self.gen_stmt(body)?;
-                self.break_targets.pop();
-                self.continue_targets.pop();
-                self.asm.place(l_cont);
-                if let Some(step) = step {
-                    self.gen_expr(step)?;
-                }
-                self.asm.b(l_top);
-                self.asm.place(l_end);
-                self.scopes.pop();
+                crate::backend::gen_for(self, init.as_deref(), cond.as_ref(), step.as_ref(), body)?
             }
 
             StmtKind::Switch { cond, body } => self.gen_switch(cond, body, s.span.pos)?,
@@ -1105,7 +1038,7 @@ impl Cg {
                             let size = self.type_size(&ty).max(1);
                             let align = self.type_align(&ty);
                             let tmp = self.alloc(size, align);
-                            self.gen_init_into(&Place::Local(tmp), &ty, 0, e)?;
+                            self.gen_init_into(Place::Local(tmp), &ty, 0, e)?;
                             self.asm.sub_imm(RES, FP, tmp);
                         } else {
                             self.gen_expr(e)?; // RES = source address
@@ -1150,110 +1083,11 @@ impl Cg {
         Ok(())
     }
 
+    /// Lower a `switch`. The control structure (partition, dispatch, body) is the
+    /// shared [`crate::backend::gen_switch`] driver; this backend supplies the leaf
+    /// emits via [`SwitchEmitter`], including the O(1) jump-table fast path.
     fn gen_switch(&mut self, cond: &Expr, body: &Stmt, pos: Pos) -> Result<(), CodegenError> {
-        let StmtKind::Block(stmts) = &body.kind else {
-            return Err(CodegenError::at(pos, "switch body must be a block"));
-        };
-
-        self.gen_expr(cond)?;
-        let voff = self.alloc(8, 8);
-        self.asm.sub_imm(T2, FP, voff);
-        self.gen_store(RES, T2, &Type::I64);
-
-        // HolyC `start:` / `end:` sub-labels partition the body into an optional
-        // prologue (runs on entry, before dispatch) and epilogue (reached by
-        // fall-through; `break` skips it). Sema has checked the ordering.
-        let start_idx = stmts
-            .iter()
-            .position(|s| matches!(s.kind, StmtKind::SwitchStart));
-        let first_case = stmts
-            .iter()
-            .position(|s| matches!(s.kind, StmtKind::Case { .. } | StmtKind::Default));
-        let end_idx = stmts
-            .iter()
-            .position(|s| matches!(s.kind, StmtKind::SwitchEnd));
-        let prologue = start_idx.map(|si| (si + 1)..first_case.unwrap_or(stmts.len()));
-
-        let l_end = self.asm.new_label();
-        self.break_targets.push(l_end);
-        self.scopes.push(HashMap::new());
-
-        // Prologue: always runs, before the dispatch compares.
-        if let Some(range) = prologue.clone() {
-            for st in &stmts[range] {
-                self.gen_stmt(st)?;
-            }
-        }
-
-        let mut label_at: HashMap<usize, usize> = HashMap::new();
-        let mut default_label: Option<usize> = None;
-        let end_label = end_idx.map(|_| self.asm.new_label());
-        for (i, st) in stmts.iter().enumerate() {
-            match &st.kind {
-                StmtKind::Case { .. } => {
-                    label_at.insert(i, self.asm.new_label());
-                }
-                StmtKind::Default => {
-                    let l = self.asm.new_label();
-                    label_at.insert(i, l);
-                    default_label = Some(l);
-                }
-                _ => {}
-            }
-        }
-
-        // No case matched: fall to default, else the epilogue, else the exit.
-        let gap_target = default_label.or(end_label).unwrap_or(l_end);
-        // Prefer an O(1) branch table when the cases are dense integer constants;
-        // otherwise fall back to a linear compare-chain.
-        if !self.try_gen_branch_table(stmts, &label_at, voff, gap_target)? {
-            for (i, st) in stmts.iter().enumerate() {
-                if let StmtKind::Case { lo, hi } = &st.kind {
-                    let target = label_at[&i];
-                    self.gen_expr(lo)?;
-                    self.asm.mov_reg(T2, RES);
-                    self.load_local(RES, voff, &Type::I64);
-                    self.asm.cmp_reg(RES, T2);
-                    match hi {
-                        None => self.asm.b_cond(COND_EQ, target),
-                        Some(hi) => {
-                            let skip = self.asm.new_label();
-                            self.asm.b_cond(COND_LT, skip);
-                            self.gen_expr(hi)?;
-                            self.asm.mov_reg(T2, RES);
-                            self.load_local(RES, voff, &Type::I64);
-                            self.asm.cmp_reg(RES, T2);
-                            self.asm.b_cond(COND_GT, skip);
-                            self.asm.b(target);
-                            self.asm.place(skip);
-                        }
-                    }
-                }
-            }
-            self.asm.b(gap_target);
-        }
-
-        for (i, st) in stmts.iter().enumerate() {
-            if prologue.as_ref().is_some_and(|r| r.contains(&i)) {
-                continue; // already emitted as the prologue
-            }
-            if let Some(&l) = label_at.get(&i) {
-                self.asm.place(l);
-            }
-            match &st.kind {
-                StmtKind::Case { .. } | StmtKind::Default | StmtKind::SwitchStart => {}
-                StmtKind::SwitchEnd => {
-                    if let Some(l) = end_label {
-                        self.asm.place(l);
-                    }
-                }
-                _ => self.gen_stmt(st)?,
-            }
-        }
-        self.scopes.pop();
-        self.break_targets.pop();
-        self.asm.place(l_end);
-        Ok(())
+        crate::backend::gen_switch(self, cond, body, pos)
     }
 
     /// Try to dispatch a switch through an O(1) jump table instead of a linear
@@ -1345,7 +1179,7 @@ impl Cg {
         if is_brace_init(init) {
             // A global is common storage the linker zeroes, so only the provided
             // elements/fields need stores.
-            self.gen_init_into(&Place::Global(sym), &ty, 0, init)?;
+            self.gen_init_into(Place::Global(sym), &ty, 0, init)?;
             return Ok(());
         }
         if matches!(ty, Type::Named(_)) {
@@ -1430,94 +1264,17 @@ impl Cg {
         }
     }
 
-    /// Emit the stores for a brace initialiser (or a single leaf value) into the
-    /// aggregate at `place`, at byte offset `byte_off`. Recurses for nested
-    /// arrays/structs; only provided elements are written (locals are zeroed
-    /// first, globals are linker-zeroed).
+    /// Emit a brace/designated initialiser into the aggregate at `place`. The
+    /// recursion/dispatch is the shared [`crate::backend::gen_init_into`] driver;
+    /// this backend supplies the leaf stores via [`InitEmitter`].
     fn gen_init_into(
         &mut self,
-        place: &Place,
+        place: Place,
         ty: &Type,
         byte_off: u32,
         init: &Expr,
     ) -> Result<(), CodegenError> {
-        if let ExprKind::InitList(items) = &init.kind {
-            match ty {
-                Type::Array(elem, _) => {
-                    let stride = self.layouts.stride_of(elem) as u32;
-                    for (i, item) in items.iter().enumerate() {
-                        self.gen_init_into(place, elem, byte_off + i as u32 * stride, item)?;
-                    }
-                }
-                Type::Named(class) => {
-                    let fields: Vec<(Type, u32)> = self
-                        .layouts
-                        .get(class)
-                        .map(|l| {
-                            l.fields
-                                .iter()
-                                .map(|f| (f.ty.clone(), f.offset as u32))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for (item, (fty, foff)) in items.iter().zip(fields.iter()) {
-                        self.gen_init_into(place, fty, byte_off + foff, item)?;
-                    }
-                }
-                _ => {
-                    return Err(CodegenError::at(
-                        init.span.pos,
-                        "arm64 backend: an initializer list can only initialize an array, class, or union",
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        if let ExprKind::DesignatedInit(items) = &init.kind {
-            let Type::Named(class) = ty else {
-                return Err(CodegenError::at(
-                    init.span.pos,
-                    "arm64 backend: a designated initializer can only initialize a class or union",
-                ));
-            };
-            // Field name -> (type, offset), captured before the store loop.
-            let fields: Vec<(String, Type, u32)> = self
-                .layouts
-                .get(class)
-                .map(|l| {
-                    l.fields
-                        .iter()
-                        .map(|f| (f.name.clone(), f.ty.clone(), f.offset as u32))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (name, value) in items {
-                let Some((_, fty, foff)) = fields.iter().find(|(n, _, _)| n == name) else {
-                    return Err(CodegenError::at(
-                        value.span.pos,
-                        format!("arm64 backend: `{class}` has no field `{name}`"),
-                    ));
-                };
-                self.gen_init_into(place, &fty.clone(), byte_off + foff, value)?;
-            }
-            return Ok(());
-        }
-        // A leaf value: scalar, pointer, float, or an aggregate-valued expression.
-        if is_f64(ty) {
-            self.gen_foperand(init)?;
-            self.elem_addr(T2, place, byte_off);
-            self.asm.fmov_to_gpr(RES, FRES);
-            self.asm.store_mem(RES, T2, 8);
-        } else if is_aggregate(ty) {
-            self.gen_expr(init)?; // RES = source address
-            self.elem_addr(T2, place, byte_off);
-            self.gen_memcpy(T2, RES, self.type_size(ty), SCRATCH);
-        } else {
-            self.gen_int_expr(init, ty)?;
-            self.elem_addr(T2, place, byte_off);
-            self.gen_store(RES, T2, ty);
-        }
-        Ok(())
+        crate::backend::gen_init_into(self, place, ty, byte_off, init)
     }
 
     // ---- expressions: value -> RES ----
@@ -3343,27 +3100,14 @@ impl Cg {
         varargs: bool,
     ) -> Result<(), CodegenError> {
         let n = params.len();
-
-        // For an indirect call, evaluate the function-pointer value up front and
-        // spill it on the stack so it survives argument evaluation (it is popped
-        // back just before the `blr`, after the arg pushes/pops are balanced).
-        if let CallTarget::Indirect(callee) = target {
-            self.gen_expr(callee)?; // RES = function address
-            self.asm.push(RES);
-        }
-
-        // A by-value aggregate result is returned through a caller-allocated
-        // temporary whose address is handed to the callee in x8.
-        let sret_off = if is_aggregate(ret) {
-            let size = self.type_size(ret).max(1);
-            let align = self.type_align(ret);
-            Some(self.alloc(size, align))
+        let indirect_callee = if let CallTarget::Indirect(c) = target {
+            Some(c)
         } else {
             None
         };
-
-        // Evaluate each argument left-to-right, spilling its raw 8 bytes (an
-        // integer/pointer or class address, or the bit pattern of a double).
+        // Named args = the declared params, filling a missing trailing arg from its
+        // default (an error if none); anything past them is variadic `extra`.
+        let mut named: Vec<(&Type, &Expr)> = Vec::with_capacity(n);
         for i in 0..n {
             let arg = if i < args.len() {
                 &args[i]
@@ -3372,116 +3116,48 @@ impl Cg {
                     CodegenError::at(pos, format!("missing argument for `{name}`"))
                 })?
             };
-            if is_f64(&params[i].ty) {
-                self.gen_foperand(arg)?;
-                self.asm.fmov_to_gpr(RES, FRES);
-            } else {
-                self.gen_int_expr(arg, &params[i].ty)?;
-            }
-            self.asm.push(RES);
+            named.push((&params[i].ty, arg));
         }
-
-        // Variadic call: stage the trailing args (past the named params) into a
-        // frame buffer — 8 bytes each, an F64 by its bit pattern. The buffer lives
-        // in our frame (so it outlives the call); its address and count are passed
-        // as two hidden integer args after the named ones. `va_ptr = FP - off`
-        // (element 0); element j is at `FP - (off - j*8)`.
-        // For a variadic callee, always pass the hidden va_ptr/va_cnt — even with zero
-        // trailing args (`Sum()`), where the count is 0; otherwise the callee would read
-        // them from uninitialised registers and deref a garbage `VargV`.
-        let va = if varargs {
-            let extra = args.get(n..).unwrap_or(&[]);
-            let k = extra.len() as u32;
-            let off = self.alloc(k * 8, 8);
-            for (j, arg) in extra.iter().enumerate() {
-                if is_f64(&self.expr_ty(arg)) {
-                    self.gen_foperand(arg)?;
-                    self.asm.fmov_to_gpr(RES, FRES);
-                } else {
-                    self.gen_expr(arg)?;
-                }
-                self.asm.sub_imm(T2, FP, off - (j as u32) * 8);
-                self.asm.store_mem(RES, T2, 8);
-            }
-            Some((off, k))
-        } else {
-            None
-        };
-
-        // Assign each argument to its ABI register: x0.. for integers, v0.. for
-        // doubles, numbered independently.
-        let mut igr = 0u32;
-        let mut fpr = 0u32;
-        let mut targets = Vec::with_capacity(n);
-        for p in params {
-            if is_f64(&p.ty) {
-                if fpr > 7 {
-                    return Err(CodegenError::at(
-                        pos,
-                        "arm64 backend: at most 8 floating-point arguments",
-                    ));
-                }
-                targets.push((true, fpr));
-                fpr += 1;
-            } else {
-                if igr > 7 {
-                    return Err(CodegenError::at(
-                        pos,
-                        "arm64 backend: at most 8 integer arguments",
-                    ));
-                }
-                targets.push((false, igr));
-                igr += 1;
-            }
-        }
-        for i in (0..n).rev() {
-            let (is_float, reg) = targets[i];
-            if is_float {
-                self.asm.pop(RES);
-                self.asm.fmov_from_gpr(reg, RES);
-            } else {
-                self.asm.pop(reg);
-            }
-        }
-
-        // The hidden variadic args go in the next two integer registers (`igr` is
-        // the integer named-param count): `x{igr}` = va_ptr, `x{igr+1}` = va_cnt.
-        if let Some((off, k)) = va {
-            if igr + 1 > 7 {
-                return Err(CodegenError::at(
+        let extra: Vec<&Expr> = args.get(n..).unwrap_or(&[]).iter().collect();
+        // x0.. for integers, v0.. for doubles, numbered independently (arm64: 8 each).
+        let classes =
+            crate::backend::classify_args(named.iter().map(|(t, _)| *t), 8, 8).map_err(|o| {
+                CodegenError::at(
                     pos,
-                    "arm64 backend: too many integer args before `...`",
-                ));
-            }
-            self.asm.sub_imm(igr, FP, off); // va_ptr = &buffer
-            self.asm.load_imm(igr + 1, k as i64); // va_cnt
-        }
-
-        if let Some(off) = sret_off {
-            self.asm.sub_imm(SCRATCH, FP, off); // x8 = &result temp
-        }
-        match target {
-            CallTarget::Label(label) => self.asm.bl(label),
-            CallTarget::Extern(sym) => self.asm.bl_extern(sym),
-            CallTarget::Syscall(nr) => {
-                self.asm.load_imm(SCRATCH, nr); // x8 = syscall number
-                self.asm.svc();
-            }
-            CallTarget::Indirect(_) => {
-                // The function address was spilled first, so it is on top of the
-                // stack now that the arguments have been popped into registers.
-                self.asm.pop(T2);
-                self.asm.blr(T2);
-            }
-        }
-        if let Some(off) = sret_off {
-            self.asm.sub_imm(RES, FP, off); // result value is the temp's address
-        } else if is_f64(ret) {
-            self.asm.fmov_reg(FRES, 0); // result in d0
-        } else {
-            self.asm.mov_reg(RES, 0);
-        }
-        Ok(())
+                    match o {
+                        crate::backend::ArgOverflow::Int => {
+                            "arm64 backend: at most 8 integer arguments"
+                        }
+                        crate::backend::ArgOverflow::Float => {
+                            "arm64 backend: at most 8 floating-point arguments"
+                        }
+                    },
+                )
+            })?;
+        crate::backend::gen_call(
+            self,
+            indirect_callee,
+            &named,
+            &extra,
+            &classes,
+            ret,
+            varargs,
+            pos,
+            |cg| match target {
+                CallTarget::Label(label) => cg.asm.bl(label),
+                CallTarget::Extern(sym) => cg.asm.bl_extern(sym),
+                CallTarget::Syscall(nr) => {
+                    cg.asm.load_imm(SCRATCH, nr); // x8 = syscall number
+                    cg.asm.svc();
+                }
+                CallTarget::Indirect(_) => {
+                    // The callee was spilled first, so it is on top of the stack now
+                    // that the args have been popped into registers.
+                    cg.asm.pop(T2);
+                    cg.asm.blr(T2);
+                }
+            },
+        )
     }
 
     fn gen_expr_stmt(&mut self, e: &Expr) -> Result<(), CodegenError> {
@@ -3726,35 +3402,14 @@ impl Cg {
                 return Err(too_few());
             }
             arg_i += 1;
-            let mut flags: i64 = 0;
-            if spec.minus {
-                flags |= F_MINUS;
-            }
-            if spec.plus {
-                flags |= F_PLUS;
-            }
-            if spec.space {
-                flags |= F_SPACE;
-            }
-            if spec.zero {
-                flags |= F_ZERO;
-            }
-            if spec.hash {
-                flags |= F_HASH;
-            }
+            let flags = crate::backend::spec_flags(&spec);
             self.fs_routine("OutWrite"); // ensure the sink is emitted
             // Each conversion evaluates its value, then `fs_width_prec_flags` puts
             // width → x13, precision → x14, (sign-adjusted) flags → x15 (popping any
             // `*` args), which the conversion moves into its routine's ABI registers.
             match spec.conv {
                 'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
-                    let (radix, extra) = match spec.conv {
-                        'd' | 'i' => (10, F_SIGNED),
-                        'u' => (10, 0),
-                        'x' => (16, 0),
-                        'X' => (16, F_UPPER),
-                        _ => (8, 0), // 'o'
-                    };
+                    let (radix, extra) = crate::backend::int_conv(spec.conv);
                     self.gen_expr(&args[i])?;
                     self.asm.mov_reg(0, RES); // x0 = value
                     self.asm.load_imm(1, radix);
@@ -3802,12 +3457,7 @@ impl Cg {
                     self.asm.bl(l);
                 }
                 'e' | 'E' | 'g' | 'G' => {
-                    let conv = match spec.conv {
-                        'e' => 1,
-                        'E' => 1 | 4,
-                        'g' => 2,
-                        _ => 2 | 4, // 'G'
-                    };
+                    let conv = crate::backend::float_eg_conv(spec.conv);
                     self.gen_fexpr(&args[i])?;
                     self.asm.fmov_reg(0, FRES); // d0 = value
                     self.fs_width_prec_flags(&spec, flags, false);
@@ -4735,7 +4385,7 @@ impl Cg {
         self.asm.load_imm(8, 0x7FFF_FFFF_FFFF_FFFF);
         self.asm.and(9, 23, 8); // magnitude bits
         self.asm.load_imm(22, 0); // sign = none
-        self.asm.cbz(9, signpos); // ±0 is non-negative
+        // -0.0 keeps its sign (the IEEE sign bit); no ±0 short-circuit.
         self.asm.lsr_imm(10, 23, 63);
         self.asm.cbz(10, signpos);
         self.asm.load_imm(22, b'-' as i64);
@@ -5040,7 +4690,7 @@ impl Cg {
         self.asm.load_imm(8, 0x7FFF_FFFF_FFFF_FFFF);
         self.asm.and(9, 23, 8);
         self.asm.load_imm(22, 0);
-        self.asm.cbz(9, sgpos);
+        // -0.0 keeps its sign (the IEEE sign bit); no ±0 short-circuit.
         self.asm.lsr_imm(10, 23, 63);
         self.asm.cbz(10, sgpos);
         self.asm.load_imm(22, b'-' as i64);
@@ -5821,9 +5471,256 @@ impl Cg {
 
 /// Where an aggregate being initialised lives: a local frame slot (`x29 - off`)
 /// or a global symbol.
+#[derive(Clone, Copy)]
 enum Place {
     Local(u32),
     Global(u32),
+}
+
+/// Leaf stores for the shared [`crate::backend::gen_init_into`] initialiser driver.
+impl crate::backend::InitEmitter for Cg {
+    type Place = Place;
+
+    fn backend_label(&self) -> &'static str {
+        "arm64 backend"
+    }
+
+    fn init_layouts(&self) -> &Layouts {
+        &self.layouts
+    }
+
+    fn emit_float_init(
+        &mut self,
+        place: Place,
+        byte_off: u32,
+        init: &Expr,
+    ) -> Result<(), CodegenError> {
+        self.gen_foperand(init)?;
+        self.elem_addr(T2, &place, byte_off);
+        self.asm.fmov_to_gpr(RES, FRES);
+        self.asm.store_mem(RES, T2, 8);
+        Ok(())
+    }
+
+    fn emit_aggregate_init(
+        &mut self,
+        place: Place,
+        byte_off: u32,
+        ty: &Type,
+        init: &Expr,
+    ) -> Result<(), CodegenError> {
+        self.gen_expr(init)?; // RES = source address
+        self.elem_addr(T2, &place, byte_off);
+        self.gen_memcpy(T2, RES, self.type_size(ty), SCRATCH);
+        Ok(())
+    }
+
+    fn emit_scalar_init(
+        &mut self,
+        place: Place,
+        byte_off: u32,
+        ty: &Type,
+        init: &Expr,
+    ) -> Result<(), CodegenError> {
+        self.gen_int_expr(init, ty)?;
+        self.elem_addr(T2, &place, byte_off);
+        self.gen_store(RES, T2, ty);
+        Ok(())
+    }
+}
+
+/// Leaf emits for the shared control-flow drivers ([`crate::backend::CodeEmitter`]):
+/// `switch` (the slot is a frame offset `x29 - off`; the jump-table fast path is this
+/// backend's) and the loops/conditionals.
+impl crate::backend::CodeEmitter for Cg {
+    type Slot = u32;
+
+    fn backend_label(&self) -> &'static str {
+        "arm64 backend"
+    }
+    fn new_label(&mut self) -> usize {
+        self.asm.new_label()
+    }
+    fn place_label(&mut self, l: usize) {
+        self.asm.place(l);
+    }
+    fn branch(&mut self, l: usize) {
+        self.asm.b(l);
+    }
+    fn push_break(&mut self, l: usize) {
+        self.break_targets.push(l);
+    }
+    fn pop_break(&mut self) {
+        self.break_targets.pop();
+    }
+    fn push_continue(&mut self, l: usize) {
+        self.continue_targets.push(l);
+    }
+    fn pop_continue(&mut self) {
+        self.continue_targets.pop();
+    }
+    fn enter_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+    fn exit_scope(&mut self) {
+        self.scopes.pop();
+    }
+    fn lower_stmt(&mut self, s: &Stmt) -> Result<(), CodegenError> {
+        self.gen_stmt(s)
+    }
+    fn branch_if_false(&mut self, cond: &Expr, label: usize) -> Result<(), CodegenError> {
+        self.gen_expr(cond)?;
+        self.asm.cbz(RES, label);
+        Ok(())
+    }
+    fn branch_if_true(&mut self, cond: &Expr, label: usize) -> Result<(), CodegenError> {
+        self.gen_expr(cond)?;
+        self.asm.cbnz(RES, label);
+        Ok(())
+    }
+    fn eval_expr_discard(&mut self, e: &Expr) -> Result<(), CodegenError> {
+        self.gen_expr(e)
+    }
+
+    fn eval_switch_value(&mut self, cond: &Expr) -> Result<u32, CodegenError> {
+        self.gen_expr(cond)?;
+        let voff = self.alloc(8, 8);
+        self.asm.sub_imm(T2, FP, voff);
+        self.gen_store(RES, T2, &Type::I64);
+        Ok(voff)
+    }
+
+    fn switch_cmp_branch(
+        &mut self,
+        slot: u32,
+        bound: &Expr,
+        cc: crate::backend::SwitchCc,
+        target: usize,
+    ) -> Result<(), CodegenError> {
+        self.gen_expr(bound)?;
+        self.asm.mov_reg(T2, RES);
+        self.load_local(RES, slot, &Type::I64);
+        self.asm.cmp_reg(RES, T2);
+        let cond = match cc {
+            crate::backend::SwitchCc::Eq => COND_EQ,
+            crate::backend::SwitchCc::Lt => COND_LT,
+            crate::backend::SwitchCc::Gt => COND_GT,
+        };
+        self.asm.b_cond(cond, target);
+        Ok(())
+    }
+
+    fn try_switch_table(
+        &mut self,
+        stmts: &[Stmt],
+        label_at: &HashMap<usize, usize>,
+        slot: u32,
+        gap_target: usize,
+    ) -> Result<bool, CodegenError> {
+        self.try_gen_branch_table(stmts, label_at, slot, gap_target)
+    }
+}
+
+/// Leaf emits for the shared call driver ([`crate::backend::gen_call`]). The sret
+/// slot is a frame offset; variadics are marshalled by computing the buffer address
+/// (`x29 - off`) and count directly into the registers after the named args.
+impl crate::backend::CallEmitter for Cg {
+    type Slot = u32;
+
+    fn spill_callee(&mut self, callee: &Expr) -> Result<(), CodegenError> {
+        self.gen_expr(callee)?; // RES = function address
+        self.asm.push(RES);
+        Ok(())
+    }
+
+    fn alloc_sret(&mut self, ret: &Type) -> Option<u32> {
+        // A by-value aggregate result returns through a caller-allocated temp whose
+        // address is handed to the callee in x8.
+        is_aggregate(ret).then(|| self.alloc(self.type_size(ret).max(1), self.type_align(ret)))
+    }
+
+    fn eval_arg_spill(&mut self, ty: &Type, arg: &Expr) -> Result<(), CodegenError> {
+        if is_f64(ty) {
+            self.gen_foperand(arg)?;
+            self.asm.fmov_to_gpr(RES, FRES);
+        } else {
+            self.gen_int_expr(arg, ty)?;
+        }
+        self.asm.push(RES);
+        Ok(())
+    }
+
+    fn place_args(
+        &mut self,
+        classes: &[crate::backend::ArgClass],
+        extra: &[&Expr],
+        varargs: bool,
+        pos: Pos,
+    ) -> Result<(), CodegenError> {
+        // Variadic call: stage the trailing args into a frame buffer (8 bytes each,
+        // an F64 by its bit pattern); its address + count become two hidden integer
+        // args after the named ones. Always staged for a variadic callee (count 0 for
+        // none), else the callee reads uninitialised registers.
+        let va = if varargs {
+            let k = extra.len() as u32;
+            let off = self.alloc(k * 8, 8);
+            for (j, arg) in extra.iter().enumerate() {
+                if is_f64(&self.expr_ty(arg)) {
+                    self.gen_foperand(arg)?;
+                    self.asm.fmov_to_gpr(RES, FRES);
+                } else {
+                    self.gen_expr(arg)?;
+                }
+                self.asm.sub_imm(T2, FP, off - (j as u32) * 8);
+                self.asm.store_mem(RES, T2, 8);
+            }
+            Some((off, k))
+        } else {
+            None
+        };
+        let igr = classes
+            .iter()
+            .filter(|c| matches!(c, crate::backend::ArgClass::Int(_)))
+            .count() as u32;
+        for class in classes.iter().rev() {
+            match *class {
+                crate::backend::ArgClass::Float(r) => {
+                    self.asm.pop(RES);
+                    self.asm.fmov_from_gpr(r as u32, RES);
+                }
+                crate::backend::ArgClass::Int(r) => self.asm.pop(r as u32),
+            }
+        }
+        // The hidden variadic args go in the next two integer registers: `x{igr}` =
+        // va_ptr, `x{igr+1}` = va_cnt.
+        if let Some((off, k)) = va {
+            if igr + 1 > 7 {
+                return Err(CodegenError::at(
+                    pos,
+                    "arm64 backend: too many integer args before `...`",
+                ));
+            }
+            self.asm.sub_imm(igr, FP, off); // va_ptr = &buffer
+            self.asm.load_imm(igr + 1, k as i64); // va_cnt
+        }
+        Ok(())
+    }
+
+    fn set_sret_reg(&mut self, slot: Option<u32>) {
+        if let Some(off) = slot {
+            self.asm.sub_imm(SCRATCH, FP, off); // x8 = &result temp
+        }
+    }
+
+    fn deliver_result(&mut self, ret: &Type, sret: Option<u32>) {
+        if let Some(off) = sret {
+            self.asm.sub_imm(RES, FP, off); // result value is the temp's address
+        } else if is_f64(ret) {
+            self.asm.fmov_reg(FRES, 0); // result in d0
+        } else {
+            self.asm.mov_reg(RES, 0);
+        }
+    }
 }
 
 /// The callee of an `emit_call`: a local function (resolved by label), an

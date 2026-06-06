@@ -312,10 +312,7 @@ impl Analyzer {
 
     /// An array decays to a pointer in value contexts.
     fn decay(ty: Type) -> Type {
-        match ty {
-            Type::Array(inner, _) => Type::Ptr(inner),
-            other => other,
-        }
+        decay(ty)
     }
 
     // ---- top-level & statements ----
@@ -1218,8 +1215,17 @@ fn is_arithmetic(ty: &Type) -> bool {
     is_integer(ty) || matches!(ty, Type::F64)
 }
 
-fn is_pointer(ty: &Type) -> bool {
+pub(crate) fn is_pointer(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_) | Type::Array(..) | Type::FuncPtr { .. })
+}
+
+/// Array-to-pointer decay applied at use sites. Shared with the mono pass's
+/// inference typer so both stages agree on operand types.
+pub(crate) fn decay(ty: Type) -> Type {
+    match ty {
+        Type::Array(inner, _) => Type::Ptr(inner),
+        other => other,
+    }
 }
 
 /// Whether a field name is the generated placeholder for an anonymous embedded
@@ -1235,9 +1241,9 @@ fn is_scalar(ty: &Type) -> bool {
 /// The result type of arithmetic / a ternary over two scalar operands. Floats
 /// win over integers; a pointer operand makes the result that pointer; integer
 /// arithmetic is performed at 64-bit width (HolyC register semantics).
-fn arith_result(a: &Type, b: &Type) -> Type {
-    let a = Analyzer::decay(a.clone());
-    let b = Analyzer::decay(b.clone());
+pub(crate) fn arith_result(a: &Type, b: &Type) -> Type {
+    let a = decay(a.clone());
+    let b = decay(b.clone());
     if a == Type::F64 || b == Type::F64 {
         return Type::F64;
     }

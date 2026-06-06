@@ -175,6 +175,40 @@ fn nested_parens_in_arguments() {
     );
 }
 
+#[test]
+fn nested_call_to_same_function_macro_expands() {
+    // Regression: each argument is fully expanded *before* substitution, so a
+    // nested call to the *same* macro inside the argument is not blocked by the
+    // outer macro's hide-set. `ID(ID(5))` -> the arg `ID(5)` expands to `5`,
+    // then `ID(5)` -> `5`. (Previously the inner `ID` was emitted as a literal.)
+    assert_eq!(pp("#define ID(x) x\nID(ID(5))"), vec![int(5)]);
+}
+
+#[test]
+fn nested_same_macro_with_body_expands() {
+    // `INC(INC(0))`: the argument `INC(0)` pre-expands to `((0)+1)`, then the
+    // outer `INC` wraps it: `( ( ((0)+1) ) + 1 )`.
+    use TokenKind::{LParen, Plus, RParen};
+    assert_eq!(
+        pp("#define INC(x) ((x)+1)\nINC(INC(0))"),
+        vec![
+            LParen,
+            LParen,
+            LParen,
+            LParen,
+            int(0),
+            RParen,
+            Plus,
+            int(1),
+            RParen,
+            RParen,
+            Plus,
+            int(1),
+            RParen,
+        ]
+    );
+}
+
 // ---- conditionals ----
 
 #[test]

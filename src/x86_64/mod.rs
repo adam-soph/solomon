@@ -290,13 +290,16 @@ const R14: u8 = 14;
 const R15: u8 = 15;
 
 // `fmt_int`/`fmt_str` flag bits (compile-time assembled from a parsed `fmt::Spec`).
-const F_SIGNED: i32 = 1; // a signed conversion (`%d`/`%i`): emit a sign, magnitude in digits
-const F_UPPER: i32 = 2; // uppercase hex (`%X`) and `0X` prefix
-const F_MINUS: i32 = 4; // left-justify
-const F_ZERO: i32 = 8; // zero-pad
-const F_PLUS: i32 = 16; // always show a sign
-const F_SPACE: i32 = 32; // space before a non-negative
-const F_HASH: i32 = 64; // alternate form (`0x`/leading `0`)
+// The bit values are the shared printf runtime ABI (`crate::backend`); these are the
+// `i32` view this backend's `Asm` immediates want, derived so they can't drift from
+// the canonical definitions the arm64 backend also tests.
+const F_SIGNED: i32 = crate::backend::F_SIGNED as i32; // signed conversion (`%d`/`%i`)
+const F_UPPER: i32 = crate::backend::F_UPPER as i32; // uppercase hex (`%X`) and `0X`
+const F_MINUS: i32 = crate::backend::F_MINUS as i32; // left-justify
+const F_ZERO: i32 = crate::backend::F_ZERO as i32; // zero-pad
+const F_PLUS: i32 = crate::backend::F_PLUS as i32; // always show a sign
+const F_SPACE: i32 = crate::backend::F_SPACE as i32; // space before a non-negative
+const F_HASH: i32 = crate::backend::F_HASH as i32; // alternate form (`0x`/leading `0`)
 
 /// A global variable's location: a byte offset into the BSS region. Its address
 /// is RIP-relative (resolved like a string reference, but past the file image).
@@ -870,77 +873,17 @@ impl Cg {
                 self.asm.jmp(self.ret_label);
             }
             StmtKind::If { cond, then, else_ } => {
-                let l_else = self.asm.new_label();
-                self.gen_cond_jump_false(cond, l_else)?;
-                self.gen_stmt(then)?;
-                if let Some(else_branch) = else_ {
-                    let l_end = self.asm.new_label();
-                    self.asm.jmp(l_end);
-                    self.asm.place(l_else);
-                    self.gen_stmt(else_branch)?;
-                    self.asm.place(l_end);
-                } else {
-                    self.asm.place(l_else);
-                }
+                crate::backend::gen_if(self, cond, then, else_.as_deref())?
             }
-            StmtKind::While { cond, body } => {
-                let l_top = self.asm.new_label();
-                let l_end = self.asm.new_label();
-                self.asm.place(l_top);
-                self.gen_cond_jump_false(cond, l_end)?;
-                self.break_targets.push(l_end);
-                self.continue_targets.push(l_top);
-                self.gen_stmt(body)?;
-                self.break_targets.pop();
-                self.continue_targets.pop();
-                self.asm.jmp(l_top);
-                self.asm.place(l_end);
-            }
-            StmtKind::DoWhile { body, cond } => {
-                let l_top = self.asm.new_label();
-                let l_cont = self.asm.new_label();
-                let l_end = self.asm.new_label();
-                self.asm.place(l_top);
-                self.break_targets.push(l_end);
-                self.continue_targets.push(l_cont);
-                self.gen_stmt(body)?;
-                self.break_targets.pop();
-                self.continue_targets.pop();
-                self.asm.place(l_cont);
-                self.gen_expr(cond)?;
-                self.asm.test_rax();
-                self.asm.jne(l_top); // loop while cond is non-zero
-                self.asm.place(l_end);
-            }
+            StmtKind::While { cond, body } => crate::backend::gen_while(self, cond, body)?,
+            StmtKind::DoWhile { body, cond } => crate::backend::gen_do_while(self, body, cond)?,
             StmtKind::For {
                 init,
                 cond,
                 step,
                 body,
             } => {
-                self.scopes.push(HashMap::new());
-                if let Some(init) = init {
-                    self.gen_stmt(init)?;
-                }
-                let l_top = self.asm.new_label();
-                let l_cont = self.asm.new_label();
-                let l_end = self.asm.new_label();
-                self.asm.place(l_top);
-                if let Some(cond) = cond {
-                    self.gen_cond_jump_false(cond, l_end)?;
-                }
-                self.break_targets.push(l_end);
-                self.continue_targets.push(l_cont);
-                self.gen_stmt(body)?;
-                self.break_targets.pop();
-                self.continue_targets.pop();
-                self.asm.place(l_cont);
-                if let Some(step) = step {
-                    self.gen_expr(step)?;
-                }
-                self.asm.jmp(l_top);
-                self.asm.place(l_end);
-                self.scopes.pop();
+                crate::backend::gen_for(self, init.as_deref(), cond.as_ref(), step.as_ref(), body)?
             }
             StmtKind::Break => {
                 let l = *self.break_targets.last().ok_or_else(|| {
@@ -989,115 +932,11 @@ impl Cg {
     /// nothing matches. The optional `start:`/`end:` sub-labels partition the body
     /// into a prologue (runs before dispatch) and epilogue (reached by fall-through,
     /// skipped by `break`). Mirrors the arm64 backend's compare-chain.
+    /// Lower a `switch`. The control structure is the shared
+    /// [`crate::backend::gen_switch`] driver; this backend supplies the leaf emits via
+    /// [`SwitchEmitter`] (and uses the default no-jump-table compare-chain path).
     fn gen_switch(&mut self, cond: &Expr, body: &Stmt, pos: Pos) -> Result<(), CodegenError> {
-        let StmtKind::Block(stmts) = &body.kind else {
-            return Err(CodegenError::at(
-                pos,
-                "x86_64 backend: switch body must be a block",
-            ));
-        };
-
-        self.gen_expr(cond)?; // rax = switch value
-        let voff = self.alloc(8, 8);
-        self.asm.store_local(voff, 8);
-
-        let start_idx = stmts
-            .iter()
-            .position(|s| matches!(s.kind, StmtKind::SwitchStart));
-        let first_case = stmts
-            .iter()
-            .position(|s| matches!(s.kind, StmtKind::Case { .. } | StmtKind::Default));
-        let end_idx = stmts
-            .iter()
-            .position(|s| matches!(s.kind, StmtKind::SwitchEnd));
-        let prologue = start_idx.map(|si| (si + 1)..first_case.unwrap_or(stmts.len()));
-
-        let l_end = self.asm.new_label();
-        self.break_targets.push(l_end);
-        self.scopes.push(HashMap::new());
-
-        // Prologue: always runs, before the dispatch compares.
-        if let Some(range) = prologue.clone() {
-            for st in &stmts[range] {
-                self.gen_stmt(st)?;
-            }
-        }
-
-        // One label per case/default.
-        let mut label_at: HashMap<usize, usize> = HashMap::new();
-        let mut default_label: Option<usize> = None;
-        let end_label = end_idx.map(|_| self.asm.new_label());
-        for (i, st) in stmts.iter().enumerate() {
-            match &st.kind {
-                StmtKind::Case { .. } => {
-                    label_at.insert(i, self.asm.new_label());
-                }
-                StmtKind::Default => {
-                    let l = self.asm.new_label();
-                    label_at.insert(i, l);
-                    default_label = Some(l);
-                }
-                _ => {}
-            }
-        }
-        // No case matched: fall to default, else the epilogue, else the exit.
-        let gap_target = default_label.or(end_label).unwrap_or(l_end);
-
-        // Compare-chain dispatch.
-        for (i, st) in stmts.iter().enumerate() {
-            if let StmtKind::Case { lo, hi } = &st.kind {
-                let target = label_at[&i];
-                match hi {
-                    None => {
-                        self.gen_expr(lo)?; // rax = case value
-                        self.asm.mov_rcx_rax(); // rcx = case value
-                        self.asm.load_local(voff, 8, false); // rax = v
-                        self.asm.cmp_rax_rcx();
-                        self.asm.je(target);
-                    }
-                    Some(hi) => {
-                        // lo <= v <= hi
-                        let skip = self.asm.new_label();
-                        self.gen_expr(lo)?;
-                        self.asm.mov_rcx_rax();
-                        self.asm.load_local(voff, 8, false);
-                        self.asm.cmp_rax_rcx();
-                        self.asm.jl(skip); // v < lo
-                        self.gen_expr(hi)?;
-                        self.asm.mov_rcx_rax();
-                        self.asm.load_local(voff, 8, false);
-                        self.asm.cmp_rax_rcx();
-                        self.asm.jg(skip); // v > hi
-                        self.asm.jmp(target);
-                        self.asm.place(skip);
-                    }
-                }
-            }
-        }
-        self.asm.jmp(gap_target);
-
-        // Emit the body, placing each case/default label and the epilogue marker.
-        for (i, st) in stmts.iter().enumerate() {
-            if prologue.as_ref().is_some_and(|r| r.contains(&i)) {
-                continue; // already emitted as the prologue
-            }
-            if let Some(&l) = label_at.get(&i) {
-                self.asm.place(l);
-            }
-            match &st.kind {
-                StmtKind::Case { .. } | StmtKind::Default | StmtKind::SwitchStart => {}
-                StmtKind::SwitchEnd => {
-                    if let Some(l) = end_label {
-                        self.asm.place(l);
-                    }
-                }
-                _ => self.gen_stmt(st)?,
-            }
-        }
-        self.scopes.pop();
-        self.break_targets.pop();
-        self.asm.place(l_end);
-        Ok(())
+        crate::backend::gen_switch(self, cond, body, pos)
     }
 
     /// Emit the initialiser store for a top-level global. Storage is BSS (zeroed),
@@ -1724,11 +1563,10 @@ impl Cg {
         }
     }
 
-    /// Emit the stores for a brace initialiser (or a single leaf value) into the
-    /// aggregate at `place`, at byte offset `byte_off`. Recurses for nested
-    /// arrays/classes; only the provided elements/fields are written (local slots
-    /// are zeroed first, globals are linker-zeroed), so partial initialisers leave
-    /// the rest zero. Mirrors the arm64 backend's `gen_init_into`.
+    /// Emit a brace/designated initialiser into the aggregate at `place`. The
+    /// recursion/dispatch is the shared [`crate::backend::gen_init_into`] driver;
+    /// this backend supplies the leaf stores via [`InitEmitter`]. (Byte offsets are
+    /// non-negative; the driver works in `u32`, this backend's frame math in `i32`.)
     fn gen_init_into(
         &mut self,
         place: Place,
@@ -1736,92 +1574,7 @@ impl Cg {
         byte_off: i32,
         init: &Expr,
     ) -> Result<(), CodegenError> {
-        if let ExprKind::InitList(items) = &init.kind {
-            match ty {
-                Type::Array(elem, _) => {
-                    let stride = self.stride_of(elem);
-                    for (i, item) in items.iter().enumerate() {
-                        self.gen_init_into(place, elem, byte_off + i as i32 * stride, item)?;
-                    }
-                }
-                Type::Named(class) => {
-                    let fields: Vec<(Type, i32)> = self
-                        .layouts
-                        .get(class)
-                        .map(|l| {
-                            l.fields
-                                .iter()
-                                .map(|f| (f.ty.clone(), f.offset as i32))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for (item, (fty, foff)) in items.iter().zip(fields.iter()) {
-                        self.gen_init_into(place, fty, byte_off + foff, item)?;
-                    }
-                }
-                _ => {
-                    return Err(CodegenError::at(
-                        init.span.pos,
-                        "x86_64 backend: an initializer list can only initialize an array, class, or union",
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        if let ExprKind::DesignatedInit(items) = &init.kind {
-            let Type::Named(class) = ty else {
-                return Err(CodegenError::at(
-                    init.span.pos,
-                    "x86_64 backend: a designated initializer can only initialize a class or union",
-                ));
-            };
-            // Field name -> (type, offset), captured before the store loop.
-            let fields: Vec<(String, Type, i32)> = self
-                .layouts
-                .get(class)
-                .map(|l| {
-                    l.fields
-                        .iter()
-                        .map(|f| (f.name.clone(), f.ty.clone(), f.offset as i32))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (name, value) in items {
-                let Some((_, fty, foff)) = fields.iter().find(|(n, _, _)| n == name) else {
-                    return Err(CodegenError::at(
-                        value.span.pos,
-                        format!("x86_64 backend: `{class}` has no field `{name}`"),
-                    ));
-                };
-                self.gen_init_into(place, &fty.clone(), byte_off + foff, value)?;
-            }
-            return Ok(());
-        }
-        // A leaf value: scalar, pointer, float, or an aggregate-valued expression.
-        if is_f64(ty) {
-            self.gen_foperand(init)?; // xmm0 = value
-            self.elem_addr(place, byte_off); // rax = dest
-            self.asm.movsd_store_at(RAX); // [rax] = xmm0
-        } else if is_aggregate(ty) {
-            let size = self.size_of(ty);
-            self.gen_expr(init)?; // rax = source address
-            self.asm.push_rax();
-            self.elem_addr(place, byte_off); // rax = dest
-            self.asm.mov_rdi_rax(); // rdi = dest
-            self.asm.pop_rax();
-            self.asm.mov_rsi_rax(); // rsi = src
-            self.asm.mov_rcx_imm32(size);
-            self.asm.rep_movsb();
-        } else {
-            let size = self.size_of(ty);
-            self.gen_int_expr(init, ty)?; // rax = value (float source converts per signedness)
-            self.asm.push_rax();
-            self.elem_addr(place, byte_off); // rax = dest
-            self.asm.mov_rcx_rax(); // rcx = dest
-            self.asm.pop_rax(); // rax = value
-            self.asm.store_through(size); // [rcx] = rax
-        }
-        Ok(())
+        crate::backend::gen_init_into(self, place, ty, byte_off as u32, init)
     }
 
     /// Dispatch a call: a bare name that isn't a variable is a direct
@@ -1969,133 +1722,58 @@ impl Cg {
         args: &[Expr],
         pos: Pos,
     ) -> Result<(), CodegenError> {
-        // For an indirect call, evaluate the function-pointer value first and spill
-        // it (deepest on the stack) so it survives argument evaluation; it is popped
-        // back into rax just before the `call` (after sret setup, the last use of rax).
-        if let CallTarget::Indirect(callee) = target {
-            self.gen_expr(callee)?; // rax = function address
-            self.asm.push_rax();
-        }
-        // A class-returning callee uses an sret pointer: the caller allocates a
-        // result temp in its frame and hands its address to the callee in r11.
-        let sret_slot = if matches!(ret_ty, Type::Named(_)) {
-            Some(self.alloc(self.size_of(ret_ty).max(1), self.align_of(ret_ty)))
+        let indirect_callee = if let CallTarget::Indirect(c) = target {
+            Some(c)
         } else {
             None
         };
-        // For a variadic callee, only the named params are register-passed; the
-        // trailing args go into a frame buffer whose address + count are passed as
-        // two hidden integer args (see below).
+        // For a variadic callee only the named params are register-passed; trailing
+        // args become variadic `extra`. A missing param type (a malformed over-long
+        // call) defaults to I64, as before.
         let n_named = if varargs {
             param_tys.len().min(args.len())
         } else {
             args.len()
         };
-        let named = &args[..n_named];
-        let extra = &args[n_named..];
-        // Class each named arg: F64 → an xmm register (xmm0..), everything else →
-        // a GP register (rdi..). Reject overflow of either class.
-        let mut gpr = 0usize;
-        let mut fpr = 0usize;
-        let mut targets = Vec::with_capacity(named.len());
-        for (i, _) in named.iter().enumerate() {
-            let pty = param_tys.get(i).cloned().unwrap_or(Type::I64);
-            if is_f64(&pty) {
-                if fpr >= 8 {
-                    return Err(CodegenError::at(
-                        pos,
-                        "x86_64 backend: at most 8 F64 arguments",
-                    ));
-                }
-                targets.push((true, fpr, pty));
-                fpr += 1;
-            } else {
-                if gpr >= ARG_REGS {
-                    return Err(CodegenError::at(
-                        pos,
-                        "x86_64 backend: at most 6 integer arguments",
-                    ));
-                }
-                targets.push((false, gpr, pty));
-                gpr += 1;
-            }
-        }
-        // Evaluate named args left to right, each spilled to the machine stack (a
-        // float is moved through a GPR first).
-        for (arg, (is_float, _, pty)) in named.iter().zip(&targets) {
-            if *is_float {
-                self.gen_foperand(arg)?; // xmm0 = value
-                self.asm.movq_r_from_xmm(RAX, 0);
-                self.asm.push_rax();
-            } else {
-                self.gen_int_expr(arg, pty)?; // rax = value
-                self.asm.push_rax();
-            }
-        }
-        // Variadic: stage the trailing args into a frame buffer (8 bytes each, an
-        // F64 by its bit pattern), then push va_ptr + va_cnt for the next two int
-        // registers. Buffer element j is at slot offset `off - j*8`.
-        // Always pass the hidden va_ptr/va_cnt for a variadic callee — even with zero
-        // trailing args (`Sum()`), count 0; otherwise the callee reads them from
-        // uninitialised registers and derefs a garbage `VargV`.
-        let va = if varargs {
-            if gpr + 1 >= ARG_REGS {
-                return Err(CodegenError::at(
+        let fallback = Type::I64;
+        let named: Vec<(&Type, &Expr)> = (0..n_named)
+            .map(|i| (param_tys.get(i).unwrap_or(&fallback), &args[i]))
+            .collect();
+        let extra: Vec<&Expr> = args[n_named..].iter().collect();
+        // F64 → xmm0.., everything else → GP rdi.. (System V: 6 integer, 8 float).
+        let classes = crate::backend::classify_args(named.iter().map(|(t, _)| *t), ARG_REGS, 8)
+            .map_err(|o| {
+                CodegenError::at(
                     pos,
-                    "x86_64 backend: too many integer args before `...`",
-                ));
-            }
-            let k = extra.len() as i32;
-            let off = self.alloc(k * 8, 8);
-            for (j, arg) in extra.iter().enumerate() {
-                if is_f64(&self.expr_ty(arg)) {
-                    self.gen_foperand(arg)?;
-                    self.asm.movq_r_from_xmm(RAX, 0);
-                } else {
-                    self.gen_expr(arg)?;
+                    match o {
+                        crate::backend::ArgOverflow::Int => {
+                            "x86_64 backend: at most 6 integer arguments"
+                        }
+                        crate::backend::ArgOverflow::Float => {
+                            "x86_64 backend: at most 8 F64 arguments"
+                        }
+                    },
+                )
+            })?;
+        crate::backend::gen_call(
+            self,
+            indirect_callee,
+            &named,
+            &extra,
+            &classes,
+            ret_ty,
+            varargs,
+            pos,
+            |cg| match target {
+                CallTarget::Direct(label) => cg.asm.call(label),
+                CallTarget::Indirect(_) => {
+                    // The callee was spilled first, so it is on top of the stack now
+                    // that the args are in registers (rax is free post-sret).
+                    cg.asm.pop_rax();
+                    cg.asm.call_reg(RAX);
                 }
-                self.asm.store_local(off - j as i32 * 8, 8);
-            }
-            self.asm.lea_local(off); // va_ptr = &buffer
-            self.asm.push_rax();
-            self.asm.mov_ri(RAX, k);
-            self.asm.push_rax(); // va_cnt
-            Some(gpr)
-        } else {
-            None
-        };
-        // Pop the hidden args first (they were pushed last): va_cnt then va_ptr.
-        if let Some(gpr_named) = va {
-            self.asm.pop_argreg(gpr_named + 1); // va_cnt
-            self.asm.pop_argreg(gpr_named); // va_ptr
-        }
-        for (is_float, idx, _) in targets.iter().rev() {
-            if *is_float {
-                self.asm.pop_rax();
-                self.asm.movq_xmm_from_r(*idx as u8, RAX);
-            } else {
-                self.asm.pop_argreg(*idx);
-            }
-        }
-        // Hand the result temp's address to the callee in r11 (set last, after the
-        // arg registers, so nothing clobbers it before the call).
-        if let Some(off) = sret_slot {
-            self.asm.lea_local(off); // rax = &temp
-            self.asm.mov_rr(R11, RAX);
-        }
-        match target {
-            CallTarget::Direct(label) => self.asm.call(label),
-            CallTarget::Indirect(_) => {
-                // The function address was spilled first, so it is on top of the
-                // stack now that the args are in registers (rax is free post-sret).
-                self.asm.pop_rax();
-                self.asm.call_reg(RAX);
-            }
-        }
-        if let Some(off) = sret_slot {
-            self.asm.lea_local(off); // the class rvalue *is* the temp's address
-        }
-        Ok(())
+            },
+        )
     }
 
     // ---- builtins (no libc: each is lowered inline or to an emitted routine) ----
@@ -2956,37 +2634,16 @@ impl Cg {
                 self.asm.push_rax();
             }
 
-            let mut flags = 0;
-            if spec.minus {
-                flags |= F_MINUS;
-            }
-            if spec.plus {
-                flags |= F_PLUS;
-            }
-            if spec.space {
-                flags |= F_SPACE;
-            }
-            if spec.zero {
-                flags |= F_ZERO;
-            }
-            if spec.hash {
-                flags |= F_HASH;
-            }
+            let flags = crate::backend::spec_flags(&spec) as i32;
 
             let a = next_arg(args, &mut arg_i)?;
             match spec.conv {
                 'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
-                    let (radix, extra) = match spec.conv {
-                        'd' | 'i' => (10, F_SIGNED),
-                        'u' => (10, 0),
-                        'x' => (16, 0),
-                        'X' => (16, F_UPPER),
-                        _ => (8, 0), // 'o'
-                    };
+                    let (radix, extra) = crate::backend::int_conv(spec.conv);
                     self.gen_expr(&args[a])?;
                     self.asm.mov_rdi_rax(); // rdi = value
-                    self.setup_width_prec_flags(&spec, flags | extra, false);
-                    self.asm.mov_ri(RSI, radix);
+                    self.setup_width_prec_flags(&spec, flags | extra as i32, false);
+                    self.asm.mov_ri(RSI, radix as i32);
                     let l = self.helper(Helper::FmtInt);
                     self.asm.call(l);
                 }
@@ -3021,12 +2678,13 @@ impl Cg {
                     self.asm.mov_rr(RSI, RDX); // esi = flags
                     self.asm.mov_rr(RDI, R8); //  edi = precision
                     self.asm.mov_rr(RDX, RCX); // edx = width
-                    let (h, conv) = match spec.conv {
-                        'f' => (Helper::FmtFloat, 0),
-                        'e' => (Helper::FmtFloatEg, 1),
-                        'E' => (Helper::FmtFloatEg, 1 | 4),
-                        'g' => (Helper::FmtFloatEg, 2),
-                        _ => (Helper::FmtFloatEg, 2 | 4), // 'G'
+                    let (h, conv) = if spec.conv == 'f' {
+                        (Helper::FmtFloat, 0)
+                    } else {
+                        (
+                            Helper::FmtFloatEg,
+                            crate::backend::float_eg_conv(spec.conv) as i32,
+                        )
                     };
                     self.asm.mov_ri(RCX, conv); // ecx = conv (FmtFloatEg only)
                     let l = self.helper(h);
@@ -3783,8 +3441,8 @@ impl Cg {
         self.asm.mov_rr(RDX, R15);
         self.asm.and_rr(RDX, RAX); // magnitude bits
         self.asm.mov_ri(R12, 0);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(signpos); // ±0 is never negative
+        // The sign is the IEEE sign bit, so -0.0 prints with a `-` (matching libc,
+        // Rust, and the interpreter); no ±0 short-circuit.
         self.asm.mov_rr(RAX, R15);
         self.asm.shr_ri(RAX, 63);
         self.asm.test_rr(RAX, RAX);
@@ -4108,8 +3766,7 @@ impl Cg {
         self.asm.mov_rr(RDX, R15);
         self.asm.and_rr(RDX, RAX);
         self.asm.mov_ri(R12, 0);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(sgpos);
+        // -0.0 keeps its sign (the IEEE sign bit); no ±0 short-circuit.
         self.asm.mov_rr(RAX, R15);
         self.asm.shr_ri(RAX, 63);
         self.asm.test_rr(RAX, RAX);
@@ -4886,6 +4543,253 @@ fn is_brace_init(e: &Expr) -> bool {
 enum Place {
     Local(i32),
     Global(i32),
+}
+
+/// Leaf stores for the shared [`crate::backend::gen_init_into`] initialiser driver.
+/// The driver's `u32` byte offset is cast to this backend's `i32` frame math.
+impl crate::backend::InitEmitter for Cg {
+    type Place = Place;
+
+    fn backend_label(&self) -> &'static str {
+        "x86_64 backend"
+    }
+
+    fn init_layouts(&self) -> &Layouts {
+        &self.layouts
+    }
+
+    fn emit_float_init(
+        &mut self,
+        place: Place,
+        byte_off: u32,
+        init: &Expr,
+    ) -> Result<(), CodegenError> {
+        self.gen_foperand(init)?; // xmm0 = value
+        self.elem_addr(place, byte_off as i32); // rax = dest
+        self.asm.movsd_store_at(RAX); // [rax] = xmm0
+        Ok(())
+    }
+
+    fn emit_aggregate_init(
+        &mut self,
+        place: Place,
+        byte_off: u32,
+        ty: &Type,
+        init: &Expr,
+    ) -> Result<(), CodegenError> {
+        let size = self.size_of(ty);
+        self.gen_expr(init)?; // rax = source address
+        self.asm.push_rax();
+        self.elem_addr(place, byte_off as i32); // rax = dest
+        self.asm.mov_rdi_rax(); // rdi = dest
+        self.asm.pop_rax();
+        self.asm.mov_rsi_rax(); // rsi = src
+        self.asm.mov_rcx_imm32(size);
+        self.asm.rep_movsb();
+        Ok(())
+    }
+
+    fn emit_scalar_init(
+        &mut self,
+        place: Place,
+        byte_off: u32,
+        ty: &Type,
+        init: &Expr,
+    ) -> Result<(), CodegenError> {
+        let size = self.size_of(ty);
+        self.gen_int_expr(init, ty)?; // rax = value (float source converts per signedness)
+        self.asm.push_rax();
+        self.elem_addr(place, byte_off as i32); // rax = dest
+        self.asm.mov_rcx_rax(); // rcx = dest
+        self.asm.pop_rax(); // rax = value
+        self.asm.store_through(size); // [rcx] = rax
+        Ok(())
+    }
+}
+
+/// Leaf emits for the shared control-flow drivers ([`crate::backend::CodeEmitter`]):
+/// `switch` (the slot is a frame offset; this backend uses the default no-jump-table
+/// compare-chain) and the loops/conditionals.
+impl crate::backend::CodeEmitter for Cg {
+    type Slot = i32;
+
+    fn backend_label(&self) -> &'static str {
+        "x86_64 backend"
+    }
+    fn new_label(&mut self) -> usize {
+        self.asm.new_label()
+    }
+    fn place_label(&mut self, l: usize) {
+        self.asm.place(l);
+    }
+    fn branch(&mut self, l: usize) {
+        self.asm.jmp(l);
+    }
+    fn push_break(&mut self, l: usize) {
+        self.break_targets.push(l);
+    }
+    fn pop_break(&mut self) {
+        self.break_targets.pop();
+    }
+    fn push_continue(&mut self, l: usize) {
+        self.continue_targets.push(l);
+    }
+    fn pop_continue(&mut self) {
+        self.continue_targets.pop();
+    }
+    fn enter_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+    fn exit_scope(&mut self) {
+        self.scopes.pop();
+    }
+    fn lower_stmt(&mut self, s: &Stmt) -> Result<(), CodegenError> {
+        self.gen_stmt(s)
+    }
+    fn branch_if_false(&mut self, cond: &Expr, label: usize) -> Result<(), CodegenError> {
+        self.gen_cond_jump_false(cond, label)
+    }
+    fn branch_if_true(&mut self, cond: &Expr, label: usize) -> Result<(), CodegenError> {
+        self.gen_expr(cond)?;
+        self.asm.test_rax();
+        self.asm.jne(label);
+        Ok(())
+    }
+    fn eval_expr_discard(&mut self, e: &Expr) -> Result<(), CodegenError> {
+        self.gen_expr(e)
+    }
+
+    fn eval_switch_value(&mut self, cond: &Expr) -> Result<i32, CodegenError> {
+        self.gen_expr(cond)?; // rax = switch value
+        let voff = self.alloc(8, 8);
+        self.asm.store_local(voff, 8);
+        Ok(voff)
+    }
+
+    fn switch_cmp_branch(
+        &mut self,
+        slot: i32,
+        bound: &Expr,
+        cc: crate::backend::SwitchCc,
+        target: usize,
+    ) -> Result<(), CodegenError> {
+        self.gen_expr(bound)?; // rax = bound
+        self.asm.mov_rcx_rax(); // rcx = bound
+        self.asm.load_local(slot, 8, false); // rax = v
+        self.asm.cmp_rax_rcx();
+        match cc {
+            crate::backend::SwitchCc::Eq => self.asm.je(target),
+            crate::backend::SwitchCc::Lt => self.asm.jl(target),
+            crate::backend::SwitchCc::Gt => self.asm.jg(target),
+        }
+        Ok(())
+    }
+}
+
+/// Leaf emits for the shared call driver ([`crate::backend::gen_call`]). The sret
+/// slot is a frame offset; variadics are marshalled by pushing the buffer
+/// address + count on the stack and popping them into registers before the named
+/// args.
+impl crate::backend::CallEmitter for Cg {
+    type Slot = i32;
+
+    fn spill_callee(&mut self, callee: &Expr) -> Result<(), CodegenError> {
+        self.gen_expr(callee)?; // rax = function address
+        self.asm.push_rax();
+        Ok(())
+    }
+
+    fn alloc_sret(&mut self, ret: &Type) -> Option<i32> {
+        // A class-returning callee uses an sret pointer: the caller allocates a
+        // result temp and hands its address to the callee in r11.
+        matches!(ret, Type::Named(_))
+            .then(|| self.alloc(self.size_of(ret).max(1), self.align_of(ret)))
+    }
+
+    fn eval_arg_spill(&mut self, ty: &Type, arg: &Expr) -> Result<(), CodegenError> {
+        if is_f64(ty) {
+            self.gen_foperand(arg)?; // xmm0 = value
+            self.asm.movq_r_from_xmm(RAX, 0);
+        } else {
+            self.gen_int_expr(arg, ty)?; // rax = value
+        }
+        self.asm.push_rax();
+        Ok(())
+    }
+
+    fn place_args(
+        &mut self,
+        classes: &[crate::backend::ArgClass],
+        extra: &[&Expr],
+        varargs: bool,
+        pos: Pos,
+    ) -> Result<(), CodegenError> {
+        let gpr = classes
+            .iter()
+            .filter(|c| matches!(c, crate::backend::ArgClass::Int(_)))
+            .count();
+        // Variadic: stage the trailing args into a frame buffer (8 bytes each, an F64
+        // by its bit pattern), then push va_ptr + va_cnt for the next two int regs.
+        // Always staged for a variadic callee (count 0 for none).
+        let va = if varargs {
+            if gpr + 1 >= ARG_REGS {
+                return Err(CodegenError::at(
+                    pos,
+                    "x86_64 backend: too many integer args before `...`",
+                ));
+            }
+            let k = extra.len() as i32;
+            let off = self.alloc(k * 8, 8);
+            for (j, arg) in extra.iter().enumerate() {
+                if is_f64(&self.expr_ty(arg)) {
+                    self.gen_foperand(arg)?;
+                    self.asm.movq_r_from_xmm(RAX, 0);
+                } else {
+                    self.gen_expr(arg)?;
+                }
+                self.asm.store_local(off - j as i32 * 8, 8);
+            }
+            self.asm.lea_local(off); // va_ptr = &buffer
+            self.asm.push_rax();
+            self.asm.mov_ri(RAX, k);
+            self.asm.push_rax(); // va_cnt
+            Some(gpr)
+        } else {
+            None
+        };
+        // Pop the hidden args first (they were pushed last): va_cnt then va_ptr.
+        if let Some(gpr_named) = va {
+            self.asm.pop_argreg(gpr_named + 1); // va_cnt
+            self.asm.pop_argreg(gpr_named); // va_ptr
+        }
+        for class in classes.iter().rev() {
+            match *class {
+                crate::backend::ArgClass::Float(i) => {
+                    self.asm.pop_rax();
+                    self.asm.movq_xmm_from_r(i as u8, RAX);
+                }
+                crate::backend::ArgClass::Int(i) => self.asm.pop_argreg(i),
+            }
+        }
+        Ok(())
+    }
+
+    fn set_sret_reg(&mut self, slot: Option<i32>) {
+        // Hand the result temp's address to the callee in r11 (set last, so nothing
+        // clobbers it before the call).
+        if let Some(off) = slot {
+            self.asm.lea_local(off); // rax = &temp
+            self.asm.mov_rr(R11, RAX);
+        }
+    }
+
+    fn deliver_result(&mut self, _ret: &Type, sret: Option<i32>) {
+        // For a non-aggregate return the result is already in rax/xmm0 by ABI; an
+        // aggregate's rvalue *is* the temp's address.
+        if let Some(off) = sret {
+            self.asm.lea_local(off);
+        }
+    }
 }
 
 /// The destination of a call: a known function's code `label` (a direct `call

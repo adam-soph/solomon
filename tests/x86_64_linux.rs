@@ -634,6 +634,9 @@ fn printing_matches_the_interpreter() {
         r#"U0 Main(){ "%g %g %g %g\n", 1.5, 1000000.0, 0.0001, 0.00001; } Main;"#,
         r#"U0 Main(){ "%g %.3g %#g %G\n", 1234567.0, 1234567.0, 1.5, 0.00001; } Main;"#,
         r#"U0 Main(){ "[%12.3e][%-12.3e][%+g][%015.2e]\n", 1.5, 1.5, 2.5, 42.0; } Main;"#,
+        // Negative zero keeps its IEEE sign across every conversion (the bignum's
+        // sign bit, matching the interpreter / libc / Rust): `-0.000000`, not `0`.
+        r#"U0 Main(){ "%f %e %g %E %G %.0f\n", -0.0, -0.0, -0.0, -0.0, -0.0, -0.0; } Main;"#,
         // Pathological width/precision: clamped at the shared `fmt` layer (width
         // ≤1024, precision ≤512) so the hand-emitted fixed scratch buffers never
         // overflow. Pre-clamp these segfaulted; they must now match the interpreter.

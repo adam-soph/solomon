@@ -9,6 +9,7 @@
 
 pub mod arm64;
 pub mod ast;
+pub mod backend;
 pub mod builtins;
 pub mod codegen;
 pub mod fmt;

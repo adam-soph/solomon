@@ -463,7 +463,7 @@ impl Mono {
     }
 
     /// Intern the canonical tuple struct for `elems`, generating the synthetic
-    /// `class $Tup$…` once, and return its type name.
+    /// `class $Tup…` once, and return its type name.
     fn intern_tuple(&mut self, elems: &[Type]) -> String {
         let name = tuple_type_name(elems);
         if self.tuple_types.insert(name.clone()) {
@@ -697,6 +697,9 @@ impl Mono {
                 Type::Ptr(inner) | Type::Array(inner, _) => Some(*inner),
                 _ => None,
             },
+            // Logical-not yields a boolean-valued I64 regardless of operand type;
+            // the other unary/postfix ops (`-`, `~`, `++`, `--`) preserve it.
+            ExprKind::Unary { op: UnOp::Not, .. } => Some(Type::I64),
             ExprKind::Unary { expr, .. } | ExprKind::Postfix { expr, .. } => self.type_expr(expr),
             ExprKind::Cast { ty, .. } => Some(ty.clone()),
             ExprKind::Call { callee, .. } => self.call_ret(callee),
@@ -708,24 +711,49 @@ impl Mono {
                 Type::Ptr(elem) | Type::Array(elem, _) => Some(*elem),
                 _ => None,
             },
-            ExprKind::Binary { op, lhs, rhs } => match op {
-                BinOp::Eq
-                | BinOp::Ne
-                | BinOp::Lt
-                | BinOp::Gt
-                | BinOp::Le
-                | BinOp::Ge
-                | BinOp::And
-                | BinOp::Or => Some(Type::I64),
-                _ => {
-                    let f = matches!(self.type_expr(lhs), Some(Type::F64))
-                        || matches!(self.type_expr(rhs), Some(Type::F64));
-                    Some(if f { Type::F64 } else { Type::I64 })
+            ExprKind::Binary { op, lhs, rhs } => {
+                use BinOp::*;
+                match op {
+                    // Comparisons, logicals, and bitwise/shift ops are I64-valued
+                    // (mirrors sema::check_binary).
+                    Eq | Ne | Lt | Gt | Le | Ge | And | Or | BitAnd | BitOr | BitXor | Shl
+                    | Shr => Some(Type::I64),
+                    // Arithmetic follows the shared `arith_result` rule so pointer
+                    // arithmetic types correctly (e.g. `arr + 1` is `T*`, not I64);
+                    // pointer-minus-pointer is an integer offset. When an operand
+                    // can't be typed yet, fall back to the float-or-int heuristic so
+                    // inference stays as permissive as before.
+                    Add | Sub | Mul | Div | Mod => {
+                        let lt = self.type_expr(lhs).map(crate::sema::decay);
+                        let rt = self.type_expr(rhs).map(crate::sema::decay);
+                        match (&lt, &rt) {
+                            (Some(a), Some(b)) => {
+                                if *op == Sub
+                                    && crate::sema::is_pointer(a)
+                                    && crate::sema::is_pointer(b)
+                                {
+                                    Some(Type::I64)
+                                } else {
+                                    Some(crate::sema::arith_result(a, b))
+                                }
+                            }
+                            _ => {
+                                let f =
+                                    matches!(lt, Some(Type::F64)) || matches!(rt, Some(Type::F64));
+                                Some(if f { Type::F64 } else { Type::I64 })
+                            }
+                        }
+                    }
                 }
-            },
-            // A ternary's type is its arms' common type (prefer the `then` arm).
+            }
+            // A ternary's type is its arms' common type via the shared `arith_result`
+            // rule (so `c ? 1 : 1.0` is F64, matching sema); if only one arm types,
+            // fall back to it.
             ExprKind::Ternary { then, else_, .. } => {
-                self.type_expr(then).or_else(|| self.type_expr(else_))
+                match (self.type_expr(then), self.type_expr(else_)) {
+                    (Some(a), Some(b)) => Some(crate::sema::arith_result(&a, &b)),
+                    (a, b) => a.or(b),
+                }
             }
             ExprKind::Sizeof(_) => Some(Type::I64),
             _ => None,

@@ -604,6 +604,16 @@ impl<S: TokenStream> Preprocessor<S> {
                             Macro::Func { params, body } => {
                                 if matches!(self.peek_kind()?, TokenKind::LParen) {
                                     let args = self.collect_args(pt.tok.span.pos)?;
+                                    // Each argument is fully macro-expanded in its own
+                                    // context *before* substitution (the standard macro
+                                    // algorithm). This is what lets a nested call to the
+                                    // same macro inside an argument — `F(F(2))` — expand:
+                                    // the inner call is resolved here, before the outer
+                                    // macro's name is added to the hide-set.
+                                    let args = args
+                                        .into_iter()
+                                        .map(|a| self.expand_arg(a))
+                                        .collect::<LResult<Vec<_>>>()?;
                                     let body = self.substitute(
                                         &params,
                                         &body,
@@ -629,14 +639,106 @@ impl<S: TokenStream> Preprocessor<S> {
     /// Push replacement tokens to the front of the pending queue, each carrying
     /// the current hide-set plus `mac` to prevent re-expanding `mac`.
     fn expand_into_pending(&mut self, body: Vec<Token>, mac: &str, base_hide: &HashSet<String>) {
-        let mut hide = base_hide.clone();
-        hide.insert(mac.to_string());
-        for tok in body.into_iter().rev() {
-            self.pending.push_front(PpTok {
+        prepend_with_hide(&mut self.pending, body, mac, base_hide);
+    }
+
+    /// Fully macro-expand a standalone macro argument in its own context. Unlike
+    /// [`next_expanded`](Self::next_expanded) this never pulls from the underlying
+    /// stream: it expands only the tokens of `arg` to a fixpoint. This implements
+    /// the per-argument pre-expansion of the standard (Prosser) macro algorithm —
+    /// a macro call fully contained in an argument expands here, so a nested call
+    /// to the *same* macro is resolved before the outer macro's name enters the
+    /// hide-set. A function-macro *name* at the very end of the argument is left
+    /// untouched: its `(` (if any) lives in the enclosing stream and is handled by
+    /// the outer rescan.
+    fn expand_arg(&self, arg: Vec<Token>) -> LResult<Vec<Token>> {
+        let mut work: VecDeque<PpTok> = arg
+            .into_iter()
+            .map(|tok| PpTok {
                 tok,
-                hide: hide.clone(),
-            });
+                hide: HashSet::new(),
+            })
+            .collect();
+        let mut out: Vec<Token> = Vec::new();
+        while let Some(pt) = work.pop_front() {
+            if let TokenKind::Ident(name) = &pt.tok.kind {
+                let name = name.clone();
+                if !pt.hide.contains(&name) {
+                    if let Some(mac) = self.macros.get(&name).cloned() {
+                        match mac {
+                            Macro::Object(body) => {
+                                prepend_with_hide(&mut work, body, &name, &pt.hide);
+                                continue;
+                            }
+                            Macro::Func { params, body } => {
+                                // Only a call if the next *local* token is `(`; if the
+                                // argument ends here, it is an ordinary identifier.
+                                if matches!(
+                                    work.front().map(|p| &p.tok.kind),
+                                    Some(TokenKind::LParen)
+                                ) {
+                                    let args =
+                                        self.collect_args_from(&mut work, pt.tok.span.pos)?;
+                                    let args = args
+                                        .into_iter()
+                                        .map(|a| self.expand_arg(a))
+                                        .collect::<LResult<Vec<_>>>()?;
+                                    let body = self.substitute(
+                                        &params,
+                                        &body,
+                                        args,
+                                        &name,
+                                        pt.tok.span.pos,
+                                    )?;
+                                    prepend_with_hide(&mut work, body, &name, &pt.hide);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(pt.tok);
         }
+        Ok(out)
+    }
+
+    /// Collect a function-like macro's arguments from a local token deque (used by
+    /// [`expand_arg`](Self::expand_arg)). Mirrors [`collect_args`](Self::collect_args),
+    /// which collects from the live stream; this variant consumes only `work` and so
+    /// never reaches past the argument it is expanding. Assumes `work.front()` is `(`.
+    fn collect_args_from(&self, work: &mut VecDeque<PpTok>, pos: Pos) -> LResult<Vec<Vec<Token>>> {
+        work.pop_front(); // consume `(`
+        let mut args: Vec<Vec<Token>> = Vec::new();
+        let mut cur: Vec<Token> = Vec::new();
+        let mut depth = 1usize;
+        loop {
+            let Some(pt) = work.pop_front() else {
+                return Err(self.err(pos, "unterminated macro argument list"));
+            };
+            match &pt.tok.kind {
+                TokenKind::Eof => return Err(self.err(pos, "unterminated macro argument list")),
+                TokenKind::LParen => {
+                    depth += 1;
+                    cur.push(pt.tok);
+                }
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    cur.push(pt.tok);
+                }
+                TokenKind::Comma if depth == 1 => {
+                    args.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(pt.tok),
+            }
+        }
+        if !cur.is_empty() || !args.is_empty() {
+            args.push(cur);
+        }
+        Ok(args)
     }
 
     /// Collect a function-like macro's arguments. Assumes the next token is `(`.
@@ -722,6 +824,26 @@ impl<S: TokenStream> TokenStream for Preprocessor<S> {
 
 /// The directive keyword after `#`. Most directive names lex as identifiers;
 /// `else` is the lone keyword among them.
+/// Push replacement tokens to the front of a pending deque, each carrying
+/// `base_hide` plus `mac` so `mac` is not re-expanded within its own expansion.
+/// Shared by the main expander (over `self.pending`) and the per-argument
+/// pre-expander (over a local deque).
+fn prepend_with_hide(
+    queue: &mut VecDeque<PpTok>,
+    body: Vec<Token>,
+    mac: &str,
+    base_hide: &HashSet<String>,
+) {
+    let mut hide = base_hide.clone();
+    hide.insert(mac.to_string());
+    for tok in body.into_iter().rev() {
+        queue.push_front(PpTok {
+            tok,
+            hide: hide.clone(),
+        });
+    }
+}
+
 /// Reconstruct HolyC source text from a token slice (for re-parsing an `#exe` block).
 /// Tokens are space-joined; literals are rendered faithfully — strings re-escaped,
 /// floats with a decimal point, char constants as their packed integer value.

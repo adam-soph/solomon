@@ -232,6 +232,73 @@ fn native_command_line_args() {
 }
 
 #[test]
+fn native_float_formatting_matches_interp_over_a_hard_battery() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // A hard battery of `%f`/`%e`/`%g` cases — subnormals, the 2^53 integer-precision
+    // boundary, round-half-to-even ties, and extreme magnitudes — formatted by the
+    // native backend (which on Darwin lowers to **libc** `printf`) and the
+    // interpreter (Rust's correctly-rounded `{:.P}`/`fmt.rs`). Asserting they agree
+    // cross-checks the shared format spec against an independent oracle (libc) over
+    // exactly the inputs that stress the correctly-rounded float formatters — the
+    // safety net for sharing the freestanding bignum formatters (which CI exercises;
+    // Darwin uses libc, so the bignum itself runs only under the freestanding tests).
+    let values: &[&str] = &[
+        "0.0",
+        "0.5",
+        "1.5",
+        "2.5",
+        "0.125",
+        "2.675",
+        "0.05",
+        "0.15",
+        "0.25",
+        "0.35",
+        "0.45",
+        "1.0",
+        "10.0",
+        "100.0",
+        "0.1",
+        "0.0001",
+        "0.00001",
+        "1000000.0",
+        "9999999.0",
+        "123456.789",
+        "3.141592653589793",
+        "2.718281828459045",
+        "0.3333333333333333",
+        "9007199254740991.0",
+        "9007199254740992.0",
+        "9007199254740993.0",
+        "1.0e300",
+        "1.0e-300",
+        "1.0e16",
+        "1.0e17",
+        "1.7976931348623157e308",
+        "2.2250738585072014e-308",
+        "5.0e-324",
+        "-0.0",
+        "-2.675",
+        "-123456.789",
+        "-1.0e300",
+        "-5.0e-324",
+    ];
+    let specs: &[&str] = &[
+        "%f", "%.0f", "%.1f", "%.3f", "%.10f", "%.17f", "%e", "%.0e", "%.3e", "%.10e", "%.17e",
+        "%E", "%g", "%.1g", "%.6g", "%.17g", "%G",
+    ];
+    let mut src = String::from("F64 v;\n");
+    for v in values {
+        for s in specs {
+            src.push_str(&format!("v = {v}; \"{s}\\n\", v;\n"));
+        }
+    }
+    assert_native_matches_interp(&src);
+}
+
+#[test]
 fn compiles_integer_expressions_to_exit_code() {
     if !toolchain_available() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");

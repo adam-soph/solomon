@@ -2966,7 +2966,10 @@ impl<W: Write> Interpreter<W> {
                 }
                 'f' | 'e' | 'E' | 'g' | 'G' => {
                     let v = value_as_f64(&take(&mut ai)?);
-                    let neg = v.is_sign_negative() && v != 0.0;
+                    // The sign comes from the IEEE sign bit, so negative zero prints
+                    // with a `-` (matching libc and the freestanding bignum
+                    // formatters); a plain `v < 0.0` would drop `-0.0`'s sign.
+                    let neg = v.is_sign_negative();
                     let mag = v.abs();
                     let body = match spec.conv {
                         // C's default `%f` precision is 6 — match libc exactly.
