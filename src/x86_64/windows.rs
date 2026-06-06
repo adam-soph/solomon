@@ -90,8 +90,13 @@ impl WindowsTarget {
     /// Returns the byte count, or -1 on failure. Same 72-byte frame as `emit_std_write`
     /// (the established WriteFile shim), with the handle taken from `rdi`.
     fn emit_read_write(&mut self, asm: &mut Asm, func: &'static str) {
+        // rsp is force-16-aligned (save it in the non-volatile r15, `and rsp,-16`, then a
+        // 16-multiple frame), so the call lands on a 16-aligned rsp regardless of the
+        // body alignment — some kernel32 functions fault on a misaligned stack.
         let wf = self.extern_idx(func);
-        asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
+        asm.mov_rr(R15, super::RSP); // save rsp (non-volatile; survives the call)
+        asm.and_ri(super::RSP, -16); // 16-align
+        asm.emit(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64 (32 shadow + arg/scratch slots)
         asm.emit(&[0x48, 0x89, 0x74, 0x24, 0x30]); // mov [rsp+48], rsi  (save buf)
         asm.emit(&[0x48, 0x89, 0x54, 0x24, 0x38]); // mov [rsp+56], rdx  (save n)
         asm.mov_rr(RCX, RDI); // hFile = handle
@@ -109,7 +114,7 @@ impl WindowsTarget {
         asm.place(fail);
         asm.mov_ri(RAX, -1);
         asm.place(done);
-        asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+        asm.mov_rr(super::RSP, R15); // restore rsp
     }
 
     /// `Open(path, flags, mode)` → `CreateFileA`. Translates the `io.hc` open flags
@@ -163,7 +168,11 @@ impl WindowsTarget {
         asm.mov_ri(R11, 5); // TRUNCATE_EXISTING
         asm.place(dispdone);
         // CreateFileA(path, access, share=3, sec=NULL, disposition, NORMAL=0x80, tmpl=NULL).
-        asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
+        // Force-16-align rsp (CreateFileA faults on a misaligned stack, unlike the
+        // simpler WriteFile); r10/r11/rdi are registers, unaffected by the rsp moves.
+        asm.mov_rr(R15, super::RSP); // save rsp (non-volatile; survives the call)
+        asm.and_ri(super::RSP, -16); // 16-align
+        asm.emit(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64 (32 shadow + 3 stack args)
         asm.mov_rr(RCX, RDI); // lpFileName = path
         asm.mov_rr(RDX, R10); // dwDesiredAccess
         asm.mov_ri(R8, 3); // dwShareMode = FILE_SHARE_READ|WRITE
@@ -172,7 +181,7 @@ impl WindowsTarget {
         asm.store_rsp_imm(40, 0x80); // [rsp+40] = FILE_ATTRIBUTE_NORMAL
         asm.store_rsp_imm(48, 0); // [rsp+48] = hTemplateFile = NULL
         asm.call_extern(cf);
-        asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+        asm.mov_rr(super::RSP, R15); // restore rsp
     }
 }
 
@@ -231,12 +240,6 @@ impl OsTarget for WindowsTarget {
     }
 
     fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp) {
-        // NOTE: currently unreached — file ops are gated to POSIX in `gen_builtin`
-        // because this `kernel32` lowering crashes at runtime on Windows (CI), and the
-        // bug can't be diagnosed without a Windows host (the PE never executes on the
-        // dev host). The implementation is kept intact for that future debugging:
-        // re-enable by dropping the `is_posix` guard on the file ops in `gen_builtin`.
-        //
         // The fd args arrive in the System V registers (rdi/rsi/rdx); each op maps to a
         // `kernel32` call (MS x64 ABI: rcx/rdx/r8/r9, stack args at [rsp+32]+, a 32-byte
         // shadow area, rsp 16-aligned at the call). The "fd" is a Win32 HANDLE. Results
@@ -264,7 +267,9 @@ impl OsTarget for WindowsTarget {
                 // dwMoveMethod=whence). io.hc SEEK_SET/CUR/END (0/1/2) == FILE_BEGIN/
                 // CURRENT/END. BOOL → newpos (64-bit) / -1. `newpos` is the [rsp+40] slot.
                 let wf = self.extern_idx("SetFilePointerEx");
-                asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
+                asm.mov_rr(R15, super::RSP); // save rsp (non-volatile; survives the call)
+                asm.and_ri(super::RSP, -16); // 16-align
+                asm.emit(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64 (shadow + &newpos slot)
                 asm.mov_rr(R9, RDX); // dwMoveMethod = whence (before rdx is reused)
                 asm.mov_rr(RCX, RDI); // hFile = handle
                 asm.mov_rr(RDX, RSI); // liDistanceToMove = off (by value)
@@ -279,7 +284,7 @@ impl OsTarget for WindowsTarget {
                 asm.place(fail);
                 asm.mov_ri(RAX, -1);
                 asm.place(done);
-                asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+                asm.mov_rr(super::RSP, R15); // restore rsp
             }
         }
     }
