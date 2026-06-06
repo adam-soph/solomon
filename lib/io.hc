@@ -16,7 +16,8 @@
 //     I64 n = ReadFile("/cfg", buf, sizeof(buf));
 //     if (n < 0) { "read failed (errno %d)\n", -n; return; }
 
-#include <cstr.hc>   // StrLen
+#include <cstr.hc>    // StrLen
+#include <stdio.hc>   // StdWrite + STDOUT/STDERR (the standard-stream write)
 
 // `Open` flags use the **Linux** `open(2)` values as the canonical set; the Darwin
 // backend and the interpreter translate them to the host's flags, so the same
@@ -43,15 +44,8 @@ I64 Read(I64 fd, U8 *buf, I64 n);          // bytes read (0 = EOF), or -errno
 I64 Write(I64 fd, U8 *buf, I64 n);         // bytes written, or -errno
 I64 Close(I64 fd);                         // 0, or -errno
 
-// Write to a *standard stream* portably: `fd` 1 = stdout, 2 = stderr. Unlike `Write`
-// (a POSIX fd op with no Windows mapping), this lowers per target — the write syscall
-// / libc on POSIX, `WriteFile(GetStdHandle(...))` on Windows — so it is the one output
-// primitive that works on every backend. Returns bytes written, or -errno.
-#define STDOUT 1
-#define STDERR 2
-I64 StdWrite(I64 fd, U8 *buf, I64 n);
-
-// (Filesystem mutation — `Remove`/`Rename`/`Mkdir` — and process control live in
+// (`StdWrite` — the portable stdout/stderr write — lives in `<stdio.hc>`, included
+// above. Filesystem mutation — `Remove`/`Rename`/`Mkdir` — and process control live in
 // `<os.hc>`.)
 
 // --- fd helpers ---------------------------------------------------------------

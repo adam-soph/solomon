@@ -1950,11 +1950,21 @@ impl Cg {
                 self.os.emit_std_write(&mut self.asm);
                 Ok(())
             }
-            // File fd primitives — lowered through the OS seam (Linux syscall, Windows
-            // `kernel32`), so they work on both targets. Args are in the System V
-            // registers; the result (fd/HANDLE, byte count, offset, 0, or negative
-            // error) is in rax.
+            // File fd primitives — lowered through the OS seam. On Linux this is the
+            // raw syscall and is execution-tested. The Windows `kernel32` lowering
+            // (`emit_fileop` in `windows.rs`) compiles and byte-scans but crashes at
+            // runtime (CI), and can't be debugged without a Windows host — so file I/O
+            // is gated to POSIX for now (a clear error beats a crash). Re-enable by
+            // dropping this guard once the `CreateFileA` shim is fixed on Windows.
             "Open" | "LSeek" | "Read" | "Write" | "Close" => {
+                if !self.os.is_posix() {
+                    return Err(CodegenError::at(
+                        pos,
+                        format!(
+                            "x86_64 backend: `{name}` is not supported on the Windows target yet"
+                        ),
+                    ));
+                }
                 let op = match name {
                     "Open" => FileOp::Open,
                     "Read" => FileOp::Read,

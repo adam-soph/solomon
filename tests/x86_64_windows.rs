@@ -269,54 +269,12 @@ fn time_builtins_lower_to_kernel32() {
 }
 
 #[test]
-fn file_io_lowers_to_kernel32() {
-    // `Open`/`Write`/`Close` lower to `CreateFileA`/`WriteFile`/`CloseHandle`. A
-    // print-free program keeps the `WriteFile`/`CloseHandle` calls unambiguous (no
-    // `StdWrite` from a `Print`).
-    let pe = build_pe(
-        "#include <io.hc>\n\
-         U0 Main() { I64 fd = Open(\"t\", O_WRONLY|O_CREAT|O_TRUNC, MODE_0644);\n\
-         U8 *m = \"hi\"; Write(fd, m, 2); Close(fd); }\n\
-         Main;",
-    );
-    // CreateFileA: the two trailing stack-arg stores (FILE_ATTRIBUTE_NORMAL = 0x80,
-    // hTemplateFile = NULL) immediately precede the `call [rip]`.
-    let cf = find_code(
-        &pe,
-        &[
-            0x48, 0xC7, 0x44, 0x24, 0x28, 0x80, 0x00, 0x00, 0x00, // mov qword [rsp+40], 0x80
-            0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00, // mov qword [rsp+48], 0
-            0xFF, 0x15, // call [rip]
-        ],
-    );
-    assert_eq!(call_target(&pe, cf + 18), "CreateFileA");
-    // WriteFile: the `lpOverlapped = NULL` store then the call (the Read/Write tail).
-    let wf = find_code(
-        &pe,
-        &[
-            0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, // mov qword [rsp+32], 0
-            0xFF, 0x15, // call [rip]
-        ],
-    );
-    assert_eq!(call_target(&pe, wf + 9), "WriteFile");
-    // CloseHandle: the program's only `call_aligned` shim.
-    let close = find_code(
-        &pe,
-        &[
-            0x49, 0x89, 0xE7, // mov r15, rsp
-            0x48, 0x81, 0xE4, 0xF0, 0xFF, 0xFF, 0xFF, // and rsp, -16
-            0x48, 0x83, 0xEC, 0x20, // sub rsp, 32
-            0xFF, 0x15, // call [rip]
-        ],
-    );
-    assert_eq!(call_target(&pe, close + 14), "CloseHandle");
-}
-
-#[test]
 fn posix_only_builtins_rejected_on_windows() {
-    // The syscall-group primitives with no Windows lowering yet (sockets, filesystem
-    // mutation, process ids, working dir, threads, futex) must be a clear compile
-    // error on the PE target — not a silently-emitted, invalid Linux `syscall`.
+    // Primitives with no working Windows lowering must be a clear compile error on the
+    // PE target — not a silently-emitted, invalid Linux `syscall`. This covers the
+    // syscall-group ops (sockets, filesystem mutation, process ids, working dir,
+    // threads, futex) and, for now, file I/O (the `kernel32` lowering exists but is
+    // gated pending a Windows-host fix — see `windows.rs::emit_fileop`).
     for (src, name) in [
         (
             "#include <os.hc>\nU0 Main(){ Mkdir(\"d\", 0700); } Main;",
@@ -329,6 +287,10 @@ fn posix_only_builtins_rejected_on_windows() {
         (
             "#include <os.hc>\nU0 Main(){ I64 p = Getpid(); } Main;",
             "Getpid",
+        ),
+        (
+            "#include <io.hc>\nU0 Main(){ U8 b[8]; ReadFile(\"f\", b, 8); } Main;",
+            "Open",
         ),
     ] {
         let program = parse_with(src, std::path::Path::new("."), &[lib_dir()]).unwrap();
@@ -447,34 +409,6 @@ fn pe_printing_matches_the_interpreter() {
             .collect(),
     );
 }
-
-#[test]
-fn pe_file_io_matches_interpreter() {
-    // File I/O end-to-end: write a string to a temp file via the kernel32
-    // `CreateFileA`/`WriteFile`, read it back via `ReadFile`, and print it. The
-    // interpreter (over `std::fs`) and the executed PE must agree byte-for-byte. Runs
-    // only on a Windows host (self-skips elsewhere). A process-unique temp path keeps
-    // the interpreter's write (which happens on every host while computing the expected
-    // output) out of the repo; backslashes are normalized so the path embeds cleanly in
-    // a HolyC string literal (Windows file APIs accept forward slashes).
-    let path = std::env::temp_dir()
-        .join(format!("solomon-pe-io-{}.txt", std::process::id()))
-        .to_string_lossy()
-        .replace('\\', "/");
-    let _ = std::fs::remove_file(&path);
-    let src = format!(
-        "#include <io.hc>\n\
-        U0 Main() {{\n\
-          U8 *m = \"solomon\\n\";\n\
-          WriteFile(\"{path}\", m, StrLen(m));\n\
-          U8 buf[64];\n\
-          I64 n = ReadFile(\"{path}\", buf, 64);\n\
-          if (n < 0) {{ \"read failed\\n\"; return; }}\n\
-          buf[n] = 0;\n\
-          \"got: %s\", buf;\n\
-        }}\n\
-        Main;"
-    );
-    run_pe_conformance(vec![("file_io".to_string(), compile(&src))]);
-    let _ = std::fs::remove_file(&path);
-}
+// (No file-I/O execution conformance: file ops are gated to POSIX on Windows for now —
+// the kernel32 lowering crashes at runtime and needs a Windows host to debug. See
+// `posix_only_builtins_rejected_on_windows` and `windows.rs::emit_fileop`.)

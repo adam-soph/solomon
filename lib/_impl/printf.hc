@@ -11,7 +11,9 @@
 // Private (`_impl/`): user code prints via `Print` / `"%f", …`, never by calling
 // these directly.
 
-#include <io.hc>            // StdWrite (the fd sink)
+#include <stdio.hc>         // StdWrite (the fd sink) — NOT <io.hc>, to avoid compiling
+                            // its file helpers (gated on unsupported targets) into every
+                            // printing program (there is no dead-code elimination)
 #include <mem.hc>           // ReAlloc (MStrPrint growth)
 #include <cstr.hc>          // StrLen
 #include <_impl/fltfmt.hc>  // _FmtFloat + the _FLT_* flag bits

@@ -78,6 +78,7 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("_impl/strhash.hc", include_str!("../lib/_impl/strhash.hc")),
     ("fmt.hc", include_str!("../lib/fmt.hc")),
     ("_impl/fltfmt.hc", include_str!("../lib/_impl/fltfmt.hc")),
+    ("stdio.hc", include_str!("../lib/stdio.hc")),
     ("_impl/printf.hc", include_str!("../lib/_impl/printf.hc")),
     ("bignum.hc", include_str!("../lib/bignum.hc")),
     ("strconv.hc", include_str!("../lib/strconv.hc")),

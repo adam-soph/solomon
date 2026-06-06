@@ -231,6 +231,12 @@ impl OsTarget for WindowsTarget {
     }
 
     fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp) {
+        // NOTE: currently unreached — file ops are gated to POSIX in `gen_builtin`
+        // because this `kernel32` lowering crashes at runtime on Windows (CI), and the
+        // bug can't be diagnosed without a Windows host (the PE never executes on the
+        // dev host). The implementation is kept intact for that future debugging:
+        // re-enable by dropping the `is_posix` guard on the file ops in `gen_builtin`.
+        //
         // The fd args arrive in the System V registers (rdi/rsi/rdx); each op maps to a
         // `kernel32` call (MS x64 ABI: rcx/rdx/r8/r9, stack args at [rsp+32]+, a 32-byte
         // shadow area, rsp 16-aligned at the call). The "fd" is a Win32 HANDLE. Results
