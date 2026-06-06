@@ -187,6 +187,91 @@ fn native_arm64_freestanding_file() {
     assert_eq!(got, EXPECTED, "arm64 freestanding");
 }
 
+// ---- StdWrite: portable stdout/stderr ----
+
+/// Writes a line to stderr (fd 2, a side channel) then a line to stdout (fd 1),
+/// and prints the byte count `StdWrite` returned. Deterministic *stdout*:
+/// `stdout line\nwrote=12\n` — the stderr write must NOT appear there.
+const STDWRITE_PROGRAM: &str = r#"
+    #include <io.hc>
+    U0 Main() {
+      U8 *o = "stdout line\n";
+      U8 *e = "stderr line\n";
+      StdWrite(STDERR, e, StrLen(e)); // → fd 2, not captured in stdout
+      I64 w = StdWrite(STDOUT, o, StrLen(o));
+      "wrote=%d\n", w;
+    }
+    Main;
+"#;
+
+const STDWRITE_EXPECTED: &str = "stdout line\nwrote=12\n";
+
+#[test]
+fn interp_stdwrite() {
+    let out =
+        run_to_string(&compile(STDWRITE_PROGRAM)).unwrap_or_else(|e| panic!("interp error: {e}"));
+    assert_eq!(out, STDWRITE_EXPECTED);
+}
+
+/// `StdWrite` on native arm64 Darwin (libc `write` with the fd). Only stdout is
+/// captured, so this also confirms the `StdWrite(STDERR, …)` byte goes to fd 2.
+#[test]
+fn native_arm64_stdwrite() {
+    if !darwin_toolchain() {
+        eprintln!("skipping: native StdWrite test needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let bin = std::env::temp_dir().join(format!("solomon-stdw-{}", std::process::id()));
+    Arm64Darwin::new(&bin)
+        .run(&compile(STDWRITE_PROGRAM))
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let output = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run produced binary: {e}"));
+    let _ = std::fs::remove_file(&bin);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), STDWRITE_EXPECTED);
+}
+
+/// `StdWrite` through the **freestanding x86-64** backend (raw `write` syscall).
+/// linux/x86_64 host only (CI); self-skips elsewhere.
+#[test]
+fn native_x86_64_freestanding_stdwrite() {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("skipping: freestanding x86-64 StdWrite test needs a linux/x86_64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-x64-stdw-{}", std::process::id()));
+    let mut backend = X64Linux::new(&out);
+    backend
+        .run(&compile(STDWRITE_PROGRAM))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let output = Command::new(&out)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run produced ELF: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), STDWRITE_EXPECTED);
+}
+
+/// `StdWrite` through the **freestanding aarch64** backend (raw `write` syscall).
+/// linux/aarch64 host only; self-skips elsewhere.
+#[test]
+fn native_arm64_freestanding_stdwrite() {
+    if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        eprintln!("skipping: freestanding aarch64 StdWrite test needs a linux/aarch64 host");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("solomon-arm-stdw-{}", std::process::id()));
+    let mut backend = Arm64Linux::new(&out);
+    backend
+        .run(&compile(STDWRITE_PROGRAM))
+        .unwrap_or_else(|e| panic!("freestanding build failed: {e}"));
+    let output = Command::new(&out)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run produced ELF: {e}"));
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), STDWRITE_EXPECTED);
+}
+
 // ---- filesystem mutation: Mkdir / Rename / Remove ----
 
 /// A program that creates a directory, writes a file in it, renames it, reads it back,

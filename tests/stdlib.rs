@@ -8,10 +8,13 @@ use solomon::parser::parse_with;
 use solomon::sema::check_program;
 
 /// Parse `src` with the repository's `lib/` on the angle-include search path, then
-/// type-check and run it, returning captured output.
+/// type-check and run it, returning captured output. The base directory is `lib/`
+/// itself, so a test may exercise private `_impl/` helpers (the `_`-directory
+/// privacy is keyed on the file's directory — a program rooted in `lib/` is inside
+/// the `_impl/` parent subtree).
 fn run_with_stdlib(src: &str) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let program = parse_with(src, std::path::Path::new("."), &[lib])
+    let program = parse_with(src, &lib, std::slice::from_ref(&lib))
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
@@ -236,6 +239,237 @@ fn strtof64_parses_correctly_rounded() {
          3.140 -250.000 6.000\n\
          0 inf 0 -0\n"
     );
+}
+
+#[test]
+fn holyc_float_f_formatter_matches_rust() {
+    // The pure-HolyC `%f` formatter (`lib/fltfmt.hc`, the portable replacement for
+    // the hand-emitted bignum) must be byte-for-byte Rust's `{:.P}` — including
+    // round-half-to-even ties, subnormals, the 2^53 boundary, extremes, and -0.0.
+    // Each value is reconstructed from its exact bits via `Float64frombits`, so the
+    // lexer's float parsing can't perturb the input.
+    let values: &[f64] = &[
+        0.0,
+        -0.0,
+        0.5,
+        1.5,
+        2.5,
+        0.125,
+        2.675,
+        0.05,
+        0.15,
+        0.25,
+        0.35,
+        0.45,
+        1.0,
+        10.0,
+        100.0,
+        0.1,
+        0.0001,
+        0.00001,
+        1000000.0,
+        9999999.0,
+        123456.789,
+        std::f64::consts::PI,
+        std::f64::consts::E,
+        1.0 / 3.0,
+        9007199254740991.0,
+        9007199254740992.0,
+        9007199254740993.0,
+        1e300,
+        1e-300,
+        1e16,
+        1e17,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        -2.675,
+        -123456.789,
+        -1e300,
+        -f64::from_bits(1),
+    ];
+    let precs: &[usize] = &[0, 1, 2, 3, 6, 10, 15, 17, 20];
+
+    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut expected = String::new();
+    for &v in values {
+        for &p in precs {
+            src.push_str(&format!(
+                "_FmtFloat(b, Float64frombits(0x{:016X}), 'f', 0, 0, {p}); \"%s\\n\", b;\n",
+                v.to_bits()
+            ));
+            expected.push_str(&format!("{:.*}\n", p, v));
+        }
+    }
+    // A few high precisions on a handful of values to exercise the large bignum.
+    for &v in &[std::f64::consts::PI, 0.1, f64::from_bits(1), 1e300] {
+        for &p in &[50usize, 120] {
+            src.push_str(&format!(
+                "_FmtFloat(b, Float64frombits(0x{:016X}), 'f', 0, 0, {p}); \"%s\\n\", b;\n",
+                v.to_bits()
+            ));
+            expected.push_str(&format!("{:.*}\n", p, v));
+        }
+    }
+    src.push_str("}\nMain;\n");
+
+    let out = run_with_stdlib(&src);
+    if out != expected {
+        // Find the first differing line for a readable failure.
+        for (i, (a, b)) in out.lines().zip(expected.lines()).enumerate() {
+            assert_eq!(a, b, "line {i} differs (got vs want)");
+        }
+        assert_eq!(out, expected, "output length differs");
+    }
+}
+
+#[test]
+fn holyc_float_e_g_formatter_matches_rust() {
+    // The pure-HolyC `%e`/`%g` formatters (`lib/fltfmt.hc`) must match the
+    // interpreter's renderers `fmt::render_exp`/`render_g` (which are Rust's
+    // correctly-rounded `{:.Pe}` restyled to libc) byte-for-byte — including `%g`'s
+    // fixed/scientific choice, trailing-zero trim, and the `#` (alt) flag.
+    use solomon::fmt::{render_exp, render_g};
+    let sign = |v: f64| if v.is_sign_negative() { "-" } else { "" };
+    // The subnormal / extreme-exponent cases (×5^~1074, extracting ~750 digits) are
+    // slow in the tree-walking interp, so they're kept few here; the bignum's
+    // subnormal path is already covered cheaply by the `%f` test.
+    let values: &[f64] = &[
+        0.0,
+        -0.0,
+        1.5,
+        1234.5,
+        9.9999996,
+        9.6,
+        0.0001,
+        0.00001,
+        1000000.0,
+        9999999.0,
+        1234567.0,
+        0.1,
+        2.675,
+        123456.789,
+        std::f64::consts::PI,
+        1.0 / 3.0,
+        9007199254740993.0,
+        1e16,
+        1e17,
+        1e300,
+        f64::MAX,
+        f64::from_bits(1),
+        -2.5,
+        -1234567.0,
+        -1e300,
+    ];
+    let precs: &[usize] = &[0, 1, 3, 6, 17];
+
+    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut expected = String::new();
+    let emit = |src: &mut String, expected: &mut String, call: String, want: String| {
+        src.push_str(&call);
+        expected.push_str(&want);
+        expected.push('\n');
+    };
+    for &v in values {
+        let bits = v.to_bits();
+        for &p in precs {
+            // %e and %E
+            emit(
+                &mut src,
+                &mut expected,
+                format!(
+                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'e', 0, 0, {p}); \"%s\\n\", b;\n"
+                ),
+                format!("{}{}", sign(v), render_exp(v.abs(), p, false)),
+            );
+            emit(
+                &mut src,
+                &mut expected,
+                format!(
+                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'E', 0, 0, {p}); \"%s\\n\", b;\n"
+                ),
+                format!("{}{}", sign(v), render_exp(v.abs(), p, true)),
+            );
+            // %g, %G, and %#G (alt keeps trailing zeros)
+            emit(
+                &mut src,
+                &mut expected,
+                format!(
+                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'g', 0, 0, {p}); \"%s\\n\", b;\n"
+                ),
+                format!("{}{}", sign(v), render_g(v.abs(), p, false, false)),
+            );
+            emit(
+                &mut src,
+                &mut expected,
+                format!(
+                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'G', 64, 0, {p}); \"%s\\n\", b;\n"
+                ),
+                format!("{}{}", sign(v), render_g(v.abs(), p, true, true)),
+            );
+        }
+    }
+    src.push_str("}\nMain;\n");
+
+    let out = run_with_stdlib(&src);
+    if out != expected {
+        for (i, (a, b)) in out.lines().zip(expected.lines()).enumerate() {
+            assert_eq!(a, b, "line {i} differs (got vs want)");
+        }
+        assert_eq!(out, expected, "output length differs");
+    }
+}
+
+#[test]
+fn holyc_float_field_matches_interp() {
+    // `_FmtFloat` assembles the COMPLETE field (sign + width + the `- 0 + space #`
+    // flags); it must equal the interpreter's own `%`-rendering (its magnitude
+    // renderer wrapped by `render_int`) byte-for-byte. Each case prints the intrinsic
+    // and `_FmtFloat` on adjacent lines and asserts the pair matches.
+    // (spec, conv char, packed flag bits, width, precision)
+    let cases: &[(&str, char, i64, usize, usize)] = &[
+        ("%8.2f", 'f', 0, 8, 2),
+        ("%-8.2f", 'f', 4, 8, 2),
+        ("%08.2f", 'f', 8, 8, 2),
+        ("%+.2f", 'f', 16, 0, 2),
+        ("% .2f", 'f', 32, 0, 2),
+        ("%012.4f", 'f', 8, 12, 4),
+        ("%+08.1f", 'f', 24, 8, 1),
+        ("%12.3e", 'e', 0, 12, 3),
+        ("%-12.3e", 'e', 4, 12, 3),
+        ("%015.2e", 'e', 8, 15, 2),
+        ("%.3E", 'E', 0, 0, 3),
+        ("%10.4g", 'g', 0, 10, 4),
+        ("%+g", 'g', 16, 0, 6),
+        ("%#g", 'g', 64, 0, 6),
+        ("%#.3g", 'g', 64, 0, 3),
+        ("%G", 'G', 0, 0, 6),
+        ("%-12g", 'g', 4, 12, 6),
+    ];
+    let values: &[f64] = &[
+        3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1e6, -0.001, 42.0, 0.5,
+    ];
+    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    for &(spec, conv, flags, width, prec) in cases {
+        for &v in values {
+            let bits = v.to_bits();
+            src.push_str(&format!("\"{spec}\\n\", Float64frombits(0x{bits:016X});\n"));
+            src.push_str(&format!(
+                "_FmtFloat(b, Float64frombits(0x{bits:016X}), '{conv}', {flags}, {width}, {prec}); \"%s\\n\", b;\n"
+            ));
+        }
+    }
+    src.push_str("}\nMain;\n");
+
+    let out = run_with_stdlib(&src);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len() % 2, 0, "expected adjacent line pairs");
+    for pair in lines.chunks(2) {
+        assert_eq!(
+            pair[0], pair[1],
+            "intrinsic vs _FmtFloat field mismatch (oracle left, _FmtFloat right)"
+        );
+    }
 }
 
 #[test]

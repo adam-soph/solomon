@@ -149,9 +149,6 @@ impl Asm {
     pub(super) fn jne(&mut self, label: usize) {
         self.jcc(&[0x0F, 0x85], label);
     }
-    pub(super) fn jns(&mut self, label: usize) {
-        self.jcc(&[0x0F, 0x89], label);
-    }
     pub(super) fn js(&mut self, label: usize) {
         self.jcc(&[0x0F, 0x88], label);
     }
@@ -170,14 +167,8 @@ impl Asm {
     pub(super) fn jl(&mut self, label: usize) {
         self.jcc(&[0x0F, 0x8C], label);
     }
-    pub(super) fn jge(&mut self, label: usize) {
-        self.jcc(&[0x0F, 0x8D], label);
-    }
     pub(super) fn jg(&mut self, label: usize) {
         self.jcc(&[0x0F, 0x8F], label);
-    }
-    pub(super) fn jle(&mut self, label: usize) {
-        self.jcc(&[0x0F, 0x8E], label);
     }
     pub(super) fn call(&mut self, label: usize) {
         self.jcc(&[0xE8], label);
@@ -198,12 +189,6 @@ impl Asm {
         self.fixups.push((self.code.len(), label));
         self.emit(&[0, 0, 0, 0]);
     }
-    /// `lea rsi, [rip + disp32]` to an interned string (a RIP-relative fixup).
-    pub(super) fn lea_rsi_string(&mut self, idx: usize) {
-        self.emit(&[0x48, 0x8D, 0x35]); // lea rsi, [rip+disp32]
-        self.str_fixups.push((self.code.len(), idx));
-        self.emit(&[0, 0, 0, 0]);
-    }
     /// `lea rax, [rip + disp32]` to an interned string.
     pub(super) fn lea_rax_string(&mut self, idx: usize) {
         self.emit(&[0x48, 0x8D, 0x05]); // lea rax, [rip+disp32]
@@ -222,11 +207,6 @@ impl Asm {
         self.emit(&[rex, 0x8D, 0x05 | ((reg & 7) << 3)]);
         self.global_fixups.push((self.code.len(), off));
         self.emit(&[0, 0, 0, 0]);
-    }
-    /// `mov rdx, imm32` (the write length).
-    pub(super) fn mov_rdx_imm32(&mut self, imm: i32) {
-        self.emit(&[0x48, 0xC7, 0xC2]);
-        self.emit(&imm.to_le_bytes());
     }
     /// `write(1, rsi, rdx)`: the buffer is in rsi and the length in rdx.
     // frame: `push rbp; mov rbp, rsp; sub rsp, imm32`. Returns the imm32 position.
@@ -485,10 +465,6 @@ impl Asm {
         self.emit(&[0x48 | if dst >= 8 { 0x01 } else { 0 }, 0xB8 | (dst & 7)]);
         self.emit(&imm.to_le_bytes());
     }
-    /// `shr dst, imm8` (logical right shift by a constant).
-    pub(super) fn shr_ri(&mut self, dst: u8, imm: u8) {
-        self.emit(&[rex_b1(dst), 0xC1, 0xC0 | (5 << 3) | (dst & 7), imm]);
-    }
     /// `<op> dst, src` for an `r/m, r` ALU opcode (01 add, 29 sub, 09 or, 21 and,
     /// 31 xor, 39 cmp, 85 test) — i.e. `dst = dst <op> src` (cmp/test set flags).
     pub(super) fn alu_rr(&mut self, op: u8, dst: u8, src: u8) {
@@ -503,40 +479,10 @@ impl Asm {
     pub(super) fn xor_rr(&mut self, dst: u8, src: u8) {
         self.alu_rr(0x31, dst, src);
     }
-    pub(super) fn and_rr(&mut self, dst: u8, src: u8) {
-        self.alu_rr(0x21, dst, src);
-    }
-    /// `mov [rsp + disp8], src` (a local in the current stack frame).
-    pub(super) fn store_rsp(&mut self, disp: i8, src: u8) {
-        self.emit(&[
-            0x48 | if src >= 8 { 0x04 } else { 0 },
-            0x89,
-            0x44 | ((src & 7) << 3),
-            0x24,
-            disp as u8,
-        ]);
-    }
-    /// `mov dst, [rsp + disp8]`.
-    pub(super) fn load_rsp(&mut self, dst: u8, disp: i8) {
-        self.emit(&[
-            0x48 | if dst >= 8 { 0x04 } else { 0 },
-            0x8B,
-            0x44 | ((dst & 7) << 3),
-            0x24,
-            disp as u8,
-        ]);
-    }
     /// `mov qword [rsp + disp8], imm32`.
     pub(super) fn store_rsp_imm(&mut self, disp: i8, imm: i32) {
         self.emit(&[0x48, 0xC7, 0x44, 0x24, disp as u8]);
         self.emit(&imm.to_le_bytes());
-    }
-    /// `sub rsp, imm8` / `add rsp, imm8` (small frame adjust).
-    pub(super) fn sub_rsp(&mut self, n: u8) {
-        self.emit(&[0x48, 0x83, 0xEC, n]);
-    }
-    pub(super) fn add_rsp(&mut self, n: u8) {
-        self.emit(&[0x48, 0x83, 0xC4, n]);
     }
     pub(super) fn cmp_rr(&mut self, a: u8, b: u8) {
         self.alu_rr(0x39, a, b); // flags from a - b
@@ -552,56 +498,8 @@ impl Asm {
     pub(super) fn add_ri(&mut self, rm: u8, imm: i32) {
         self.alu_ri(0, rm, imm);
     }
-    pub(super) fn or_ri(&mut self, rm: u8, imm: i32) {
-        self.alu_ri(1, rm, imm);
-    }
     pub(super) fn cmp_ri(&mut self, rm: u8, imm: i32) {
         self.alu_ri(7, rm, imm);
-    }
-    /// `test rm, imm32` (`F7 /0 id`).
-    pub(super) fn test_ri(&mut self, rm: u8, imm: i32) {
-        self.emit(&[rex_b1(rm), 0xF7, 0xC0 | (rm & 7)]);
-        self.emit(&imm.to_le_bytes());
-    }
-    pub(super) fn neg_r(&mut self, rm: u8) {
-        self.emit(&[rex_b1(rm), 0xF7, 0xC0 | (3 << 3) | (rm & 7)]);
-    }
-    /// `div rm` — unsigned divide rdx:rax by `rm` (quotient rax, remainder rdx).
-    pub(super) fn div_r(&mut self, rm: u8) {
-        self.emit(&[rex_b1(rm), 0xF7, 0xC0 | (6 << 3) | (rm & 7)]);
-    }
-    /// `mul rm` — unsigned multiply rax by `rm` (128-bit product in rdx:rax).
-    pub(super) fn mul_r(&mut self, rm: u8) {
-        self.emit(&[rex_b1(rm), 0xF7, 0xC0 | (4 << 3) | (rm & 7)]);
-    }
-    /// `adc rm, imm8` (add-with-carry a small immediate, sign-extended).
-    pub(super) fn adc_ri8(&mut self, rm: u8, imm: i8) {
-        self.emit(&[rex_b1(rm), 0x83, 0xC0 | (2 << 3) | (rm & 7), imm as u8]);
-    }
-    /// `or dst, src` (64-bit).
-    pub(super) fn or_rr(&mut self, dst: u8, src: u8) {
-        self.alu_rr(0x09, dst, src);
-    }
-    /// `shl dst, cl` (variable left shift).
-    pub(super) fn shl_cl(&mut self, dst: u8) {
-        self.emit(&[rex_b1(dst), 0xD3, 0xC0 | (4 << 3) | (dst & 7)]);
-    }
-    /// `shr dst, cl` (variable logical right shift).
-    pub(super) fn shr_cl(&mut self, dst: u8) {
-        self.emit(&[rex_b1(dst), 0xD3, 0xC0 | (5 << 3) | (dst & 7)]);
-    }
-    /// `mov dst, [base + idx*8]` — load a bignum limb. `base`/`idx` not rsp/rbp/r12/r13.
-    pub(super) fn load_qword_idx8(&mut self, dst: u8, base: u8, idx: u8) {
-        let rex = 0x48
-            | if dst >= 8 { 0x04 } else { 0 }
-            | if idx >= 8 { 0x02 } else { 0 }
-            | if base >= 8 { 0x01 } else { 0 };
-        self.emit(&[
-            rex,
-            0x8B,
-            0x04 | ((dst & 7) << 3),
-            0xC0 | ((idx & 7) << 3) | (base & 7),
-        ]);
     }
     /// `mov [base + idx*8], src` — store a bignum limb.
     pub(super) fn store_qword_idx8(&mut self, base: u8, idx: u8, src: u8) {
@@ -618,18 +516,6 @@ impl Asm {
     }
     pub(super) fn inc_r(&mut self, rm: u8) {
         self.emit(&[rex_b1(rm), 0xFF, 0xC0 | (rm & 7)]);
-    }
-    pub(super) fn dec_r(&mut self, rm: u8) {
-        self.emit(&[rex_b1(rm), 0xFF, 0xC0 | (1 << 3) | (rm & 7)]);
-    }
-    /// `mov byte [base], src8` (low byte of `src`). `base` must not be rsp/rbp/r12/r13.
-    pub(super) fn store_byte_at(&mut self, base: u8, src: u8) {
-        // Always emit a REX so registers 4..7 mean spl/bpl/sil/dil (uniform byte regs).
-        self.emit(&[
-            0x40 | if src >= 8 { 0x04 } else { 0 } | if base >= 8 { 0x01 } else { 0 },
-            0x88,
-            ((src & 7) << 3) | (base & 7),
-        ]);
     }
     /// `mov byte [base], imm8`.
     pub(super) fn store_byte_imm_at(&mut self, base: u8, imm: u8) {

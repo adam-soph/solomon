@@ -94,14 +94,17 @@ fn call_to_undeclared_function_is_an_error() {
 }
 
 #[test]
-fn print_intrinsic_needs_its_lib_header() {
-    // `Print` is a primitive intrinsic declared in `lib/fmt.hc` (the compiler is its
-    // implementation), so — like any library function — it must be included to be
-    // called by name. (A bare string or the `"fmt", args` comma form needs nothing.)
-    has(
-        "U0 F() { Print(\"hello\"); }",
-        "undeclared function `Print`",
-    );
+fn print_family_is_auto_available() {
+    // The printf family is ordinary HolyC (`lib/fmt.hc`) now, but the compiler
+    // auto-includes `<fmt.hc>` whenever a program prints — a call to `Print`/`StrPrint`/…
+    // by name, or a bare string / `"fmt", args` comma statement — so none of these need
+    // an explicit include (there is no dead-code elimination, so the bodies are pulled
+    // in exactly when used).
+    ok("U0 F() { Print(\"hello\"); }");
+    ok("U0 F() { \"hello\\n\"; }");
+    ok("U0 F() { \"%d\\n\", 42; }");
+    ok("U0 F() { U8 b[16]; StrPrint(b, \"%d\", 1); }");
+    // An explicit include is still a no-op (the guard dedups it).
     ok("#include <fmt.hc>\nU0 F() { Print(\"hello\"); }");
 }
 

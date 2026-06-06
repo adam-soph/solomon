@@ -83,6 +83,20 @@ names) so a type can be used before it is defined, then does the real parse — 
 finally runs the **`mono`** pass (`src/mono.rs`), which monomorphizes every deferred
 generic construct into concrete AST (see "Monomorphization is its own pass" below), so
 everything downstream sees an ordinary, fully-concrete `Program`.
+
+**Auto-availability of the float formatter.** Float printing is a pure-HolyC library
+function (`lib/_impl/fltfmt.hc`'s `_FmtFloat`) the backends *call* rather than emit, so
+it must be in scope whenever a program prints a float — but with no dead-code
+elimination it can't simply be linked unconditionally. So `hoist_type_names` also
+returns a `uses_float` flag: as it streams the tokens it inspects each string literal
+with `format_str_has_float_conv` (the same `crate::fmt::parse` the backends lower with),
+set when any conversion is `%f`/`%e`/`%E`/`%g`/`%G`. When set, `parse_core` prepends
+`#include <_impl/fltfmt.hc>` to the real-parse prelude, so `_FmtFloat` and its bignum
+helpers compile into the program. The check is shared by every target: the interpreter
+ignores the include (it renders floats via `fmt.rs`), Darwin carries it (it prints
+floats via libc `printf`, so the function is compiled but unused there), and the
+freestanding/x86/Windows backends call it. The include guard dedups it against an
+explicit `#include`.
 `sema::check_program(&Program) -> Vec<SemaError>` runs name resolution + type
 inference. `layout::compute(&Program)` computes `repr(C)` sizes/offsets. The CLI
 (`src/bin/hcc.rs`) wires these together per mode.
@@ -254,14 +268,18 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   via the `out_ptr` global), the full `FmtInt`/`FmtStr` (all flags/width/precision,
   incl. `*` width/precision from args — `fs_width_prec_flags` pushes the starred
   args before the value and pops them back, a negative `*` width left-justifying —
-  mirroring `fmt::render_int`/`render_str`), the correctly-rounded **bignum float
-  formatters** `FmtFloat` (`%f`) and `FmtFloatEg` (`%e`/`%g`) over a 48-limb `BIGNUM`
-  with `BnMul`/`BnDiv10`/`BnShl`/`BnShr` (round-half-even in `BnShr`; `÷10` via a
-  64-iteration shift/subtract since AArch64 has no 128÷64 divide), the bump allocator
+  mirroring `fmt::render_int`/`render_str`), the bump allocator
   `MAlloc` over `mmap`, the sprintf family (and the lone `StrLen` routine its
   `CatPrint` append calls), and the FP algebraic op `Sqrt` (a single AArch64
-  `fsqrt`). The reducible string/memory/ctype/PRNG ops are pure HolyC in
-  `lib/*.hc` now, so they compile as ordinary functions rather than emitted
+  `fsqrt`). **Float printing (`%f`/`%e`/`%g`) is no longer emitted runtime**: the
+  correctly-rounded formatters are pure HolyC in `lib/_impl/fltfmt.hc` (`_FmtFloat`,
+  over a formatter-sized base-2³² bignum `_Fbn`), auto-included when a format string
+  carries a float conversion (see "auto-availability" below). `gen_print_fs`'s float
+  case evaluates the value, marshals `_FmtFloat(out, v, conv, flags, width, prec)`
+  into a BSS `outbuf`, then hands the returned length to `OutWrite` — so the
+  hand-emitted bignum (`FmtFloat`/`FmtFloatEg`/`BnMul`/`BnDiv10`/`BnShl`/`BnShr`) is
+  gone. The reducible string/memory/ctype/PRNG ops are pure HolyC in
+  `lib/*.hc` too, so they compile as ordinary functions rather than emitted
   runtime. `tests/arm64_linux.rs` compiles **all 18 examples** freestanding and
   runs them under `docker --platform linux/arm64` (native on Apple silicon, no qemu),
   asserting byte-for-byte equality with the interpreter; it self-skips with no docker.
@@ -313,16 +331,15 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   **printing** — a bare string prints verbatim, `"fmt", …`/`Print("fmt", …)` are
   printf-style with the **full** `%[flags][width][.prec]conv` grammar (flags
   `- 0 + space #`, `*` width/precision from args) for `%d %i %u %x %X %o %c %s
-  %f %e %g %%` — the float forms are **correctly-rounded** via a 48-limb `BIGNUM`,
-  matching Rust's `{:.P}`/`{:.Pe}` byte-for-byte (incl. round-half-to-even ties).
-  `%f` (`emit_fmt_float` + `emit_bn_*`) builds J = round(m·2^e·10^P) by ×5^P then a
-  binary shift with round-half-even, extracts decimal digits, and places the
-  point. `%e`/`%g` (`emit_fmt_float_eg`) work from the value's **exact** finite
-  decimal expansion (a double `m·2^e` is the dyadic rational `Dint·10^pe`, so
-  `Dint = m·5^(−e)` is integer) — extract all digits, round the digit string to N
-  significant figures (half-even, with carry-overflow bumping the exponent), then
-  format `d.dddde±XX` (`%e`) or choose fixed/scientific and trim trailing zeros
-  (`%g`). It's a stack machine in `rax` (left operand spilled
+  %f %e %g %%` — the float forms are **correctly-rounded** (matching Rust's
+  `{:.P}`/`{:.Pe}` byte-for-byte, incl. round-half-to-even ties) by the **pure-HolyC**
+  `_FmtFloat` (`lib/_impl/fltfmt.hc`), shared with the freestanding arm64 backend and
+  auto-included when a format string carries a float conversion (see "auto-availability"
+  below). `gen_print`'s float case evaluates the value into `xmm0`, marshals
+  `_FmtFloat(out, v, conv, flags, width, prec)` into a BSS `outbuf`, then hands the
+  returned length to `out_write` — so the hand-emitted bignum
+  (`emit_fmt_float`/`emit_fmt_float_eg`/`emit_bn_*`) is gone. It's a stack machine in
+  `rax` (left operand spilled
   to the machine stack while the right is computed, so values survive nested
   calls); an lvalue's address comes from `gen_addr`, with width-aware load/store
   through it. Type sizes/strides come from the [layout pass](crate::layout).
@@ -357,9 +374,9 @@ transcendentals. `CodegenError` (in `codegen.rs`) is the shared run/emit error.
   core-library builtin set is covered. `F64ToStr` is **not** a builtin — it's the
   one-line HolyC wrapper `StrPrint(buf, "%g", v)` in `lib/cstr.hc`, so it reuses
   this same formatter rather than carrying its own. The print-runtime helpers are
-  emitted by a deterministic fixpoint (`emit_helpers`) so a float formatter pulled
-  in only by a compiled-but-not-top-level function — like that `F64ToStr` wrapper —
-  still gets its transitive `OutWrite`/bignum sub-routines placed. (**All 18 examples compile and run
+  emitted by a deterministic fixpoint (`emit_helpers`) — now just `FmtInt`/`FmtStr`/
+  `OutWrite`/`GrowSink` (float formatting moved to the HolyC `_FmtFloat`, an ordinary
+  compiled function, not a helper). (**All 18 examples compile and run
   natively**, matching the interpreter.) Tests in
   `tests/x86_64_linux.rs` verify the ELF structure
   on any host and **execute** the produced binary — directly on a `linux`/`x86_64`
@@ -416,8 +433,10 @@ set was: the printf family `Print` (→
 `printf`), `StrPrint` (→ `sprintf`, returns dst), `CatPrint` (sprintf-append, into
 `dst+strlen(dst)`) and `MStrPrint` (asprintf-style) — they could read `...` in HolyC
 now (the `VarArg*` accessors exist), but stay builtins because they bundle the
-format-rendering machinery (the shared `fmt` spec + correctly-rounded bignum floats
-the backends emit), not practical as byte-identical HolyC. **Float conversion is no
+format-rendering machinery (parsing the format string off the shared `fmt` spec and
+dispatching each conversion to the emitted `FmtInt`/`FmtStr` field builders + the
+output sink; floats now delegate to the HolyC `_FmtFloat`), not practical as
+byte-identical HolyC. **Float conversion is no
 longer here at all**: `StrToF64` (`atof`) is a correctly-rounded bignum parser in
 `lib/strconv.hc` (over the `Bn` big integer in `lib/bignum.hc`) — pure HolyC, so it
 works on the freestanding targets too (no host libc), and its inverse `F64ToStr` is
@@ -463,6 +482,20 @@ includable on its own:
 - `lib/fmt.hc` — the **printf-family intrinsics**: `Print`/`StrPrint`/`CatPrint`/
   `MStrPrint` prototypes (the backends render them; bare strings and the `"fmt", args`
   comma form need no include).
+- `lib/_impl/fltfmt.hc` — the **correctly-rounded float formatter** the backends call
+  to render `%f`/`%e`/`%g` (so the bignum lives once, in HolyC, instead of being
+  hand-emitted per backend). `_FmtFloat(out, v, conv, flags, width, prec)` writes the
+  complete field (sign from the IEEE bit, so `-0.0` keeps its `-`; zero-pad after the
+  sign; width/`-`/`#`) into `out` and returns the length, mirroring `fmt::render_int`'s
+  layout byte-for-byte. Built on a formatter-sized base-2³² bignum `_Fbn` and the
+  magnitude renderers `_FmtFMag`/`_FmtEMag`/`_FmtGMag` (the `%f` path builds
+  `J = round(m·5^P·2^(E+P))` with round-half-even; `%e`/`%g` work from the value's exact
+  decimal expansion). **Private** (`_impl/`): it's compiler-internal print machinery, so
+  user code prints floats via `Print`/`"%f", …` — calling `_FmtFloat`/`_Fbn`/`_FmtFMag`
+  directly is a privacy error. Auto-included when a format string carries a float
+  conversion (see "Auto-availability of the float formatter" above); the interpreter
+  ignores it (it renders floats via `fmt.rs`), Darwin compiles-but-uses-libc, the
+  freestanding/x86/Windows backends call it.
 - `lib/time.hc` — the impure **clock intrinsics** `UnixNS`/`NanoNS`/`Sleep` prototypes
   (the one non-reproducible group — conformance by property, not value), plus calendar
   math over them (`DateTime`, `FromUnix`/`ToUnix`/`FmtISO`/`IsLeap`/`Now`).

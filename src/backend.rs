@@ -444,6 +444,14 @@ pub trait CallEmitter {
     /// Deliver the call result into the expression-evaluation register(s) (the sret
     /// temp's address for an aggregate return, else the float/integer result reg).
     fn deliver_result(&mut self, ret: &Type, sret: Option<Self::Slot>);
+    /// Snapshot the frame allocator's bump pointer, so a call's transient scratch
+    /// (the variadic buffer) can be reclaimed after the call. The high-water frame
+    /// size is tracked separately, so reclaiming never shrinks the frame.
+    fn frame_mark(&self) -> u32;
+    /// Reset the bump pointer to a `frame_mark` snapshot, reclaiming the variadic
+    /// buffer. Reused by the next sequential call; a *nested* call allocated above
+    /// this mark, so the two never overlap.
+    fn frame_reset(&mut self, mark: u32);
 }
 
 /// Lower a call. Backend-independent shape: spill an indirect callee, allocate the
@@ -471,9 +479,14 @@ pub fn gen_call<E: CallEmitter>(
     for (ty, arg) in named {
         cg.eval_arg_spill(ty, arg)?;
     }
+    // The variadic buffer `place_args` stages is dead once the call returns, so
+    // reclaim it: without this, a function with many variadic calls (e.g. hundreds of
+    // `Print`s) would grow its frame by one buffer per call and overflow.
+    let mark = cg.frame_mark();
     cg.place_args(classes, extra, varargs, pos)?;
     cg.set_sret_reg(sret);
     emit_call_insn(cg);
+    cg.frame_reset(mark);
     cg.deliver_result(ret, sret);
     Ok(())
 }
@@ -614,17 +627,5 @@ pub fn int_conv(conv: char) -> (i64, i64) {
         'x' => (16, 0),
         'X' => (16, F_UPPER),
         _ => (8, 0), // 'o'
-    }
-}
-
-/// The `conv` code passed to the emitted `%e`/`%g` float formatter
-/// (`FmtFloatEg`): bit 0 selects `%g` vs `%e`, bit 2 selects uppercase
-/// (`%E`/`%G`). `%f` does not use this (it has its own formatter).
-pub fn float_eg_conv(conv: char) -> i64 {
-    match conv {
-        'e' => 1,
-        'E' => 1 | 4,
-        'g' => 2,
-        _ => 2 | 4, // 'G'
     }
 }

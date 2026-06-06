@@ -1604,6 +1604,15 @@ impl<W: Write> Interpreter<W> {
         // A user-defined function with a real body shadows a like-named primitive
         // intrinsic (e.g. a program's own `Join`/`Read`): only do the bespoke builtin
         // lowering when no body is in scope (the lib prototype, which has none).
+        // The printf family is **always** rendered by the interpreter's own
+        // `crate::fmt` — its independent conformance oracle — even though `<fmt.hc>`
+        // now gives `Print`/`StrPrint`/… real HolyC bodies that the native backends
+        // compile and call. Diffing native (the HolyC formatter) against interp (the
+        // Rust formatter) thus cross-checks two independent implementations, rather
+        // than running one copy on both sides.
+        if matches!(name, "Print" | "StrPrint" | "CatPrint" | "MStrPrint") {
+            return self.call_builtin(name, &args, pos);
+        }
         let user_defined = self.funcs.get(name).is_some_and(|f| f.body.is_some());
         if !user_defined
             && (crate::builtins::is_builtin(name) || crate::intrinsics::is_primitive(name))
@@ -1869,6 +1878,20 @@ impl<W: Write> Interpreter<W> {
                 let res = match self.fds.get_mut(&fd) {
                     Some(FdObj::Tcp(s)) => std::io::Write::write(s, &bytes),
                     Some(FdObj::File(f)) => std::io::Write::write(f, &bytes),
+                    _ => return Ok(Value::Int(-1)),
+                };
+                Ok(Value::Int(res.map(|w| w as i64).unwrap_or(-1)))
+            }
+            // Write to a standard stream. fd 1 → the captured output sink (so it is
+            // part of `run_to_string`, like `Print`); fd 2 → real stderr (a side
+            // channel, not compared in conformance). Other fds are an error.
+            "StdWrite" => {
+                let fd = self.to_i64(args[0].clone(), pos)?;
+                let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
+                let bytes = self.read_n_bytes(&args[1], n, pos)?;
+                let res = match fd {
+                    1 => self.out.write(&bytes),
+                    2 => std::io::stderr().write(&bytes),
                     _ => return Ok(Value::Int(-1)),
                 };
                 Ok(Value::Int(res.map(|w| w as i64).unwrap_or(-1)))

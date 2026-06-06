@@ -76,7 +76,7 @@ use std::collections::HashMap;
 use crate::ast::*;
 use crate::codegen::CodegenError;
 use crate::layout::{self, Layouts};
-use crate::token::Pos;
+use crate::token::{Pos, Span};
 
 mod asm;
 mod linux;
@@ -93,6 +93,17 @@ pub use windows::X64Windows;
 /// Windows target ([`X64Windows`]) calls `kernel32` imports from a self-contained
 /// PE. Each seam is a small instruction sequence with a fixed register contract
 /// so the shared `Cg` can drive it without knowing the OS.
+///
+/// A file fd primitive, dispatched through [`OsTarget::emit_fileop`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileOp {
+    Open,
+    Read,
+    Write,
+    Close,
+    LSeek,
+}
+
 trait OsTarget {
     /// Emit process exit. The exit status is in `rax` (its low 32 bits).
     fn emit_exit(&mut self, asm: &mut Asm);
@@ -101,9 +112,29 @@ trait OsTarget {
     /// `rsi` preserved" — the fresh-chunk grab inside the `MAlloc` bump allocator.
     fn emit_page_alloc(&mut self, asm: &mut Asm);
 
-    /// Emit "write the `rdx` bytes at `rsi` to standard output" — the terminal
-    /// case of the formatted-output sink.
-    fn emit_write_stdout(&mut self, asm: &mut Asm);
+    /// Emit the body of the `StdWrite(fd, buf, n)` primitive: write the `rdx` bytes
+    /// at `rsi` to the standard stream named by `rdi` (1 = stdout, 2 = stderr),
+    /// returning the bytes written in `rax`. Linux is a `write` syscall (fd passes
+    /// straight through); Windows maps fd → `GetStdHandle(STD_OUTPUT/ERROR)` + a
+    /// `WriteFile`.
+    fn emit_std_write(&mut self, asm: &mut Asm);
+
+    /// Whether this is a POSIX target (Linux). The Windows PE has no Linux syscalls,
+    /// so the syscall-group primitives (sockets, filesystem mutation, process ids,
+    /// working dir, threads, futex) that lack a Windows lowering are gated on this and
+    /// rejected with a clear error rather than emitting an invalid `syscall`.
+    fn is_posix(&self) -> bool {
+        true
+    }
+
+    /// Lower a file fd primitive (`Open`/`Read`/`Write`/`Close`/`LSeek`). Arguments
+    /// are already in the System V registers (`Open`: rdi=path, rsi=flags, rdx=mode;
+    /// `Read`/`Write`: rdi=fd, rsi=buf, rdx=n; `Close`: rdi=fd; `LSeek`: rdi=fd,
+    /// rsi=off, rdx=whence). The result (an fd/HANDLE, byte count, offset, 0, or a
+    /// negative error) lands in `rax`. Linux is the raw syscall; Windows is the
+    /// matching `kernel32` call (`CreateFileA`/`ReadFile`/`WriteFile`/`CloseHandle`/
+    /// `SetFilePointerEx`), with the `io.hc` open flags translated to Win32.
+    fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp);
 
     /// Read the wall clock into `rax` as nanoseconds since the Unix epoch.
     /// `scratch` is a 16-byte BSS slot for the OS time structure. Linux uses
@@ -206,9 +237,8 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
         }
     }
 
-    // The tiny print runtime (only the helpers actually used).
-    cg.emit_helpers();
-    // Builtin runtime routines (MAlloc, string/mem ops, …), only those used.
+    // Builtin runtime routines (MAlloc, string/mem ops, …), only those used. (The
+    // print runtime is gone — the printf family is pure HolyC, an ordinary function.)
     cg.emit_rt_routines();
 
     let bss = cg.bss as u64;
@@ -231,47 +261,6 @@ struct VarLoc {
 }
 
 /// A routine in the tiny print runtime (emitted once, on demand).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Helper {
-    /// Format an integer with full flags/width/precision (mirrors `fmt::render_int`).
-    /// `rdi`=value, `rsi`=radix, `rdx`=flags, `rcx`=width, `r8`=precision.
-    FmtInt,
-    /// Format a string/char with width/precision (mirrors `fmt::render_str`).
-    /// `rdi`=ptr, `rsi`=len (−1 ⇒ strlen), `rdx`=flags, `rcx`=width, `r8`=precision.
-    FmtStr,
-    /// The output sink: `rsi`=buf, `rdx`=len. Writes to stdout when the `out_ptr`
-    /// global is 0, else appends to `[out_ptr]` (advancing it) — the StrPrint path.
-    OutWrite,
-    /// Grow the owned `MStrPrint` buffer so the pending `rdx`-byte write (plus a
-    /// trailing NUL) fits, reallocating + copying. Preserves `rsi`/`rdx`, returns
-    /// the new cursor in `rax`, and updates `out_base`/`out_ptr`/`out_limit`.
-    GrowSink,
-    /// Format an F64 as `%f`. `xmm0`=value, `edi`=precision, `esi`=flags, `edx`=width.
-    FmtFloat,
-    /// Format an F64 as `%e`/`%g`. Same registers; `ecx`=conv (1 `e`, 2 `g`;
-    /// bit 2 = uppercase). Works from the value's exact decimal expansion.
-    FmtFloatEg,
-    /// Bignum scratch ops on the shared `BIGNUM` array: `*= rdi`.
-    BnMul,
-    /// Bignum `>>= rdi` with round-half-even.
-    BnShr,
-    /// Bignum `<<= rdi`.
-    BnShl,
-    /// Bignum `/= 10`, returning the remainder digit in rax.
-    BnDiv10,
-}
-
-/// Number of 64-bit limbs in the float-printing bignum. Must hold a double's full
-/// exact decimal expansion: the smallest subnormal's `m·5^1074` is ~767 digits ≈
-/// 2548 bits, so 48 limbs (3072 bits ≈ 925 digits) covers it with margin.
-const NLIMBS: i32 = 48;
-// Freestanding printf scratch sizes (≥ the clamped fmt::MAX_WIDTH/MAX_PRECISION),
-// so the formatters can never overflow their fixed buffers.
-const FS_INT_DIGBUF: i32 = 600;
-const FS_OUTBUF: i32 = 1152;
-const FS_FLOAT_DIGBUF: i32 = 1024;
-const FS_SIGBUF: i32 = 576;
-
 // Register numbers for the generic encoders.
 const RAX: u8 = 0;
 const RCX: u8 = 1;
@@ -284,22 +273,7 @@ const R8: u8 = 8;
 const R9: u8 = 9;
 const R10: u8 = 10;
 const R11: u8 = 11;
-const R12: u8 = 12;
-const R13: u8 = 13;
-const R14: u8 = 14;
 const R15: u8 = 15;
-
-// `fmt_int`/`fmt_str` flag bits (compile-time assembled from a parsed `fmt::Spec`).
-// The bit values are the shared printf runtime ABI (`crate::backend`); these are the
-// `i32` view this backend's `Asm` immediates want, derived so they can't drift from
-// the canonical definitions the arm64 backend also tests.
-const F_SIGNED: i32 = crate::backend::F_SIGNED as i32; // signed conversion (`%d`/`%i`)
-const F_UPPER: i32 = crate::backend::F_UPPER as i32; // uppercase hex (`%X`) and `0X`
-const F_MINUS: i32 = crate::backend::F_MINUS as i32; // left-justify
-const F_ZERO: i32 = crate::backend::F_ZERO as i32; // zero-pad
-const F_PLUS: i32 = crate::backend::F_PLUS as i32; // always show a sign
-const F_SPACE: i32 = crate::backend::F_SPACE as i32; // space before a non-negative
-const F_HASH: i32 = crate::backend::F_HASH as i32; // alternate form (`0x`/leading `0`)
 
 /// A global variable's location: a byte offset into the BSS region. Its address
 /// is RIP-relative (resolved like a string reference, but past the file image).
@@ -314,13 +288,11 @@ struct Cg {
     os: Box<dyn OsTarget>, // the per-OS policy: exit, page alloc, stdout sink, container
     layouts: Layouts,
     scopes: Vec<HashMap<String, VarLoc>>,
-    depth: i32,                    // bytes of locals allocated below rbp
+    depth: i32,     // current frame bump pointer (reclaimed after a call's va buffer)
+    max_depth: i32, // high-water mark the frame is sized to
     funcs: HashMap<String, usize>, // name -> code label
     globals: HashMap<String, GlobalLoc>,
-    bss: i32, // total bytes of BSS allocated (globals + print scratch)
-    digbuf: Option<i32>,
-    outbuf: Option<i32>,
-    charbuf: Option<i32>,
+    bss: i32,                     // total bytes of BSS allocated (globals + print scratch)
     heap_bss: Option<(i32, i32)>, // bump allocator's (heap_ptr, heap_end) BSS slots
     break_targets: Vec<usize>,
     continue_targets: Vec<usize>,
@@ -330,16 +302,11 @@ struct Cg {
     labels: HashMap<String, usize>, // named `goto` labels in the current function
     funcs_sig: HashMap<String, (Vec<Type>, Type)>, // name -> (param types, return type)
     funcs_va: HashMap<String, bool>, // name -> is variadic (`...`)
-    helpers: HashMap<Helper, usize>, // print runtime routine -> code label (on first use)
     rt_routines: HashMap<&'static str, usize>, // builtin runtime routine -> label (on first use)
-    out_ptr_off: Option<i32>, // BSS slot: the formatted-output sink pointer (0 = stdout)
     // Growing-sink globals (set only when a program uses `MStrPrint`): the base of
     // the owned, reallocating buffer and its current capacity end. `out_limit != 0`
     // is what tells the sink it may grow rather than blindly append (the StrPrint
     // path leaves it 0). `out_limit_off.is_some()` gates the grow branch in the sink.
-    out_base_off: Option<i32>,
-    out_limit_off: Option<i32>,
-    bignum_off: Option<i32>, // BSS offset of the float-printing bignum (NLIMBS limbs)
     // Command-line args: BSS slots holding argc and the argv array pointer, set
     // when the program uses `ArgC`/`ArgV` (the entry captures them). `None`/false
     // for arg-free programs, which are then byte-for-byte unchanged.
@@ -362,12 +329,10 @@ impl Cg {
             layouts,
             scopes: Vec::new(),
             depth: 0,
+            max_depth: 0,
             funcs: HashMap::new(),
             globals: HashMap::new(),
             bss: 0,
-            digbuf: None,
-            outbuf: None,
-            charbuf: None,
             heap_bss: None,
             break_targets: Vec::new(),
             continue_targets: Vec::new(),
@@ -377,12 +342,7 @@ impl Cg {
             sret_off: None,
             labels: HashMap::new(),
             funcs_sig: HashMap::new(),
-            helpers: HashMap::new(),
             rt_routines: HashMap::new(),
-            out_ptr_off: None,
-            out_base_off: None,
-            out_limit_off: None,
-            bignum_off: None,
             argc_off: None,
             argv_off: None,
             uses_args: false,
@@ -390,28 +350,6 @@ impl Cg {
             uses_env: false,
             uses_msize: false,
         }
-    }
-
-    /// BSS offset of the float-printing bignum (`NLIMBS` 64-bit limbs), on first use.
-    fn bignum_global(&mut self) -> i32 {
-        if let Some(o) = self.bignum_off {
-            return o;
-        }
-        let o = self.alloc_bss(NLIMBS * 8, 8);
-        self.bignum_off = Some(o);
-        o
-    }
-
-    /// BSS offset of the formatted-output sink pointer (`out_ptr`), allocated on
-    /// first use. 0 means "write to stdout"; otherwise it is the current write
-    /// position in a `StrPrint`/`CatPrint` destination buffer.
-    fn out_ptr_global(&mut self) -> i32 {
-        if let Some(o) = self.out_ptr_off {
-            return o;
-        }
-        let o = self.alloc_bss(8, 8);
-        self.out_ptr_off = Some(o);
-        o
     }
 
     /// The code label for a builtin runtime routine, assigning one on first use.
@@ -439,65 +377,6 @@ impl Cg {
         self.globals.insert(name.to_string(), GlobalLoc { off, ty });
     }
 
-    /// Offsets of the print-runtime scratch buffers (allocated on first use):
-    /// `digbuf` builds digit strings, `outbuf` assembles a padded field, and
-    /// `charbuf` holds a single `%c` byte.
-    fn digbuf(&mut self) -> i32 {
-        if let Some(o) = self.digbuf {
-            return o;
-        }
-        let o = self.alloc_bss(FS_INT_DIGBUF, 1);
-        self.digbuf = Some(o);
-        o
-    }
-    fn outbuf(&mut self) -> i32 {
-        if let Some(o) = self.outbuf {
-            return o;
-        }
-        let o = self.alloc_bss(FS_OUTBUF, 1);
-        self.outbuf = Some(o);
-        o
-    }
-    fn charbuf(&mut self) -> i32 {
-        if let Some(o) = self.charbuf {
-            return o;
-        }
-        let o = self.alloc_bss(1, 1);
-        self.charbuf = Some(o);
-        o
-    }
-    /// BSS slots for the growing sink (allocated together on first `MStrPrint`):
-    /// `out_base` is the start of the owned, reallocating output buffer (and the
-    /// value `MStrPrint` ultimately returns); `out_limit` is one past its last
-    /// usable byte. A nonzero `out_limit` is the sink's signal that it owns the
-    /// buffer and may grow it; `StrPrint` never sets it, so it keeps appending.
-    fn out_base_global(&mut self) -> i32 {
-        if let Some(o) = self.out_base_off {
-            return o;
-        }
-        let o = self.alloc_bss(8, 8);
-        self.out_base_off = Some(o);
-        o
-    }
-    fn out_limit_global(&mut self) -> i32 {
-        if let Some(o) = self.out_limit_off {
-            return o;
-        }
-        let o = self.alloc_bss(8, 8);
-        self.out_limit_off = Some(o);
-        o
-    }
-
-    /// The code label for a print helper, assigning one on first use.
-    fn helper(&mut self, h: Helper) -> usize {
-        if let Some(&l) = self.helpers.get(&h) {
-            return l;
-        }
-        let l = self.asm.new_label();
-        self.helpers.insert(h, l);
-        l
-    }
-
     fn size_of(&self, ty: &Type) -> i32 {
         self.layouts.size_of(ty) as i32
     }
@@ -517,6 +396,9 @@ impl Cg {
         let a = align.max(1);
         let total = self.depth + size;
         self.depth = (total + a - 1) / a * a; // round up to `a`
+        // `max_depth` is the high-water mark — the frame is sized to it, so reclaiming
+        // `depth` (a call's transient variadic buffer) never shrinks the frame.
+        self.max_depth = self.max_depth.max(self.depth);
         self.depth
     }
     fn declare(&mut self, name: &str, ty: Type, indirect: bool) -> i32 {
@@ -570,7 +452,7 @@ impl Cg {
         self.asm.mov_rax_imm(0); // default exit status if no `return` was hit
         self.asm.place(self.ret_label);
         self.os.emit_exit(&mut self.asm); // exit status in rax
-        self.asm.patch_frame(frame, align16(self.depth));
+        self.asm.patch_frame(frame, align16(self.max_depth));
         Ok(())
     }
 
@@ -706,13 +588,14 @@ impl Cg {
         }
         self.asm.place(self.ret_label);
         self.asm.epilogue();
-        self.asm.patch_frame(frame, align16(self.depth));
+        self.asm.patch_frame(frame, align16(self.max_depth));
         Ok(())
     }
 
     fn begin_function(&mut self) {
         self.scopes = vec![HashMap::new()];
         self.depth = 0;
+        self.max_depth = 0;
         self.break_targets.clear();
         self.continue_targets.clear();
         self.ret_label = self.asm.new_label();
@@ -765,7 +648,7 @@ impl Cg {
                 // `"fmt", a, b` and `Print("fmt", …)` are printf-style. Everything
                 // else is evaluated for effect.
                 if let ExprKind::Str(lit) = &e.kind {
-                    self.emit_literal(lit.as_bytes());
+                    self.gen_bare_str(lit, s.span.pos)?;
                 } else if let Some((fmt, args)) = as_print(e) {
                     self.gen_print(&fmt, args, s.span.pos)?;
                 } else {
@@ -2054,27 +1937,53 @@ impl Cg {
                 self.os.emit_sleep(&mut self.asm, scratch);
                 Ok(())
             }
-            // printf-into-a-buffer (the sprintf family)
-            "StrPrint" => self.gen_strprint(args, false, pos),
-            "CatPrint" => self.gen_strprint(args, true, pos),
-            "MStrPrint" => self.gen_mstrprint(args, pos),
-            // POSIX fd primitives via raw Linux syscalls (x86-64 numbers: read 0,
-            // write 1, open 2, close 3, lseek 8, socket 41, connect 42). Each takes
+            // (The printf family `Print`/`StrPrint`/`CatPrint`/`MStrPrint` is pure HolyC
+            // now — `lib/fmt.hc` — so it is compiled and called like any function, not
+            // lowered here.)
+            // Portable standard-stream write (fd 1 = stdout, 2 = stderr). Unlike the
+            // raw-syscall `Write` below — Linux-only — this goes through the OS seam so
+            // it also works on Windows (`WriteFile` via `GetStdHandle`). Args land in
+            // rdi=fd, rsi=buf, rdx=n; `emit_std_write` returns bytes written in rax.
+            "StdWrite" => {
+                let arg_refs: Vec<&Expr> = args.iter().collect();
+                self.gen_int_args(&arg_refs)?;
+                self.os.emit_std_write(&mut self.asm);
+                Ok(())
+            }
+            // File fd primitives — lowered through the OS seam (Linux syscall, Windows
+            // `kernel32`), so they work on both targets. Args are in the System V
+            // registers; the result (fd/HANDLE, byte count, offset, 0, or negative
+            // error) is in rax.
+            "Open" | "LSeek" | "Read" | "Write" | "Close" => {
+                let op = match name {
+                    "Open" => FileOp::Open,
+                    "Read" => FileOp::Read,
+                    "Write" => FileOp::Write,
+                    "Close" => FileOp::Close,
+                    _ => FileOp::LSeek,
+                };
+                let arg_refs: Vec<&Expr> = args.iter().collect();
+                self.gen_int_args(&arg_refs)?;
+                self.os.emit_fileop(&mut self.asm, op);
+                Ok(())
+            }
+            // POSIX-only primitives via raw Linux syscalls (x86-64 numbers: socket 41,
+            // connect 42, unlink 87, rename 82, mkdir 83, getpid 39, …). Each takes
             // ≤3 args, so the System V arg registers (rdi/rsi/rdx) coincide with the
-            // syscall registers; the `io.hc` open flags are Linux's, so they pass
-            // straight through. The result (an fd, byte count, offset, or -errno) is
-            // in rax.
-            // The filesystem mutations and `Getpid` join here: `unlink` 87 / `rename`
-            // 82 / `mkdir` 83 / `getpid` 39 take their args (if any) directly in the
-            // same arg/syscall registers.
-            "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" | "Remove"
-            | "Rename" | "Mkdir" | "Getpid" | "Getppid" | "Getuid" | "Getgid" | "Chdir" => {
+            // syscall registers; the result is in rax. There is no Windows lowering
+            // for these yet, so reject them with a clear error on the PE target rather
+            // than emitting an invalid `syscall`.
+            "Socket" | "Connect" | "Remove" | "Rename" | "Mkdir" | "Getpid" | "Getppid"
+            | "Getuid" | "Getgid" | "Chdir" => {
+                if !self.os.is_posix() {
+                    return Err(CodegenError::at(
+                        pos,
+                        format!(
+                            "x86_64 backend: `{name}` is not supported on the Windows target yet"
+                        ),
+                    ));
+                }
                 let nr: i32 = match name {
-                    "Read" => 0,
-                    "Write" => 1,
-                    "Open" => 2,
-                    "Close" => 3,
-                    "LSeek" => 8,
                     "Getpid" => 39,
                     "Chdir" => 80,
                     "Rename" => 82,
@@ -2097,6 +2006,12 @@ impl Cg {
             // `-errno`; normalise a non-negative result to 0 (matching the 0/-errno
             // contract of the other working-dir ops).
             "Getcwd" => {
+                if !self.os.is_posix() {
+                    return Err(CodegenError::at(
+                        pos,
+                        "x86_64 backend: `Getcwd` is not supported on the Windows target yet",
+                    ));
+                }
                 let arg_refs: Vec<&Expr> = args.iter().collect();
                 self.gen_int_args(&arg_refs)?; // rdi = buf, rsi = size
                 self.asm.mov_ri(RAX, 79);
@@ -2114,6 +2029,14 @@ impl Cg {
                 self.gen_expr(&args[0])?; // rax = code
                 self.os.emit_exit(&mut self.asm);
                 Ok(())
+            }
+            // Threads and the futex behind blocking sync are raw Linux clone/futex
+            // syscalls — no Windows lowering yet.
+            "Thread" | "Join" | "FutexWait" | "FutexWake" if !self.os.is_posix() => {
+                Err(CodegenError::at(
+                    pos,
+                    format!("x86_64 backend: `{name}` is not supported on the Windows target yet"),
+                ))
             }
             "Thread" => self.gen_thread(args),
             "Join" => self.gen_join(args),
@@ -2133,100 +2056,6 @@ impl Cg {
                 format!("x86_64 backend: builtin `{other}` is not supported yet"),
             )),
         }
-    }
-
-    /// `StrPrint(dst, fmt, …)` / `CatPrint(dst, fmt, …)`: printf-format into `dst`
-    /// (or `dst + StrLen(dst)` for `append`), NUL-terminate, return `dst`. Reuses
-    /// the print machinery by pointing the output sink (`out_ptr`) at the buffer.
-    fn gen_strprint(&mut self, args: &[Expr], append: bool, pos: Pos) -> Result<(), CodegenError> {
-        let ExprKind::Str(fmt) = &args[1].kind else {
-            return Err(CodegenError::at(
-                pos,
-                "x86_64 backend: StrPrint/CatPrint format must be a string literal",
-            ));
-        };
-        let fmt = fmt.clone();
-        let out = self.out_ptr_global();
-        // Evaluate dst once; keep it (the return value) in a frame slot.
-        self.gen_expr(&args[0])?;
-        let dslot = self.alloc(8, 8);
-        self.asm.store_local(dslot, 8);
-        // Point out_ptr at the write start: dst, or dst + StrLen(dst) for CatPrint.
-        if append {
-            self.asm.load_local(dslot, 8, false);
-            self.asm.mov_rdi_rax();
-            let sl = self.rt_routine("StrLen");
-            self.asm.call(sl); // rax = StrLen(dst)
-            self.asm.mov_rcx_rax();
-            self.asm.load_local(dslot, 8, false);
-            self.asm.add_rax_rcx(); // rax = dst + len
-        } else {
-            self.asm.load_local(dslot, 8, false);
-        }
-        self.asm.lea_global(R8, out);
-        self.asm.store_qword_at(R8, RAX); // out_ptr = start
-        self.gen_print(&fmt, &args[2..], pos)?; // appends to the buffer
-        self.finish_buffer_write(out);
-        self.asm.load_local(dslot, 8, false); // return dst
-        Ok(())
-    }
-
-    /// `MStrPrint(fmt, ...)`: format into a fresh, right-sized buffer and return it
-    /// (asprintf-style). This is the **growing-sink** strategy real libcs use for
-    /// `vasprintf` (glibc/BSD's `open_memstream`): allocate a small owned buffer,
-    /// arm the sink to *grow* it (realloc + copy via [`Helper::GrowSink`]) whenever
-    /// a write would overflow, then format in a single pass. No measurement pass
-    /// and no fixed cap — the result pointer is just `out_base` when we finish.
-    fn gen_mstrprint(&mut self, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        let ExprKind::Str(fmt) = &args[0].kind else {
-            return Err(CodegenError::at(
-                pos,
-                "x86_64 backend: MStrPrint's format must be a string literal",
-            ));
-        };
-        let fmt = fmt.clone();
-        const INIT_CAP: i32 = 64; // grown on demand; covers most results in one shot
-        let out = self.out_ptr_global();
-        let base = self.out_base_global();
-        let limit = self.out_limit_global();
-        self.helper(Helper::GrowSink); // ensure the grow routine is emitted
-        // buf = MAlloc(INIT_CAP); arm the sink at it (base = ptr = buf, limit = end).
-        self.asm.mov_ri(RDI, INIT_CAP);
-        let malloc = self.rt_routine("MAlloc");
-        self.asm.call(malloc); // rax = buf
-        self.asm.lea_global(R8, base);
-        self.asm.store_qword_at(R8, RAX); // out_base = buf
-        self.asm.lea_global(R8, out);
-        self.asm.store_qword_at(R8, RAX); // out_ptr = buf (write cursor)
-        self.asm.add_ri(RAX, INIT_CAP); // rax = buf + INIT_CAP
-        self.asm.lea_global(R8, limit);
-        self.asm.store_qword_at(R8, RAX); // out_limit = buf + INIT_CAP
-        // Format in one pass; the sink grows the buffer as needed.
-        self.gen_print(&fmt, &args[1..], pos)?;
-        // NUL-terminate at the cursor (GrowSink keeps cursor < limit, so this fits),
-        // then disarm: cursor = 0 (stdout), limit = 0 (StrPrint append mode).
-        self.asm.lea_global(R8, out);
-        self.asm.load_qword_at(RAX, R8); // rax = cursor
-        self.asm.store_byte_imm_at(RAX, 0); // *cursor = '\0'
-        self.asm.mov_ri(RAX, 0);
-        self.asm.lea_global(R8, out);
-        self.asm.store_qword_at(R8, RAX); // out_ptr = 0
-        self.asm.lea_global(R8, limit);
-        self.asm.store_qword_at(R8, RAX); // out_limit = 0
-        // Return the buffer base (it may have moved during a grow).
-        self.asm.lea_global(R8, base);
-        self.asm.load_qword_at(RAX, R8); // rax = out_base = result
-        Ok(())
-    }
-
-    /// NUL-terminate the buffer at `out_ptr` and reset the sink back to stdout.
-    fn finish_buffer_write(&mut self, out: i32) {
-        self.asm.lea_global(R8, out);
-        self.asm.load_qword_at(RAX, R8); // rax = end of written data
-        self.asm.store_byte_imm_at(RAX, 0); // NUL terminator
-        self.asm.mov_ri(RAX, 0);
-        self.asm.lea_global(R8, out);
-        self.asm.store_qword_at(R8, RAX); // out_ptr = 0 (stdout again)
     }
 
     /// Emit the bodies of the builtin runtime routines actually used (in a fixed
@@ -2592,1844 +2421,32 @@ impl Cg {
     /// parser (so it agrees with the interpreter), then lowers integer conversions
     /// through the `fmt_int` runtime and string/char ones through `fmt_str`, both
     /// of which apply the flags/width/precision exactly as `fmt::render_*` does.
+    /// Printing is the pure-HolyC `Print` now (auto-included via `<fmt.hc>` when a
+    /// program prints): synthesize `Print(fmt, args…)` and emit it as an ordinary call
+    /// to the compiled body. Target-independent (Linux ELF + Windows PE) — the HolyC
+    /// `Print` ultimately calls `StdWrite`, which the OS seam lowers per target.
     fn gen_print(&mut self, fmt: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        let mut chars = fmt.chars().peekable();
-        let mut arg_i = 0;
-        let mut lit: Vec<u8> = Vec::new();
-        let next_arg = |args: &[Expr], ai: &mut usize| -> Result<usize, CodegenError> {
-            let i = *ai;
-            if i >= args.len() {
-                return Err(CodegenError::at(
-                    pos,
-                    "x86_64 backend: too few arguments for format string",
-                ));
-            }
-            *ai += 1;
-            Ok(i)
-        };
-        while let Some(c) = chars.next() {
-            if c != '%' {
-                let mut b = [0u8; 4];
-                lit.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
-                continue;
-            }
-            let spec = crate::fmt::parse(&mut chars);
-            if spec.conv == '%' {
-                lit.push(b'%');
-                continue;
-            }
-            self.emit_literal(&lit);
-            lit.clear();
+        let fmt_expr = Expr::new(ExprKind::Str(fmt.to_string()), Span::dummy());
+        fmt_expr.set_ty(Type::Ptr(Box::new(Type::U8)));
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(fmt_expr);
+        call_args.extend(args.iter().cloned());
+        self.gen_call_by_name("Print", &call_args, pos)
+    }
 
-            // `*` width / precision come from arguments, consumed (left to right)
-            // before the value — push them now so they survive the value eval.
-            if spec.width_star {
-                let a = next_arg(args, &mut arg_i)?;
-                self.gen_expr(&args[a])?;
-                self.asm.push_rax();
-            }
-            if spec.prec_star {
-                let a = next_arg(args, &mut arg_i)?;
-                self.gen_expr(&args[a])?;
-                self.asm.push_rax();
-            }
-
-            let flags = crate::backend::spec_flags(&spec) as i32;
-
-            let a = next_arg(args, &mut arg_i)?;
-            match spec.conv {
-                'd' | 'i' | 'u' | 'x' | 'X' | 'o' => {
-                    let (radix, extra) = crate::backend::int_conv(spec.conv);
-                    self.gen_expr(&args[a])?;
-                    self.asm.mov_rdi_rax(); // rdi = value
-                    self.setup_width_prec_flags(&spec, flags | extra as i32, false);
-                    self.asm.mov_ri(RSI, radix as i32);
-                    let l = self.helper(Helper::FmtInt);
-                    self.asm.call(l);
-                }
-                'c' => {
-                    let cb = self.charbuf();
-                    self.gen_expr(&args[a])?;
-                    self.asm.lea_global(RCX, cb); // rcx = &charbuf
-                    self.asm.store_byte_at(RCX, RAX); // charbuf[0] = low byte
-                    self.asm.lea_global(RDI, cb); // rdi = &charbuf
-                    self.setup_width_prec_flags(&spec, flags, true); // %c ignores precision
-                    self.asm.mov_ri(RSI, 1); // len = 1
-                    let l = self.helper(Helper::FmtStr);
-                    self.asm.call(l);
-                }
-                's' => {
-                    self.gen_expr(&args[a])?;
-                    self.asm.mov_rdi_rax(); // rdi = string pointer
-                    self.setup_width_prec_flags(&spec, flags, false);
-                    self.asm.mov_ri(RSI, -1); // len = -1 ⇒ strlen
-                    let l = self.helper(Helper::FmtStr);
-                    self.asm.call(l);
-                }
-                'f' | 'e' | 'E' | 'g' | 'G' => {
-                    self.gen_foperand(&args[a])?; // xmm0 = value (int → double)
-                    self.setup_width_prec_flags(&spec, flags, false); // rcx=width, r8=prec, rdx=flags
-                    // Float precision defaults to 6 when unspecified (libc/Rust rule).
-                    let have_prec = self.asm.new_label();
-                    self.asm.cmp_ri(R8, 0);
-                    self.asm.jge(have_prec);
-                    self.asm.mov_ri(R8, 6);
-                    self.asm.place(have_prec);
-                    self.asm.mov_rr(RSI, RDX); // esi = flags
-                    self.asm.mov_rr(RDI, R8); //  edi = precision
-                    self.asm.mov_rr(RDX, RCX); // edx = width
-                    let (h, conv) = if spec.conv == 'f' {
-                        (Helper::FmtFloat, 0)
-                    } else {
-                        (
-                            Helper::FmtFloatEg,
-                            crate::backend::float_eg_conv(spec.conv) as i32,
-                        )
-                    };
-                    self.asm.mov_ri(RCX, conv); // ecx = conv (FmtFloatEg only)
-                    let l = self.helper(h);
-                    self.asm.call(l);
-                }
-                other => {
-                    return Err(CodegenError::at(
-                        pos,
-                        format!("x86_64 backend: unsupported format conversion %{other}"),
-                    ));
-                }
-            }
+    /// A bare string statement prints **verbatim** — no `%` processing, matching the
+    /// interpreter — so it lowers to `StdWrite(STDOUT, lit, len)` rather than `Print`.
+    fn gen_bare_str(&mut self, lit: &str, pos: Pos) -> Result<(), CodegenError> {
+        if lit.is_empty() {
+            return Ok(());
         }
-        self.emit_literal(&lit);
-        Ok(())
-    }
-
-    /// After the value argument is in place, set `r8`=precision, `rcx`=width, and
-    /// `rdx`=flags for a `fmt_int`/`fmt_str` call, consuming any pushed `*` args.
-    /// `force_prec_none` (for `%c`) discards a precision but still pops a `*` arg.
-    fn setup_width_prec_flags(
-        &mut self,
-        spec: &crate::fmt::Spec,
-        flags: i32,
-        force_prec_none: bool,
-    ) {
-        // Precision into r8 (−1 ⇒ none). A `*` precision was pushed after width.
-        if spec.prec_star {
-            self.asm.pop_rax();
-            if force_prec_none {
-                self.asm.mov_ri(R8, -1);
-            } else {
-                // A negative `*` precision means "no precision" (libc/interp rule).
-                self.asm.mov_rr(R8, RAX);
-                let neg = self.asm.new_label();
-                let done = self.asm.new_label();
-                self.asm.test_rr(R8, R8);
-                self.asm.js(neg);
-                self.asm.jmp(done);
-                self.asm.place(neg);
-                self.asm.mov_ri(R8, -1);
-                self.asm.place(done);
-            }
-        } else if spec.has_precision && !force_prec_none {
-            self.asm.mov_ri(R8, spec.precision as i32);
-        } else {
-            self.asm.mov_ri(R8, -1);
-        }
-        // Width into rcx, flags into rdx. A negative `*` width ⇒ left-justify + abs.
-        if spec.width_star {
-            self.asm.pop_rax();
-            self.asm.mov_rr(RCX, RAX);
-            self.asm.mov_ri(RDX, flags);
-            let pos_l = self.asm.new_label();
-            self.asm.test_rr(RCX, RCX);
-            self.asm.jns(pos_l);
-            self.asm.neg_r(RCX);
-            self.asm.or_ri(RDX, F_MINUS);
-            self.asm.place(pos_l);
-        } else {
-            self.asm.mov_ri(RCX, spec.width.unwrap_or(0) as i32);
-            self.asm.mov_ri(RDX, flags);
-        }
-    }
-
-    /// Write a literal byte run (if non-empty): `lea rsi, [str]; mov rdx, len;
-    /// write(1, rsi, rdx)`.
-    fn emit_literal(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let idx = self.asm.intern(bytes);
-        self.asm.lea_rsi_string(idx);
-        self.asm.mov_rdx_imm32(bytes.len() as i32);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-    }
-
-    /// Emit the bodies of the print-runtime helpers actually used.
-    ///
-    /// Helpers request other helpers *during* their own emission: the float
-    /// formatters call `OutWrite` and register the bignum sub-routines, and
-    /// `OutWrite` calls `GrowSink`. So a single ordered pass can miss a helper first
-    /// requested by another helper's body (e.g. a compiled-but-not-top-level
-    /// `F64ToStr` that uses `%g` pulls in `OutWrite` only when `FmtFloatEg` is
-    /// emitted). Emit in a fixed order, looping until a full pass adds nothing new —
-    /// the fixed order keeps the emitted layout deterministic, the loop guarantees
-    /// every transitively-requested routine is placed.
-    fn emit_helpers(&mut self) {
-        let order: [(Helper, fn(&mut Self)); 10] = [
-            (Helper::FmtInt, Self::emit_fmt_int),
-            (Helper::FmtStr, Self::emit_fmt_str),
-            (Helper::FmtFloat, Self::emit_fmt_float),
-            (Helper::FmtFloatEg, Self::emit_fmt_float_eg),
-            (Helper::BnMul, Self::emit_bn_mul),
-            (Helper::BnShr, Self::emit_bn_shr),
-            (Helper::BnShl, Self::emit_bn_shl),
-            (Helper::BnDiv10, Self::emit_bn_div10),
-            (Helper::OutWrite, Self::emit_out_write),
-            (Helper::GrowSink, Self::emit_grow_sink),
-        ];
-        let mut emitted: std::collections::HashSet<Helper> = std::collections::HashSet::new();
-        loop {
-            let mut progressed = false;
-            for &(h, emit) in &order {
-                if self.helpers.contains_key(&h) && emitted.insert(h) {
-                    let label = self.helpers[&h];
-                    self.asm.place(label);
-                    emit(self);
-                    progressed = true;
-                }
-            }
-            if !progressed {
-                break;
-            }
-        }
-    }
-
-    /// The output sink routine (`rsi`=buf, `rdx`=len). To stdout when `out_ptr` is
-    /// 0; otherwise it appends to the destination buffer and advances `out_ptr`.
-    /// When the buffer is an owned, growing `MStrPrint` one (`out_limit != 0`), it
-    /// first grows via [`Helper::GrowSink`] if the write would overflow.
-    fn emit_out_write(&mut self) {
-        let off = self.out_ptr_global();
-        let stdout = self.asm.new_label();
-        let copy = self.asm.new_label();
-        self.asm.lea_global(R8, off);
-        self.asm.load_qword_at(RAX, R8); // rax = out_ptr (cursor)
-        self.asm.test_rr(RAX, RAX);
-        self.asm.je(stdout);
-        // Owned/growing buffer? Grow if cursor + len would leave no room for a NUL.
-        if self.out_limit_off.is_some() {
-            let limit = self.out_limit_global();
-            self.asm.lea_global(R9, limit);
-            self.asm.load_qword_at(R9, R9); // r9 = out_limit
-            self.asm.test_rr(R9, R9);
-            self.asm.je(copy); // limit == 0 → plain StrPrint append, no grow
-            self.asm.mov_rr(RCX, RAX);
-            self.asm.add_rr(RCX, RDX); // rcx = cursor + len
-            self.asm.cmp_rr(RCX, R9);
-            self.asm.jb(copy); // cursor + len < limit → fits (NUL has room)
-            let grow = self.helper(Helper::GrowSink);
-            self.asm.call(grow); // returns the (possibly new) cursor in rax
-        }
-        // buffer mode: memcpy len bytes [rsi]->[rax]; out_ptr = rax + len
-        self.asm.place(copy);
-        self.asm.mov_rr(RDI, RAX);
-        self.asm.mov_rr(RCX, RDX);
-        self.asm.rep_movsb(); // advances rdi by len
-        self.asm.lea_global(R8, off); // (GrowSink may have clobbered r8)
-        self.asm.store_qword_at(R8, RDI); // out_ptr = new position
-        self.asm.emit(&[0xC3]); // ret
-        self.asm.place(stdout);
-        self.os.emit_write_stdout(&mut self.asm); // write rdx bytes at rsi to stdout
-        self.asm.emit(&[0xC3]); // ret
-    }
-
-    /// [`Helper::GrowSink`]: reallocate the owned `MStrPrint` buffer so a pending
-    /// `rdx`-byte write (plus a trailing NUL) fits. New capacity is `max(2·old,
-    /// used + len + 1)`. Copies the live bytes, updates `out_base`/`out_ptr`/
-    /// `out_limit`, and returns the new cursor in `rax`. Preserves `rsi`/`rdx` (the
-    /// sink still needs the pending write); other volatiles are scratch. The bump
-    /// allocator never frees, so the old buffer is simply abandoned.
-    fn emit_grow_sink(&mut self) {
-        let out = self.out_ptr_global();
-        let base = self.out_base_global();
-        let limit = self.out_limit_global();
-        self.asm.emit(&[0x56]); // push rsi
-        self.asm.emit(&[0x52]); // push rdx
-        // new_cap (r9) = max(2·oldcap, used + len + 1)
-        self.asm.lea_global(R8, base);
-        self.asm.load_qword_at(R10, R8); // r10 = base
-        self.asm.lea_global(R8, out);
-        self.asm.load_qword_at(R11, R8); // r11 = cursor
-        self.asm.sub_rr(R11, R10); // r11 = used = cursor - base
-        self.asm.add_rr(R11, RDX); // r11 = used + len
-        self.asm.add_ri(R11, 1); // r11 = used + len + 1 (need)
-        self.asm.lea_global(R8, limit);
-        self.asm.load_qword_at(R9, R8); // r9 = limit
-        self.asm.sub_rr(R9, R10); // r9 = oldcap = limit - base
-        self.asm.add_rr(R9, R9); // r9 = 2·oldcap
-        let have = self.asm.new_label();
-        self.asm.cmp_rr(R9, R11);
-        self.asm.jae(have); // 2·oldcap >= need
-        self.asm.mov_rr(R9, R11); // else new_cap = need
-        self.asm.place(have);
-        // newbuf = MAlloc(new_cap)
-        self.asm.emit(&[0x41, 0x51]); // push r9 (new_cap)
-        self.asm.mov_rr(RDI, R9);
-        let malloc = self.rt_routine("MAlloc");
-        self.asm.call(malloc); // rax = newbuf
-        self.asm.emit(&[0x41, 0x59]); // pop r9 (new_cap)
-        self.asm.mov_rr(R11, RAX); // r11 = newbuf
-        // Copy the live bytes [base .. cursor) into newbuf (rep movsb leaves rdi at
-        // newbuf + used = the new cursor).
-        self.asm.lea_global(R8, base);
-        self.asm.load_qword_at(RSI, R8); // rsi = old base (src)
-        self.asm.lea_global(R8, out);
-        self.asm.load_qword_at(RCX, R8); // rcx = cursor
-        self.asm.sub_rr(RCX, RSI); // rcx = used
-        self.asm.mov_rr(RDI, R11); // rdi = newbuf (dst)
-        self.asm.rep_movsb(); // rdi = newbuf + used
-        // Publish the new buffer: base = newbuf, cursor = rdi, limit = newbuf + cap.
-        self.asm.lea_global(R8, base);
-        self.asm.store_qword_at(R8, R11);
-        self.asm.lea_global(R8, out);
-        self.asm.store_qword_at(R8, RDI);
-        self.asm.mov_rr(RAX, R11);
-        self.asm.add_rr(RAX, R9); // rax = newbuf + new_cap
-        self.asm.lea_global(R8, limit);
-        self.asm.store_qword_at(R8, RAX);
-        self.asm.mov_rr(RAX, RDI); // return the new cursor
-        self.asm.emit(&[0x5A]); // pop rdx
-        self.asm.emit(&[0x5E]); // pop rsi
-        self.asm.emit(&[0xC3]); // ret
-    }
-
-    /// `ret` after restoring the registers the formatters borrow. Paired with
-    /// `fmt_prologue` (push rbx, r12–r15) so the helpers preserve callee-saved regs.
-    fn fmt_prologue(&mut self) {
-        self.asm.emit(&[0x53]); // push rbx
-        self.asm.emit(&[0x41, 0x54]); // push r12
-        self.asm.emit(&[0x41, 0x55]); // push r13
-        self.asm.emit(&[0x41, 0x56]); // push r14
-        self.asm.emit(&[0x41, 0x57]); // push r15
-    }
-    fn fmt_epilogue(&mut self) {
-        self.asm.emit(&[0x41, 0x5F]); // pop r15
-        self.asm.emit(&[0x41, 0x5E]); // pop r14
-        self.asm.emit(&[0x41, 0x5D]); // pop r13
-        self.asm.emit(&[0x41, 0x5C]); // pop r12
-        self.asm.emit(&[0x5B]); // pop rbx
-        self.asm.emit(&[0xC3]); // ret
-    }
-
-    /// Append the sign byte (in `r9b`, 0 ⇒ none) to the OUTBUF cursor `r14`.
-    fn fmt_append_sign(&mut self) {
-        let skip = self.asm.new_label();
-        self.asm.test_rr(R9, R9);
-        self.asm.je(skip);
-        self.asm.store_byte_at(R14, R9);
-        self.asm.inc_r(R14);
-        self.asm.place(skip);
-    }
-    /// Append the alt prefix (`0x`/`0X`) when `rcx` (alt length) is 2.
-    fn fmt_append_alt(&mut self) {
-        let skip = self.asm.new_label();
-        let wrote = self.asm.new_label();
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(skip);
-        self.asm.store_byte_imm_at(R14, b'0');
-        self.asm.inc_r(R14);
-        self.asm.mov_ri(RAX, b'x' as i32);
-        self.asm.test_ri(R11, F_UPPER);
-        self.asm.je(wrote);
-        self.asm.mov_ri(RAX, b'X' as i32);
-        self.asm.place(wrote);
-        self.asm.store_byte_at(R14, RAX);
-        self.asm.inc_r(R14);
-        self.asm.place(skip);
-    }
-    /// Append the `rbx` digits at `r15` to the OUTBUF cursor `r14` (`rep movsb`).
-    fn fmt_append_digits(&mut self) {
-        self.asm.mov_rr(RSI, R15);
-        self.asm.mov_rr(RDI, R14);
-        self.asm.mov_rr(RCX, RBX);
-        self.asm.rep_movsb();
-        self.asm.mov_rr(R14, RDI); // cursor advanced by the copy
-    }
-    /// Append `rdx` copies of byte `fill` to the OUTBUF cursor `r14`.
-    fn fmt_append_pad(&mut self, fill: u8) {
-        let top = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.place(top);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(done);
-        self.asm.store_byte_imm_at(R14, fill);
-        self.asm.inc_r(R14);
-        self.asm.dec_r(RDX);
-        self.asm.jmp(top);
-        self.asm.place(done);
-    }
-
-    /// The integer formatter — mirrors `fmt::render_int` byte for byte. Builds the
-    /// padded field in OUTBUF (sign, `0x` prefix, precision/zero padding, digits,
-    /// space padding) and writes it once. See [`Helper::FmtInt`] for the ABI.
-    fn emit_fmt_int(&mut self) {
-        let digbuf = self.digbuf();
-        let outbuf = self.outbuf();
-        self.fmt_prologue();
-        // Stash the register arguments into callee-saved slots.
-        self.asm.mov_rr(R10, RSI); // radix
-        self.asm.mov_rr(R11, RDX); // flags
-        self.asm.mov_rr(R12, RCX); // width
-        self.asm.mov_rr(R13, R8); // precision
-        // ---- derive the sign char (r9) and magnitude (rdi) ----
-        let unsigned = self.asm.new_label();
-        let havesign = self.asm.new_label();
-        let nonneg = self.asm.new_label();
-        let tryspace = self.asm.new_label();
-        self.asm.mov_ri(R9, 0);
-        self.asm.test_ri(R11, F_SIGNED);
-        self.asm.je(unsigned);
-        self.asm.test_rr(RDI, RDI);
-        self.asm.jns(nonneg);
-        self.asm.neg_r(RDI);
-        self.asm.mov_ri(R9, b'-' as i32);
-        self.asm.jmp(havesign);
-        self.asm.place(nonneg);
-        self.asm.test_ri(R11, F_PLUS);
-        self.asm.je(tryspace);
-        self.asm.mov_ri(R9, b'+' as i32);
-        self.asm.jmp(havesign);
-        self.asm.place(tryspace);
-        self.asm.test_ri(R11, F_SPACE);
-        self.asm.je(havesign);
-        self.asm.mov_ri(R9, b' ' as i32);
-        self.asm.place(havesign);
-        self.asm.place(unsigned);
-        // ---- convert the magnitude to digits in DIGBUF (right to left) ----
-        let dloop = self.asm.new_label();
-        let store = self.asm.new_label();
-        let upper = self.asm.new_label();
-        self.asm.lea_global(R15, digbuf + FS_INT_DIGBUF); // one past the buffer end
-        self.asm.mov_rr(RAX, RDI);
-        self.asm.place(dloop);
-        self.asm.xor_rr(RDX, RDX);
-        self.asm.div_r(R10); // rax = quot, rdx = rem
-        self.asm.add_ri(RDX, b'0' as i32);
-        self.asm.cmp_ri(RDX, b'9' as i32);
-        self.asm.jbe(store);
-        self.asm.test_ri(R11, F_UPPER);
-        self.asm.jne(upper);
-        self.asm.add_ri(RDX, 0x27); // 'a'..'f'
-        self.asm.jmp(store);
-        self.asm.place(upper);
-        self.asm.add_ri(RDX, 0x07); // 'A'..'F'
-        self.asm.place(store);
-        self.asm.dec_r(R15);
-        self.asm.store_byte_at(R15, RDX);
-        self.asm.test_rr(RAX, RAX);
-        self.asm.jne(dloop);
-        self.asm.lea_global(RBX, digbuf + FS_INT_DIGBUF);
-        self.asm.sub_rr(RBX, R15); // rbx = digit count
-        // ---- octal `#`: ensure a leading 0 ----
-        let nooct = self.asm.new_label();
-        self.asm.cmp_ri(R10, 8);
-        self.asm.jne(nooct);
-        self.asm.test_ri(R11, F_HASH);
-        self.asm.je(nooct);
-        self.asm.cmp_byte_imm_at(R15, b'0');
-        self.asm.je(nooct);
-        self.asm.dec_r(R15);
-        self.asm.store_byte_imm_at(R15, b'0');
-        self.asm.inc_r(RBX);
-        self.asm.place(nooct);
-        // ---- precision (min digits); 0 value with precision 0 ⇒ no digits ----
-        let precdone = self.asm.new_label();
-        let precpad = self.asm.new_label();
-        let ploop = self.asm.new_label();
-        self.asm.cmp_ri(R13, 0);
-        self.asm.jl(precdone); // precision −1 ⇒ none
-        self.asm.jne(precpad);
-        // octal `#` keeps a leading 0 even at precision 0 of value 0 (don't drop).
-        let not_octhash = self.asm.new_label();
-        self.asm.cmp_ri(R10, 8);
-        self.asm.jne(not_octhash);
-        self.asm.test_ri(R11, F_HASH);
-        self.asm.jne(precdone);
-        self.asm.place(not_octhash);
-        self.asm.cmp_ri(RBX, 1);
-        self.asm.jne(precpad);
-        self.asm.cmp_byte_imm_at(R15, b'0');
-        self.asm.jne(precpad);
-        self.asm.inc_r(R15); // drop the single '0'
-        self.asm.xor_rr(RBX, RBX);
-        self.asm.jmp(precdone);
-        self.asm.place(precpad);
-        self.asm.place(ploop);
-        self.asm.cmp_rr(RBX, R13);
-        self.asm.jge(precdone);
-        self.asm.dec_r(R15);
-        self.asm.store_byte_imm_at(R15, b'0');
-        self.asm.inc_r(RBX);
-        self.asm.jmp(ploop);
-        self.asm.place(precdone);
-        // ---- alt length (rcx): `0x`/`0X` for `#` hex of a non-zero value ----
-        let noalt = self.asm.new_label();
-        self.asm.xor_rr(RCX, RCX);
-        self.asm.test_ri(R11, F_HASH);
-        self.asm.je(noalt);
-        self.asm.cmp_ri(R10, 16);
-        self.asm.jne(noalt);
-        self.asm.test_rr(RDI, RDI);
-        self.asm.je(noalt);
-        self.asm.mov_ri(RCX, 2);
-        self.asm.place(noalt);
-        // ---- assemble into OUTBUF ----
-        self.asm.lea_global(R14, outbuf); // cursor
-        // body_len = digits + alt + (sign ? 1 : 0)  → rax
-        let nosl = self.asm.new_label();
-        self.asm.mov_rr(RAX, RBX);
-        self.asm.add_rr(RAX, RCX);
-        self.asm.test_rr(R9, R9);
-        self.asm.je(nosl);
-        self.asm.inc_r(RAX);
-        self.asm.place(nosl);
-        // pad = max(0, width - body_len)  → rdx
-        let padok = self.asm.new_label();
-        self.asm.mov_rr(RDX, R12);
-        self.asm.sub_rr(RDX, RAX);
-        self.asm.jns(padok);
-        self.asm.xor_rr(RDX, RDX);
-        self.asm.place(padok);
-        // choose justification
-        let do_minus = self.asm.new_label();
-        let do_right = self.asm.new_label();
-        let donebody = self.asm.new_label();
-        self.asm.test_ri(R11, F_MINUS);
-        self.asm.jne(do_minus);
-        self.asm.test_ri(R11, F_ZERO);
-        self.asm.je(do_right);
-        self.asm.cmp_ri(R13, 0); // zero flag ignored when precision is given
-        self.asm.jge(do_right);
-        // zero-justify: sign, alt, zeros, digits
-        self.fmt_append_sign();
-        self.fmt_append_alt();
-        self.fmt_append_pad(b'0');
-        self.fmt_append_digits();
-        self.asm.jmp(donebody);
-        // right-justify: spaces, sign, alt, digits
-        self.asm.place(do_right);
-        self.fmt_append_pad(b' ');
-        self.fmt_append_sign();
-        self.fmt_append_alt();
-        self.fmt_append_digits();
-        self.asm.jmp(donebody);
-        // left-justify: sign, alt, digits, spaces
-        self.asm.place(do_minus);
-        self.fmt_append_sign();
-        self.fmt_append_alt();
-        self.fmt_append_digits();
-        self.fmt_append_pad(b' ');
-        self.asm.place(donebody);
-        // output OUTBUF[0 .. cursor-OUTBUF] through the sink
-        self.asm.lea_global(RSI, outbuf);
-        self.asm.mov_rr(RDX, R14);
-        self.asm.sub_rr(RDX, RSI);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-        self.fmt_epilogue();
-    }
-
-    /// The string/char formatter — mirrors `fmt::render_str`. Applies a precision
-    /// (truncate) then pads to width (left-justified with `-`). See [`Helper::FmtStr`].
-    fn emit_fmt_str(&mut self) {
-        self.fmt_prologue();
-        self.asm.mov_rr(R10, RDI); // ptr
-        self.asm.mov_rr(R11, RSI); // len
-        self.asm.mov_rr(R12, RDX); // flags
-        self.asm.mov_rr(R13, RCX); // width
-        // r8 = precision
-        // ---- len: if negative, strlen(ptr) ----
-        let havelen = self.asm.new_label();
-        let slloop = self.asm.new_label();
-        let sldone = self.asm.new_label();
-        self.asm.cmp_ri(R11, 0);
-        self.asm.jge(havelen);
-        self.asm.mov_rr(RAX, R10);
-        self.asm.place(slloop);
-        self.asm.cmp_byte_imm_at(RAX, 0);
-        self.asm.je(sldone);
-        self.asm.inc_r(RAX);
-        self.asm.jmp(slloop);
-        self.asm.place(sldone);
-        self.asm.sub_rr(RAX, R10);
-        self.asm.mov_rr(R11, RAX);
-        self.asm.place(havelen);
-        // ---- precision: clamp len to precision when 0 ≤ prec < len ----
-        let noprec = self.asm.new_label();
-        self.asm.cmp_ri(R8, 0);
-        self.asm.jl(noprec);
-        self.asm.cmp_rr(R8, R11);
-        self.asm.jge(noprec);
-        self.asm.mov_rr(R11, R8);
-        self.asm.place(noprec);
-        // ---- pad = max(0, width - len)  → r15 (survives the body write) ----
-        let padok = self.asm.new_label();
-        self.asm.mov_rr(R15, R13);
-        self.asm.sub_rr(R15, R11);
-        self.asm.jns(padok);
-        self.asm.xor_rr(R15, R15);
-        self.asm.place(padok);
-        // ---- emit: minus ⇒ body then pad; else pad then body ----
-        let do_minus = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.test_ri(R12, F_MINUS);
-        self.asm.jne(do_minus);
-        self.fmt_str_pad();
-        self.fmt_str_body();
-        self.asm.jmp(done);
-        self.asm.place(do_minus);
-        self.fmt_str_body();
-        self.fmt_str_pad();
-        self.asm.place(done);
-        self.fmt_epilogue();
-    }
-
-    /// Write the `fmt_str` body (pointer r10, length r11) through the sink.
-    fn fmt_str_body(&mut self) {
-        self.asm.mov_rr(RSI, R10);
-        self.asm.mov_rr(RDX, R11);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-    }
-    /// Write `r15` space characters to stdout, in OUTBUF-sized chunks.
-    fn fmt_str_pad(&mut self) {
-        let outbuf = self.outbuf();
-        let outer = self.asm.new_label();
-        let done = self.asm.new_label();
-        let noclamp = self.asm.new_label();
-        let fill = self.asm.new_label();
-        let filled = self.asm.new_label();
-        self.asm.place(outer);
-        self.asm.test_rr(R15, R15);
-        self.asm.je(done);
-        // chunk = min(r15, OUTBUF_SIZE) → rbx
-        self.asm.mov_rr(RBX, R15);
-        self.asm.cmp_ri(RBX, 1024);
-        self.asm.jbe(noclamp);
-        self.asm.mov_ri(RBX, 1024);
-        self.asm.place(noclamp);
-        self.asm.sub_rr(R15, RBX); // remaining -= chunk
-        // fill OUTBUF[0..chunk] with spaces
-        self.asm.lea_global(R14, outbuf);
-        self.asm.mov_rr(RCX, RBX);
-        self.asm.place(fill);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(filled);
-        self.asm.store_byte_imm_at(R14, b' ');
-        self.asm.inc_r(R14);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(fill);
-        self.asm.place(filled);
-        // output OUTBUF[0 .. chunk] through the sink
-        self.asm.lea_global(RSI, outbuf);
-        self.asm.mov_rr(RDX, RBX);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-        self.asm.jmp(outer);
-        self.asm.place(done);
-    }
-
-    // ---- float printing: a correctly-rounded `%f` via bignum arithmetic ----
-    //
-    // For a magnitude m·2^e and precision P, the exact rounded integer
-    // J = round_half_even(m·2^e·10^P) (10^P = 2^P·5^P) is built in the `BIGNUM`
-    // scratch: set it to m, multiply by 5 P times, then shift left by e+P (or
-    // right, with round-to-even, when e+P<0). J's decimal digits with the point P
-    // places from the right give the byte-exact `%f` body (matching Rust's `{:.P}`).
-
-    /// `BIGNUM *= rdi` (a small multiplier).
-    fn emit_bn_mul(&mut self) {
-        let bn = self.bignum_global();
-        let loop_l = self.asm.new_label();
-        self.asm.lea_global(R8, bn);
-        self.asm.mov_ri(R9, 0); // carry
-        self.asm.mov_ri(R10, 0); // index
-        self.asm.place(loop_l);
-        self.asm.load_qword_idx8(RAX, R8, R10);
-        self.asm.mul_r(RDI); // rdx:rax = limb * k
-        self.asm.add_rr(RAX, R9);
-        self.asm.adc_ri8(RDX, 0);
-        self.asm.store_qword_idx8(R8, R10, RAX);
-        self.asm.mov_rr(R9, RDX); // new carry
-        self.asm.inc_r(R10);
-        self.asm.cmp_ri(R10, NLIMBS);
-        self.asm.jb(loop_l);
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// `BIGNUM /= 10`, returning the remainder digit in rax.
-    fn emit_bn_div10(&mut self) {
-        let bn = self.bignum_global();
-        let loop_l = self.asm.new_label();
-        self.asm.lea_global(R8, bn);
-        self.asm.mov_ri(R10, NLIMBS - 1); // process most-significant limb first
-        self.asm.mov_ri(RDX, 0); // running remainder
-        self.asm.mov_ri(R9, 10);
-        self.asm.place(loop_l);
-        self.asm.load_qword_idx8(RAX, R8, R10);
-        self.asm.div_r(R9); // rdx:rax / 10 → rax quot, rdx rem
-        self.asm.store_qword_idx8(R8, R10, RAX);
-        self.asm.dec_r(R10);
-        self.asm.jns(loop_l);
-        self.asm.mov_rr(RAX, RDX);
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// `BIGNUM <<= rdi` (bits).
-    fn emit_bn_shl(&mut self) {
-        let bn = self.bignum_global();
-        let loop_l = self.asm.new_label();
-        let zero = self.asm.new_label();
-        let store = self.asm.new_label();
-        self.asm.mov_rr(RSI, RDI);
-        self.asm.shr_ri(RSI, 6); // word = bits/64
-        self.asm.mov_rr(R11, RDI);
-        self.asm.and_ri(R11, 63); // bit = bits%64
-        self.asm.lea_global(R8, bn);
-        self.asm.mov_ri(RDI, NLIMBS - 1); // i (high → low)
-        self.asm.place(loop_l);
-        self.asm.mov_rr(R10, RDI);
-        self.asm.sub_rr(R10, RSI); // src = i - word
-        self.asm.js(zero);
-        self.asm.load_qword_idx8(RAX, R8, R10); // lo
-        self.asm.test_rr(R11, R11);
-        self.asm.je(store); // bit==0 → just lo
-        self.asm.mov_rr(RCX, R11);
-        self.asm.shl_cl(RAX); // lo << bit
-        self.asm.dec_r(R10); // src-1
-        self.asm.js(store);
-        self.asm.load_qword_idx8(RDX, R8, R10); // hi
-        self.asm.mov_ri(RCX, 64);
-        self.asm.sub_rr(RCX, R11);
-        self.asm.shr_cl(RDX); // hi >> (64-bit)
-        self.asm.or_rr(RAX, RDX);
-        self.asm.jmp(store);
-        self.asm.place(zero);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.place(store);
-        self.asm.store_qword_idx8(R8, RDI, RAX);
-        self.asm.dec_r(RDI);
-        self.asm.jns(loop_l);
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// `BIGNUM >>= rdi` (bits), rounding the dropped bits to nearest, ties to even.
-    fn emit_bn_shr(&mut self) {
-        let bn = self.bignum_global();
-        self.asm.emit(&[0x53, 0x41, 0x54, 0x41, 0x55]); // push rbx; push r12; push r13
-        self.asm.lea_global(R12, bn);
-        self.asm.mov_rr(RBX, RDI); // bits
-        // --- round bit (r13) and sticky (r9) of the dropped low `bits` bits ---
-        let sloop = self.asm.new_label();
-        let sdone = self.asm.new_label();
-        self.asm.mov_rr(RAX, RBX);
-        self.asm.add_ri(RAX, -1); // m = bits-1
-        self.asm.mov_rr(R10, RAX);
-        self.asm.shr_ri(R10, 6); // mword
-        self.asm.mov_rr(RSI, RAX);
-        self.asm.and_ri(RSI, 63); // mbit
-        self.asm.load_qword_idx8(RAX, R12, R10); // limb[mword]
-        self.asm.mov_rr(R9, RAX); // copy for sticky-partial
-        self.asm.mov_rr(RCX, RSI);
-        self.asm.shr_cl(RAX);
-        self.asm.and_ri(RAX, 1);
-        self.asm.mov_rr(R13, RAX); // round bit
-        self.asm.mov_ri(R11, 1);
-        self.asm.mov_rr(RCX, RSI);
-        self.asm.shl_cl(R11);
-        self.asm.add_ri(R11, -1); // mask = (1<<mbit)-1
-        self.asm.and_rr(R9, R11); // partial low bits of limb[mword]
-        self.asm.mov_ri(RDI, 0); // j
-        self.asm.place(sloop);
-        self.asm.cmp_reg_reg(RDI, R10);
-        self.asm.jae(sdone);
-        self.asm.load_qword_idx8(RAX, R12, RDI);
-        self.asm.or_rr(R9, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.jmp(sloop);
-        self.asm.place(sdone);
-        // --- shift right by `bits` (word = bits/64, bit = bits%64) ---
-        let shloop = self.asm.new_label();
-        let lozero = self.asm.new_label();
-        let havelo = self.asm.new_label();
-        let store2 = self.asm.new_label();
-        self.asm.mov_rr(RSI, RBX);
-        self.asm.shr_ri(RSI, 6); // word
-        self.asm.mov_rr(R11, RBX);
-        self.asm.and_ri(R11, 63); // bit
-        self.asm.mov_ri(RDI, 0); // i (low → high)
-        self.asm.place(shloop);
-        self.asm.mov_rr(R10, RDI);
-        self.asm.add_rr(R10, RSI); // src = i + word
-        self.asm.cmp_ri(R10, NLIMBS);
-        self.asm.jae(lozero);
-        self.asm.load_qword_idx8(RAX, R12, R10);
-        self.asm.jmp(havelo);
-        self.asm.place(lozero);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.place(havelo);
-        self.asm.test_rr(R11, R11);
-        self.asm.je(store2);
-        self.asm.mov_rr(RCX, R11);
-        self.asm.shr_cl(RAX); // lo >> bit
-        self.asm.inc_r(R10); // src+1
-        self.asm.cmp_ri(R10, NLIMBS);
-        self.asm.jae(store2);
-        self.asm.load_qword_idx8(RDX, R12, R10);
-        self.asm.mov_ri(RCX, 64);
-        self.asm.sub_rr(RCX, R11);
-        self.asm.shl_cl(RDX); // hi << (64-bit)
-        self.asm.or_rr(RAX, RDX);
-        self.asm.place(store2);
-        self.asm.store_qword_idx8(R12, RDI, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.cmp_ri(RDI, NLIMBS);
-        self.asm.jb(shloop);
-        // --- round up if round_bit && (sticky || quotient is odd) ---
-        let done = self.asm.new_label();
-        let roundup = self.asm.new_label();
-        let iloop = self.asm.new_label();
-        self.asm.test_rr(R13, R13);
-        self.asm.je(done);
-        self.asm.test_rr(R9, R9);
-        self.asm.jne(roundup);
-        self.asm.mov_ri(RDI, 0); // [r12] needs the SIB form (r12 is the ModRM escape)
-        self.asm.load_qword_idx8(RAX, R12, RDI); // BIGNUM[0]
-        self.asm.and_ri(RAX, 1);
-        self.asm.je(done);
-        self.asm.place(roundup);
-        self.asm.mov_ri(RDI, 0);
-        self.asm.place(iloop);
-        self.asm.load_qword_idx8(RAX, R12, RDI);
-        self.asm.add_ri(RAX, 1);
-        self.asm.store_qword_idx8(R12, RDI, RAX);
-        self.asm.jae(done); // no carry out of this limb → finished
-        self.asm.inc_r(RDI);
-        self.asm.cmp_ri(RDI, NLIMBS);
-        self.asm.jb(iloop);
-        self.asm.place(done);
-        self.asm.emit(&[0x41, 0x5D, 0x41, 0x5C, 0x5B]); // pop r13; pop r12; pop rbx
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// `%f` (currently the only conversion routed here). xmm0=value, edi=precision,
-    /// esi=flags, edx=width. Mirrors Rust's `{:.P}` byte-for-byte.
-    fn emit_fmt_float(&mut self) {
-        let bn = self.bignum_global();
-        let digbuf = self.alloc_bss(FS_FLOAT_DIGBUF, 1);
-        let digend = digbuf + FS_FLOAT_DIGBUF;
-        let outbuf = self.outbuf();
-        self.asm
-            .emit(&[0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]); // push rbx,r12-r15
-        self.asm.mov_rr(RBX, RDI); // P
-        self.asm.mov_rr(R13, RSI); // flags
-        self.asm.mov_rr(R14, RDX); // width
-        self.asm.movq_r_from_xmm(R15, 0); // value bits
-        // magnitude bits (sign cleared) → keep in r15; sign char → r12.
-        let signpos = self.asm.new_label();
-        let havesign = self.asm.new_label();
-        self.asm.mov_ri64(RAX, 0x7FFF_FFFF_FFFF_FFFF);
-        self.asm.mov_rr(RDX, R15);
-        self.asm.and_rr(RDX, RAX); // magnitude bits
-        self.asm.mov_ri(R12, 0);
-        // The sign is the IEEE sign bit, so -0.0 prints with a `-` (matching libc,
-        // Rust, and the interpreter); no ±0 short-circuit.
-        self.asm.mov_rr(RAX, R15);
-        self.asm.shr_ri(RAX, 63);
-        self.asm.test_rr(RAX, RAX);
-        self.asm.je(signpos);
-        self.asm.mov_ri(R12, b'-' as i32);
-        self.asm.jmp(havesign);
-        self.asm.place(signpos);
-        self.asm.test_ri(R13, F_PLUS);
-        self.asm.je(havesign);
-        self.asm.mov_ri(R12, b'+' as i32);
-        self.asm.place(havesign);
-        // A space flag without plus is handled here (only if no sign yet).
-        let nospace = self.asm.new_label();
-        self.asm.test_rr(R12, R12);
-        self.asm.jne(nospace);
-        self.asm.test_ri(R13, F_SPACE);
-        self.asm.je(nospace);
-        self.asm.mov_ri(R12, b' ' as i32);
-        self.asm.place(nospace);
-        self.asm.mov_rr(R15, RDX); // r15 = magnitude bits
-        // decompose: exp field and fraction.
-        let infnan = self.asm.new_label();
-        let subnormal = self.asm.new_label();
-        let havem = self.asm.new_label();
-        self.asm.mov_rr(RDX, R15);
-        self.asm.shr_ri(RDX, 52);
-        self.asm.and_ri(RDX, 0x7FF); // exp field
-        self.asm.mov_ri64(RAX, 0x000F_FFFF_FFFF_FFFF);
-        self.asm.mov_rr(RSI, R15);
-        self.asm.and_rr(RSI, RAX); // fraction → rsi (becomes mantissa m)
-        self.asm.cmp_ri(RDX, 0x7FF);
-        self.asm.je(infnan);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(subnormal);
-        // normal: m = frac | 2^52, e2 = exp - 1075
-        self.asm.mov_ri64(RAX, 0x0010_0000_0000_0000);
-        self.asm.or_rr(RSI, RAX);
-        self.asm.add_ri(RDX, -1075); // e2 = exp - 1075 (in rdx)
-        self.asm.jmp(havem);
-        self.asm.place(subnormal);
-        self.asm.mov_ri(RDX, -1074); // e2 (m = frac as-is)
-        self.asm.place(havem);
-        // s = e2 + P; push it across the multiply loop.
-        self.asm.mov_rr(RAX, RDX);
-        self.asm.add_rr(RAX, RBX);
-        self.asm.emit(&[0x50]); // push rax (s)
-        // BIGNUM = m (limb 0 = m, rest 0).
-        let zloop = self.asm.new_label();
-        self.asm.lea_global(R8, bn);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.mov_ri(R9, 0);
-        self.asm.place(zloop);
-        self.asm.store_qword_idx8(R8, R9, RAX);
-        self.asm.inc_r(R9);
-        self.asm.cmp_ri(R9, NLIMBS);
-        self.asm.jb(zloop);
-        self.asm.store_qword_at(R8, RSI); // BIGNUM[0] = m
-        // multiply by 5, P times (× 5^P).
-        let mulloop = self.asm.new_label();
-        let muldone = self.asm.new_label();
-        self.asm.mov_rr(R15, RBX); // counter = P
-        self.asm.place(mulloop);
-        self.asm.test_rr(R15, R15);
-        self.asm.je(muldone);
-        self.asm.mov_ri(RDI, 5);
-        let l = self.helper(Helper::BnMul);
-        self.asm.call(l);
-        self.asm.dec_r(R15);
-        self.asm.jmp(mulloop);
-        self.asm.place(muldone);
-        // × 2^s : shift left by s (or right, rounding, when s < 0).
-        let shrpath = self.asm.new_label();
-        let shifted = self.asm.new_label();
-        self.asm.emit(&[0x58]); // pop rax (s)
-        self.asm.test_rr(RAX, RAX);
-        self.asm.js(shrpath);
-        self.asm.mov_rr(RDI, RAX);
-        let l = self.helper(Helper::BnShl);
-        self.asm.call(l);
-        self.asm.jmp(shifted);
-        self.asm.place(shrpath);
-        self.asm.neg_r(RAX);
-        self.asm.mov_rr(RDI, RAX);
-        let l = self.helper(Helper::BnShr);
-        self.asm.call(l);
-        self.asm.place(shifted);
-        // extract decimal digits of J into DIGBUF (written downward from the end).
-        let dloop = self.asm.new_label();
-        let zchk = self.asm.new_label();
-        let notzero = self.asm.new_label();
-        let extracted = self.asm.new_label();
-        self.asm.lea_global(R15, digend); // digit cursor (grows down)
-        self.asm.place(dloop);
-        let l = self.helper(Helper::BnDiv10);
-        self.asm.call(l); // rax = next digit
-        self.asm.add_ri(RAX, b'0' as i32);
-        self.asm.dec_r(R15);
-        self.asm.store_byte_at(R15, RAX);
-        self.asm.lea_global(R8, bn);
-        self.asm.mov_ri(R9, 0);
-        self.asm.place(zchk);
-        self.asm.load_qword_idx8(RAX, R8, R9);
-        self.asm.test_rr(RAX, RAX);
-        self.asm.jne(notzero);
-        self.asm.inc_r(R9);
-        self.asm.cmp_ri(R9, NLIMBS);
-        self.asm.jb(zchk);
-        self.asm.jmp(extracted);
-        self.asm.place(notzero);
-        self.asm.jmp(dloop);
-        self.asm.place(extracted);
-        // ndig = digend - r15 → r11
-        self.asm.lea_global(RAX, digend);
-        self.asm.sub_rr(RAX, R15);
-        self.asm.mov_rr(R11, RAX); // ndig
-        // bodylen → r10: P==0 ⇒ ndig; ndig>P ⇒ ndig+1; else ⇒ P+2.
-        let pnz = self.asm.new_label();
-        let small = self.asm.new_label();
-        let haveblen = self.asm.new_label();
-        self.asm.test_rr(RBX, RBX);
-        self.asm.jne(pnz);
-        self.asm.mov_rr(R10, R11);
-        self.asm.jmp(haveblen);
-        self.asm.place(pnz);
-        self.asm.cmp_reg_reg(R11, RBX);
-        self.asm.jbe(small);
-        self.asm.mov_rr(R10, R11);
-        self.asm.inc_r(R10);
-        self.asm.jmp(haveblen);
-        self.asm.place(small);
-        self.asm.mov_rr(R10, RBX);
-        self.asm.add_ri(R10, 2);
-        self.asm.place(haveblen);
-        // pad = max(0, width - (bodylen + signlen)) → rdx
-        let nosl = self.asm.new_label();
-        let padok = self.asm.new_label();
-        self.asm.mov_rr(RAX, R10);
-        self.asm.test_rr(R12, R12);
-        self.asm.je(nosl);
-        self.asm.inc_r(RAX);
-        self.asm.place(nosl);
-        self.asm.mov_rr(RDX, R14);
-        self.asm.sub_rr(RDX, RAX);
-        self.asm.jns(padok);
-        self.asm.mov_ri(RDX, 0);
-        self.asm.place(padok);
-        // assemble the field into OUTBUF (cursor r8); no calls until out_write.
-        self.asm.lea_global(R8, outbuf);
-        let do_minus = self.asm.new_label();
-        let do_right = self.asm.new_label();
-        let fielddone = self.asm.new_label();
-        self.asm.test_ri(R13, F_MINUS);
-        self.asm.jne(do_minus);
-        self.asm.test_ri(R13, F_ZERO);
-        self.asm.je(do_right);
-        self.float_emit_sign();
-        self.float_emit_pad(b'0');
-        self.float_emit_body(digbuf);
-        self.asm.jmp(fielddone);
-        self.asm.place(do_right);
-        self.float_emit_pad(b' ');
-        self.float_emit_sign();
-        self.float_emit_body(digbuf);
-        self.asm.jmp(fielddone);
-        self.asm.place(do_minus);
-        self.float_emit_sign();
-        self.float_emit_body(digbuf);
-        self.float_emit_pad(b' ');
-        self.asm.place(fielddone);
-        // out_write(OUTBUF, cursor - OUTBUF)
-        self.asm.lea_global(RSI, outbuf);
-        self.asm.mov_rr(RDX, R8);
-        self.asm.sub_rr(RDX, RSI);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-        let epilogue = self.asm.new_label();
-        self.asm.jmp(epilogue);
-        // inf / NaN: emit the sign then "inf"/"NaN" (Rust's spelling), unpadded.
-        // rsi still holds the fraction field (nonzero ⇒ NaN), r12 the sign.
-        self.asm.place(infnan);
-        self.asm.lea_global(R8, outbuf);
-        self.float_emit_sign();
-        let is_nan = self.asm.new_label();
-        let wrote = self.asm.new_label();
-        self.asm.test_rr(RSI, RSI); // rsi = fraction; nonzero ⇒ NaN
-        self.asm.jne(is_nan);
-        self.asm.store_byte_imm_at(R8, b'i');
-        self.asm.inc_r(R8);
-        self.asm.store_byte_imm_at(R8, b'n');
-        self.asm.inc_r(R8);
-        self.asm.store_byte_imm_at(R8, b'f');
-        self.asm.inc_r(R8);
-        self.asm.jmp(wrote);
-        self.asm.place(is_nan);
-        self.asm.store_byte_imm_at(R8, b'N');
-        self.asm.inc_r(R8);
-        self.asm.store_byte_imm_at(R8, b'a');
-        self.asm.inc_r(R8);
-        self.asm.store_byte_imm_at(R8, b'N');
-        self.asm.inc_r(R8);
-        self.asm.place(wrote);
-        self.asm.lea_global(RSI, outbuf);
-        self.asm.mov_rr(RDX, R8);
-        self.asm.sub_rr(RDX, RSI);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-        self.asm.place(epilogue);
-        self.asm
-            .emit(&[0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B]); // pop r15..rbx
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// Append the sign byte (r12, 0 ⇒ none) to the OUTBUF cursor r8.
-    fn float_emit_sign(&mut self) {
-        let skip = self.asm.new_label();
-        self.asm.test_rr(R12, R12);
-        self.asm.je(skip);
-        self.asm.store_byte_at(R8, R12);
-        self.asm.inc_r(R8);
-        self.asm.place(skip);
-    }
-    /// Append rdx copies of byte `fill` to the OUTBUF cursor r8.
-    fn float_emit_pad(&mut self, fill: u8) {
-        let top = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.place(top);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(done);
-        self.asm.store_byte_imm_at(R8, fill);
-        self.asm.inc_r(R8);
-        self.asm.dec_r(RDX);
-        self.asm.jmp(top);
-        self.asm.place(done);
-    }
-    /// Append the `%f` body (digits in DIGBUF at r15, count r11, precision rbx) to
-    /// the OUTBUF cursor r8: `int.frac`, or `0.0…digits`, or the bare integer (P=0).
-    fn float_emit_body(&mut self, _digbuf: i32) {
-        let pnz = self.asm.new_label();
-        let small = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.test_rr(RBX, RBX);
-        self.asm.jne(pnz);
-        // P == 0: copy all ndig integer digits
-        self.asm.mov_rr(R9, R15);
-        self.asm.mov_rr(RCX, R11);
-        self.float_copy_digits();
-        self.asm.jmp(done);
-        self.asm.place(pnz);
-        self.asm.cmp_reg_reg(R11, RBX);
-        self.asm.jbe(small);
-        // ndig > P: (ndig-P) integer digits, '.', then P fractional digits
-        self.asm.mov_rr(R9, R15);
-        self.asm.mov_rr(RCX, R11);
-        self.asm.sub_rr(RCX, RBX);
-        self.float_copy_digits();
-        self.asm.store_byte_imm_at(R8, b'.');
-        self.asm.inc_r(R8);
-        self.asm.mov_rr(RCX, RBX);
-        self.float_copy_digits(); // r9 already advanced to the fractional digits
-        self.asm.jmp(done);
-        self.asm.place(small);
-        // ndig <= P: "0", '.', (P-ndig) zeros, then ndig digits
-        self.asm.store_byte_imm_at(R8, b'0');
-        self.asm.inc_r(R8);
-        self.asm.store_byte_imm_at(R8, b'.');
-        self.asm.inc_r(R8);
-        let zloop = self.asm.new_label();
-        let zdone = self.asm.new_label();
-        self.asm.mov_rr(RCX, RBX);
-        self.asm.sub_rr(RCX, R11); // P - ndig leading zeros
-        self.asm.place(zloop);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(zdone);
-        self.asm.store_byte_imm_at(R8, b'0');
-        self.asm.inc_r(R8);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(zloop);
-        self.asm.place(zdone);
-        self.asm.mov_rr(R9, R15);
-        self.asm.mov_rr(RCX, R11);
-        self.float_copy_digits();
-        self.asm.place(done);
-    }
-    /// Copy rcx digit bytes from r9 to the OUTBUF cursor r8 (advancing both).
-    fn float_copy_digits(&mut self) {
-        self.asm.mov_rr(RSI, R9);
-        self.asm.mov_rr(RDI, R8);
-        self.asm.rep_movsb();
-        self.asm.mov_rr(R8, RDI);
-        self.asm.mov_rr(R9, RSI);
-    }
-
-    /// `%e`/`%g`: format from the value's exact decimal digit string (since a
-    /// double `m·2^e` is the dyadic rational `Dint·10^pe`, `Dint` integer), rounded
-    /// to N significant figures. Mirrors `fmt::render_exp`/`render_g` byte-for-byte.
-    fn emit_fmt_float_eg(&mut self) {
-        let bn = self.bignum_global();
-        let egdig = self.alloc_bss(1024, 1);
-        let egend = egdig + 1024;
-        let sigbuf = self.alloc_bss(FS_SIGBUF, 1);
-        let bodybuf = self.alloc_bss(1024, 1);
-        let outbuf = self.outbuf();
-        const CONV: i8 = 0;
-        const PE: i8 = 8;
-        const XOFF: i8 = 16;
-        const NSIG: i8 = 24;
-        // prologue + 64-byte frame
-        self.asm
-            .emit(&[0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57]);
-        self.asm.sub_rsp(64);
-        self.asm.mov_rr(RBX, RDI); // P
-        self.asm.mov_rr(R13, RSI); // flags
-        self.asm.mov_rr(R14, RDX); // width
-        self.asm.store_rsp(CONV, RCX); // conv
-        // sign (r12) + magnitude bits (r15)
-        let sgpos = self.asm.new_label();
-        let strysp = self.asm.new_label();
-        let shavesign = self.asm.new_label();
-        self.asm.movq_r_from_xmm(R15, 0);
-        self.asm.mov_ri64(RAX, 0x7FFF_FFFF_FFFF_FFFF);
-        self.asm.mov_rr(RDX, R15);
-        self.asm.and_rr(RDX, RAX);
-        self.asm.mov_ri(R12, 0);
-        // -0.0 keeps its sign (the IEEE sign bit); no ±0 short-circuit.
-        self.asm.mov_rr(RAX, R15);
-        self.asm.shr_ri(RAX, 63);
-        self.asm.test_rr(RAX, RAX);
-        self.asm.je(sgpos);
-        self.asm.mov_ri(R12, b'-' as i32);
-        self.asm.jmp(shavesign);
-        self.asm.place(sgpos);
-        self.asm.test_ri(R13, F_PLUS);
-        self.asm.je(strysp);
-        self.asm.mov_ri(R12, b'+' as i32);
-        self.asm.jmp(shavesign);
-        self.asm.place(strysp);
-        self.asm.test_ri(R13, F_SPACE);
-        self.asm.je(shavesign);
-        self.asm.mov_ri(R12, b' ' as i32);
-        self.asm.place(shavesign);
-        self.asm.mov_rr(R15, RDX); // magnitude bits
-        // decompose → exp(rdx), frac(rsi)
-        let eg_infnan = self.asm.new_label();
-        let eg_zero = self.asm.new_label();
-        let eg_subn = self.asm.new_label();
-        let eg_havem = self.asm.new_label();
-        self.asm.mov_rr(RDX, R15);
-        self.asm.shr_ri(RDX, 52);
-        self.asm.and_ri(RDX, 0x7FF);
-        self.asm.mov_ri64(RAX, 0x000F_FFFF_FFFF_FFFF);
-        self.asm.mov_rr(RSI, R15);
-        self.asm.and_rr(RSI, RAX); // frac
-        self.asm.cmp_ri(RDX, 0x7FF);
-        self.asm.je(eg_infnan);
-        self.asm.test_rr(R15, R15);
-        self.asm.je(eg_zero);
-        self.asm.test_rr(RDX, RDX);
-        self.asm.je(eg_subn);
-        self.asm.mov_ri64(RAX, 0x0010_0000_0000_0000);
-        self.asm.or_rr(RSI, RAX);
-        self.asm.add_ri(RDX, -1075);
-        self.asm.jmp(eg_havem);
-        self.asm.place(eg_subn);
-        self.asm.mov_ri(RDX, -1074);
-        self.asm.place(eg_havem);
-        // m=rsi, e2=rdx. BIGNUM = m.
-        let ezloop = self.asm.new_label();
-        self.asm.lea_global(R8, bn);
-        self.asm.mov_ri(RAX, 0);
-        self.asm.mov_ri(R9, 0);
-        self.asm.place(ezloop);
-        self.asm.store_qword_idx8(R8, R9, RAX);
-        self.asm.inc_r(R9);
-        self.asm.cmp_ri(R9, NLIMBS);
-        self.asm.jb(ezloop);
-        self.asm.store_qword_at(R8, RSI); // BIGNUM[0] = m
-        // pe = min(e2,0); build Dint = m·2^e2 (e2≥0) or m·5^(−e2) (e2<0).
-        let eg_neg = self.asm.new_label();
-        let eg_mulloop = self.asm.new_label();
-        let eg_built = self.asm.new_label();
-        self.asm.test_rr(RDX, RDX);
-        self.asm.js(eg_neg);
-        self.asm.store_rsp_imm(PE, 0);
-        self.asm.mov_rr(RDI, RDX);
-        let l = self.helper(Helper::BnShl);
-        self.asm.call(l);
-        self.asm.jmp(eg_built);
-        self.asm.place(eg_neg);
-        self.asm.store_rsp(PE, RDX); // pe = e2
-        self.asm.mov_rr(R15, RDX);
-        self.asm.neg_r(R15); // count = -e2
-        self.asm.place(eg_mulloop);
-        self.asm.test_rr(R15, R15);
-        self.asm.je(eg_built);
-        self.asm.mov_ri(RDI, 5);
-        let l = self.helper(Helper::BnMul);
-        self.asm.call(l);
-        self.asm.dec_r(R15);
-        self.asm.jmp(eg_mulloop);
-        self.asm.place(eg_built);
-        // extract all digits of Dint into EGDIG (downward); r15 = MSB ptr.
-        let eg_dloop = self.asm.new_label();
-        let eg_zchk = self.asm.new_label();
-        let eg_notz = self.asm.new_label();
-        let eg_done = self.asm.new_label();
-        self.asm.lea_global(R15, egend);
-        self.asm.place(eg_dloop);
-        let l = self.helper(Helper::BnDiv10);
-        self.asm.call(l);
-        self.asm.add_ri(RAX, b'0' as i32);
-        self.asm.dec_r(R15);
-        self.asm.store_byte_at(R15, RAX);
-        self.asm.lea_global(R8, bn);
-        self.asm.mov_ri(R9, 0);
-        self.asm.place(eg_zchk);
-        self.asm.load_qword_idx8(RAX, R8, R9);
-        self.asm.test_rr(RAX, RAX);
-        self.asm.jne(eg_notz);
-        self.asm.inc_r(R9);
-        self.asm.cmp_ri(R9, NLIMBS);
-        self.asm.jb(eg_zchk);
-        self.asm.jmp(eg_done);
-        self.asm.place(eg_notz);
-        self.asm.jmp(eg_dloop);
-        self.asm.place(eg_done);
-        // ndig (rcx), X = ndig - 1 + pe → [XOFF]
-        self.asm.lea_global(RAX, egend);
-        self.asm.sub_rr(RAX, R15);
-        self.asm.mov_rr(RCX, RAX); // ndig
-        self.asm.load_rsp(RDX, PE);
-        self.asm.add_rr(RAX, RDX);
-        self.asm.add_ri(RAX, -1);
-        self.asm.store_rsp(XOFF, RAX); // X
-        // nsig: e → P+1; g → max(P,1). conv kind in low 2 bits.
-        let eg_isg = self.asm.new_label();
-        let eg_havensig = self.asm.new_label();
-        self.asm.load_rsp(RAX, CONV);
-        self.asm.and_ri(RAX, 3);
-        self.asm.cmp_ri(RAX, 2);
-        self.asm.je(eg_isg);
-        self.asm.mov_rr(RAX, RBX);
-        self.asm.add_ri(RAX, 1); // P+1
-        self.asm.jmp(eg_havensig);
-        self.asm.place(eg_isg);
-        self.asm.mov_rr(RAX, RBX); // max(P,1)
-        self.asm.test_rr(RAX, RAX);
-        self.asm.jne(eg_havensig);
-        self.asm.mov_ri(RAX, 1);
-        self.asm.place(eg_havensig);
-        self.asm.store_rsp(NSIG, RAX);
-        // round EGDIG[r15..] (ndig=rcx) to nsig=rax significant figures.
-        // real = min(ndig, nsig); if ndig > nsig, round (may bump X).
-        let eg_noround = self.asm.new_label();
-        let eg_haveround = self.asm.new_label();
-        self.asm.cmp_reg_reg(RCX, RAX); // ndig vs nsig
-        self.asm.jbe(eg_noround);
-        self.asm.store_rsp(32, RCX); // stash ndig for eg_round
-        self.eg_round(); // rounds in place; updates [XOFF]; leaves real=nsig
-        self.asm.load_rsp(RAX, NSIG);
-        self.asm.mov_rr(R11, RAX); // real = nsig
-        self.asm.jmp(eg_haveround);
-        self.asm.place(eg_noround);
-        self.asm.mov_rr(R11, RCX); // real = ndig
-        self.asm.place(eg_haveround);
-        // copy `real` digits (r15) + pad with '0' to nsig into SIGBUF.
-        let eg_cploop = self.asm.new_label();
-        let eg_cpz = self.asm.new_label();
-        let eg_cpput = self.asm.new_label();
-        let eg_cpdone = self.asm.new_label();
-        self.asm.lea_global(R8, sigbuf); // dst
-        self.asm.mov_rr(R9, R15); // src
-        self.asm.load_rsp(R10, NSIG);
-        self.asm.mov_ri(RDI, 0); // i
-        self.asm.place(eg_cploop);
-        self.asm.cmp_reg_reg(RDI, R10);
-        self.asm.jae(eg_cpdone);
-        self.asm.cmp_reg_reg(RDI, R11); // i < real?
-        self.asm.jae(eg_cpz);
-        self.asm.load_byte_zx(RAX, R9);
-        self.asm.inc_r(R9);
-        self.asm.jmp(eg_cpput);
-        self.asm.place(eg_cpz);
-        self.asm.mov_ri(RAX, b'0' as i32);
-        self.asm.place(eg_cpput);
-        self.asm.store_byte_at(R8, RAX);
-        self.asm.inc_r(R8);
-        self.asm.inc_r(RDI);
-        self.asm.jmp(eg_cploop);
-        self.asm.place(eg_cpdone);
-        // SIGBUF[0..nsig] now holds the rounded significant digits.
-        // Decide formatting style and build BODYBUF; r15 = SIGBUF base.
-        self.asm.lea_global(R15, sigbuf);
-        self.eg_format(sigbuf, bodybuf);
-        // field render: sign + pad + BODYBUF → OUTBUF → out_write.
-        // (rdi = end of BODYBUF after eg_format; bodylen = rdi - bodybuf)
-        self.eg_field(bodybuf, outbuf);
-        let epilogue = self.asm.new_label();
-        self.asm.jmp(epilogue);
-        // value == 0: digits are all '0'; format with X = 0.
-        self.asm.place(eg_zero);
-        self.asm.store_rsp_imm(XOFF, 0);
-        let eg_isg0 = self.asm.new_label();
-        let eg_hns0 = self.asm.new_label();
-        self.asm.load_rsp(RAX, CONV);
-        self.asm.and_ri(RAX, 3);
-        self.asm.cmp_ri(RAX, 2);
-        self.asm.je(eg_isg0);
-        self.asm.mov_rr(RAX, RBX);
-        self.asm.add_ri(RAX, 1);
-        self.asm.jmp(eg_hns0);
-        self.asm.place(eg_isg0);
-        self.asm.mov_rr(RAX, RBX);
-        self.asm.test_rr(RAX, RAX);
-        self.asm.jne(eg_hns0);
-        self.asm.mov_ri(RAX, 1);
-        self.asm.place(eg_hns0);
-        self.asm.store_rsp(NSIG, RAX);
-        // SIGBUF = nsig zeros
-        let eg_z2 = self.asm.new_label();
-        let eg_z2d = self.asm.new_label();
-        self.asm.lea_global(R8, sigbuf);
-        self.asm.mov_ri(RCX, 0);
-        self.asm.place(eg_z2);
-        self.asm.cmp_reg_reg(RCX, RAX);
-        self.asm.jae(eg_z2d);
-        self.asm.store_byte_imm_at(R8, b'0');
-        self.asm.inc_r(R8);
-        self.asm.inc_r(RCX);
-        self.asm.jmp(eg_z2);
-        self.asm.place(eg_z2d);
-        self.asm.lea_global(R15, sigbuf);
-        self.eg_format(sigbuf, bodybuf);
-        self.eg_field(bodybuf, outbuf);
-        self.asm.jmp(epilogue);
-        // inf / NaN: sign then "inf"/"NaN" (rsi = fraction, nonzero ⇒ NaN).
-        self.asm.place(eg_infnan);
-        self.asm.lea_global(R8, outbuf);
-        self.float_emit_sign();
-        let eg_nan = self.asm.new_label();
-        let eg_wrote = self.asm.new_label();
-        self.asm.test_rr(RSI, RSI);
-        self.asm.jne(eg_nan);
-        for c in [b'i', b'n', b'f'] {
-            self.asm.store_byte_imm_at(R8, c);
-            self.asm.inc_r(R8);
-        }
-        self.asm.jmp(eg_wrote);
-        self.asm.place(eg_nan);
-        for c in [b'N', b'a', b'N'] {
-            self.asm.store_byte_imm_at(R8, c);
-            self.asm.inc_r(R8);
-        }
-        self.asm.place(eg_wrote);
-        self.asm.lea_global(RSI, outbuf);
-        self.asm.mov_rr(RDX, R8);
-        self.asm.sub_rr(RDX, RSI);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-        self.asm.place(epilogue);
-        self.asm.add_rsp(64);
-        self.asm
-            .emit(&[0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B]);
-        self.asm.emit(&[0xC3]);
-    }
-
-    /// Round the digit string at r15 (`ndig` digits at `[rsp+32]`, ndig > nsig) to
-    /// nsig (`[rsp+24]`) significant figures, in place. Round-half-to-even on the
-    /// trailing digits; a carry overflow ("99..9"→"10..0") bumps X (`[rsp+16]`).
-    fn eg_round(&mut self) {
-        let sloop = self.asm.new_label();
-        let nstick = self.asm.new_label();
-        let sdone = self.asm.new_label();
-        let roundup = self.asm.new_label();
-        let noup = self.asm.new_label();
-        let iloop = self.asm.new_label();
-        let carry = self.asm.new_label();
-        let overflow = self.asm.new_label();
-        let done = self.asm.new_label();
-        self.asm.load_rsp(R8, 24); // nsig
-        // round digit = r15[nsig]  → rcx
-        self.asm.mov_rr(RAX, R15);
-        self.asm.add_rr(RAX, R8);
-        self.asm.load_byte_zx(RCX, RAX);
-        // sticky: any digit in (nsig, ndig) ≠ '0'  → r9
-        self.asm.mov_ri(R9, 0);
-        self.asm.mov_rr(RDX, RAX);
-        self.asm.inc_r(RDX); // ptr to r15[nsig+1]
-        self.asm.load_rsp(R10, 32); // ndig
-        self.asm.mov_rr(RAX, R15);
-        self.asm.add_rr(RAX, R10); // end = r15 + ndig
-        self.asm.place(sloop);
-        self.asm.cmp_reg_reg(RDX, RAX);
-        self.asm.jae(sdone);
-        self.asm.load_byte_zx(R11, RDX);
-        self.asm.cmp_ri(R11, b'0' as i32);
-        self.asm.je(nstick);
-        self.asm.mov_ri(R9, 1);
-        self.asm.jmp(sdone);
-        self.asm.place(nstick);
-        self.asm.inc_r(RDX);
-        self.asm.jmp(sloop);
-        self.asm.place(sdone);
-        // round up if digit>'5', or (=='5' and (sticky or last-kept odd))
-        self.asm.cmp_ri(RCX, b'5' as i32);
-        self.asm.jg(roundup);
-        self.asm.jl(noup);
-        self.asm.test_rr(R9, R9);
-        self.asm.jne(roundup);
-        self.asm.mov_rr(RAX, R15);
-        self.asm.add_rr(RAX, R8);
-        self.asm.add_ri(RAX, -1); // &r15[nsig-1]
-        self.asm.load_byte_zx(RDX, RAX);
-        self.asm.and_ri(RDX, 1); // ASCII parity = digit parity
-        self.asm.je(noup);
-        self.asm.place(roundup);
-        // increment the nsig-digit number from the last digit
-        self.asm.mov_rr(RDX, R8);
-        self.asm.add_ri(RDX, -1); // index = nsig-1
-        self.asm.place(iloop);
-        self.asm.mov_rr(RAX, R15);
-        self.asm.add_rr(RAX, RDX); // &digit[idx]
-        self.asm.load_byte_zx(RCX, RAX);
-        self.asm.cmp_ri(RCX, b'9' as i32);
-        self.asm.je(carry);
-        self.asm.add_ri(RCX, 1);
-        self.asm.store_byte_at(RAX, RCX);
-        self.asm.jmp(done);
-        self.asm.place(carry);
-        self.asm.store_byte_imm_at(RAX, b'0');
-        self.asm.dec_r(RDX);
-        self.asm.js(overflow);
-        self.asm.jmp(iloop);
-        self.asm.place(overflow);
-        // all '9' → "1" followed by zeros (already set); X += 1
-        self.asm.store_byte_imm_at(R15, b'1');
-        self.asm.load_rsp(RDX, 16);
-        self.asm.add_ri(RDX, 1);
-        self.asm.store_rsp(16, RDX);
-        self.asm.place(noup);
-        self.asm.place(done);
-    }
-
-    /// Build the `%e`/`%g` numeric body into BODYBUF from SIGBUF (r15, nsig digits)
-    /// and X. Leaves the BODYBUF end in rdi. `%g` trims trailing zeros (unless `#`).
-    fn eg_format(&mut self, _sigbuf: i32, bodybuf: i32) {
-        // dispatch on conv kind (g uses %f-style or %e-style; e is always %e-style)
-        let kind_g = self.asm.new_label();
-        let use_e = self.asm.new_label();
-        let trim = self.asm.new_label();
-        let no_trim = self.asm.new_label();
-        self.asm.lea_global(RDI, bodybuf); // body cursor
-        self.asm.load_rsp(RAX, 0); // conv
-        self.asm.and_ri(RAX, 3);
-        self.asm.cmp_ri(RAX, 2);
-        self.asm.je(kind_g);
-        // %e: precision = P (rbx), nsig = P+1
-        self.eg_body_sci(RBX);
-        self.asm.jmp(no_trim);
-        self.asm.place(kind_g);
-        // %g: p = nsig; X decides %f-style (−4 ≤ X < p) vs %e-style.
-        self.asm.load_rsp(RAX, 16); // X
-        self.asm.cmp_ri(RAX, -4);
-        self.asm.jl(use_e);
-        self.asm.load_rsp(RCX, 24); // p (= nsig)
-        self.asm.cmp_reg_reg(RAX, RCX);
-        self.asm.jge(use_e);
-        // %f-style: fixed notation from the digits
-        self.eg_body_fixed();
-        self.asm.jmp(trim);
-        self.asm.place(use_e);
-        // %e-style with precision p-1
-        self.asm.load_rsp(RAX, 24);
-        self.asm.add_ri(RAX, -1); // p-1
-        self.asm.mov_rr(R8, RAX);
-        self.eg_body_sci(R8);
-        self.asm.place(trim);
-        // trim trailing zeros (unless the # flag)
-        self.asm.test_ri(R13, F_HASH);
-        self.asm.jne(no_trim);
-        self.eg_trim(bodybuf);
-        self.asm.place(no_trim);
-    }
-
-    /// `%e`-style body: `d`, then `.fff` (precision `prec_reg` digits), then
-    /// `e`/`E`, sign, and the ≥2-digit exponent. Reads SIGBUF (r15), X (`[rsp+16]`).
-    fn eg_body_sci(&mut self, prec_reg: u8) {
-        let pr = if prec_reg == RBX { RBX } else { prec_reg };
-        // first digit
-        self.asm.load_byte_zx(RAX, R15);
-        self.asm.store_byte_at(RDI, RAX);
-        self.asm.inc_r(RDI);
-        // if prec > 0: '.', then prec fractional digits SIGBUF[1..1+prec]
-        let nofrac = self.asm.new_label();
-        let floop = self.asm.new_label();
-        let fdone = self.asm.new_label();
-        self.asm.mov_rr(RCX, pr);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(nofrac);
-        self.asm.store_byte_imm_at(RDI, b'.');
-        self.asm.inc_r(RDI);
-        self.asm.mov_rr(R8, R15);
-        self.asm.inc_r(R8); // &SIGBUF[1]
-        self.asm.place(floop);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(fdone);
-        self.asm.load_byte_zx(RAX, R8);
-        self.asm.store_byte_at(RDI, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(R8);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(floop);
-        self.asm.place(fdone);
-        self.asm.place(nofrac);
-        // 'e' / 'E'
-        let lower = self.asm.new_label();
-        let wrote_e = self.asm.new_label();
-        self.asm.load_rsp(RAX, 0); // conv
-        self.asm.test_ri(RAX, 4); // upper bit
-        self.asm.je(lower);
-        self.asm.store_byte_imm_at(RDI, b'E');
-        self.asm.jmp(wrote_e);
-        self.asm.place(lower);
-        self.asm.store_byte_imm_at(RDI, b'e');
-        self.asm.place(wrote_e);
-        self.asm.inc_r(RDI);
-        // exponent sign + |X| (≥ 2 digits)
-        let xneg = self.asm.new_label();
-        let xpos = self.asm.new_label();
-        self.asm.load_rsp(RAX, 16); // X
-        self.asm.test_rr(RAX, RAX);
-        self.asm.jns(xpos);
-        self.asm.store_byte_imm_at(RDI, b'-');
-        self.asm.inc_r(RDI);
-        self.asm.neg_r(RAX);
-        self.asm.jmp(xneg);
-        self.asm.place(xpos);
-        self.asm.store_byte_imm_at(RDI, b'+');
-        self.asm.inc_r(RDI);
-        self.asm.place(xneg);
-        // rax = |X|; emit hundreds (if any), then tens, ones (min 2 digits)
-        let nohund = self.asm.new_label();
-        self.asm.mov_ri(RCX, 100);
-        self.asm.mov_ri(RDX, 0);
-        self.asm.div_r(RCX); // rax = X/100, rdx = X%100
-        self.asm.test_rr(RAX, RAX);
-        self.asm.je(nohund);
-        self.asm.add_ri(RAX, b'0' as i32);
-        self.asm.store_byte_at(RDI, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.place(nohund);
-        // rdx = X%100; tens then ones
-        self.asm.mov_rr(RAX, RDX);
-        self.asm.mov_ri(RCX, 10);
-        self.asm.mov_ri(RDX, 0);
-        self.asm.div_r(RCX); // rax = tens, rdx = ones
-        self.asm.add_ri(RAX, b'0' as i32);
-        self.asm.store_byte_at(RDI, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.add_ri(RDX, b'0' as i32);
-        self.asm.store_byte_at(RDI, RDX);
-        self.asm.inc_r(RDI);
-    }
-
-    /// `%g` `%f`-style body: fixed notation of the SIGBUF digits placed by X.
-    fn eg_body_fixed(&mut self) {
-        // X (r9), nsig (r10), SIGBUF base (r15), cursor rdi.
-        self.asm.load_rsp(R9, 16); // X
-        self.asm.load_rsp(R10, 24); // nsig (= p)
-        let xneg = self.asm.new_label();
-        // if X >= 0: int = SIGBUF[0..X+1], frac = SIGBUF[X+1..nsig]
-        self.asm.test_rr(R9, R9);
-        self.asm.js(xneg);
-        // integer digits: count = X+1
-        let iloop = self.asm.new_label();
-        let idone = self.asm.new_label();
-        self.asm.mov_rr(R8, R15); // src
-        self.asm.mov_rr(RCX, R9);
-        self.asm.add_ri(RCX, 1); // X+1
-        self.asm.place(iloop);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(idone);
-        self.asm.load_byte_zx(RAX, R8);
-        self.asm.store_byte_at(RDI, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(R8);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(iloop);
-        self.asm.place(idone);
-        // frac: remaining nsig-(X+1) digits, if any
-        let nofrac = self.asm.new_label();
-        let floop = self.asm.new_label();
-        let fdone = self.asm.new_label();
-        self.asm.mov_rr(RCX, R10);
-        self.asm.sub_rr(RCX, R9);
-        self.asm.add_ri(RCX, -1); // nsig - X - 1
-        self.asm.test_rr(RCX, RCX);
-        self.asm.jle(nofrac);
-        self.asm.store_byte_imm_at(RDI, b'.');
-        self.asm.inc_r(RDI);
-        self.asm.place(floop);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(fdone);
-        self.asm.load_byte_zx(RAX, R8);
-        self.asm.store_byte_at(RDI, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(R8);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(floop);
-        self.asm.place(fdone);
-        self.asm.place(nofrac);
-        let done = self.asm.new_label();
-        self.asm.jmp(done);
-        // X < 0: "0." then (−X−1) zeros then all nsig digits
-        self.asm.place(xneg);
-        self.asm.store_byte_imm_at(RDI, b'0');
-        self.asm.inc_r(RDI);
-        self.asm.store_byte_imm_at(RDI, b'.');
-        self.asm.inc_r(RDI);
-        let zloop = self.asm.new_label();
-        let zdone = self.asm.new_label();
-        self.asm.mov_rr(RCX, R9);
-        self.asm.neg_r(RCX);
-        self.asm.add_ri(RCX, -1); // -X-1 leading zeros
-        self.asm.place(zloop);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(zdone);
-        self.asm.store_byte_imm_at(RDI, b'0');
-        self.asm.inc_r(RDI);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(zloop);
-        self.asm.place(zdone);
-        let dloop = self.asm.new_label();
-        let ddone = self.asm.new_label();
-        self.asm.mov_rr(R8, R15);
-        self.asm.mov_rr(RCX, R10);
-        self.asm.place(dloop);
-        self.asm.test_rr(RCX, RCX);
-        self.asm.je(ddone);
-        self.asm.load_byte_zx(RAX, R8);
-        self.asm.store_byte_at(RDI, RAX);
-        self.asm.inc_r(RDI);
-        self.asm.inc_r(R8);
-        self.asm.dec_r(RCX);
-        self.asm.jmp(dloop);
-        self.asm.place(ddone);
-        self.asm.place(done);
-    }
-
-    /// Trim trailing zeros from BODYBUF's mantissa (and a bare `.`), keeping any
-    /// exponent suffix. The body is `[bodybuf .. rdi)`; rdi is updated.
-    fn eg_trim(&mut self, bodybuf: i32) {
-        // find 'e'/'E' (split point) → r8 = mantissa end; r9 = exponent start/len.
-        let scan = self.asm.new_label();
-        let found_e = self.asm.new_label();
-        let no_e = self.asm.new_label();
-        let have_split = self.asm.new_label();
-        self.asm.lea_global(RAX, bodybuf); // p
-        self.asm.place(scan);
-        self.asm.cmp_reg_reg(RAX, RDI);
-        self.asm.jae(no_e);
-        self.asm.load_byte_zx(RCX, RAX);
-        self.asm.cmp_ri(RCX, b'e' as i32);
-        self.asm.je(found_e);
-        self.asm.cmp_ri(RCX, b'E' as i32);
-        self.asm.je(found_e);
-        self.asm.inc_r(RAX);
-        self.asm.jmp(scan);
-        self.asm.place(no_e);
-        self.asm.mov_rr(R8, RDI); // mantissa end = body end
-        self.asm.mov_ri(R9, 0); // no exponent
-        self.asm.jmp(have_split);
-        self.asm.place(found_e);
-        self.asm.mov_rr(R8, RAX); // mantissa end = 'e' position
-        self.asm.mov_rr(R9, RDI);
-        self.asm.sub_rr(R9, RAX); // exponent length
-        self.asm.place(have_split);
-        // only trim if the mantissa contains '.'
-        let mscan = self.asm.new_label();
-        let has_dot = self.asm.new_label();
-        let nodot = self.asm.new_label();
-        self.asm.lea_global(RAX, bodybuf);
-        self.asm.place(mscan);
-        self.asm.cmp_reg_reg(RAX, R8);
-        self.asm.jae(nodot);
-        self.asm.load_byte_zx(RCX, RAX);
-        self.asm.cmp_ri(RCX, b'.' as i32);
-        self.asm.je(has_dot);
-        self.asm.inc_r(RAX);
-        self.asm.jmp(mscan);
-        self.asm.place(has_dot);
-        // strip trailing '0' then a trailing '.' from [bodybuf .. r8)
-        let tloop = self.asm.new_label();
-        let tdone = self.asm.new_label();
-        self.asm.place(tloop);
-        self.asm.mov_rr(RAX, R8);
-        self.asm.add_ri(RAX, -1); // last mantissa char
-        self.asm.load_byte_zx(RCX, RAX);
-        self.asm.cmp_ri(RCX, b'0' as i32);
-        self.asm.jne(tdone);
-        self.asm.dec_r(R8);
-        self.asm.jmp(tloop);
-        self.asm.place(tdone);
-        // drop a trailing '.'
-        let nodot2 = self.asm.new_label();
-        self.asm.mov_rr(RAX, R8);
-        self.asm.add_ri(RAX, -1);
-        self.asm.load_byte_zx(RCX, RAX);
-        self.asm.cmp_ri(RCX, b'.' as i32);
-        self.asm.jne(nodot2);
-        self.asm.dec_r(R8);
-        self.asm.place(nodot2);
-        // move the exponent suffix down to r8 (if any), set rdi = new end
-        let eloop = self.asm.new_label();
-        let edone = self.asm.new_label();
-        self.asm.mov_rr(RSI, RDI);
-        self.asm.sub_rr(RSI, R9); // exponent source start = old end - explen
-        self.asm.place(eloop);
-        self.asm.test_rr(R9, R9);
-        self.asm.je(edone);
-        self.asm.load_byte_zx(RAX, RSI);
-        self.asm.store_byte_at(R8, RAX);
-        self.asm.inc_r(R8);
-        self.asm.inc_r(RSI);
-        self.asm.dec_r(R9);
-        self.asm.jmp(eloop);
-        self.asm.place(edone);
-        self.asm.mov_rr(RDI, R8); // new body end
-        self.asm.place(nodot);
-    }
-
-    /// Render the assembled body (`[bodybuf .. rdi)`) as a field: sign + width pad
-    /// (precision is None for floats, so a `0` flag zero-pads) → OUTBUF → out_write.
-    fn eg_field(&mut self, bodybuf: i32, outbuf: i32) {
-        // bodylen = rdi - bodybuf → r11
-        self.asm.lea_global(RAX, bodybuf);
-        self.asm.mov_rr(R11, RDI);
-        self.asm.sub_rr(R11, RAX); // bodylen
-        // pad = max(0, width - (bodylen + signlen)) → rdx
-        let nosl = self.asm.new_label();
-        let padok = self.asm.new_label();
-        self.asm.mov_rr(RAX, R11);
-        self.asm.test_rr(R12, R12);
-        self.asm.je(nosl);
-        self.asm.inc_r(RAX);
-        self.asm.place(nosl);
-        self.asm.mov_rr(RDX, R14);
-        self.asm.sub_rr(RDX, RAX);
-        self.asm.jns(padok);
-        self.asm.mov_ri(RDX, 0);
-        self.asm.place(padok);
-        // assemble: justify by flags (minus / zero / right)
-        self.asm.lea_global(R8, outbuf); // cursor
-        let do_minus = self.asm.new_label();
-        let do_right = self.asm.new_label();
-        let fielddone = self.asm.new_label();
-        self.asm.test_ri(R13, F_MINUS);
-        self.asm.jne(do_minus);
-        self.asm.test_ri(R13, F_ZERO);
-        self.asm.je(do_right);
-        self.float_emit_sign();
-        self.float_emit_pad(b'0');
-        self.eg_copy_body(bodybuf);
-        self.asm.jmp(fielddone);
-        self.asm.place(do_right);
-        self.float_emit_pad(b' ');
-        self.float_emit_sign();
-        self.eg_copy_body(bodybuf);
-        self.asm.jmp(fielddone);
-        self.asm.place(do_minus);
-        self.float_emit_sign();
-        self.eg_copy_body(bodybuf);
-        self.float_emit_pad(b' ');
-        self.asm.place(fielddone);
-        self.asm.lea_global(RSI, outbuf);
-        self.asm.mov_rr(RDX, R8);
-        self.asm.sub_rr(RDX, RSI);
-        let l = self.helper(Helper::OutWrite);
-        self.asm.call(l);
-    }
-
-    /// Copy the body (length r11) from BODYBUF to the OUTBUF cursor r8.
-    fn eg_copy_body(&mut self, bodybuf: i32) {
-        self.asm.lea_global(RSI, bodybuf);
-        self.asm.mov_rr(RDI, R8);
-        self.asm.mov_rr(RCX, R11);
-        self.asm.rep_movsb();
-        self.asm.mov_rr(R8, RDI);
+        let s = Expr::new(ExprKind::Str(lit.to_string()), Span::dummy());
+        s.set_ty(Type::Ptr(Box::new(Type::U8)));
+        let fd = Expr::new(ExprKind::Int(1), Span::dummy()); // STDOUT
+        fd.set_ty(Type::I64);
+        let n = Expr::new(ExprKind::Int(lit.len() as i64), Span::dummy());
+        n.set_ty(Type::I64);
+        self.gen_call_by_name("StdWrite", &[fd, s, n], pos)
     }
 }
 
@@ -4789,6 +2806,14 @@ impl crate::backend::CallEmitter for Cg {
         if let Some(off) = sret {
             self.asm.lea_local(off);
         }
+    }
+
+    fn frame_mark(&self) -> u32 {
+        self.depth as u32 // depth is non-negative
+    }
+
+    fn frame_reset(&mut self, mark: u32) {
+        self.depth = mark as i32; // reclaim the call's variadic buffer (max_depth preserved)
     }
 }
 

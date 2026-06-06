@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use super::{Asm, OsTarget, R8, R9, R10, RAX, RCX, RDI, RDX, RSI};
+use super::{Asm, FileOp, OsTarget, R8, R9, R10, RAX, RCX, RDI, RDX, RSI};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
@@ -104,39 +104,27 @@ impl OsTarget for LinuxTarget {
         asm.syscall();
     }
 
-    fn emit_write_stdout(&mut self, asm: &mut Asm) {
-        // write(1, rsi, rdx), looping until the whole buffer is written: `write`
-        // may return a short count, and `-EINTR` (-4) means retry. rsi=buf, rdx=remaining.
-        //
-        // The raw `syscall` instruction clobbers rcx and r11, but the format
-        // routines treat OutWrite as an ordinary call and keep working state there
-        // — fmt_str holds the string length in r11 across the pad write, so a
-        // right-justified `%s` would otherwise read a garbage length and dump
-        // memory (real hardware clobbers r11; qemu does not, which hid this). Save
-        // and restore the syscall-clobbered registers so OutWrite preserves them.
-        asm.emit(&[0x51]); // push rcx
-        asm.emit(&[0x41, 0x53]); // push r11
-        let wloop = asm.new_label();
-        let advance = asm.new_label();
-        let wdone = asm.new_label();
-        asm.place(wloop);
-        asm.test_rr(RDX, RDX);
-        asm.je(wdone); // nothing left
+    fn emit_std_write(&mut self, asm: &mut Asm) {
+        // write(fd, buf, n): rdi=fd, rsi=buf, rdx=n are already in the syscall
+        // registers (they coincide with the System V arg registers); nr 1; the byte
+        // count (or -errno) is left in rax — a single write, matching `Write`.
         asm.emit(&[0xB8, 1, 0, 0, 0]); // mov eax, 1 (SYS_write)
-        asm.emit(&[0xBF, 1, 0, 0, 0]); // mov edi, 1 (stdout)
-        asm.syscall(); // rax = bytes written (or -errno)
-        asm.test_rr(RAX, RAX);
-        asm.jg(advance); // wrote >0 bytes
-        asm.cmp_ri(RAX, -4); // -EINTR?
-        asm.je(wloop); // EINTR: retry same buf/len
-        asm.jmp(wdone); // other error / 0: give up
-        asm.place(advance);
-        asm.add_rr(RSI, RAX); // buf += written
-        asm.sub_rr(RDX, RAX); // remaining -= written
-        asm.jmp(wloop);
-        asm.place(wdone);
-        asm.emit(&[0x41, 0x5B]); // pop r11
-        asm.emit(&[0x59]); // pop rcx
+        asm.syscall();
+    }
+
+    fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp) {
+        // The fd args are already in rdi/rsi/rdx (the System V registers coincide with
+        // the syscall registers), and the `io.hc` open flags are Linux's, so each is a
+        // plain syscall: open 2, read 0, write 1, close 3, lseek 8. Result in rax.
+        let nr = match op {
+            FileOp::Read => 0,
+            FileOp::Write => 1,
+            FileOp::Open => 2,
+            FileOp::Close => 3,
+            FileOp::LSeek => 8,
+        };
+        asm.mov_ri(RAX, nr);
+        asm.syscall();
     }
 
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {

@@ -163,13 +163,18 @@ fn entry_is_framed_and_exits_via_exitprocess() {
 fn printing_lowers_to_getstdhandle_then_writefile() {
     let pe = build_pe("\"hi\\n\";");
 
-    // The full `emit_write_stdout` shim, byte for byte (the two disp32s aside):
-    //   sub rsp,72; mov [rsp+48],rsi; mov [rsp+56],rdx; mov ecx,-11; call [GetStdHandle]
+    // A bare string lowers to `StdWrite(STDOUT, …)`, whose Windows shim selects the std
+    // handle from the fd before `GetStdHandle`, byte for byte (the disp32s aside):
+    //   sub rsp,72; mov [rsp+48],rsi; mov [rsp+56],rdx;
+    //   mov ecx,-11; cmp rdi,2; jne +5; mov ecx,-12; call [GetStdHandle]
     let head = [
         0x48, 0x83, 0xEC, 0x48, // sub rsp, 72
         0x48, 0x89, 0x74, 0x24, 0x30, // mov [rsp+48], rsi
         0x48, 0x89, 0x54, 0x24, 0x38, // mov [rsp+56], rdx
-        0xB9, 0xF5, 0xFF, 0xFF, 0xFF, // mov ecx, -11
+        0xB9, 0xF5, 0xFF, 0xFF, 0xFF, // mov ecx, -11 (STD_OUTPUT_HANDLE)
+        0x48, 0x83, 0xFF, 0x02, // cmp rdi, 2
+        0x75, 0x05, // jne +5 (keep stdout)
+        0xB9, 0xF4, 0xFF, 0xFF, 0xFF, // mov ecx, -12 (STD_ERROR_HANDLE)
         0xFF, 0x15, // call [rip] (GetStdHandle)
     ];
     let start = find_code(&pe, &head);
@@ -193,9 +198,14 @@ fn printing_lowers_to_getstdhandle_then_writefile() {
     );
     let wf = mid_at + mid.len() - 2;
     assert_eq!(call_target(&pe, wf), "WriteFile");
-    // ... and tear the frame down.
+    // ... return the written count, then tear the frame down.
     assert_eq!(
-        &pe[wf + 6..wf + 6 + 4],
+        &pe[wf + 6..wf + 10],
+        &[0x8B, 0x44, 0x24, 0x28],
+        "mov eax, [rsp+40] (written → rax)"
+    );
+    assert_eq!(
+        &pe[wf + 10..wf + 14],
         &[0x48, 0x83, 0xC4, 0x48],
         "add rsp, 72"
     );
@@ -255,6 +265,82 @@ fn time_builtins_lower_to_kernel32() {
         let at = find_code(&pe, shim);
         let call = at + shim.len() - 2;
         assert_eq!(call_target(&pe, call), fname, "for `{src}`");
+    }
+}
+
+#[test]
+fn file_io_lowers_to_kernel32() {
+    // `Open`/`Write`/`Close` lower to `CreateFileA`/`WriteFile`/`CloseHandle`. A
+    // print-free program keeps the `WriteFile`/`CloseHandle` calls unambiguous (no
+    // `StdWrite` from a `Print`).
+    let pe = build_pe(
+        "#include <io.hc>\n\
+         U0 Main() { I64 fd = Open(\"t\", O_WRONLY|O_CREAT|O_TRUNC, MODE_0644);\n\
+         U8 *m = \"hi\"; Write(fd, m, 2); Close(fd); }\n\
+         Main;",
+    );
+    // CreateFileA: the two trailing stack-arg stores (FILE_ATTRIBUTE_NORMAL = 0x80,
+    // hTemplateFile = NULL) immediately precede the `call [rip]`.
+    let cf = find_code(
+        &pe,
+        &[
+            0x48, 0xC7, 0x44, 0x24, 0x28, 0x80, 0x00, 0x00, 0x00, // mov qword [rsp+40], 0x80
+            0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00, // mov qword [rsp+48], 0
+            0xFF, 0x15, // call [rip]
+        ],
+    );
+    assert_eq!(call_target(&pe, cf + 18), "CreateFileA");
+    // WriteFile: the `lpOverlapped = NULL` store then the call (the Read/Write tail).
+    let wf = find_code(
+        &pe,
+        &[
+            0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, // mov qword [rsp+32], 0
+            0xFF, 0x15, // call [rip]
+        ],
+    );
+    assert_eq!(call_target(&pe, wf + 9), "WriteFile");
+    // CloseHandle: the program's only `call_aligned` shim.
+    let close = find_code(
+        &pe,
+        &[
+            0x49, 0x89, 0xE7, // mov r15, rsp
+            0x48, 0x81, 0xE4, 0xF0, 0xFF, 0xFF, 0xFF, // and rsp, -16
+            0x48, 0x83, 0xEC, 0x20, // sub rsp, 32
+            0xFF, 0x15, // call [rip]
+        ],
+    );
+    assert_eq!(call_target(&pe, close + 14), "CloseHandle");
+}
+
+#[test]
+fn posix_only_builtins_rejected_on_windows() {
+    // The syscall-group primitives with no Windows lowering yet (sockets, filesystem
+    // mutation, process ids, working dir, threads, futex) must be a clear compile
+    // error on the PE target — not a silently-emitted, invalid Linux `syscall`.
+    for (src, name) in [
+        (
+            "#include <os.hc>\nU0 Main(){ Mkdir(\"d\", 0700); } Main;",
+            "Mkdir",
+        ),
+        (
+            "#include <os.hc>\nU0 Main(){ Remove(\"f\"); } Main;",
+            "Remove",
+        ),
+        (
+            "#include <os.hc>\nU0 Main(){ I64 p = Getpid(); } Main;",
+            "Getpid",
+        ),
+    ] {
+        let program = parse_with(src, std::path::Path::new("."), &[lib_dir()]).unwrap();
+        assert!(check_program(&program).is_empty(), "{name}: sema errors");
+        let out = temp_out();
+        let err = X64Windows::new(&out).run(&program).unwrap_err();
+        let _ = std::fs::remove_file(&out);
+        assert!(
+            err.to_string()
+                .contains("not supported on the Windows target"),
+            "{name}: expected a clear Windows-unsupported error, got: {err}"
+        );
     }
 }
 
@@ -360,4 +446,35 @@ fn pe_printing_matches_the_interpreter() {
             .map(|(n, s)| (n.to_string(), compile(s)))
             .collect(),
     );
+}
+
+#[test]
+fn pe_file_io_matches_interpreter() {
+    // File I/O end-to-end: write a string to a temp file via the kernel32
+    // `CreateFileA`/`WriteFile`, read it back via `ReadFile`, and print it. The
+    // interpreter (over `std::fs`) and the executed PE must agree byte-for-byte. Runs
+    // only on a Windows host (self-skips elsewhere). A process-unique temp path keeps
+    // the interpreter's write (which happens on every host while computing the expected
+    // output) out of the repo; backslashes are normalized so the path embeds cleanly in
+    // a HolyC string literal (Windows file APIs accept forward slashes).
+    let path = std::env::temp_dir()
+        .join(format!("solomon-pe-io-{}.txt", std::process::id()))
+        .to_string_lossy()
+        .replace('\\', "/");
+    let _ = std::fs::remove_file(&path);
+    let src = format!(
+        "#include <io.hc>\n\
+        U0 Main() {{\n\
+          U8 *m = \"solomon\\n\";\n\
+          WriteFile(\"{path}\", m, StrLen(m));\n\
+          U8 buf[64];\n\
+          I64 n = ReadFile(\"{path}\", buf, 64);\n\
+          if (n < 0) {{ \"read failed\\n\"; return; }}\n\
+          buf[n] = 0;\n\
+          \"got: %s\", buf;\n\
+        }}\n\
+        Main;"
+    );
+    run_pe_conformance(vec![("file_io".to_string(), compile(&src))]);
+    let _ = std::fs::remove_file(&path);
 }

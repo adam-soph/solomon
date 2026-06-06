@@ -8,8 +8,10 @@
 // Pure HolyC over raw byte pointers (`U8 *`). Byte values are `U8` (unsigned), so the
 // `<`/`>` comparisons are unsigned — matching libc's `strcmp` family. Include with
 // `#include <cstr.hc>`.
-
-#include <fmt.hc>   // F64ToStr is a StrPrint("%g") wrapper
+//
+// (`F64ToStr`, a `StrPrint("%g")` wrapper, lives in `<fmt.hc>` next to the rest of the
+// printf machinery — keeping `cstr.hc` free of a dependency on `fmt.hc`, which now
+// includes the printf core that depends back on these string primitives.)
 
 // --- length & comparison (sign-normalised to -1/0/1) ---
 
@@ -187,11 +189,5 @@ U8 *I64ToStr(I64 n, U8 *buf)
   buf[j] = 0;
   return buf;
 }
-
-// Format a float into `buf` with the `%g` conversion; return `buf`. The inverse of
-// the `StrToF64` builtin. This is just the printf machinery (`StrPrint`) applied to
-// a single `%g`, so it needs no float-formatting code of its own — that lives once,
-// in the backends' correctly-rounded bignum formatter.
-U8 *F64ToStr(F64 v, U8 *buf) { return StrPrint(buf, "%g", v); }
 
 #endif

@@ -431,32 +431,6 @@ impl Asm {
     pub(super) fn lslv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
-    /// UMULH Xd, Xn, Xm — the high 64 bits of the unsigned 64×64→128 product.
-    pub(super) fn umulh(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.e_rrr(0x9BC0_7C00 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
-    }
-    /// ADDS Xd, Xn, Xm — add, setting NZCV (so a following ADC sees the carry).
-    pub(super) fn adds(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.e_rrr(0xAB00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
-    }
-    /// ADC Xd, Xn, Xm — add with the carry flag.
-    pub(super) fn adc(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.e_rrr(0x9A00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
-    }
-    /// SUBS Xd, Xn, Xm — subtract, setting NZCV.
-    pub(super) fn subs(&mut self, rd: u32, rn: u32, rm: u32) {
-        self.e_rrr(0xEB00_0000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
-    }
-    /// LDR Xt, [Xn, Xm, LSL #3] — load a 64-bit limb at `base + idx*8`.
-    pub(super) fn ldr_idx8(&mut self, rt: u32, base: u32, idx: u32) {
-        let w = 0xF860_7800 | (idx << 16) | (base << 5) | rt;
-        self.emit_du(w, rt as i32, gpb(base) | gpb(idx), B_NORMAL);
-    }
-    /// STR Xt, [Xn, Xm, LSL #3] — store a 64-bit limb at `base + idx*8`.
-    pub(super) fn str_idx8(&mut self, rt: u32, base: u32, idx: u32) {
-        let w = 0xF820_7800 | (idx << 16) | (base << 5) | rt;
-        self.emit_du(w, -1, gpb(rt) | gpb(base) | gpb(idx), B_NORMAL);
-    }
     /// LDR Wt, [Xn] — load the 32-bit word at `[base, #0]` (zero-extended).
     pub(super) fn ldr_w(&mut self, rt: u32, base: u32) {
         self.emit_du(
@@ -813,9 +787,6 @@ impl Asm {
     pub(super) fn adr_label(&mut self, rd: u32, label: usize) {
         self.fixups.push((self.words.len(), label, Fixup::Adr));
         self.e_wr(0x1000_0000 | rd, rd);
-    }
-    pub(super) fn bl_printf(&mut self) {
-        self.bl_extern("_printf");
     }
     /// `bl <extern>` — a call to an undefined external (libc) symbol, resolved by
     /// the linker via a BRANCH26 relocation.

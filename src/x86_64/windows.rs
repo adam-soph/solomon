@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use super::{Asm, OsTarget, R8, R9, R15, RAX, RCX, RDI, RDX, RSI};
+use super::{Asm, FileOp, OsTarget, R8, R9, R10, R11, R15, RAX, RCX, RDI, RDX, RSI};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
@@ -85,6 +85,95 @@ impl WindowsTarget {
         asm.call_extern(i);
         asm.mov_rr(super::RSP, R15); // restore rsp
     }
+
+    /// `Read`/`Write` → `ReadFile`/`WriteFile(hFile=rdi, buf=rsi, n=rdx, &done, NULL)`.
+    /// Returns the byte count, or -1 on failure. Same 72-byte frame as `emit_std_write`
+    /// (the established WriteFile shim), with the handle taken from `rdi`.
+    fn emit_read_write(&mut self, asm: &mut Asm, func: &'static str) {
+        let wf = self.extern_idx(func);
+        asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
+        asm.emit(&[0x48, 0x89, 0x74, 0x24, 0x30]); // mov [rsp+48], rsi  (save buf)
+        asm.emit(&[0x48, 0x89, 0x54, 0x24, 0x38]); // mov [rsp+56], rdx  (save n)
+        asm.mov_rr(RCX, RDI); // hFile = handle
+        asm.emit(&[0x48, 0x8B, 0x54, 0x24, 0x30]); // mov rdx, [rsp+48]  (lpBuffer)
+        asm.emit(&[0x4C, 0x8B, 0x44, 0x24, 0x38]); // mov r8, [rsp+56]   (nBytes)
+        asm.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x28]); // lea r9, [rsp+40]   (&done)
+        asm.emit(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]); // [rsp+32]=NULL
+        asm.call_extern(wf);
+        let fail = asm.new_label();
+        let done = asm.new_label();
+        asm.test_rr(RAX, RAX); // BOOL
+        asm.je(fail);
+        asm.emit(&[0x8B, 0x44, 0x24, 0x28]); // mov eax, [rsp+40]  (bytes done → rax)
+        asm.jmp(done);
+        asm.place(fail);
+        asm.mov_ri(RAX, -1);
+        asm.place(done);
+        asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+    }
+
+    /// `Open(path, flags, mode)` → `CreateFileA`. Translates the `io.hc` open flags
+    /// (`O_RDONLY`/`O_WRONLY`/`O_RDWR` + `O_CREAT`/`O_TRUNC`) into the Win32 access mask
+    /// (r10) and creation disposition (r11). `mode` is ignored (no POSIX perm bits on
+    /// Windows). Returns the HANDLE, or `INVALID_HANDLE_VALUE` (-1) on failure.
+    fn emit_open(&mut self, asm: &mut Asm) {
+        let cf = self.extern_idx("CreateFileA");
+        // access (r10d): GENERIC_READ (0x80000000) unless O_WRONLY; GENERIC_WRITE
+        // (0x40000000) unless O_RDONLY. `flags & 3` is the access-mode field.
+        asm.mov_ri(R10, 0);
+        let skip_r = asm.new_label();
+        asm.mov_rr(RAX, RSI);
+        asm.and_ri(RAX, 3);
+        asm.cmp_ri(RAX, 1); // O_WRONLY → no read
+        asm.je(skip_r);
+        asm.alu_ri(1, R10, 0x8000_0000u32 as i32); // or r10d, GENERIC_READ
+        asm.place(skip_r);
+        let skip_w = asm.new_label();
+        asm.mov_rr(RAX, RSI);
+        asm.and_ri(RAX, 3);
+        asm.cmp_ri(RAX, 0); // O_RDONLY → no write
+        asm.je(skip_w);
+        asm.alu_ri(1, R10, 0x4000_0000); // or r10d, GENERIC_WRITE
+        asm.place(skip_w);
+        // disposition (r11d): O_CREAT (0x40) / O_TRUNC (0x200) →
+        //   creat&trunc=CREATE_ALWAYS(2), creat=OPEN_ALWAYS(4),
+        //   trunc=TRUNCATE_EXISTING(5), else OPEN_EXISTING(3).
+        asm.mov_ri(R11, 3);
+        let nocreat = asm.new_label();
+        let dispdone = asm.new_label();
+        asm.mov_rr(RAX, RSI);
+        asm.and_ri(RAX, 0x40);
+        asm.cmp_ri(RAX, 0);
+        asm.je(nocreat);
+        let creat_notrunc = asm.new_label();
+        asm.mov_rr(RAX, RSI);
+        asm.and_ri(RAX, 0x200);
+        asm.cmp_ri(RAX, 0);
+        asm.je(creat_notrunc);
+        asm.mov_ri(R11, 2); // CREATE_ALWAYS
+        asm.jmp(dispdone);
+        asm.place(creat_notrunc);
+        asm.mov_ri(R11, 4); // OPEN_ALWAYS
+        asm.jmp(dispdone);
+        asm.place(nocreat);
+        asm.mov_rr(RAX, RSI);
+        asm.and_ri(RAX, 0x200);
+        asm.cmp_ri(RAX, 0);
+        asm.je(dispdone); // stays OPEN_EXISTING
+        asm.mov_ri(R11, 5); // TRUNCATE_EXISTING
+        asm.place(dispdone);
+        // CreateFileA(path, access, share=3, sec=NULL, disposition, NORMAL=0x80, tmpl=NULL).
+        asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
+        asm.mov_rr(RCX, RDI); // lpFileName = path
+        asm.mov_rr(RDX, R10); // dwDesiredAccess
+        asm.mov_ri(R8, 3); // dwShareMode = FILE_SHARE_READ|WRITE
+        asm.mov_ri(R9, 0); // lpSecurityAttributes = NULL
+        asm.emit(&[0x4C, 0x89, 0x5C, 0x24, 0x20]); // mov [rsp+32], r11 (dwCreationDisposition)
+        asm.store_rsp_imm(40, 0x80); // [rsp+40] = FILE_ATTRIBUTE_NORMAL
+        asm.store_rsp_imm(48, 0); // [rsp+48] = hTemplateFile = NULL
+        asm.call_extern(cf);
+        asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+    }
 }
 
 impl OsTarget for WindowsTarget {
@@ -111,17 +200,21 @@ impl OsTarget for WindowsTarget {
         asm.emit(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
     }
 
-    fn emit_write_stdout(&mut self, asm: &mut Asm) {
-        // WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), rsi, rdx, &written, NULL).
-        // A 72-byte frame (≡ 8 mod 16, so rsp is 16-aligned at each call) holds the
-        // shadow area, the 5th stack arg, a scratch `written` DWORD, and the saved
-        // buffer/length across the GetStdHandle call (which clobbers volatile rdx).
+    fn emit_std_write(&mut self, asm: &mut Asm) {
+        // StdWrite(fd, buf, n): rdi=fd, rsi=buf, rdx=n. Pick the handle from fd
+        // (2 ⇒ STD_ERROR_HANDLE −12, else STD_OUTPUT_HANDLE −11), then
+        // WriteFile(handle, buf, n, &written, NULL); return the written count in rax.
+        // Same 72-byte frame as emit_write_stdout (rsp stays 16-aligned at each call).
         let gsh = self.extern_idx("GetStdHandle");
         let wf = self.extern_idx("WriteFile");
         asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
         asm.emit(&[0x48, 0x89, 0x74, 0x24, 0x30]); // mov [rsp+48], rsi  (save buf)
         asm.emit(&[0x48, 0x89, 0x54, 0x24, 0x38]); // mov [rsp+56], rdx  (save len)
+        // ecx = (rdi == 2) ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE
         asm.emit(&[0xB9, 0xF5, 0xFF, 0xFF, 0xFF]); // mov ecx, -11 (STD_OUTPUT_HANDLE)
+        asm.emit(&[0x48, 0x83, 0xFF, 0x02]); // cmp rdi, 2
+        asm.emit(&[0x75, 0x05]); // jne +5 (keep stdout handle)
+        asm.emit(&[0xB9, 0xF4, 0xFF, 0xFF, 0xFF]); // mov ecx, -12 (STD_ERROR_HANDLE)
         asm.call_extern(gsh); // call [GetStdHandle] -> rax = handle
         asm.emit(&[0x48, 0x89, 0xC1]); // mov rcx, rax          (hFile)
         asm.emit(&[0x48, 0x8B, 0x54, 0x24, 0x30]); // mov rdx, [rsp+48]  (lpBuffer)
@@ -129,7 +222,60 @@ impl OsTarget for WindowsTarget {
         asm.emit(&[0x4C, 0x8D, 0x4C, 0x24, 0x28]); // lea r9, [rsp+40]   (&written)
         asm.emit(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp+32], 0
         asm.call_extern(wf); // call [WriteFile]
+        asm.emit(&[0x8B, 0x44, 0x24, 0x28]); // mov eax, [rsp+40]  (written → rax)
         asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+    }
+
+    fn is_posix(&self) -> bool {
+        false // the Windows PE has no Linux syscalls
+    }
+
+    fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp) {
+        // The fd args arrive in the System V registers (rdi/rsi/rdx); each op maps to a
+        // `kernel32` call (MS x64 ABI: rcx/rdx/r8/r9, stack args at [rsp+32]+, a 32-byte
+        // shadow area, rsp 16-aligned at the call). The "fd" is a Win32 HANDLE. Results
+        // follow the `io.hc` contract (count/offset/HANDLE, 0, or a negative error).
+        match op {
+            FileOp::Open => self.emit_open(asm), // CreateFileA, with io.hc flag → Win32 translation
+            FileOp::Read => self.emit_read_write(asm, "ReadFile"),
+            FileOp::Write => self.emit_read_write(asm, "WriteFile"),
+            FileOp::Close => {
+                // CloseHandle(hObject = handle). BOOL → 0 (success) / -1 (failure).
+                asm.mov_rr(RCX, RDI);
+                self.call_aligned(asm, "CloseHandle");
+                let fail = asm.new_label();
+                let done = asm.new_label();
+                asm.test_rr(RAX, RAX);
+                asm.je(fail);
+                asm.xor_rr(RAX, RAX); // success → 0
+                asm.jmp(done);
+                asm.place(fail);
+                asm.mov_ri(RAX, -1);
+                asm.place(done);
+            }
+            FileOp::LSeek => {
+                // SetFilePointerEx(hFile, liDistanceToMove=off, lpNewFilePointer=&newpos,
+                // dwMoveMethod=whence). io.hc SEEK_SET/CUR/END (0/1/2) == FILE_BEGIN/
+                // CURRENT/END. BOOL → newpos (64-bit) / -1. `newpos` is the [rsp+40] slot.
+                let wf = self.extern_idx("SetFilePointerEx");
+                asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
+                asm.mov_rr(R9, RDX); // dwMoveMethod = whence (before rdx is reused)
+                asm.mov_rr(RCX, RDI); // hFile = handle
+                asm.mov_rr(RDX, RSI); // liDistanceToMove = off (by value)
+                asm.emit(&[0x4C, 0x8D, 0x44, 0x24, 0x28]); // lea r8, [rsp+40] (&newpos)
+                asm.call_extern(wf);
+                let fail = asm.new_label();
+                let done = asm.new_label();
+                asm.test_rr(RAX, RAX);
+                asm.je(fail);
+                asm.emit(&[0x48, 0x8B, 0x44, 0x24, 0x28]); // mov rax, [rsp+40] (newpos)
+                asm.jmp(done);
+                asm.place(fail);
+                asm.mov_ri(RAX, -1);
+                asm.place(done);
+                asm.emit(&[0x48, 0x83, 0xC4, 0x48]); // add rsp, 72
+            }
+        }
     }
 
     fn emit_unix_ns(&mut self, asm: &mut Asm, ft: i32) {

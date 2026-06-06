@@ -61,6 +61,13 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // general fd ops shared by files and sockets; `Socket`/`Connect` are the
         // socket-specific pair. (The libs build `ReadFile`/`TcpConnect`/… on top.)
         "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" => Primitive,
+        // The standard-stream write primitive — `lib/io.hc` prototype. `StdWrite(fd,…)`
+        // writes to stdout (fd 1) or stderr (fd 2), *portably*: unlike `Write` (a POSIX
+        // fd op with no Windows mapping), it lowers per-target — the write syscall /
+        // libc on POSIX, `WriteFile(GetStdHandle(…))` on Windows — and the interpreter
+        // routes fd 1 to its captured output sink (fd 2 to real stderr). It is the sink
+        // primitive the HolyC print machinery is built on.
+        "StdWrite" => Primitive,
         // Filesystem mutation — `lib/os.hc` prototypes; impure, like the fd ops above.
         // Freestanding uses the aarch64 `*at` syscalls / x86-64 bare syscalls, Darwin
         // libc; the interpreter emulates over `std::fs`. Return 0, or `-errno`.

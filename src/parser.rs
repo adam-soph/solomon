@@ -1777,11 +1777,21 @@ fn parse_core(
     search: &[std::path::PathBuf],
     with_prelude: bool,
 ) -> PResult<Program> {
-    let known_types = hoist_type_names(src, dir, search, with_prelude)?;
+    let (known_types, uses_print) = hoist_type_names(src, dir, search, with_prelude)?;
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
-        pp = pp.with_prelude(prelude());
+        // The implicit prelude is `builtin.hc`, plus the printf family (`<fmt.hc>`)
+        // pulled in on demand whenever the program prints — a bare string statement and
+        // the `"fmt", …` comma form lower to `Print` calls, and `Print`/`StrPrint`/… are
+        // ordinary HolyC now, so their bodies must be in scope (there is no dead-code
+        // elimination). `<fmt.hc>` transitively pulls in the float formatter, so this
+        // also covers `%f`/`%e`/`%g`. The include guard makes a user `#include` a no-op.
+        let mut p = prelude().to_string();
+        if uses_print {
+            p.push_str("\n#include <fmt.hc>\n");
+        }
+        pp = pp.with_prelude(&p);
     }
     let mut parser = Parser::with_known_types(pp, known_types);
     let program = parser.parse_program()?;
@@ -1803,15 +1813,26 @@ fn hoist_type_names(
     dir: &std::path::Path,
     search: &[std::path::PathBuf],
     with_prelude: bool,
-) -> PResult<HashSet<String>> {
+) -> PResult<(HashSet<String>, bool)> {
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
         pp = pp.with_prelude(prelude());
     }
     let mut names = HashSet::new();
+    // Also note whether the program *prints*, so `parse_core` can pull in `<fmt.hc>`
+    // (the printf family) on demand — there is no dead-code elimination, so the
+    // `Print`/`StrPrint`/… bodies must be present only when used. A print is either a
+    // call to a print-family function by name, or a bare string / `"fmt", …` comma
+    // statement: a `Str` at a statement boundary followed by `;` (bare) or `,` (comma
+    // form). The boundary check avoids matching a string *expression*
+    // (`U8 *p = "x";`, `f("a", b)`), which would pull the machinery in needlessly.
+    let mut uses_print = false;
+    let mut at_boundary = true; // start of input begins a statement
+    let mut pending_str = false; // a Str seen at a statement boundary, awaiting `;`/`,`
     loop {
         let t = pp.next_token()?;
+        let (mut next_boundary, mut next_pending) = (false, false);
         match &t.kind {
             TokenKind::Eof => break,
             TokenKind::Keyword(Keyword::Class) | TokenKind::Keyword(Keyword::Union) => {
@@ -1819,10 +1840,37 @@ fn hoist_type_names(
                     names.insert(name.clone());
                 }
             }
+            TokenKind::Ident(name) => {
+                if matches!(
+                    name.as_str(),
+                    "Print" | "StrPrint" | "CatPrint" | "MStrPrint" | "F64ToStr"
+                ) {
+                    uses_print = true;
+                }
+            }
+            TokenKind::Str(_) => next_pending = at_boundary,
+            TokenKind::Semicolon => {
+                if pending_str {
+                    uses_print = true;
+                }
+                next_boundary = true;
+            }
+            TokenKind::Comma => {
+                if pending_str {
+                    uses_print = true;
+                }
+            }
+            // `{`/`}`/`)`/`:` begin a following statement (block, control-flow body,
+            // `else`/label), so a string just after one is a bare-string statement.
+            TokenKind::LBrace | TokenKind::RBrace | TokenKind::RParen | TokenKind::Colon => {
+                next_boundary = true;
+            }
             _ => {}
         }
+        at_boundary = next_boundary;
+        pending_str = next_pending;
     }
-    Ok(names)
+    Ok((names, uses_print))
 }
 
 // ---- generic-template handling ----

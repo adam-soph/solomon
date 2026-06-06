@@ -299,6 +299,61 @@ fn native_float_formatting_matches_interp_over_a_hard_battery() {
 }
 
 #[test]
+fn native_holyc_float_formatter_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // The pure-HolyC float formatter (`lib/fltfmt.hc`, the eventual replacement for
+    // the hand-emitted bignum) compiled by the **native** backend must match the
+    // interpreter running the same HolyC `_FmtFloat` — the first end-to-end test of
+    // the formatter as real machine code (proving the bignum codegens correctly).
+    let cases: &[(char, i64, usize, usize)] = &[
+        ('f', 0, 0, 6),
+        ('f', 8, 8, 2),  // zero-pad after sign
+        ('f', 4, 10, 3), // left-justify
+        ('f', 16, 0, 2), // plus
+        ('e', 0, 12, 3),
+        ('E', 0, 0, 6),
+        ('g', 0, 0, 6),
+        ('G', 64, 0, 4), // alt (#)
+        ('g', 16, 0, 6), // plus
+    ];
+    let values: &[f64] = &[
+        3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1000000.0, -0.001, 1e300,
+    ];
+    let mut src = String::from("#include <_impl/fltfmt.hc>\nU0 Main(){ U8 b[2048];\n");
+    for &(conv, flags, width, prec) in cases {
+        for &v in values {
+            src.push_str(&format!(
+                "_FmtFloat(b, Float64frombits(0x{:016X}), '{conv}', {flags}, {width}, {prec}); \"%s\\n\", b;\n",
+                v.to_bits()
+            ));
+        }
+    }
+    src.push_str("}\nMain;\n");
+    // `_FmtFloat` is private to the stdlib's `_impl/`, so root the parse in `lib/`
+    // (a program inside the `_impl/` parent subtree may call it).
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(&src, &lib, std::slice::from_ref(&lib)).expect("parse failed");
+    assert!(check_program(&program).is_empty(), "semantic errors");
+    let interp = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let out =
+        std::env::temp_dir().join(format!("solomon-arm64-fltfmt-{}-{id}", std::process::id()));
+    Arm64Darwin::new(&out)
+        .run(&program)
+        .expect("native build failed");
+    let output = Command::new(&out).output().expect("run failed");
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        interp,
+        "native _FmtFloat != interp"
+    );
+}
+
+#[test]
 fn compiles_integer_expressions_to_exit_code() {
     if !toolchain_available() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
