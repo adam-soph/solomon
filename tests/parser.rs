@@ -749,6 +749,26 @@ fn generic_param_requires_a_kind_keyword() {
 }
 
 #[test]
+fn function_pointer_type_aliases() {
+    // The C-style named function-pointer `typedef` (`typedef I64 (*Name)(args);`), which
+    // buries the alias name inside the declarator, is rejected...
+    let err = parse("typedef I64 (*F)(I64);").expect_err("named fn-ptr typedef must be rejected");
+    assert!(
+        err.to_string().contains("puts the name after the type"),
+        "expected guidance toward a valid form, got: {err}",
+    );
+    // ...in favour of two spellings: the trailing-name `typedef` (name after an anonymous
+    // function-pointer type)...
+    parse("typedef I64 (*)(I64) F; I64 Inc(I64 x) { return x + 1; } F a = &Inc;")
+        .expect("`typedef <ret> (*)(<args>) Name;` should parse");
+    // ...and the keyword-less bare-declarator form.
+    parse("I64 (*G)(I64); I64 Inc(I64 x) { return x + 1; } G b = &Inc;")
+        .expect("keyword-less fn-ptr type should parse");
+    // A non-function-pointer `typedef` still works.
+    parse("typedef I64 MyInt; MyInt x = 1;").expect("scalar typedef should still parse");
+}
+
+#[test]
 fn generic_function_infers_type_args() {
     // `Id<type T>(T)` called as `Id(1)` infers `T=I64`. That generates `2IdI64` and
     // resolves the un-annotated call to it.

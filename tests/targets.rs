@@ -89,8 +89,7 @@ fn aarch64_freestanding_globals_and_runtime_need_no_libc() {
     // relocation. Behaviour is checked against the interpreter by the per-target
     // conformance suites.
     let program = checked(
-        r#"#include <cstr.hc>
-           #include <mem.hc>
+        r#"#include <string.hc>
            I64 g = 5; U0 Main(){ U8 *b = MAlloc(32); StrCpy(b, "hi"); StrCat(b, "!");
            "%s %d %d\n", b, StrLen(b), g; } Main;"#,
     );

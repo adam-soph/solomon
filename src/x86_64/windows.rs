@@ -122,7 +122,7 @@ impl WindowsTarget {
         asm.mov_rr(super::RSP, R15); // restore rsp
     }
 
-    /// Lowers `Open(path, flags, mode)` to `CreateFileA`. Translates the `io.hc`
+    /// Lowers `Open(path, flags, mode)` to `CreateFileA`. Translates the `fcntl.hc`
     /// open flags (`O_RDONLY`/`O_WRONLY`/`O_RDWR` plus `O_CREAT`/`O_TRUNC`) into
     /// the Win32 access mask (r10) and creation disposition (r11). `mode` is
     /// ignored, as Windows has no POSIX permission bits. Returns the HANDLE, or
@@ -251,10 +251,10 @@ impl OsTarget for WindowsTarget {
         // The fd args arrive in the System V registers (rdi/rsi/rdx). Each op maps
         // to a `kernel32` call under the MS x64 ABI: args in rcx/rdx/r8/r9, stack
         // args at [rsp+32] and up, a 32-byte shadow area, and rsp 16-aligned at
-        // the call. The "fd" is a Win32 HANDLE. Results follow the `io.hc`
+        // the call. The "fd" is a Win32 HANDLE. Results follow the `unistd.hc`
         // contract: a count, offset, or HANDLE; 0; or a negative error.
         match op {
-            FileOp::Open => self.emit_open(asm), // CreateFileA, with io.hc flag → Win32 translation
+            FileOp::Open => self.emit_open(asm), // CreateFileA, with fcntl.hc flag → Win32 translation
             FileOp::Read => self.emit_read_write(asm, "ReadFile"),
             FileOp::Write => self.emit_read_write(asm, "WriteFile"),
             FileOp::Close => {
@@ -273,7 +273,7 @@ impl OsTarget for WindowsTarget {
             }
             FileOp::LSeek => {
                 // SetFilePointerEx(hFile, liDistanceToMove=off, lpNewFilePointer=&newpos,
-                // dwMoveMethod=whence). io.hc SEEK_SET/CUR/END (0/1/2) == FILE_BEGIN/
+                // dwMoveMethod=whence). unistd.hc SEEK_SET/CUR/END (0/1/2) == FILE_BEGIN/
                 // CURRENT/END. BOOL → newpos (64-bit) / -1. `newpos` is the [rsp+40] slot.
                 let wf = self.extern_idx("SetFilePointerEx");
                 asm.mov_rr(R15, super::RSP); // save rsp (non-volatile; survives the call)
@@ -329,8 +329,8 @@ impl OsTarget for WindowsTarget {
         // of "KEY=VALUE\0" strings from GetEnvironmentStringsA. Build a NULL-terminated
         // pointer array (`U8 **EnvP`) over that block — each entry points straight into
         // the block (already NUL-separated, no copy). This runs at the entry before any
-        // program code, so it may clobber any register. (`os.hc`'s `Environ`/`Getenv`
-        // are pure HolyC over `EnvP`, so they now work on Windows too.)
+        // program code, so it may clobber any register. (`stdlib.hc`'s `Getenv` and
+        // `vec.hc`'s `Environ` are pure HolyC over `EnvP`, so they now work on Windows too.)
         let ges = self.extern_idx("GetEnvironmentStringsA");
         let va = self.extern_idx("VirtualAlloc");
 

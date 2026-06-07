@@ -56,9 +56,6 @@ pub fn analyze(program: &Program) -> Result<(), Vec<SemaError>> {
 /// A class or union definition, flattened for field lookup. Each field keeps its
 /// source position so type-reference errors can point at it.
 struct TypeDef {
-    /// Whether this is a `union` (vs a `class`). Two same-fielded types of different
-    /// kinds are *not* structurally compatible.
-    is_union: bool,
     fields: Vec<(String, Type, Pos)>,
     base: Option<String>,
     /// Position of the definition, used to locate base-class errors.
@@ -200,7 +197,6 @@ impl Analyzer {
                 self.types.insert(
                     c.name.clone(),
                     TypeDef {
-                        is_union: c.is_union,
                         fields,
                         base: c.base.clone(),
                         base_pos: item.span.pos,
@@ -1122,21 +1118,20 @@ impl Analyzer {
     fn check_call(&mut self, callee: &Expr, args: &[Expr]) -> Type {
         // Always resolve the argument types first.
         let argc = args.len();
-        for a in args {
-            self.check_expr(a);
-        }
+        let arg_types: Vec<Type> = args.iter().map(|a| self.check_expr(a)).collect();
         // A direct call to a named function or builtin, unless a local variable of
         // the same name shadows it — in which case it is a function-pointer call.
         if let ExprKind::Ident(name) = &callee.kind {
             if self.lookup_var(name).is_none() {
                 if let Some(sig) = self.funcs.get(name) {
-                    let (required, total, varargs, ret, is_public, file) = (
+                    let (required, total, varargs, ret, is_public, file, params) = (
                         sig.required,
                         sig.total,
                         sig.varargs,
                         sig.ret.clone(),
                         sig.is_public,
                         sig.file,
+                        sig.params.clone(),
                     );
                     self.check_visibility(is_public, file, callee.span.file, name, callee.span.pos);
                     let ok = if varargs {
@@ -1156,6 +1151,15 @@ impl Analyzer {
                             callee.span.pos,
                             format!("function `{name}` expects {expected} argument(s), got {argc}"),
                         );
+                    }
+                    // Aggregate arguments are nominally checked against their parameter
+                    // type (scalar/pointer conversions stay permissive); extras past the
+                    // declared params are varargs and untyped.
+                    for (i, pty) in params.iter().enumerate() {
+                        if i >= argc {
+                            break;
+                        }
+                        self.check_arg(pty, &arg_types[i], i, args[i].span.pos);
                     }
                     return ret;
                 }
@@ -1178,10 +1182,45 @@ impl Analyzer {
                     ),
                 );
             }
+            for (i, pty) in params.iter().enumerate() {
+                if i >= argc {
+                    break;
+                }
+                self.check_arg(pty, &arg_types[i], i, args[i].span.pos);
+            }
             return *ret;
         }
         self.error(callee.span.pos, "called value is not a function");
         Type::I64
+    }
+
+    /// Check that argument `idx` (0-based) is type-compatible with its parameter. Only
+    /// genuine **aggregate** mismatches are flagged — a `class`/`union` value must match
+    /// its parameter's named type (nominal). Scalar and pointer arguments stay permissive
+    /// (int/float/pointer conversions, `NULL`, array decay), matching `check_assignable`.
+    fn check_arg(&mut self, param: &Type, arg: &Type, idx: usize, pos: Pos) {
+        let p = Self::decay(param.clone());
+        let a = Self::decay(arg.clone());
+        if self.types_compatible(&p, &a) {
+            return;
+        }
+        let n = idx + 1;
+        match (&p, &a) {
+            (Type::Named(pn), Type::Named(an)) => self.error(
+                pos,
+                format!("argument {n}: cannot pass `{an}` to a parameter of type `{pn}`"),
+            ),
+            (Type::Named(pn), _) => self.error(
+                pos,
+                format!("argument {n}: cannot pass a scalar to the class parameter `{pn}`"),
+            ),
+            (_, Type::Named(an)) => self.error(
+                pos,
+                format!("argument {n}: cannot pass class type `{an}` to a scalar parameter"),
+            ),
+            // Scalar/pointer args stay permissive (matching `check_assignable`).
+            _ => {}
+        }
     }
 
     fn check_index(&mut self, base: &Expr, index: &Expr) -> Type {
@@ -1331,34 +1370,29 @@ impl Analyzer {
         }
     }
 
-    /// Whether two types are **structurally compatible** — assignable across each
-    /// other regardless of name.
-    ///
-    /// Aggregates compare by *shape*: same kind (class vs union) and the same ordered
-    /// `(field name, field type)` list, recursively. So a `Pair`, an anonymous
-    /// `class { I64 x; I64 y; }`, and a `typedef` of either are interchangeable, while
-    /// differing field names, field types, arity, or struct-vs-union are not. Scalars
-    /// (and pointers/funcptrs as operands) are handled by [`Self::check_assignable`]'s
-    /// permissive fall-through, not here — `types_compatible` is *exact* about
-    /// non-aggregates so that nested field types are compared faithfully.
+    /// Whether two types are assignable across each other. Aggregates are **nominal**:
+    /// a `class`/`union` value is compatible only with the *same* named type — two
+    /// differently-named classes never assign across each other even with identical
+    /// fields (matching HolyC, which is nominally typed; reinterpret via a pointer cast,
+    /// `union`, or `MemCpy` instead). Identical anonymous or tuple types intern to one
+    /// synthetic name, so they still match. Pointers/arrays/funcptrs compare
+    /// component-wise (so an array dim written `[3]` matches `[1 + 2]`); scalars and
+    /// pointers as operands are otherwise handled by [`Self::check_assignable`]'s
+    /// permissive fall-through.
     fn types_compatible(&self, a: &Type, b: &Type) -> bool {
-        let mut seen = HashSet::new();
-        self.compat(&Self::decay(a.clone()), &Self::decay(b.clone()), &mut seen)
+        self.compat(&Self::decay(a.clone()), &Self::decay(b.clone()))
     }
 
-    /// The coinductive core of [`Self::types_compatible`]. `seen` records the
-    /// `(name, name)` aggregate pairs currently being compared; re-encountering one is
-    /// *assumed* compatible, so mutually-recursive types (`class Node { Node *next; }`)
-    /// terminate instead of looping. Inner types are compared raw (no decay), so an
-    /// inline array field never matches a pointer field.
-    fn compat(&self, a: &Type, b: &Type, seen: &mut HashSet<(String, String)>) -> bool {
+    /// The recursive core of [`Self::types_compatible`]. Inner types are compared raw (no
+    /// decay), so an inline array field never matches a pointer field.
+    fn compat(&self, a: &Type, b: &Type) -> bool {
         if a == b {
             return true;
         }
         match (a, b) {
-            (Type::Ptr(x), Type::Ptr(y)) => self.compat(x, y, seen),
+            (Type::Ptr(x), Type::Ptr(y)) => self.compat(x, y),
             (Type::Array(x, dx), Type::Array(y, dy)) => {
-                array_dims_equal(dx, dy) && self.compat(x, y, seen)
+                array_dims_equal(dx, dy) && self.compat(x, y)
             }
             (
                 Type::FuncPtr {
@@ -1371,29 +1405,13 @@ impl Analyzer {
                 },
             ) => {
                 p1.len() == p2.len()
-                    && self.compat(r1, r2, seen)
-                    && p1.iter().zip(p2).all(|(x, y)| self.compat(x, y, seen))
+                    && self.compat(r1, r2)
+                    && p1.iter().zip(p2).all(|(x, y)| self.compat(x, y))
             }
-            (Type::Named(x), Type::Named(y)) => {
-                if seen.contains(&(x.clone(), y.clone())) || seen.contains(&(y.clone(), x.clone()))
-                {
-                    return true; // already comparing this pair — assume compatible
-                }
-                seen.insert((x.clone(), y.clone()));
-                let (Some(dx), Some(dy)) = (self.types.get(x), self.types.get(y)) else {
-                    return x == y; // an unknown type is compatible only with itself
-                };
-                if dx.is_union != dy.is_union {
-                    return false;
-                }
-                let fx = self.class_fields(x);
-                let fy = self.class_fields(y);
-                fx.len() == fy.len()
-                    && fx
-                        .iter()
-                        .zip(&fy)
-                        .all(|((nx, tx), (ny, ty))| nx == ny && self.compat(tx, ty, seen))
-            }
+            // Nominal aggregates: a `class`/`union` matches only the same named type. (The
+            // `a == b` check above already accepts identical names, including the one
+            // synthetic name shared by identical anonymous/tuple types.)
+            (Type::Named(x), Type::Named(y)) => x == y,
             _ => false,
         }
     }
@@ -1427,8 +1445,8 @@ impl Analyzer {
 
 /// Whether two array dimensions denote the same length: both unsized, or both
 /// constant-folding to the same value (falling back to structural expression equality
-/// when they aren't constant). Distinguishes `I64 a[4]` from `I64 a[8]` when comparing
-/// aggregate field types structurally.
+/// when they aren't constant). Distinguishes `I64 a[4]` from `I64 a[8]` when `compat`
+/// compares array types (so `[3]` matches `[1 + 2]`).
 fn array_dims_equal(a: &Option<Box<Expr>>, b: &Option<Box<Expr>>) -> bool {
     match (a, b) {
         (None, None) => true,

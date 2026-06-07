@@ -4,7 +4,7 @@
 // changes — the sort itself is element-size agnostic, monomorphized per `T`.
 
 #include <vec.hc>    // Vec<T> + VecSort/VecBSearch (pulls in <sort.hc>)
-#include <cstr.hc>   // CmpStr (the U8 * string comparator)
+#include <string.hc>   // CmpStr (the U8 * string comparator)
 
 U0 Main()
 {

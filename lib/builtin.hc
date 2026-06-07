@@ -7,7 +7,7 @@
 // true builtins: the predefined constants, and the primitives that can't be ordinary
 // library functions because they read hidden globals or need ABI support. The
 // backends and interpreter still lower these specially; the prototypes below only
-// give sema their signatures, exactly like the printf family in <fmt.hc>.
+// give sema their signatures, exactly like the printf family in <stdio.hc>.
 
 // Predefined constants.
 #define NULL  0
@@ -19,7 +19,8 @@
 // `malloc`/`free` hosted). Like the command line below, they are ambient with no
 // `#include`. `MAlloc(n)` returns `n` uninitialised bytes; `Free(p)` releases them (a
 // no-op on the bump allocators). The advanced heap primitives `HeapExtend`/`MSize` and
-// the `mem*`/`ReAlloc` helpers built on these stay in <mem.hc>.
+// the `ReAlloc`/`CAlloc` helpers built on these live in `<stdlib.hc>`; the `mem*` family
+// is in `<string.hc>`.
 public U8 *MAlloc(I64 n);
 public U0 Free(U8 *ptr);
 
@@ -34,7 +35,7 @@ public U0 Free(U8 *ptr);
 // The environment is the implicit global `U8 **EnvP`, a NULL-terminated array of
 // "KEY=VALUE" strings. It is captured at the entry, like the command line, and is
 // sema-injected (only documented here). It is the low-level primitive: for a lookup
-// by name, use `Getenv("NAME")` from `<os.hc>` (pure HolyC over `EnvP`). Walk `EnvP`
+// by name, use `Getenv("NAME")` from `<stdlib.hc>` (pure HolyC over `EnvP`). Walk `EnvP`
 // directly only to iterate the whole environment:
 //
 //   extern U8   **EnvP;   // I64 i = 0; while (EnvP[i]) { /* "%s\n", EnvP[i]; */ i++; }

@@ -2,7 +2,7 @@
 // RandU64 PRNG. Because RandU64 is seeded the same in both backends, the result
 // is reproducible and identical between the interpreter and native code.
 
-#include <rand.hc>   // RandU64
+#include <stdlib.hc>   // RandU64
 
 #define N 10
 

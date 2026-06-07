@@ -11,8 +11,7 @@
 // documented divergence. Simplifications: number exponents (`1e3`) are not
 // handled, and containers hold up to 32 elements.
 
-#include <cstr.hc>
-#include <mem.hc>    // MAlloc/Free
+#include <string.hc>
 
 #define J_NULL 0
 #define J_BOOL 1

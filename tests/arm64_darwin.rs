@@ -307,7 +307,7 @@ fn native_holyc_float_formatter_matches_interp() {
         return;
     }
     // Checks the pure-HolyC float formatter as real machine code. The native backend
-    // compiles `FmtFloat` (in `lib/fltfmt.hc`), and its output must match the
+    // compiles `FmtFloat` (in `lib/stdio.hc`), and its output must match the
     // interpreter running the same HolyC `FmtFloat`. This confirms the formatter's
     // base-2^32 bignum codegens correctly.
     let cases: &[(char, i64, usize, usize)] = &[
@@ -324,7 +324,7 @@ fn native_holyc_float_formatter_matches_interp() {
     let values: &[f64] = &[
         3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1000000.0, -0.001, 1e300,
     ];
-    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){ U8 b[2048];\n");
+    let mut src = String::from("#include <stdio.hc>\n#include <math.hc>\nU0 Main(){ U8 b[2048];\n");
     for &(conv, flags, width, prec) in cases {
         for &v in values {
             src.push_str(&format!(
@@ -334,8 +334,8 @@ fn native_holyc_float_formatter_matches_interp() {
         }
     }
     src.push_str("}\nMain;\n");
-    // `FmtFloat` is private (it lives in the `_`-prefixed `fltfmt.hc`), so root the
-    // parse in `lib/` — a program inside the stdlib subtree may call it.
+    // `FmtFloat` lives in `<stdio.hc>` (with its private helpers); root the parse in
+    // `lib/` so the call resolves against the embedded stdlib like any in-tree caller.
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let program = parse_with(&src, &lib, std::slice::from_ref(&lib)).expect("parse failed");
     assert!(check_program(&program).is_empty(), "semantic errors");
@@ -2239,11 +2239,19 @@ fn compiles_function_pointers() {
              I64 (*fp)(I64, I64) = &Add; return fp(40, 2);",
             42,
         ),
-        // reassign the pointer between calls
+        // reassign the pointer between calls (a global fn-ptr now needs an initializer,
+        // since a bare top-level `I64 (*fp)(I64);` declares a *type* — see below)
         (
             "I64 A(I64 x){ return x + 1; } I64 B(I64 x){ return x * 2; } \
-             I64 (*fp)(I64); fp = &A; I64 r = fp(10); fp = &B; return r + fp(10);",
+             I64 (*fp)(I64) = NULL; fp = &A; I64 r = fp(10); fp = &B; return r + fp(10);",
             31,
+        ),
+        // a bare top-level fn-ptr declarator names a *type* (a `typedef` without the
+        // keyword); use it as a parameter type
+        (
+            "I64 Add(I64 a, I64 b){ return a + b; } I64 (*BinOp)(I64, I64); \
+             I64 Apply(BinOp op, I64 x, I64 y){ return op(x, y); } return Apply(&Add, 19, 23);",
+            42,
         ),
         // a callback parameter
         (
@@ -2295,13 +2303,13 @@ fn compiles_typedef() {
         ("typedef I64 MyInt; MyInt x = 40; return x + 2;", 42),
         // a function-pointer alias
         (
-            "typedef I64 (*Fn)(I64); I64 Inc(I64 x){ return x + 1; } \
+            "I64 (*Fn)(I64); I64 Inc(I64 x){ return x + 1; } \
              Fn f = &Inc; return f(41);",
             42,
         ),
         // a function returning a typedef'd function pointer (unblocked by typedef)
         (
-            "typedef I64 (*Fn)(I64); I64 Dbl(I64 x){ return x * 2; } \
+            "I64 (*Fn)(I64); I64 Dbl(I64 x){ return x * 2; } \
              Fn Get(){ return &Dbl; } return Get()(21);",
             42,
         ),
@@ -2479,7 +2487,7 @@ fn native_exceptions_are_per_thread() {
     }
     let out = build_and_capture(
         r#"
-        #include <thread.hc>
+        #include <threads.hc>
         I64 Worker(I64 id) {
           I64 got = -1;
           try { throw(id * 100); }
@@ -2568,12 +2576,12 @@ fn native_exit_sets_status_and_halts() {
     // `Exit(code)` lowers to libc `exit` (Darwin): the process status is the code and
     // statements after it don't run. `build_and_run` returns the exit status.
     assert_eq!(
-        build_and_run("#include <os.hc>\nU0 Main() { Exit(42); } Main;"),
+        build_and_run("#include <stdlib.hc>\nU0 Main() { Exit(42); } Main;"),
         42
     );
     // Output before the exit is produced; code after the exit is skipped.
     assert_eq!(
-        build_and_capture("#include <os.hc>\nU0 Main() { \"x\\n\"; Exit(0); \"y\\n\"; } Main;"),
+        build_and_capture("#include <stdlib.hc>\nU0 Main() { \"x\\n\"; Exit(0); \"y\\n\"; } Main;"),
         "x\n"
     );
 }

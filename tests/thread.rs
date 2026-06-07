@@ -18,7 +18,7 @@ use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
 /// Spawn four threads computing `Square(i)` for i in 2..=5, join them, and print each
 /// result and the total. The stdout is deterministic regardless of thread interleaving.
 const PROGRAM: &str = r#"
-    #include <thread.hc>
+    #include <threads.hc>
     I64 Square(I64 x) { return x * x; }
     U0 Main() {
       I64 h[4];
@@ -43,7 +43,7 @@ const EXPECTED: &str = "t0=4\nt1=9\nt2=16\nt3=25\ntotal=54\n";
 /// race — a shared global would corrupt the caught values. Deterministic regardless of
 /// interleaving (results are reported in join order).
 const EXC_PROGRAM: &str = r#"
-    #include <thread.hc>
+    #include <threads.hc>
     I64 Worker(I64 id) {
       I64 got = -1;
       try { throw(id * 100); }

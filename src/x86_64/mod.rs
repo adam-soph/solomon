@@ -80,13 +80,13 @@
 //! stack while the right is computed, so values survive nested calls. An lvalue's
 //! address is computed by `gen_addr`, with a width-aware load/store through it.
 //!
-//! Printing needs no libc. A tiny emitted runtime (`fmt_int`/`fmt_str`, mirroring
-//! [`crate::fmt`]) formats integers/strings into a BSS scratch buffer and hands
-//! them to a single output sink, `out_write`. The sink writes via the `write`
-//! syscall when the `out_ptr` global is 0, otherwise it appends to a destination
-//! buffer — so the same format machinery serves both `Print` and
-//! `StrPrint`/`CatPrint`. For `MStrPrint` the sink *grows* the buffer (reallocs)
-//! on overflow, like libc `vasprintf`.
+//! Printing needs no libc and no native formatter. The whole printf family
+//! (`Print`/`StrPrint`/`CatPrint`/`MStrPrint` and the `VFmt`/`FmtFloat` core) is pure
+//! HolyC in `<stdio.hc>`, auto-included when a program prints; this backend just
+//! compiles those bodies and calls them. A bare string prints verbatim and the
+//! `"fmt", …` comma form synthesizes a `Print(fmt, …)` call (`gen_print`/`as_print`).
+//! The one irreducible leaf is `StdWrite`, lowered per-OS to the `write` syscall — the
+//! single sink all of the above bottoms out at.
 //!
 //! String literals live after the code, RIP-relative addressed. The ELF layout is
 //! `[ELF header | one PT_LOAD | code | strings | BSS]`, mapped R+W+X at `0x400000`
@@ -158,7 +158,7 @@ trait OsTarget {
     /// byte count, offset, 0, or a negative error. Linux uses the raw syscall.
     /// Windows uses the matching `kernel32` call
     /// (`CreateFileA`/`ReadFile`/`WriteFile`/`CloseHandle`/`SetFilePointerEx`), with
-    /// the `io.hc` open flags translated to Win32.
+    /// the `fcntl.hc` open flags translated to Win32.
     fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp);
 
     /// Read the wall clock into `rax` as nanoseconds since the Unix epoch. `scratch`
@@ -2059,7 +2059,7 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower an atomic op (`sync.hc`), width-directed by the pointer's pointee type
+    /// Lower an atomic op (`atomic.hc`), width-directed by the pointer's pointee type
     /// (1/2/4/8 bytes). On x86-64 a plain aligned `mov` already gives an atomic
     /// acquire load / release store; add/swap/cas use the `lock`-prefixed
     /// `xadd`/`xchg`/`cmpxchg`. The loaded value is sign/zero-extended to the pointee
@@ -2164,7 +2164,7 @@ impl Cg {
                 Ok(())
             }
             // The printf family `Print`/`StrPrint`/`CatPrint`/`MStrPrint` is pure
-            // HolyC now (`lib/fmt.hc`), so it is compiled and called like any
+            // HolyC now (`lib/stdio.hc`), so it is compiled and called like any
             // function, not lowered here.
             // Portable standard-stream write (fd 1 = stdout, 2 = stderr). Unlike the
             // Linux-only raw-syscall `Write` below, this goes through the OS seam, so
@@ -2644,7 +2644,7 @@ impl Cg {
     // ---- printing ----
 
     /// Lower a printf-style print of the literal format `fmt` with `args`. Printing
-    /// is the pure-HolyC `Print` now, auto-included via `<fmt.hc>` when a program
+    /// is the pure-HolyC `Print` now, auto-included via `<stdio.hc>` when a program
     /// prints, so this synthesizes `Print(fmt, args…)` and emits it as an ordinary
     /// call to the compiled body. Target-independent (Linux ELF and Windows PE): the
     /// HolyC `Print` ultimately calls `StdWrite`, which the OS seam lowers per

@@ -119,7 +119,7 @@ impl OsTarget for LinuxTarget {
 
     fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp) {
         // The fd args are already in rdi/rsi/rdx, since the System V registers
-        // coincide with the syscall registers. The `io.hc` open flags are already
+        // coincide with the syscall registers. The `fcntl.hc` open flags are already
         // Linux's, so each op is a plain syscall: open 2, read 0, write 1, close
         // 3, lseek 8. The result is left in rax.
         let nr = match op {

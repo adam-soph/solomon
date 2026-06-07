@@ -19,8 +19,7 @@ use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
 // atomic counter under real threads, the mutex on its *uncontended* fast path
 // (single-threaded, no kernel block), a fence, and the full width matrix.
 const PROGRAM: &str = r#"
-    #include <sync.hc>
-    #include <thread.hc>
+    #include <threads.hc>
     I64 acount = 0;
     Mutex mu;
     I64 mcount = 0;
@@ -61,8 +60,7 @@ const EXPECTED: &str =
 // arm64 Darwin here, and the freestanding Linux path on a native linux/aarch64 or
 // linux/x86_64 host (e.g. CI).
 const CONTENDED: &str = r#"
-    #include <sync.hc>
-    #include <thread.hc>
+    #include <threads.hc>
     Mutex mu;
     I64 mcount = 0;
     I64 MWorker(I64 n) { I64 i; for (i = 0; i < 2000; i++) { MutexLock(&mu); mcount++; MutexUnlock(&mu); } return 0; }
@@ -81,9 +79,8 @@ const CONTENDED_EXPECTED: &str = "mcount=8000\n";
 // predicate and `CondBroadcast`s, then each bumps `done`. The synchronous interpreter
 // can't model a consumer that waits for a later producer, so this is native-only.
 const CONDVAR: &str = r#"
-    #include <sync.hc>
+    #include <threads.hc>
     #include <time.hc>
-    #include <thread.hc>
     Mutex mu;
     Cond cv;
     I64 go = 0;
@@ -112,8 +109,7 @@ const CONDVAR_EXPECTED: &str = "done=4\n";
 // read-locked read). The writes are mutually exclusive, so the counter is exactly 4000.
 // This is interleaving-independent, so the synchronous interpreter handles it too.
 const RWLOCK: &str = r#"
-    #include <sync.hc>
-    #include <thread.hc>
+    #include <threads.hc>
     RwLock rw;
     I64 counter = 0;
     I64 W(I64 n) {

@@ -12,16 +12,17 @@
 //     I64 x = VecAt(&v, 0);
 //     VecFree(&v);
 //
-// It works for scalar, pointer, and class element types. It is built on `<mem.hc>`'s
-// `ReAlloc`, so a push loop grows the buffer in place, and on `<sort.hc>` for
-// `VecSort`/`VecBSearch`. The implementation is pure HolyC and behaves identically on
-// the interpreter and every backend. Include with `#include <vec.hc>`.
+// It works for scalar, pointer, and class element types. It is built on `<stdlib.hc>`'s
+// `ReAlloc` (a push loop grows the buffer in place) and `Sort`/`BSearch` (`VecSort`/
+// `VecBSearch`), plus `<string.hc>`'s `MemCpy` for `VecClone`. The implementation is pure
+// HolyC and behaves identically on the interpreter and every backend. Include with
+// `#include <vec.hc>`.
 //
 // The caller owns the `Vec` struct, and `VecInit(&v)` is required before use. A `Vec`
 // owns its buffer: copy it with `VecClone` (not `=`), and free it with `VecFree`.
 
-#include <mem.hc>
-#include <sort.hc>
+#include <string.hc>   // MemCpy (VecClone)
+#include <stdlib.hc>   // ReAlloc (VecReserve), Sort / BSearch (VecSort / VecBSearch)
 
 public class Vec<type T> {
   T  *data;   // heap buffer of `cap` elements, or NULL before the first allocation
@@ -79,7 +80,7 @@ U0 VecClone<type T>(Vec<T> *dst, Vec<T> *src)
   dst->len = src->len;
 }
 
-// Sort the elements in place by `cmp`, a `<sort.hc>` comparator over element pointers
+// Sort the elements in place by `cmp`, a `<stdlib.hc>` comparator over element pointers
 // (`I64 (*)(T *, T *)`).
 U0 VecSort<type T>(Vec<T> *v, I64 (*cmp)(T *, T *))
 {
@@ -93,6 +94,23 @@ I64 VecBSearch<type T>(Vec<T> *v, T *key, I64 (*cmp)(T *, T *))
   T *p = BSearch<T>(key, v->data, v->len, cmp);
   if (p == NULL) return -1;
   return p - v->data;
+}
+
+// Collect every environment entry ("KEY=VALUE", a `U8 *`) into `out`, a `Vec<U8 *>`
+// initialised here, in the OS's order. Read an entry with `VecAt(&out, i)`. This builds
+// a `Vec` from the implicit `EnvP` (C's `environ`), so it lives here next to `Vec`
+// rather than in `<stdlib.hc>` (where the scalar `Getenv` is). The entries point into
+// the process environment and are read-only. `VecFree(&out)` frees the Vec's own buffer,
+// not the entries.
+public U0 Environ(Vec<U8 *> *out)
+{
+  VecInit(out);
+  if (EnvP == NULL) return;   // no environment (e.g. Windows, for now)
+  I64 i = 0;
+  while (EnvP[i] != NULL) {
+    VecPush(out, EnvP[i]);
+    i++;
+  }
 }
 
 #endif

@@ -17,7 +17,6 @@ use std::collections::HashMap;
 
 use crate::ast::{Expr, ExprKind, Stmt, StmtKind, Type};
 use crate::codegen::CodegenError;
-use crate::fmt::Spec;
 use crate::layout::Layouts;
 use crate::token::Pos;
 
@@ -592,59 +591,4 @@ pub fn classify_args<'a>(
         }
     }
     Ok(out)
-}
-
-/// The packed flag bits passed to the emitted `printf` runtime — `FmtInt`, `FmtStr`,
-/// and the float formatters — in both backends.
-///
-/// The bit *values* are a shared runtime ABI. [`spec_flags`] sets them and each
-/// backend's emitted formatter tests them, so the two definitions must agree. They
-/// are defined once here as `i64`. The x86-64 backend re-exposes them as `i32`
-/// derived from these, so they can't drift.
-pub const F_SIGNED: i64 = 1; // signed conversion (`%d`/`%i`): emit a sign, magnitude in digits
-pub const F_UPPER: i64 = 2; // uppercase hex (`%X`) and `0X` prefix
-pub const F_MINUS: i64 = 4; // left-justify
-pub const F_ZERO: i64 = 8; // zero-pad
-pub const F_PLUS: i64 = 16; // always show a sign
-pub const F_SPACE: i64 = 32; // space before a non-negative
-pub const F_HASH: i64 = 64; // alternate form (`0x`/leading `0`)
-
-/// Pack a parsed [`Spec`]'s presentation flags into the runtime flag word (the `F_*`
-/// bits above).
-///
-/// The conversion-derived flags `F_SIGNED` and `F_UPPER` are added by the caller via
-/// [`int_conv`], since they depend on the conversion character rather than the flag
-/// run.
-pub fn spec_flags(spec: &Spec) -> i64 {
-    let mut flags = 0;
-    if spec.minus {
-        flags |= F_MINUS;
-    }
-    if spec.plus {
-        flags |= F_PLUS;
-    }
-    if spec.space {
-        flags |= F_SPACE;
-    }
-    if spec.zero {
-        flags |= F_ZERO;
-    }
-    if spec.hash {
-        flags |= F_HASH;
-    }
-    flags
-}
-
-/// The `(radix, extra_flags)` for an integer conversion (`d i u x X o`).
-///
-/// The extra flags fold the conversion's signedness and case into the flag word:
-/// `%d`/`%i` are `F_SIGNED`, `%X` is `F_UPPER`, and the rest add nothing.
-pub fn int_conv(conv: char) -> (i64, i64) {
-    match conv {
-        'd' | 'i' => (10, F_SIGNED),
-        'u' => (10, 0),
-        'x' => (16, 0),
-        'X' => (16, F_UPPER),
-        _ => (8, 0), // 'o'
-    }
 }

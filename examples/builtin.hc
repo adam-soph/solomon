@@ -7,8 +7,7 @@
 // would be only "whatever the host libm does," with no portable solomon
 // semantics, so they're left to a future HolyC standard library.)
 
-#include <cstr.hc>    // StrLen/StrCmp/StrCpy/StrCat
-#include <mem.hc>     // MemCpy/MemSet/MemCmp
+#include <string.hc>  // StrLen/StrCmp/StrCpy/StrCat + MemCpy/MemSet/MemCmp
 #include <ctype.hc>   // ToUpper
 #include <math.hc>    // Sqrt
 

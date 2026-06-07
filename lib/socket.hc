@@ -1,17 +1,18 @@
-#ifndef _NET_HC
-#define _NET_HC
-// net.hc — TCP networking over the raw BSD socket primitives.
+#ifndef _SOCKET_HC
+#define _SOCKET_HC
+// socket.hc — TCP networking over the raw BSD socket primitives (C `<sys/socket.h>` /
+// `<netinet/in.h>` / `<arpa/inet.h>`, consolidated).
 //
-// `Socket`/`Connect` are intrinsics: the prototypes live here, and the compiler
-// lowers them to socket syscalls on the freestanding targets, or to libc on Darwin.
-// The fd I/O primitives `Read`/`Write`/`Close` (and `WriteAll`) are shared with
-// files, in `<io.hc>`. They do real, impure network I/O, so a program using them is
-// not reproducible; conformance is by property, not by interp-vs-native value. On top
-// of these primitives the module builds `ParseIPv4`, `MakeSockaddr`, `TcpConnect`, and
-// a minimal `HttpGet`. Include with `#include <net.hc>`.
+// `Socket`/`Connect` are intrinsics: the prototypes live here, and the compiler lowers
+// them to socket syscalls on the freestanding targets, or to libc on Darwin. The fd I/O
+// primitives `Read`/`Write`/`Close` (and `WriteAll`) are shared with files, in
+// `<unistd.hc>`. They do real, impure network I/O, so a program using them is not
+// reproducible; conformance is by property, not by interp-vs-native value. On top of
+// these primitives the module builds `ParseIPv4`, `MakeSockaddr`, `TcpConnect`, and a
+// minimal `HttpGet`. Include with `#include <socket.hc>`.
 
-#include <io.hc>     // Read/Write/Close/WriteAll
-#include <fmt.hc>    // StrPrint (for HttpGet)
+#include <unistd.hc>   // Read/Write/Close/WriteAll
+#include <stdio.hc>    // StrPrint (for HttpGet)
 
 #define AF_INET     2
 #define SOCK_STREAM 1

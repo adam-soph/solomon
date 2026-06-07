@@ -28,12 +28,12 @@ fn temp_out() -> std::path::PathBuf {
 }
 
 /// Parse a program/source with the standard library available, so `#include
-/// <cstr.hc>` and friends resolve. Examples carry their own includes, but inline
-/// sources don't, so the primitive modules (`cstr`/`mem`/`ctype`) are prepended.
+/// <string.hc>` and friends resolve. Examples carry their own includes, but inline
+/// sources don't, so the primitive modules (`string`/`stdlib`/`ctype`) are prepended.
 /// The extra unused definitions don't change a program's output.
 fn parse_src(src: &str) -> solomon::Program {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let mut s = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
+    let mut s = String::from("#include <string.hc>\n#include <stdlib.hc>\n#include <ctype.hc>\n");
     // Add `math.hc` only when the source needs it. We don't prepend it
     // unconditionally because that collides with examples that define their own
     // `Pow`/`Floor`/etc. See the note on `common::with_stdlib_prelude`.
@@ -41,9 +41,6 @@ fn parse_src(src: &str) -> solomon::Program {
         && !src.contains("#include <math.hc>")
     {
         s.push_str("#include <math.hc>\n");
-    }
-    if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
-        s.push_str("#include <rand.hc>\n");
     }
     if (src.contains("UnixNS") || src.contains("NanoNS") || src.contains("Sleep"))
         && !src.contains("#include <time.hc>")
@@ -568,7 +565,7 @@ fn printing_matches_the_interpreter() {
         r#"I64 Sq(I64 x){ return x*x; } U0 Main(){ I64 i; for(i=1;i<=5;i++) "sq(%d)=%d\n", i, Sq(i); } Main;"#,
         r#"I64 Fib(I64 n){ if(n<2) return n; return Fib(n-1)+Fib(n-2); } U0 Main(){ I64 i; for(i=0;i<12;i++) Print("%d ", Fib(i)); "\n"; } Main;"#,
         r#"U0 Main(){ I64 a[5]; I64 i; for(i=0;i<5;i++) a[i]=i*i; for(i=0;i<5;i++) "%d ", a[i]; "\n"; } Main;"#,
-        // Width / precision / flags on integers (mirrors `fmt::render_int`).
+        // Width / precision / flags on integers (the HolyC `VFmt` integer field).
         r#"U0 Main(){ "[%5d][%-5d][%05d]\n", 42, 42, 42; } Main;"#,
         r#"U0 Main(){ "[%+d][% d][%+d]\n", 7, 7, -7; } Main;"#,
         r#"U0 Main(){ "[%8.3d][%.5d][%5.2d]\n", 5, 42, 7; } Main;"#,
@@ -861,13 +858,13 @@ fn stdlib_math_matches_the_interpreter() {
 
 #[test]
 fn strtof64_matches_the_interpreter() {
-    // The correctly-rounded `atof` (`#include <cstr.hc>`, over `<bignum.hc>`)
+    // The correctly-rounded `atof` (`#include <stdlib.hc>`, over its private `Bn`)
     // compiles and runs freestanding. Previously `StrToF64` lowered to a libc
     // `_atof` that the static ELF couldn't resolve. Both the Clinger fast path and
     // the exact bignum slow path (long significands, large/small exponents, the
     // smallest normal double) must print byte-for-byte what the interpreter does.
     let src = r#"
-        #include <cstr.hc>
+        #include <stdlib.hc>
         U0 Main() {
           "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
           "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");
@@ -975,7 +972,7 @@ fn function_pointers_match_the_interpreter() {
         class Pt { I64 x; I64 y; }
         Pt MkPt(I64 a, I64 b) { Pt p = {a, b}; return p; }
         class Dispatch { I64 (*op)(I64, I64); }
-        typedef I64 (*BinOp)(I64, I64);
+        I64 (*BinOp)(I64, I64);
         BinOp Pick(I64 sub) { if (sub) return &Sub; return &Add; }
         U0 Main() {
           I64 (*f)(I64, I64) = &Add;

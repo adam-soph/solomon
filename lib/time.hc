@@ -14,7 +14,7 @@
 // computes the same bits everywhere; only `Now` reads the clock. Include with
 // `#include <time.hc>`.
 
-#include <fmt.hc>    // StrPrint/CatPrint for FmtISO
+#include <stdio.hc>    // StrPrint/CatPrint for FmtISO
 
 // --- clock primitives (intrinsics) -------------------------------------------
 

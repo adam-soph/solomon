@@ -96,7 +96,7 @@ fn call_to_undeclared_function_is_an_error() {
 #[test]
 fn print_family_is_auto_available() {
     // The printf family is ordinary HolyC (`lib/fmt.hc`) now. The compiler
-    // auto-includes `<fmt.hc>` whenever a program prints: a call to
+    // auto-includes `<stdio.hc>` whenever a program prints: a call to
     // `Print`/`StrPrint`/… by name, a bare string, or a `"fmt", args` comma
     // statement. So none of these need an explicit include. There is no dead-code
     // elimination, so the bodies are pulled in exactly when used.
@@ -105,7 +105,7 @@ fn print_family_is_auto_available() {
     ok("U0 F() { \"%d\\n\", 42; }");
     ok("U0 F() { U8 b[16]; StrPrint(b, \"%d\", 1); }");
     // An explicit include is still a no-op (the guard dedups it).
-    ok("#include <fmt.hc>\nU0 F() { Print(\"hello\"); }");
+    ok("#include <stdio.hc>\nU0 F() { Print(\"hello\"); }");
 }
 
 #[test]
@@ -262,45 +262,78 @@ fn non_scalar_condition() {
     );
 }
 
-// ---- structural aggregate compatibility ----
+// ---- nominal aggregate compatibility ----
 
 #[test]
-fn same_signature_named_classes_are_compatible() {
-    // Two differently-named classes with the same signature assign across each other.
-    ok("class A { I64 x; I64 y; } class B { I64 x; I64 y; } \
-        U0 F() { A a; B b; a = b; b = a; }");
+fn same_named_class_assigns_to_itself() {
+    // A `class` value assigns to a slot of the *same* named type.
+    ok("class A { I64 x; I64 y; } U0 F() { A a; A b; b = a; a = b; }");
 }
 
 #[test]
-fn same_signature_anon_and_named_are_compatible() {
-    ok("class A { I64 x; I64 y; } \
-        U0 F() { A a; class { I64 x; I64 y; } q; q = a; a = q; }");
-}
-
-#[test]
-fn typedef_of_anon_is_compatible_with_named() {
-    ok(
-        "class A { I64 x; I64 y; } typedef class { I64 x; I64 y; } P; \
-        U0 F() { A a; P p; p = a; a = p; }",
+fn same_signature_named_classes_are_not_compatible() {
+    // Aggregates are nominal: two differently-named classes never assign across each
+    // other, even with identical fields (reinterpret via a pointer cast / union / MemCpy).
+    has(
+        "class A { I64 x; I64 y; } class B { I64 x; I64 y; } U0 F() { A a; B b; b = a; }",
+        "cannot assign",
     );
 }
 
 #[test]
-fn anon_aggregate_works_as_param_and_return() {
-    ok("class A { I64 x; I64 y; } \
-        I64 Sum(class { I64 x; I64 y; } p) { return p.x + p.y; } \
-        class { I64 x; I64 y; } Mk() { class { I64 x; I64 y; } r; return r; } \
-        U0 F() { A a; A b = Mk(); Sum(a); }");
+fn anon_and_named_same_signature_are_not_compatible() {
+    has(
+        "class A { I64 x; I64 y; } U0 F() { A a; class { I64 x; I64 y; } q; q = a; }",
+        "cannot assign",
+    );
 }
 
 #[test]
-fn recursive_same_shape_classes_are_compatible() {
-    // The compatibility check is coinductive, so mutually self-referential types
-    // terminate and compare as equal-shaped.
+fn identical_anonymous_types_share_one_type() {
+    // Anonymous aggregates intern to a single synthetic name, so two identical ones are
+    // the *same* nominal type and assign across each other.
     ok(
+        "class { I64 x; I64 y; } Mk() { class { I64 x; I64 y; } r; return r; } \
+        U0 F() { class { I64 x; I64 y; } v = Mk(); v.x = 1; }",
+    );
+}
+
+#[test]
+fn recursive_same_shape_classes_are_not_compatible() {
+    has(
         "class NodeA { I64 v; NodeA *next; } class NodeB { I64 v; NodeB *next; } \
-        U0 F() { NodeA a; NodeB b; b = a; }",
+         U0 F() { NodeA a; NodeB b; b = a; }",
+        "cannot assign",
     );
+}
+
+// ---- nominal aggregate arguments ----
+
+#[test]
+fn mismatched_aggregate_argument_is_rejected() {
+    // A `class` argument must match its parameter's named type — passing a same-arity
+    // but differently-shaped class is a compile error, not a silent byte-pun.
+    has(
+        "class A { I64 p; I64 q; } class B { F64 r; F64 s; } \
+         I64 Sum(A a) { return a.p + a.q; } U0 F() { B b; Sum(b); }",
+        "argument 1",
+    );
+}
+
+#[test]
+fn matching_aggregate_argument_is_ok() {
+    ok("class A { I64 p; I64 q; } \
+        I64 Sum(A a) { return a.p + a.q; } U0 F() { A a; Sum(a); }");
+}
+
+#[test]
+fn scalar_and_pointer_arguments_stay_permissive() {
+    // Scalar conversions, NULL, and pointer reinterpretation across aggregate pointers
+    // are still allowed at a call (HolyC-style looseness off the nominal-aggregate path).
+    ok("F64 Half(F64 x) { return x / 2.0; } U0 Take(I64 *p) {} \
+        U0 F() { Half(9); Take(NULL); }");
+    ok("class A { I64 x; } class B { I64 x; } U0 G(A *a) {} \
+        U0 F() { B b; G((A *)&b); G(&b); }");
 }
 
 #[test]
@@ -399,7 +432,7 @@ fn typedef_aliases_are_usable() {
     // a simple alias
     ok("typedef I64 MyInt; U0 F() { MyInt x = 1; x = x + 2; }");
     // a function-pointer alias, and a function that returns one
-    ok("typedef I64 (*BinOp)(I64, I64); \
+    ok("I64 (*BinOp)(I64, I64); \
         I64 Add(I64 a, I64 b) { return a + b; } \
         BinOp Pick() { return &Add; } \
         U0 F() { BinOp op = Pick(); op(1, 2); }");

@@ -2577,7 +2577,7 @@ impl Cg {
         if name == "Join" {
             return self.gen_join(args, pos);
         }
-        // Atomics (`sync.hc`): hardware `ldaxr`/`stlxr` loops, acquire/release.
+        // Atomics (`atomic.hc`): hardware `ldaxr`/`stlxr` loops, acquire/release.
         if matches!(
             name,
             "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas"
@@ -2723,7 +2723,7 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower `Open(path, flags, mode)`. The `io.hc` flags are Linux's; freestanding
+    /// Lower `Open(path, flags, mode)`. The `fcntl.hc` flags are Linux's; freestanding
     /// uses `openat(AT_FDCWD, …)` (aarch64 has no bare `open`) with them verbatim,
     /// while Darwin calls libc `open` after translating the flag bits that differ
     /// (`O_CREAT`/`O_TRUNC`/`O_APPEND`) to their macOS values and sign-extending the
@@ -2940,7 +2940,7 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower an atomic op (`sync.hc`), width-directed by the pointer's pointee type.
+    /// Lower an atomic op (`atomic.hc`), width-directed by the pointer's pointee type.
     /// Load/store use `ldar`/`stlr`; add/swap/cas use `ldaxr`/`stlxr` retry loops. All
     /// are sized 1/2/4/8 bytes. Each loaded value is sign/zero-extended to the pointee
     /// width (`gen_cast`) so the result matches a normal load, and so the add is
@@ -3028,7 +3028,7 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` (`sync.hc`). Freestanding
+    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` (`atomic.hc`). Freestanding
     /// uses the Linux `futex(2)` syscall (`FUTEX_WAIT`/`FUTEX_WAKE` on the low 32 bits
     /// of `*addr`); Darwin uses libc `__ulock_wait`/`__ulock_wake`
     /// (`UL_COMPARE_AND_WAIT`). A `FutexWait` carries a short timeout, so a missed
@@ -3306,7 +3306,7 @@ impl Cg {
         if let ExprKind::Ident(name) = &callee.kind {
             // Primitive intrinsics (the heap, the clock, sockets, …) get bespoke
             // lowering in `gen_call`. The printf family is ordinary HolyC now
-            // (`fmt.hc`), so `gen_call` routes those to their compiled bodies via the
+            // (`stdio.hc`), so `gen_call` routes those to their compiled bodies via the
             // shadow check (`funcs.contains_key`).
             if crate::intrinsics::is_primitive(name) {
                 return self.gen_call(name, args, pos);
@@ -3451,7 +3451,7 @@ impl Cg {
         }
     }
 
-    /// Lower a print as a call to the pure-HolyC `Print` (auto-included via `<fmt.hc>`
+    /// Lower a print as a call to the pure-HolyC `Print` (auto-included via `<stdio.hc>`
     /// when a program prints): synthesize `Print(fmt, args…)` and emit it as an
     /// ordinary call to the compiled body. This is target-independent — the same path
     /// serves Darwin and the freestanding ELF, since the HolyC `Print` ultimately calls
@@ -3508,7 +3508,7 @@ impl Cg {
     /// order. Each follows the internal ABI (args `x0..`, result `x0`) and clobbers
     /// only caller-saved registers, so it is a safe `bl` target.
     fn emit_fs_runtime(&mut self) {
-        // The printf family is pure HolyC now (`fmt.hc`), so the formatted-output
+        // The printf family is pure HolyC now (`stdio.hc`), so the formatted-output
         // runtime (`OutWrite`/`FmtInt`/`FmtStr`/`StrLen`) is gone. Only the heap
         // primitives remain emitted; everything else is an ordinary compiled function.
         const ORDER: &[&str] = &["MAlloc", "HeapExtend", "MSize", "Free"];

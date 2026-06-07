@@ -224,7 +224,7 @@ fn args_capture_calls_getcommandline() {
 
 #[test]
 fn malloc_lowers_to_virtualalloc() {
-    let pe = build_pe("#include <mem.hc>\nU8 *p = MAlloc(16); p[0] = 7;");
+    let pe = build_pe("U8 *p = MAlloc(16); p[0] = 7;");
 
     // The `emit_page_alloc` shim, byte for byte (disp32 aside):
     //   xor ecx,ecx; mov rdx,rsi; mov r8d,0x3000; mov r9d,4; sub rsp,32; call [VirtualAlloc]; add rsp,32
@@ -277,7 +277,7 @@ fn file_io_lowers_to_kernel32() {
     // scan the alignment-independent arg-marshalling tails just before each
     // `call [rip]`.
     let pe = build_pe(
-        "#include <io.hc>\n\
+        "#include <stdio.hc>\n\
          U0 Main() { I64 fd = Open(\"t\", O_WRONLY|O_CREAT|O_TRUNC, MODE_0644);\n\
          U8 *m = \"hi\"; Write(fd, m, 2); Close(fd); }\n\
          Main;",
@@ -312,15 +312,15 @@ fn posix_only_builtins_rejected_on_windows() {
     // I/O is wired via kernel32, so it is not in this set.
     for (src, name) in [
         (
-            "#include <os.hc>\nU0 Main(){ Mkdir(\"d\", 0700); } Main;",
+            "#include <unistd.hc>\nU0 Main(){ Mkdir(\"d\", 0700); } Main;",
             "Mkdir",
         ),
         (
-            "#include <os.hc>\nU0 Main(){ Remove(\"f\"); } Main;",
+            "#include <stdio.hc>\nU0 Main(){ Remove(\"f\"); } Main;",
             "Remove",
         ),
         (
-            "#include <os.hc>\nU0 Main(){ I64 p = Getpid(); } Main;",
+            "#include <unistd.hc>\nU0 Main(){ I64 p = Getpid(); } Main;",
             "Getpid",
         ),
     ] {
@@ -450,7 +450,7 @@ fn pe_env_matches_interpreter() {
     run_pe_conformance(vec![(
         "env".to_string(),
         compile(
-            "#include <os.hc>\n\
+            "#include <stdlib.hc>\n\
              U0 Main(){ I64 n = 0; while (EnvP[n]) n++; \
                \"%d %d %d\\n\", n > 0, Getenv(\"PATH\") != NULL, Getenv(\"NOPE_X9Z7\") != NULL; } \
              Main;",
@@ -473,7 +473,7 @@ fn pe_file_io_matches_interpreter() {
         .replace('\\', "/");
     let _ = std::fs::remove_file(&path);
     let src = format!(
-        "#include <io.hc>\n\
+        "#include <stdio.hc>\n\
         U0 Main() {{\n\
           U8 *m = \"solomon\\n\";\n\
           WriteFile(\"{path}\", m, StrLen(m));\n\

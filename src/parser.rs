@@ -122,6 +122,12 @@ pub struct Parser<S: TokenStream> {
     /// `Type::Param`, keeping a template body's parameters symbolic for `mono` to
     /// substitute.
     template_params: Option<Vec<String>>,
+    /// Whether the statement about to be parsed is a top-level item (directly under
+    /// [`parse_program`]), not a function-local one. `parse_program` sets it before each
+    /// item and `parse_stmt` captures-then-clears it, so a bare top-level
+    /// function-pointer declarator (`I64 (*BinOp)(I64, I64);`) can be recognised as a
+    /// *type* alias while a local one of the same shape stays a variable.
+    top_level: bool,
 }
 
 /// Maximum expression/statement nesting depth before the parser bails out.
@@ -149,6 +155,7 @@ impl<S: TokenStream> Parser<S> {
             generics: Generics::new(),
             depth: 0,
             template_params: None,
+            top_level: false,
         }
     }
 
@@ -167,6 +174,7 @@ impl<S: TokenStream> Parser<S> {
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut items = Vec::new();
         while !self.at(&TokenKind::Eof)? {
+            self.top_level = true;
             let stmt = self.parse_stmt()?;
             // Synthetic types (embedded unions) defined while parsing this item are
             // emitted first, so they're laid out and registered before their use.
@@ -649,6 +657,9 @@ impl<S: TokenStream> Parser<S> {
     }
     fn parse_stmt_inner(&mut self) -> PResult<Stmt> {
         let m = self.mark()?;
+        // Capture whether this is a top-level item, then clear it so any nested
+        // statement (a block body, a control-flow body) parses as non-top-level.
+        let top = std::mem::replace(&mut self.top_level, false);
 
         // Label: `name:`, but not `name::`, which is a scope operator.
         if matches!(self.peek()?.kind, TokenKind::Ident(_))
@@ -746,7 +757,7 @@ impl<S: TokenStream> Parser<S> {
                     // `class Name { … }` is a definition; `class { … } v;` is a
                     // declaration whose type is an anonymous aggregate.
                     if matches!(self.peek_n(1)?.kind, TokenKind::LBrace) {
-                        self.parse_declaration(m, false)
+                        self.parse_declaration(m, false, top)
                     } else {
                         self.parse_class(m, false)
                     }
@@ -756,12 +767,12 @@ impl<S: TokenStream> Parser<S> {
                 // class/union, function, global, or typedef.
                 Keyword::Public => {
                     self.advance()?; // `public`
-                    self.parse_public_item(m)
+                    self.parse_public_item(m, top)
                 }
-                _ if k.is_type() => self.parse_declaration(m, false),
+                _ if k.is_type() => self.parse_declaration(m, false, top),
                 _ => self.parse_expr_stmt(m),
             },
-            _ if self.is_type_start()? => self.parse_declaration(m, false),
+            _ if self.is_type_start()? => self.parse_declaration(m, false, top),
             _ => self.parse_expr_stmt(m),
         }
     }
@@ -1002,7 +1013,39 @@ impl<S: TokenStream> Parser<S> {
         // simplification: type aliases are not file-scoped).
         self.advance()?; // `typedef`
         let base = self.parse_base_type()?;
+        // `typedef <ret> (*)(<args>) Name;` — an anonymous function-pointer type with the
+        // alias name *after* it, the consistent `typedef <type> <name>` shape. Detected by
+        // the `(*)` immediately following the return type (the named form `(*F)(…)` has an
+        // identifier where this has `)`).
+        if self.at(&TokenKind::LParen)?
+            && self.peek_n(1)?.kind == TokenKind::Star
+            && self.peek_n(2)?.kind == TokenKind::RParen
+        {
+            self.advance()?; // `(`
+            self.advance()?; // `*`
+            self.advance()?; // `)`
+            let params = self.parse_param_types()?;
+            let ty = Type::FuncPtr {
+                ret: Box::new(base),
+                params,
+            };
+            let name = self.expect_ident()?;
+            self.expect(&TokenKind::Semicolon, "`;`")?;
+            self.known_types.insert(name.clone());
+            self.type_aliases.insert(name, ty);
+            return Ok(self.st(StmtKind::Empty, m));
+        }
         let (name, ty) = self.parse_declarator(&base)?;
+        // The C-style named function-pointer `typedef` (`typedef I64 (*Name)(args);`),
+        // with the name buried inside the declarator, is rejected: use the trailing-name
+        // form above, or the keyword-less `I64 (*Name)(args);`.
+        if matches!(ty, Type::FuncPtr { .. }) {
+            return self.err(format!(
+                "a function-pointer `typedef` puts the name after the type: \
+                 `typedef <ret> (*)(<args>) {name};` (or use the keyword-less \
+                 `<ret> (*{name})(<args>);`)"
+            ));
+        }
         self.expect(&TokenKind::Semicolon, "`;`")?;
         self.known_types.insert(name.clone());
         self.type_aliases.insert(name, ty);
@@ -1010,7 +1053,7 @@ impl<S: TokenStream> Parser<S> {
     }
 
     /// Dispatch the top-level declaration that follows a consumed `public` modifier.
-    fn parse_public_item(&mut self, m: Mark) -> PResult<Stmt> {
+    fn parse_public_item(&mut self, m: Mark, top_level: bool) -> PResult<Stmt> {
         // A generic function definition (`public Ret Name<T>(…)`) is detected the same
         // way as in `parse_stmt`, since its return type may be a bare type parameter
         // that `is_type_start` doesn't recognise. Its monomorphized instances are
@@ -1022,14 +1065,14 @@ impl<S: TokenStream> Parser<S> {
         match k {
             TokenKind::Keyword(Keyword::Class) | TokenKind::Keyword(Keyword::Union) => {
                 if matches!(self.peek_n(1)?.kind, TokenKind::LBrace) {
-                    self.parse_declaration(m, true)
+                    self.parse_declaration(m, true, top_level)
                 } else {
                     self.parse_class(m, true)
                 }
             }
             TokenKind::Keyword(Keyword::Typedef) => self.parse_typedef(m, true),
-            TokenKind::Keyword(kw) if kw.is_type() => self.parse_declaration(m, true),
-            _ if self.is_type_start()? => self.parse_declaration(m, true),
+            TokenKind::Keyword(kw) if kw.is_type() => self.parse_declaration(m, true, top_level),
+            _ if self.is_type_start()? => self.parse_declaration(m, true, top_level),
             _ => self.err(
                 "`public` must precede a function, global, `class`, `union`, or `typedef` declaration",
             ),
@@ -1039,10 +1082,22 @@ impl<S: TokenStream> Parser<S> {
     /// A declaration that begins with a type: either a function (definition or
     /// prototype) or a variable declaration list. `is_public` is set when a leading
     /// `public` modifier was consumed.
-    fn parse_declaration(&mut self, m: Mark, is_public: bool) -> PResult<Stmt> {
+    fn parse_declaration(&mut self, m: Mark, is_public: bool, top_level: bool) -> PResult<Stmt> {
         let base = self.parse_base_type()?;
         let dm = self.mark()?;
         let (name, ty) = self.parse_declarator(&base)?;
+
+        // A bare *top-level* function-pointer declarator with no initializer names a
+        // *type*, i.e. a `typedef` without the keyword:
+        //     I64 (*BinOp)(I64, I64);   // defines the type `BinOp`
+        // An initializer (`= …`) makes it an ordinary global instead, and the same shape
+        // at function-local scope always stays a variable.
+        if top_level && matches!(ty, Type::FuncPtr { .. }) && self.at(&TokenKind::Semicolon)? {
+            self.advance()?; // `;`
+            self.known_types.insert(name.clone());
+            self.type_aliases.insert(name, ty);
+            return Ok(self.st(StmtKind::Empty, m));
+        }
 
         if self.at(&TokenKind::LParen)? {
             let (params, varargs) = self.parse_params()?;
@@ -2063,20 +2118,25 @@ fn parse_core(
     search: &[std::path::PathBuf],
     with_prelude: bool,
 ) -> PResult<Program> {
-    let (known_types, uses_print) = hoist_type_names(src, dir, search, with_prelude)?;
+    let (known_types, uses_print, uses_f64tostr) =
+        hoist_type_names(src, dir, search, with_prelude)?;
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
-        // The implicit prelude is `builtin.hc`. The printf family (`<fmt.hc>`) is
+        // The implicit prelude is `builtin.hc`. The printf family (`<stdio.hc>`) is
         // pulled in on demand whenever the program prints: a bare string statement and
         // the `"fmt", …` comma form lower to `Print` calls, and `Print`/`StrPrint`/…
         // are ordinary HolyC functions, so their bodies must be in scope (there is no
-        // dead-code elimination). `<fmt.hc>` transitively pulls in the float formatter,
-        // so this also covers `%f`/`%e`/`%g`. The include guard makes a user `#include`
-        // of it a no-op.
+        // dead-code elimination). `<stdio.hc>` transitively pulls in the float formatter,
+        // so this also covers `%f`/`%e`/`%g`. `F64ToStr` (the round-trip float→string
+        // helper) lives in `<stdlib.hc>`, pulled in the same way. The include guards make
+        // a user `#include` of either a no-op.
         let mut p = prelude().to_string();
         if uses_print {
-            p.push_str("\n#include <fmt.hc>\n");
+            p.push_str("\n#include <stdio.hc>\n");
+        }
+        if uses_f64tostr {
+            p.push_str("\n#include <stdlib.hc>\n");
         }
         pp = pp.with_prelude(&p);
     }
@@ -2100,21 +2160,23 @@ fn hoist_type_names(
     dir: &std::path::Path,
     search: &[std::path::PathBuf],
     with_prelude: bool,
-) -> PResult<(HashSet<String>, bool)> {
+) -> PResult<(HashSet<String>, bool, bool)> {
     let mut pp =
         Preprocessor::with_base_dir_and_search(Lexer::new(src), dir.to_path_buf(), search.to_vec());
     if with_prelude {
         pp = pp.with_prelude(prelude());
     }
     let mut names = HashSet::new();
-    // Also note whether the program *prints*, so `parse_core` can pull in `<fmt.hc>`
+    // Also note whether the program *prints*, so `parse_core` can pull in `<stdio.hc>`
     // (the printf family) on demand. There is no dead-code elimination, so the
     // `Print`/`StrPrint`/… bodies should be present only when used. A print is either
     // a call to a print-family function by name, or a bare string / `"fmt", …` comma
     // statement — a `Str` at a statement boundary followed by `;` (bare) or `,` (comma
     // form). The boundary check keeps a string *expression* (`U8 *p = "x";`,
-    // `f("a", b)`) from pulling the machinery in needlessly.
+    // `f("a", b)`) from pulling the machinery in needlessly. `F64ToStr` (the float
+    // round-trip formatter) lives in `<stdlib.hc>`, so it is tracked separately.
     let mut uses_print = false;
+    let mut uses_f64tostr = false;
     let mut at_boundary = true; // start of input begins a statement
     let mut pending_str = false; // a Str seen at a statement boundary, awaiting `;`/`,`
     loop {
@@ -2127,14 +2189,11 @@ fn hoist_type_names(
                     names.insert(name.clone());
                 }
             }
-            TokenKind::Ident(name) => {
-                if matches!(
-                    name.as_str(),
-                    "Print" | "StrPrint" | "CatPrint" | "MStrPrint" | "F64ToStr"
-                ) {
-                    uses_print = true;
-                }
-            }
+            TokenKind::Ident(name) => match name.as_str() {
+                "Print" | "StrPrint" | "CatPrint" | "MStrPrint" => uses_print = true,
+                "F64ToStr" => uses_f64tostr = true,
+                _ => {}
+            },
             TokenKind::Str(_) => next_pending = at_boundary,
             TokenKind::Semicolon => {
                 if pending_str {
@@ -2158,7 +2217,7 @@ fn hoist_type_names(
         at_boundary = next_boundary;
         pending_str = next_pending;
     }
-    Ok((names, uses_print))
+    Ok((names, uses_print, uses_f64tostr))
 }
 
 // ---- generic-template handling ----
@@ -2417,7 +2476,7 @@ impl<S: TokenStream> Parser<S> {
         let saved_tp = self.template_params.replace(type_param_names(&params));
         self.buf = dropped.into();
         let dm = self.mark()?;
-        let parsed = self.parse_declaration(dm, false);
+        let parsed = self.parse_declaration(dm, false, false);
         self.template_params = saved_tp;
         self.buf = saved_buf;
         let def = match parsed?.kind {

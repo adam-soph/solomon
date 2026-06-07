@@ -3,9 +3,8 @@
 // uppercase a string in place. Output is integer/string only, so it is identical
 // under the interpreter and the native backend.
 
-#include <cstr.hc>    // StrLen/StrCpy/StrFind
+#include <string.hc>  // StrLen/StrCpy/StrFind
 #include <ctype.hc>   // ToUpper
-#include <mem.hc>    // MAlloc/Free
 
 I64 WordCount(U8 *s) {
   I64 words = 0;

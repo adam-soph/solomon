@@ -1,48 +1,35 @@
-#ifndef _SYNC_HC
-#define _SYNC_HC
-// sync.hc — atomics and a mutex for sharing mutable state between threads.
+#ifndef _THREADS_HC
+#define _THREADS_HC
+// threads.hc — C11 `<threads.h>`: spawn a function on a new thread and join it
+// (`Thread`/`Join`), plus the blocking synchronization primitives built on atomics — a
+// mutex (`Mutex`), a condition variable (`Cond`), and a reader/writer lock (`RwLock`).
 //
-// `AtomicLoad`/`AtomicStore`/`AtomicAdd`/`AtomicSwap`/`AtomicCas` are intrinsics: the
-// prototypes live here, and the compiler lowers them to the hardware atomic
-// instructions — `ldaxr`/`stlxr` loops on AArch64, `lock`-prefixed
-// `xadd`/`xchg`/`cmpxchg` on x86-64 — with acquire/release ordering. They operate on a
-// naturally-aligned `I64` in shared memory: a global, or a heap/`MAlloc` slot, anything
-// visible to the other thread. `AtomicFence` is a full barrier. `FutexWait`/`FutexWake`
-// are the kernel wait/wake. `Mutex` is a blocking futex lock built on these in pure
-// HolyC. Include with `#include <sync.hc>`.
+// `Thread`/`Join` are intrinsics: the prototypes live here, and the compiler lowers them
+// to libc `pthread_create`/`pthread_join` on Darwin, or to the raw `clone(2)` syscall
+// with a hand-built child stack on the freestanding targets. Threads share the address
+// space (globals and the heap), so they communicate through shared memory. The locks are
+// pure-HolyC futex primitives over `<atomic.hc>` (Drepper "Futexes Are Tricky").
 //
-// Conformance: the interpreter runs threads synchronously (see `thread.hc`), so it has
-// no real contention. It performs each atomic as a plain read-modify-write, the
-// fence/futex ops are no-ops, and `MutexLock` always acquires on the first try (never
-// blocking). A native run with real threads gets the same answer for race-free use
-// (atomic counters, mutex-guarded sections).
+// Threading is impure and concurrent, so a program using it is not reproducible by
+// value; conformance is by property. The interpreter (the oracle) runs each thread body
+// synchronously at spawn time and returns the saved result on join, and `MutexLock`
+// always acquires on the first try (never blocking). That matches a native run only for
+// interleaving-independent, race-free work: have each thread write to its own slot or
+// return its own value, then combine after joining. Include with `#include <threads.hc>`.
 
-// --- atomic primitives (intrinsics) ------------------------------------------
+#include <atomic.hc>
 
-public I64 AtomicLoad(I64 *p);                            // atomic *p
-public U0  AtomicStore(I64 *p, I64 v);                    // atomic *p = v
-public I64 AtomicAdd(I64 *p, I64 delta);                  // *p += delta, returns the NEW value
-public I64 AtomicSwap(I64 *p, I64 v);                     // *p = v, returns the OLD value
-public I64 AtomicCas(I64 *p, I64 expected, I64 desired);  // CAS, returns the PREVIOUS value
+// --- thread spawn / join (intrinsics) ----------------------------------------
 
-// A full (sequentially-consistent) memory fence (`dmb ish` / `mfence`). Orders this
-// thread's loads and stores around it, and pairs with the acquire/release the atomics
-// already carry. (A no-op in the synchronous interpreter.)
-public U0 AtomicFence();
+// The thread entry point: takes one I64 argument, returns an I64 result. A bare
+// function-pointer declarator names the type (the keyword-less form of a `typedef`).
+I64 (*ThreadFn)(I64);
 
-// --- low-level futex (intrinsics) --------------------------------------------
-//
-// The kernel wait/wake used to build blocking primitives. They compare and sleep on
-// the low 32 bits of the word at `addr` (Linux `futex(2)`; Darwin
-// `__ulock_wait`/`__ulock_wake`). Most code wants `Mutex`, not these directly.
+// Spawn `fn(arg)` on a new thread. Returns an opaque handle (pass to `Join`), or -1.
+public I64 Thread(ThreadFn fn, I64 arg);
 
-public I64 FutexWait(I64 *addr, I64 expected);  // sleep while *addr == expected; wakes spuriously
-public I64 FutexWake(I64 *addr, I64 n);         // wake up to `n` waiters on `addr`
-
-// --- atomic convenience -------------------------------------------------------
-
-public I64 AtomicInc(I64 *p) { return AtomicAdd(p, 1); }
-public I64 AtomicDec(I64 *p) { return AtomicAdd(p, -1); }
+// Wait for the thread `handle` to finish; returns the value its function returned.
+public I64 Join(I64 handle);
 
 // --- mutex (a futex-backed 3-state lock; Drepper "Futexes Are Tricky") -------
 

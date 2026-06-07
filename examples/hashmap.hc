@@ -3,8 +3,7 @@
 // StrLen/StrCpy/StrCmp, pointer-linked nodes, an array-of-pointers field, and a
 // class threaded through functions by pointer.
 
-#include <cstr.hc>
-#include <mem.hc>    // MAlloc/Free
+#include <string.hc>
 
 #define NBUCKETS 8
 

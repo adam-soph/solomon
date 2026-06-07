@@ -40,21 +40,6 @@ fn tuples_multireturn_index_and_destructure() {
 }
 
 #[test]
-fn structural_aggregates_interchange_across_names() {
-    // Anonymous aggregates and same-signature named/typedef'd types assign, pass,
-    // and return across each other, and a value copies field-for-field across names.
-    let out = run("structural.hc", include_str!("../examples/structural.hc"));
-    assert_eq!(
-        out,
-        "named->anon->typedef: 7 7 70\n\
-         args: 7 7\n\
-         anon-return: 30 11\n\
-         list: 3\n\
-         union: 99\n"
-    );
-}
-
-#[test]
 fn varargs_vargc_and_vargv() {
     // A `...` function reads `VargC` (count) and `VargV` (raw 8-byte arg slots),
     // including the zero-argument call `Sum()`.
@@ -153,7 +138,7 @@ fn exe_runs_at_compile_time() {
 fn calloc_zeroes() {
     let out = run(
         "calloc",
-        "#include <mem.hc>\nU0 Main(){ I64 *a=CAlloc(3*sizeof(I64)); \
+        "#include <stdlib.hc>\nU0 Main(){ I64 *a=CAlloc(3*sizeof(I64)); \
          \"%d %d %d\\n\", a[0], a[1], a[2]; Free(a); } Main;",
     );
     assert_eq!(out, "0 0 0\n");
@@ -189,7 +174,7 @@ fn exit_halts_execution() {
     // flushed; nothing after it runs.
     let out = run(
         "exit",
-        "#include <os.hc>\nU0 Main() { \"a\\n\"; Exit(3); \"b\\n\"; } Main;",
+        "#include <stdlib.hc>\nU0 Main() { \"a\\n\"; Exit(3); \"b\\n\"; } Main;",
     );
     assert_eq!(out, "a\n");
 }

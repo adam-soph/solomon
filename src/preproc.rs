@@ -1031,9 +1031,9 @@ fn file_info_for_disk(file: &Path) -> FileInfo {
 }
 
 /// The [`FileInfo`] of an embedded-stdlib file, named by its angle-include path,
-/// e.g. `strhash.hc`. The embedded library is its own root namespace
-/// (`<stdlib>`), so a `_`-prefixed file like `strhash.hc` is private to that
-/// `<stdlib>` subtree.
+/// e.g. `string.hc`. The embedded library is its own root namespace (`<stdlib>`), so all
+/// its files share one directory — the basis for the same-directory `public`-visibility
+/// rule that keeps stdlib-internal helpers out of user code.
 fn file_info_for_embedded(angle_path: &str) -> FileInfo {
     let mut dir = vec!["<stdlib>".to_string()];
     let parts: Vec<&str> = angle_path.split('/').collect();

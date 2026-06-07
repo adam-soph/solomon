@@ -125,8 +125,8 @@ fn realloc_extends_the_last_block_in_place() {
     // so there's no copy and no leak. This differs from the libc/interp heaps. Also
     // checks the contents survive the grows.
     let src = r#"
-        #include <cstr.hc>
-        #include <mem.hc>
+        #include <string.hc>
+        #include <stdlib.hc>
         U0 Main() {
           U8 *q = MAlloc(16);
           StrCpy(q, "keep");
@@ -254,12 +254,12 @@ fn stdlib_math_matches_the_interpreter() {
 
 #[test]
 fn strtof64_matches_the_interpreter() {
-    // The correctly-rounded `atof` (`#include <cstr.hc>`, over `<bignum.hc>`)
+    // The correctly-rounded `atof` (`#include <stdlib.hc>`, over its private `Bn`)
     // compiles and runs freestanding. Previously `StrToF64` lowered to a libc `_atof`
     // the static ELF couldn't resolve. Both paths (Clinger fast and exact bignum slow)
     // must print byte-for-byte what the interpreter does.
     let src = r#"
-        #include <cstr.hc>
+        #include <stdlib.hc>
         U0 Main() {
           "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
           "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");

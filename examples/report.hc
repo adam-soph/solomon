@@ -3,8 +3,7 @@
 // alignment (`%-10s`, `%4d`), fixed-point money (`%8.2f`), and accumulation —
 // all rendered identically by the interpreter and the native backend.
 
-#include <cstr.hc>
-#include <mem.hc>    // MAlloc/Free
+#include <string.hc>
 
 class Item {
   U8 *name;

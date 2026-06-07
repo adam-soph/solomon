@@ -612,7 +612,7 @@ impl Asm {
         self.words[idx] |= (imm & 0xFFF) << 10;
     }
 
-    // Atomic / acquire-release memory ops (for `sync.hc`). `sz` = log2(bytes),
+    // Atomic / acquire-release memory ops (for `atomic.hc`). `sz` = log2(bytes),
     // placed in bits 31:30: 0=byte (`*b`), 1=half (`*h`), 2=word (32-bit),
     // 3=dword (64-bit). The narrow loads zero-extend into the 64-bit register; the
     // caller then sign/zero-extends per the pointee type. These ops use `emit`'s

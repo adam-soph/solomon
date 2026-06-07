@@ -27,7 +27,6 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("tuples.hc", include_str!("../examples/tuples.hc")),
     ("sort.hc", include_str!("../examples/sort.hc")),
     ("generic.hc", include_str!("../examples/generic.hc")),
-    ("structural.hc", include_str!("../examples/structural.hc")),
     ("exe.hc", include_str!("../examples/exe.hc")),
     ("exceptions.hc", include_str!("../examples/exceptions.hc")),
     ("args.hc", include_str!("../examples/args.hc")),
@@ -40,7 +39,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
 // Shared by two test sets so both exercise identical source: the interpreter-pinned
 // exact-output tests (`tests/programs.rs`, run on every host) and the arm64-Darwin
 // native-parity tests (`tests/arm64_darwin.rs`, run on an Apple-silicon Mac). They
-// cover the `<sort.hc>`/`<vec.hc>`/`<hmap.hc>` surface beyond the happy path the
+// cover the `Sort`/`<vec.hc>`/`<hmap.hc>` surface beyond the happy path the
 // examples show: empty/single/reverse/duplicate inputs, search boundaries, the
 // quicksort (>cutoff) path, I64 keys, rehash/update/delete, and the
 // `HmapValues`/`HmapEntries` collectors. Sorted bases are heap buffers
@@ -49,8 +48,7 @@ pub const EXAMPLES: &[(&str, &str)] = &[
 
 #[allow(dead_code)]
 pub const LIB_SORT_EDGES: &str = r#"
-#include <sort.hc>
-#include <mem.hc>
+#include <stdlib.hc>
 I64 Cmp(U8 *a, U8 *b) { I64 x = *(I64 *)a, y = *(I64 *)b; return x < y ? -1 : x > y; }
 U0 PrintBuf(I64 *a, I64 n) { I64 i; for (i = 0; i < n; i++) "%d ", a[i]; "\n"; }
 U0 Main()
@@ -146,13 +144,12 @@ Main;
 "#;
 
 /// Parse an example/source with the standard library on the angle-include search path,
-/// so `#include <cstr.hc>` and friends resolve to the repo `lib/`. The reducible
-/// builtins now live in the HolyC standard library: `lib/cstr.hc` (C strings),
-/// `lib/mem.hc` (memory + `ReAlloc`), `lib/ctype.hc` (classification), the math
-/// functions in `lib/math.hc`, and the `RandU64` PRNG in `lib/rand.hc`. Example files
-/// carry their own includes, but
-/// the many inline test sources do not, so this prepends the primitive modules. The
-/// extra unused defs don't affect a program's output.
+/// so `#include <string.hc>` and friends resolve to the repo `lib/`. The reducible
+/// builtins now live in the HolyC standard library: `lib/string.hc` (C strings + memory),
+/// `lib/stdlib.hc` (conversions + `CAlloc`/`ReAlloc` + `RandU64` + sorting), `lib/ctype.hc`
+/// (classification), and the math functions in `lib/math.hc`. Example files carry their
+/// own includes, but the many inline test sources do not, so this prepends the primitive
+/// modules. The extra unused defs don't affect a program's output.
 #[allow(dead_code)]
 pub fn parse_example(src: &str) -> Result<solomon::Program, solomon::ParseError> {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
@@ -160,27 +157,25 @@ pub fn parse_example(src: &str) -> Result<solomon::Program, solomon::ParseError>
     solomon::parser::parse_with(&src, std::path::Path::new("."), &[lib])
 }
 
-/// Prepend the stdlib primitive modules an inline test source may use (`cstr.hc`,
-/// `mem.hc`, `ctype.hc`), plus `math.hc` when it uses `Abs`/`Fabs`/`Sqrt`/`Sign`,
-/// `rand.hc` when it uses `RandU64`, and `time.hc` for the clock primitives.
+/// Prepend the stdlib primitive modules an inline test source may use (`string.hc`,
+/// `stdlib.hc`, `ctype.hc`), plus `math.hc` when it uses `Abs`/`Fabs`/`Sqrt`/`Sign`,
+/// and `time.hc` for the clock primitives.
 ///
-/// The string/memory/ctype modules are prepended unconditionally. They're guarded, so
+/// The string/stdlib/ctype modules are prepended unconditionally. They're guarded, so
 /// re-including is a no-op, and they define no name any example/test collides with.
-/// (`cstr.hc` now carries `StrToF64`/`F64ToStr` too, so the number conversions need no
-/// separate include.) The rest are gated on use. `math.hc` is gated on
-/// `Abs`/`Fabs`/`Sqrt`/`Sign`, since the rest of it (`Pow`/`Floor`/`Gcd`/`PI`/…)
-/// collides with examples that roll their own. `rand.hc` is gated on `RandU64`, and
-/// `time.hc` on the clock primitives.
+/// (`stdlib.hc` carries the number conversions `StrToF64`/`F64ToStr`/`StrToI64` and the
+/// `RandU64` PRNG, so those need no separate include.) The rest are gated on use.
+/// `math.hc` is gated on `Abs`/`Fabs`/`Sqrt`/`Sign`, since the rest of it
+/// (`Pow`/`Floor`/`Gcd`/`PI`/…) collides with examples that roll their own. `time.hc` is
+/// gated on the clock primitives.
 #[allow(dead_code)]
 pub fn with_stdlib_prelude(src: &str) -> String {
-    let mut prelude = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
+    let mut prelude =
+        String::from("#include <string.hc>\n#include <stdlib.hc>\n#include <ctype.hc>\n");
     if (src.contains("Abs") || src.contains("Fabs") || src.contains("Sqrt") || src.contains("Sign"))
         && !src.contains("#include <math.hc>")
     {
         prelude.push_str("#include <math.hc>\n");
-    }
-    if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
-        prelude.push_str("#include <rand.hc>\n");
     }
     // `time.hc` holds the clock intrinsics (and calendar math), gated on use so its
     // `DateTime`/`FromUnix`/… don't collide with tests/examples that roll their own.

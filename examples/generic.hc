@@ -4,7 +4,7 @@
 // stamped out and type-checked at compile time, so you get typed APIs with no casts —
 // one template serves every element type.
 
-#include <mem.hc>
+#include <stdlib.hc>   // ReAlloc
 
 // ---- generic classes + functions, with inferred type arguments ----
 

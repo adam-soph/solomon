@@ -4,8 +4,7 @@
 // columns use the truncated value; the float columns the original. Output is
 // byte-identical in the interpreter and the native backend.
 
-#include <fmt.hc>   // Print / StrPrint
-#include <mem.hc>    // MAlloc/Free
+#include <stdio.hc>   // Print / StrPrint
 
 U0 Show(U8 *buf, U8 *label, F64 x) {
   I64 n = x;

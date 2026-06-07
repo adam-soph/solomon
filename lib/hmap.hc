@@ -14,7 +14,7 @@
 //
 // Stock key ops are provided: `HmapI64Hash`/`HmapI64Eq` for I64 keys, and
 // `HmapStrHash`/`HmapStrEq` for `U8 *` string keys (content-hashed and content-compared).
-// It is built on `<mem.hc>`, on `<cstr.hc>` for string keys, and on `<vec.hc>` for
+// It is built on `<string.hc>` for string keys (`StrCmp`) and on `<vec.hc>` for
 // `HmapKeys`/`HmapValues`. The implementation is pure HolyC and behaves identically on
 // the interpreter and every backend. Include with `#include <hmap.hc>`.
 //
@@ -22,12 +22,20 @@
 // entries, so free it with `HmapFree`. A `U8 *` string key stores the pointer, so the
 // key must outlive the map (string literals do).
 
-#include <cstr.hc>
-#include <mem.hc>
+#include <string.hc>
 #include <vec.hc>
-#include <strhash.hc>   // private djb2 (the `_`-file privacy demo)
 
 #define HMAP_INIT_BUCKETS 8
+
+// djb2 string hash, reduced to a non-negative I64 (a private helper for the stock
+// string-key hashing below).
+I64 Djb2(U8 *s)
+{
+  I64 h = 5381;
+  I64 i = 0;
+  while (s[i] != 0) { h = h * 33 + s[i]; i++; }
+  return h & 0x7FFFFFFFFFFFFFFF;
+}
 
 public class HmapEntry<type K, type V> {
   HmapEntry<K, V> *next; // a chain of entries in the same bucket
@@ -48,7 +56,7 @@ public class Hmap<type K, type V> {
 public I64 HmapI64Hash(I64 *k) { I64 v = *k; return (v ^ (v >> 32)) & 0x7FFFFFFFFFFFFFFF; }
 public Bool HmapI64Eq(I64 *a, I64 *b) { return *a == *b; }
 // String keys: the key is a `U8 *`, so the op takes `U8 **` and dereferences it. `Djb2`
-// is the private `<strhash.hc>` helper, reachable from the stdlib subtree.
+// is the private djb2 helper defined above.
 public I64 HmapStrHash(U8 **k) { return Djb2(*k); }
 public Bool HmapStrEq(U8 **a, U8 **b) { return StrCmp(*a, *b) == 0; }
 

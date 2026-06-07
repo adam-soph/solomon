@@ -6,22 +6,20 @@ use solomon::sema::check_program;
 
 /// Parse, semantically check, then interpret `src`, returning captured output.
 ///
-/// The reducible builtins now live in the HolyC stdlib: string/memory/ctype ops in
-/// `lib/cstr.hc`, `lib/mem.hc`, and `lib/ctype.hc`; math and `RandU64` in `lib/math.hc`.
-/// So the primitive modules are prepended (resolved against the repo `lib/`). The extra
-/// unused definitions don't change a program's output.
+/// The reducible builtins now live in the HolyC stdlib: string/memory ops in
+/// `lib/string.hc`, conversions/`RandU64`/`CAlloc` in `lib/stdlib.hc`, classification in
+/// `lib/ctype.hc`, and math in `lib/math.hc`. So the primitive modules are prepended
+/// (resolved against the repo `lib/`). The extra unused definitions don't change a
+/// program's output.
 fn run(src: &str) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let mut s = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
-    // Include `math.hc` only when the source uses the moved math/PRNG functions.
+    let mut s = String::from("#include <string.hc>\n#include <stdlib.hc>\n#include <ctype.hc>\n");
+    // Include `math.hc` only when the source uses the moved math functions.
     // See the note on `common::with_stdlib_prelude`.
     if (src.contains("Abs") || src.contains("Fabs") || src.contains("Sqrt") || src.contains("Sign"))
         && !src.contains("#include <math.hc>")
     {
         s.push_str("#include <math.hc>\n");
-    }
-    if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
-        s.push_str("#include <rand.hc>\n");
     }
     if (src.contains("UnixNS") || src.contains("NanoNS") || src.contains("Sleep"))
         && !src.contains("#include <time.hc>")
@@ -39,6 +37,38 @@ fn run(src: &str) -> String {
 #[test]
 fn implicit_string_print() {
     assert_eq!(run(r#""Hello, World!\n";"#), "Hello, World!\n");
+}
+
+#[test]
+fn reinterpreting_a_cell_class_gives_a_clear_diagnostic() {
+    // Casting a pointer to a cell-allocated class and reading a field the stored object
+    // lacks (tier-2), or a byte-level `MemCpy` of one (tier-3), hits the interpreter's
+    // byte-addressability limit. The diagnostic should explain it and point at the
+    // byte-buffer workaround rather than the raw "no field" / "out of bounds".
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let err_for = |src: &str| -> String {
+        let program = parse_with(src, std::path::Path::new("."), &[lib.clone()]).unwrap();
+        assert!(check_program(&program).is_empty(), "should type-check");
+        run_to_string(&program)
+            .expect_err("reinterpreting a cell class should error")
+            .to_string()
+    };
+    let field = err_for(
+        "class A { I64 x; I64 y; } class B { I64 a; I64 b; } \
+         U0 Main() { A v; v.x = 1; v.y = 2; B *p = (B *)&v; \"%d\\n\", p->a; } Main;",
+    );
+    assert!(
+        field.contains("reinterpret") && field.contains("byte buffer"),
+        "tier-2 hint missing: {field}"
+    );
+    let bytes = err_for(
+        "#include <string.hc>\nclass A { I64 x; I64 y; } \
+         U0 Main() { A a; A b; MemCpy(&b, &a, sizeof(A)); } Main;",
+    );
+    assert!(
+        bytes.contains("byte") && bytes.contains("MAlloc"),
+        "tier-3 hint missing: {bytes}"
+    );
 }
 
 #[test]
@@ -1006,7 +1036,7 @@ fn typedef_aliases() {
     // A function-pointer typedef (`BinOp`), including a function that returns one.
     // This is the readable form of the otherwise-arcane declarator.
     let src = r#"
-        typedef I64 (*BinOp)(I64, I64);
+        I64 (*BinOp)(I64, I64);
         typedef U8 *String;
         I64 Add(I64 a, I64 b) { return a + b; }
         I64 Mul(I64 a, I64 b) { return a * b; }
@@ -1482,6 +1512,10 @@ fn argc_and_argv_expose_the_command_line() {
     // `ArgC`/`ArgV` are the implicit command-line globals. Each `ArgV[i]` is a `U8 *`.
     let src = r#"I64 i; for (i = 0; i < ArgC; i++) "%d=%s\n", i, ArgV[i];"#;
     let program = parse(src).unwrap();
+    // Type-check first: the interpreter runs analyzed programs (sema annotates every
+    // expression's type in place), and the `"fmt", …` form now executes the HolyC
+    // `Print` body, whose `fmt[i]` deref reads the element type off that annotation.
+    assert!(check_program(&program).is_empty(), "should type-check");
     let mut interp = Interpreter::new(Vec::<u8>::new());
     interp.set_args(vec!["prog".into(), "alpha".into(), "beta".into()]);
     interp.run(&program).unwrap();

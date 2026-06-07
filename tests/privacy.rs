@@ -163,7 +163,7 @@ fn public_on_a_local_is_an_error() {
 #[test]
 fn public_stdlib_symbol_is_callable() {
     // The stdlib's public API is callable from user code across the file boundary.
-    let src = "#include <cstr.hc>\nU0 Main() { U8 *s = \"hi\"; StrLen(s); }\nMain;";
+    let src = "#include <string.hc>\nU0 Main() { U8 *s = \"hi\"; StrLen(s); }\nMain;";
     let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(
         errors(&program).is_empty(),
@@ -174,10 +174,10 @@ fn public_stdlib_symbol_is_callable() {
 
 #[test]
 fn private_stdlib_helper_is_rejected_from_user_code() {
-    // `PfPut` is a non-`public` helper in the stdlib's `printf.hc`. User code lives in a
+    // `PfPut` is a non-`public` helper in the stdlib's `stdio.hc`. User code lives in a
     // different directory than the embedded `<stdlib>`, so the cross-directory rule
     // rejects the call.
-    let src = "#include <printf.hc>\nU0 Main() { Pf p; PfPut(&p, \"x\", 1); }\nMain;";
+    let src = "#include <stdio.hc>\nU0 Main() { Pf p; PfPut(&p, \"x\", 1); }\nMain;";
     let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = errors(&program);
     assert!(

@@ -55,7 +55,7 @@ impl FileInfo {
         }
     }
 
-    /// A human-readable path for diagnostics (e.g. `"lib/cstr.hc"`).
+    /// A human-readable path for diagnostics (e.g. `"lib/string.hc"`).
     pub fn display(&self) -> String {
         let dir = self.dir.join("/");
         match (dir.is_empty(), self.name.is_empty()) {

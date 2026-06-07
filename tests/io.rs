@@ -1,4 +1,4 @@
-//! File I/O intrinsic tests (`lib/io.hc`).
+//! File I/O intrinsic tests (`lib/unistd.hc` + `lib/stdio.hc`).
 //!
 //! File I/O is impure, so these are **property** tests. A HolyC program writes a
 //! known string to a path, reads it back, and prints the content plus size. Against
@@ -19,7 +19,7 @@ use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
 fn file_program(path: &str) -> String {
     format!(
         r#"
-        #include <io.hc>
+        #include <stdio.hc>
         U0 Main() {{
           U8 *msg = "solomon\n";
           I64 wr = WriteFile("{path}", msg, StrLen(msg));
@@ -76,7 +76,7 @@ fn interp_file_roundtrip() {
 /// reports a different code (`ERROR_PATH_NOT_FOUND` = 3), so the value check below is
 /// Unix-only.
 const ERR_PROGRAM: &str = r#"
-    #include <io.hc>
+    #include <stdio.hc>
     U0 Main() {
       U8 buf[16];
       I64 n = ReadFile("/no/such/solomon/path", buf, 16);
@@ -193,7 +193,7 @@ fn native_arm64_freestanding_file() {
 /// prints the byte count `StdWrite` returned. The deterministic *stdout* is
 /// `stdout line\nwrote=12\n`. The stderr write must NOT appear there.
 const STDWRITE_PROGRAM: &str = r#"
-    #include <io.hc>
+    #include <stdio.hc>
     U0 Main() {
       U8 *o = "stdout line\n";
       U8 *e = "stderr line\n";
@@ -279,8 +279,8 @@ fn native_arm64_freestanding_stdwrite() {
 fn fsops_program(dir: &str) -> String {
     format!(
         r#"
-        #include <io.hc>
-        #include <os.hc>
+        #include <stdio.hc>
+        #include <unistd.hc>
         U0 Main() {{
           "mkdir=%d\n", Mkdir("{dir}", 0700);
           U8 *msg = "hi\n";
@@ -387,7 +387,7 @@ fn native_arm64_freestanding_fsops() {
 /// entry has a '='. So the check is deterministic without depending on a specific
 /// variable.
 const ENV_INVARIANTS: &str = r#"
-    #include <cstr.hc>
+    #include <string.hc>
     U0 Main() {
       I64 i = 0, all_kv = 1;
       while (EnvP[i] != NULL) {
@@ -428,7 +428,7 @@ fn native_arm64_envp_invariants_and_lookup() {
     // variable is scoped to the spawned process, so there's no parallel-test race on
     // the shared env.
     let lookup = r#"
-        #include <cstr.hc>
+        #include <string.hc>
         U0 Main() {
           I64 i = 0;
           while (EnvP[i] != NULL) {
@@ -477,13 +477,13 @@ fn native_x86_64_freestanding_envp() {
 // ---- Getenv (os.hc) ----
 
 const GETENV_UNSET: &str = r#"
-    #include <os.hc>
+    #include <stdlib.hc>
     U0 Main() { "unset=%d\n", Getenv("SOLOMON_UNSET_XYZ") == NULL; }
     Main;
 "#;
 
 const GETENV_LOOKUP: &str = r#"
-    #include <os.hc>
+    #include <stdlib.hc>
     U0 Main() {
       U8 *v = Getenv("SOLOMON_ENV");
       if (v != NULL) "got=%s\n", v; else "missing\n";
@@ -544,7 +544,7 @@ fn native_x86_64_freestanding_getenv() {
 // ---- Getpid (os.hc) ----
 
 const GETPID_PROG: &str = r#"
-    #include <os.hc>
+    #include <unistd.hc>
     U0 Main() { "pos=%d\n", Getpid() > 0; }
     Main;
 "#;
@@ -597,7 +597,7 @@ fn native_x86_64_freestanding_getpid() {
 // `/`-prefix check).
 #[cfg(unix)]
 const CWD_INVARIANTS: &str = r#"
-    #include <os.hc>
+    #include <unistd.hc>
     U0 Main() {
       U8 buf[256];
       I64 r = Getcwd(buf, 256);
@@ -611,7 +611,7 @@ const CWD_INVARIANTS: &str = r#"
 // Deterministic value check: Chdir to root, then Getcwd reports exactly "/". Run in an
 // isolated child so the cwd change can't leak.
 const CWD_ROOT: &str = r#"
-    #include <os.hc>
+    #include <unistd.hc>
     U0 Main() {
       U8 buf[256];
       "chdir=%d\n", Chdir("/");
@@ -667,7 +667,7 @@ fn native_x86_64_freestanding_chdir_getcwd() {
 // ---- Getppid / Getuid (os.hc) ----
 
 const IDS_PROG: &str = r#"
-    #include <os.hc>
+    #include <unistd.hc>
     U0 Main() { "ppid=%d uid=%d gid=%d\n", Getppid() > 0, Getuid() >= 0, Getgid() >= 0; }
     Main;
 "#;
@@ -718,8 +718,8 @@ fn native_x86_64_freestanding_getppid_getuid() {
 // ---- Environ (os.hc) ----
 
 const ENVIRON_PROG: &str = r#"
-    #include <os.hc>
-    #include <cstr.hc>
+    #include <vec.hc>
+    #include <string.hc>
     U0 Main() {
       Vec<U8 *> env;
       Environ(&env);

@@ -11,7 +11,6 @@ pub mod arm64;
 pub mod ast;
 pub mod backend;
 pub mod codegen;
-pub mod fmt;
 pub mod interp;
 pub mod intrinsics;
 pub mod layout;
@@ -73,27 +72,21 @@ pub fn stdlib_dirs() -> Vec<std::path::PathBuf> {
 /// copy in sync.
 pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("builtin.hc", include_str!("../lib/builtin.hc")),
-    ("cstr.hc", include_str!("../lib/cstr.hc")),
+    // Public C-named headers.
+    ("string.hc", include_str!("../lib/string.hc")),
     ("ctype.hc", include_str!("../lib/ctype.hc")),
-    ("mem.hc", include_str!("../lib/mem.hc")),
-    ("vec.hc", include_str!("../lib/vec.hc")),
-    ("sort.hc", include_str!("../lib/sort.hc")),
-    ("hmap.hc", include_str!("../lib/hmap.hc")),
-    ("strhash.hc", include_str!("../lib/strhash.hc")),
-    ("fmt.hc", include_str!("../lib/fmt.hc")),
-    ("fltfmt.hc", include_str!("../lib/fltfmt.hc")),
-    ("printf.hc", include_str!("../lib/printf.hc")),
-    ("bignum.hc", include_str!("../lib/bignum.hc")),
-    ("bits.hc", include_str!("../lib/bits.hc")),
+    ("stdio.hc", include_str!("../lib/stdio.hc")),
+    ("stdlib.hc", include_str!("../lib/stdlib.hc")),
     ("math.hc", include_str!("../lib/math.hc")),
-    ("special.hc", include_str!("../lib/special.hc")),
-    ("rand.hc", include_str!("../lib/rand.hc")),
     ("time.hc", include_str!("../lib/time.hc")),
-    ("io.hc", include_str!("../lib/io.hc")),
-    ("os.hc", include_str!("../lib/os.hc")),
-    ("net.hc", include_str!("../lib/net.hc")),
-    ("thread.hc", include_str!("../lib/thread.hc")),
-    ("sync.hc", include_str!("../lib/sync.hc")),
+    ("fcntl.hc", include_str!("../lib/fcntl.hc")),
+    ("unistd.hc", include_str!("../lib/unistd.hc")),
+    ("socket.hc", include_str!("../lib/socket.hc")),
+    ("threads.hc", include_str!("../lib/threads.hc")),
+    ("atomic.hc", include_str!("../lib/atomic.hc")),
+    // Container extensions (no C equivalent).
+    ("vec.hc", include_str!("../lib/vec.hc")),
+    ("hmap.hc", include_str!("../lib/hmap.hc")),
 ];
 
 /// The embedded source for stdlib angle-include `name`, or `None` if it is not a

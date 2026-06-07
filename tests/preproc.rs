@@ -425,7 +425,7 @@ fn angle_include_resolves_from_the_embedded_stdlib() {
     // `parse` carries no filesystem search path, so `#include <...>` of a standard
     // library module must resolve from the copy embedded in the compiler at build
     // time. Its types (generic `Vec<T>`) and functions (`StrLen`) then become usable.
-    let src = "#include <vec.hc>\n#include <cstr.hc>\n\
+    let src = "#include <vec.hc>\n#include <string.hc>\n\
                U0 Main() { Vec<I64> v; VecInit(&v); I64 n = StrLen(\"hi\"); }";
     let program = parse(src).expect("angle include should resolve from the embedded stdlib");
     assert!(

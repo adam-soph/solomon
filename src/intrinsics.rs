@@ -50,29 +50,32 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // rather than baseline SSE2. The HolyC versions handle huge, inf, and NaN
         // inputs, so they match the instruction bit-for-bit.
         "Sqrt" | "Fabs" | "Floor" | "Ceil" | "Trunc" | "Round" | "RoundToEven" => Optimization,
-        // The printf family. These are prototypes in `lib/fmt.hc`. The backends
-        // render them via the shared `fmt` spec plus correctly-rounded bignum
-        // floats; the interpreter renders via `crate::fmt`. Bare strings and the
-        // `"fmt", args` comma form are lowered inline, not as calls to these, so
-        // they need no include.
-        "Print" | "StrPrint" | "CatPrint" | "MStrPrint" => Primitive,
+        // The printf family `Print`/`StrPrint`/`CatPrint`/`MStrPrint` is **not** an
+        // intrinsic: it is pure HolyC with real bodies in `lib/stdio.hc` (the `VFmt`
+        // core over the format machinery, bottoming out at the `StdWrite` primitive).
+        // Every target compiles and calls those bodies — the interpreter runs them,
+        // and the backends synthesize `Print(fmt, …)` calls for bare strings and the
+        // `"fmt", args` comma form. So they are ordinary functions, resolved by include.
+        //
         // The impure clock primitives, prototyped in `lib/time.hc`. They read the
         // OS clock or sleep, so they are non-reproducible: conformance is checked
         // by property, not by value.
         "UnixNS" | "NanoNS" | "Sleep" => Primitive,
-        // The heap, prototyped in `lib/mem.hc`. A syscall or libc primitive: an
-        // `mmap` bump allocator freestanding, or libc `malloc`/`free` hosted.
-        // `HeapExtend` is the irreducible part of `realloc`; `MSize` reads a
-        // block's tracked size.
+        // The heap. `MAlloc`/`Free` are prototyped in the `lib/builtin.hc` prelude;
+        // `HeapExtend`/`MSize` in `lib/stdlib.hc`. A
+        // syscall or libc primitive: an `mmap` bump allocator freestanding, or libc
+        // `malloc`/`free` hosted. `HeapExtend` is the irreducible part of `realloc`;
+        // `MSize` reads a block's tracked size.
         "MAlloc" | "Free" | "HeapExtend" | "MSize" => Primitive,
-        // The raw fd I/O primitives, prototyped in `lib/io.hc` (files) and
-        // `lib/net.hc` (sockets). Impure OS I/O, so non-reproducible like the
-        // clock; raw syscalls freestanding, libc on Darwin.
-        // `Read`/`Write`/`Close`/`Open`/`LSeek` are general fd ops shared by files
-        // and sockets; `Socket`/`Connect` are the socket-specific pair. The libs
-        // build `ReadFile`, `TcpConnect`, and so on, on top of these.
+        // The raw fd I/O primitives. `Open` is prototyped in `lib/fcntl.hc`,
+        // `LSeek`/`Read`/`Write`/`Close` in `lib/unistd.hc`, `Socket`/`Connect` in
+        // `lib/socket.hc`. Impure OS I/O, so non-reproducible like the clock; raw
+        // syscalls freestanding, libc on Darwin. `Read`/`Write`/`Close`/`Open`/`LSeek`
+        // are general fd ops shared by files and sockets; `Socket`/`Connect` are the
+        // socket-specific pair. The libs build `ReadFile`, `TcpConnect`, and so on, on
+        // top of these.
         "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" => Primitive,
-        // The standard-stream write primitive, prototyped in `lib/io.hc`.
+        // The standard-stream write primitive, prototyped in `lib/unistd.hc`.
         // `StdWrite(fd,…)` writes to stdout (fd 1) or stderr (fd 2) portably.
         // `Write` is a POSIX fd op with no Windows mapping; `StdWrite` instead
         // lowers per-target: the write syscall or libc on POSIX, and
@@ -80,35 +83,36 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // its captured output sink and fd 2 to real stderr. This is the sink
         // primitive the HolyC print machinery is built on.
         "StdWrite" => Primitive,
-        // Filesystem mutation, prototyped in `lib/os.hc`. Impure, like the fd ops
+        // Filesystem mutation. `Remove`/`Rename` are prototyped in `lib/stdio.hc`
+        // (C's `<stdio.h>`), `Mkdir` in `lib/unistd.hc`. Impure, like the fd ops
         // above. Freestanding uses the aarch64 `*at` syscalls or x86-64 bare
         // syscalls; Darwin uses libc; the interpreter emulates over `std::fs`.
         // Each returns 0 on success, or `-errno`.
         "Remove" | "Rename" | "Mkdir" => Primitive,
-        // Process control, prototyped in `lib/os.hc`. `Exit(code)` terminates the
-        // process: freestanding `exit_group`, Darwin libc `exit`, Windows
-        // `ExitProcess`, and the interpreter halts the run.
-        // `Getpid`/`Getppid`/`Getuid` read process ids; impure, so property-tested.
-        // All lower to a syscall or libc call.
+        // Process control and ids. `Exit` is prototyped in `lib/stdlib.hc`, the
+        // `Getpid`/… family in `lib/unistd.hc`. `Exit(code)` terminates the process:
+        // freestanding `exit_group`, Darwin libc `exit`, Windows `ExitProcess`, and
+        // the interpreter halts the run. `Getpid`/`Getppid`/`Getuid` read process
+        // ids; impure, so property-tested. All lower to a syscall or libc call.
         "Exit" | "Getpid" | "Getppid" | "Getuid" | "Getgid" => Primitive,
-        // Working directory, prototyped in `lib/os.hc`. `Chdir(path)` wraps chdir
+        // Working directory, prototyped in `lib/unistd.hc`. `Chdir(path)` wraps chdir
         // and `Getcwd(buf, size)` wraps getcwd, with its return normalised to
         // 0/-errno, over the syscall or libc. The interpreter uses `std::env`.
         // Impure, property-tested.
         "Chdir" | "Getcwd" => Primitive,
-        // POSIX-style threads, prototyped in `lib/thread.hc`. Impure and
+        // C11-style threads, prototyped in `lib/threads.hc`. Impure and
         // concurrent, so non-reproducible by value: libc
         // `pthread_create`/`pthread_join` on Darwin, raw `clone(2)` freestanding.
         // The interpreter runs the body synchronously.
         "Thread" | "Join" => Primitive,
-        // Atomics, prototyped in `lib/sync.hc`. Lowered to the hardware atomic
+        // Atomics, prototyped in `lib/atomic.hc`. Lowered to the hardware atomic
         // instructions: `ldaxr`/`stlxr` loops, or `lock xadd`/`xchg`/`cmpxchg`.
         // The interpreter has synchronous threads and no contention, so it does a
         // plain read-modify-write. `Mutex` is pure HolyC on top of these.
         "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas" => Primitive,
-        // Memory fence plus the kernel wait/wake behind the blocking `Mutex`:
-        // `dmb` or `mfence`, and `futex(2)` freestanding or `__ulock_*` on Darwin.
-        // No-ops in the synchronous interpreter.
+        // Memory fence plus the kernel wait/wake behind the blocking `Mutex`,
+        // prototyped in `lib/atomic.hc`: `dmb` or `mfence`, and `futex(2)`
+        // freestanding or `__ulock_*` on Darwin. No-ops in the synchronous interpreter.
         "AtomicFence" | "FutexWait" | "FutexWake" => Primitive,
         _ => return None,
     })

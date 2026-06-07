@@ -512,7 +512,7 @@ pub struct Interpreter<W: Write> {
     /// threads, so it runs each spawned thread body **synchronously at spawn time**
     /// and stashes the function's return here, keyed by handle, for `Join` to
     /// return. This is sound for interleaving-independent work, the documented
-    /// `thread.hc` contract.
+    /// `threads.hc` contract.
     thread_results: HashMap<i64, i64>,
     /// The next `Thread` handle, in a namespace distinct from fds.
     next_thread: i64,
@@ -1069,11 +1069,14 @@ impl<W: Write> Interpreter<W> {
                 write!(self.out, "{s}").map_err(|err| self.io(err))?;
             }
             ExprKind::Comma(items) => {
+                // The `"fmt", args` print form lowers to a `Print` call (as in the
+                // backends), so the interpreter runs the one HolyC `Print` body — there
+                // is no separate Rust formatter.
                 let vals = items
                     .iter()
                     .map(|it| self.eval(it, env))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.print_formatted(&vals, e.span.pos)?;
+                self.call("Print", vals, e.span.pos)?;
             }
             _ => {
                 self.eval(e, env)?;
@@ -1715,25 +1718,21 @@ impl<W: Write> Interpreter<W> {
     }
 
     fn call(&mut self, name: &str, args: Vec<Value>, pos: Pos) -> Result<Value, CodegenError> {
-        // **Primitive intrinsics** are lib prototypes with no HolyC body (the printf
-        // family, heap, clock). The interpreter implements them directly. An
-        // *optimization* intrinsic like `Sqrt` is an ordinary lib function with a
-        // real body, so it falls through to the user-function path below and runs
-        // that body.
+        // **Primitive intrinsics** are lib prototypes with no HolyC body (the heap,
+        // clock, fd I/O, the `StdWrite` sink). The interpreter implements them
+        // directly. An *optimization* intrinsic like `Sqrt` is an ordinary lib
+        // function with a real body, so it falls through to the user-function path
+        // below and runs that body.
         //
         // A user-defined function with a real body shadows a like-named primitive
         // intrinsic, e.g. a program's own `Join`/`Read`. So do the bespoke builtin
         // lowering only when no body is in scope, i.e. the bodyless lib prototype.
         //
-        // The printf family is **always** rendered by the interpreter's own
-        // `crate::fmt`, its independent conformance oracle, even though `<fmt.hc>`
-        // now gives `Print`/`StrPrint`/… real HolyC bodies that the native backends
-        // compile and call. Diffing native (the HolyC formatter) against interp (the
-        // Rust formatter) thus cross-checks two independent implementations, rather
-        // than running one copy on both sides.
-        if matches!(name, "Print" | "StrPrint" | "CatPrint" | "MStrPrint") {
-            return self.call_builtin(name, &args, pos);
-        }
+        // The printf family (`Print`/`StrPrint`/…) is **not** primitive: it is pure
+        // HolyC in `<stdio.hc>`, so it falls through here and the interpreter runs the
+        // one HolyC `Print`/`VFmt`/`FmtFloat` body the backends also compile — the same
+        // formatter on every target. (The `"fmt", …` print form lowers to a `Print`
+        // call; bare string statements print verbatim.)
         let user_defined = self.funcs.get(name).is_some_and(|f| f.body.is_some());
         if !user_defined && crate::intrinsics::is_primitive(name) {
             return self.call_builtin(name, &args, pos);
@@ -1772,10 +1771,18 @@ impl<W: Write> Interpreter<W> {
                 let varargs = args.get(f.params.len()..).unwrap_or(&[]);
                 let mut bytes = vec![0u8; varargs.len() * 8];
                 for (i, v) in varargs.iter().enumerate() {
-                    let v = if matches!(v, Value::Str(_)) {
-                        coerce_to(&Type::Ptr(Box::new(Type::U8)), v.clone())
-                    } else {
-                        v.clone()
+                    // A string literal or an array argument decays to a pointer in its
+                    // slot, so the body's `*(U8 **)&VargV[i]` recovers it (e.g. `%s` of a
+                    // `U8 buf[]`). Without a declared parameter type, the decay has to
+                    // happen here: a literal interns to a stable byte buffer, an array
+                    // takes the address of its storage.
+                    let v = match v {
+                        Value::Str(_) => coerce_to(&Type::Ptr(Box::new(Type::U8)), v.clone()),
+                        Value::Array(_) => match as_pointer(v) {
+                            Some(Some(pv)) => Value::Ptr(Some(pv)),
+                            _ => v.clone(),
+                        },
+                        _ => v.clone(),
                     };
                     let le = match &v {
                         Value::Float(_) => v.as_f64().unwrap_or(0.0).to_le_bytes(),
@@ -1813,36 +1820,6 @@ impl<W: Write> Interpreter<W> {
         pos: Pos,
     ) -> Result<Value, CodegenError> {
         match name {
-            "Print" => {
-                self.print_formatted(args, pos)?;
-                Ok(Value::Void)
-            }
-            "StrPrint" | "CatPrint" => {
-                // Format `fmt, rest...`. `StrPrint` writes at the start of dst;
-                // `CatPrint` appends, writing at dst + StrLen(dst). Both
-                // NUL-terminate and return dst.
-                let fmt = match &args[1] {
-                    Value::Str(s) => s.to_string(),
-                    other => String::from_utf8_lossy(&self.cstr_bytes(other, pos)?).into_owned(),
-                };
-                let s = self.format(&fmt, &args[2..], pos)?;
-                let mut bytes = s.into_bytes();
-                bytes.push(0);
-                let at = if name == "CatPrint" {
-                    // Append: write at dst + StrLen(dst). `dst` may be a pointer, an
-                    // array (which decays to a pointer), or a string literal; turn any
-                    // of them into a pointer before applying the offset.
-                    let cur = self.cstr_bytes(&args[0], pos)?.len() as i64;
-                    match as_pointer(&args[0]) {
-                        Some(Some(pv)) => Value::Ptr(Some(pv.offset(cur))),
-                        _ => args[0].clone(),
-                    }
-                } else {
-                    args[0].clone()
-                };
-                self.write_bytes(&at, &bytes, pos)?;
-                Ok(args[0].clone())
-            }
             "MAlloc" => {
                 // A bare allocation with no element-type context gets a raw byte
                 // buffer. A typed `T *p = MAlloc(...)` is retyped by
@@ -1868,22 +1845,8 @@ impl<W: Write> Interpreter<W> {
                 };
                 Ok(Value::Int(n))
             }
-            "MStrPrint" => {
-                // Format into a freshly allocated, right-sized buffer and return it.
-                let fmt = match &args[0] {
-                    Value::Str(s) => s.to_string(),
-                    other => String::from_utf8_lossy(&self.cstr_bytes(other, pos)?).into_owned(),
-                };
-                let s = self.format(&fmt, &args[1..], pos)?;
-                let mut bytes = s.into_bytes();
-                bytes.push(0);
-                let mut env = Env::top_level();
-                let buf = self.alloc(bytes.len() as i64, &Type::U8, &mut env)?;
-                self.write_bytes(&buf, &bytes, pos)?;
-                Ok(buf)
-            }
             // Float conversion is not a builtin: `StrToF64` (a correctly-rounded bignum
-            // `atof`) and its round-trip inverse `F64ToStr` are pure HolyC in lib/cstr.hc.
+            // `atof`) and its round-trip inverse `F64ToStr` are pure HolyC in lib/stdlib.hc.
             //
             // Storage is reclaimed by `Rc`, so freeing is a no-op.
             "Free" => Ok(Value::Void),
@@ -1932,7 +1895,7 @@ impl<W: Write> Interpreter<W> {
                 }
             }
             // `Open(path, flags, mode)`. The canonical flags are Linux's (see
-            // `lib/io.hc`); map them to `OpenOptions`: `O_RDONLY`/`O_WRONLY`/`O_RDWR`
+            // `lib/fcntl.hc`); map them to `OpenOptions`: `O_RDONLY`/`O_WRONLY`/`O_RDWR`
             // plus `O_CREAT`/`O_TRUNC`/`O_APPEND`.
             "Open" => {
                 let path_bytes = self.cstr_bytes(&args[0], pos)?;
@@ -2148,7 +2111,7 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// An atomic op (`sync.hc`), width-directed by the pointer's pointee type `pty`.
+    /// An atomic op (`atomic.hc`), width-directed by the pointer's pointee type `pty`.
     /// The interpreter runs threads synchronously, with no real contention, so each
     /// op is a plain read-modify-write of the `pty`-sized scalar the pointer names.
     /// Values are masked or extended to the pointee width, so it matches the native
@@ -2348,16 +2311,6 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Format `args` as `"fmt", rest...` and write the result. Shared by the
-    /// implicit-print statement and the `Print` intrinsic.
-    fn print_formatted(&mut self, args: &[Value], pos: Pos) -> Result<(), CodegenError> {
-        if let Some(Value::Str(fmt)) = args.first() {
-            let s = self.format(fmt, &args[1..], pos)?;
-            write!(self.out, "{s}").map_err(|e| self.io(e))?;
-        }
-        Ok(())
-    }
-
     // ---- expressions (lvalue) ----
 
     /// The cell an lvalue expression designates (for assignment, `&`, `++/--`).
@@ -2401,7 +2354,23 @@ impl<W: Write> Interpreter<W> {
                         ptrs: self.ptr_table.clone(),
                     })
                 } else {
-                    Ok(Place::Cell(pv.target(pos)?))
+                    // A non-heap (cell-based) region. Running past its cells is commonly a
+                    // byte-level / reinterpreting access into a stack-allocated class or
+                    // array, which the interpreter addresses by element, not byte.
+                    pv.target(pos).map(Place::Cell).map_err(|_| {
+                        CodegenError::at(
+                            pos,
+                            format!(
+                                "pointer access out of bounds (element {}): past this \
+                                 value's storage. The interpreter addresses cell-allocated \
+                                 classes and arrays by element, not byte, so a reinterpreting \
+                                 cast or byte-level operation (e.g. `MemCpy`) that runs past \
+                                 their cells fails here — back the data with a byte buffer \
+                                 (`U8 *raw = MAlloc(...)`) for raw byte access",
+                                pv.index
+                            ),
+                        )
+                    })
                 }
             }
             // Assigning a scalar union field writes into the shared byte buffer.
@@ -2513,16 +2482,49 @@ impl<W: Write> Interpreter<W> {
         };
         let sv = class_cell.borrow();
         match &*sv {
-            Value::Class(fields) => fields
-                .borrow()
-                .get(field)
-                .cloned()
-                .ok_or_else(|| CodegenError::at(pos, format!("no field `{field}`"))),
+            Value::Class(fields) => match fields.borrow().get(field).cloned() {
+                Some(c) => Ok(c),
+                None => Err(self.field_access_oob(base, field, pos)),
+            },
             _ => Err(CodegenError::at(
                 pos,
                 "member access on a value that is not a class or union",
             )),
         }
+    }
+
+    /// The error for a field that the stored object lacks. If `field` is declared on the
+    /// base's *static* class, the object here is a different type — i.e. a reinterpreting
+    /// cast of a stack/cell-allocated class, which the interpreter can't byte-address.
+    fn field_access_oob(&self, base: &Expr, field: &str, pos: Pos) -> CodegenError {
+        let static_class = match base.ty() {
+            Some(Type::Named(n)) => Some(n),
+            Some(Type::Ptr(inner)) => match *inner {
+                Type::Named(n) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(cls) = static_class {
+            let declared = self
+                .layouts
+                .get(&cls)
+                .map(|l| l.fields.iter().any(|f| f.name == field))
+                .unwrap_or(false);
+            if declared {
+                return CodegenError::at(
+                    pos,
+                    format!(
+                        "field `{field}` belongs to `{cls}`, but the object stored here is a \
+                         different type — the interpreter can't reinterpret a cell-allocated \
+                         class (a stack local, or `MAlloc` typed as a class pointer) through \
+                         a cast. Back it with a byte buffer instead: \
+                         `U8 *raw = MAlloc(sizeof(...));` then cast `raw` to the class pointer"
+                    ),
+                );
+            }
+        }
+        CodegenError::at(pos, format!("no field `{field}`"))
     }
 
     /// Resolve `base.field` (or `base->field`) to a union byte buffer plus the
@@ -2994,168 +2996,8 @@ impl<W: Write> Interpreter<W> {
         let v = self.eval(e, env)?;
         self.to_i64(v, pos)
     }
-
-    /// printf-style formatting supporting `%d %u %x %X %c %s %f %p %%`.
-    fn format(&self, fmt: &str, args: &[Value], pos: Pos) -> Result<String, CodegenError> {
-        use crate::fmt::{render_int, render_str};
-        let mut out = String::new();
-        let mut chars = fmt.chars().peekable();
-        let mut ai = 0;
-        // Fetch the next argument for a conversion specifier.
-        let take = |ai: &mut usize| -> Result<Value, CodegenError> {
-            let v = args
-                .get(*ai)
-                .cloned()
-                .ok_or_else(|| CodegenError::at(pos, "not enough arguments for format string"))?;
-            *ai += 1;
-            Ok(v)
-        };
-        while let Some(c) = chars.next() {
-            if c != '%' {
-                out.push(c);
-                continue;
-            }
-            let mut spec = crate::fmt::parse(&mut chars);
-            if spec.conv == '%' {
-                out.push('%');
-                continue;
-            }
-            // A `*` width or precision comes from an argument, consumed left to right
-            // before the value. A negative `*` width means left-justify.
-            let width = if spec.width_star {
-                let w = value_as_i64(&take(&mut ai)?);
-                if w < 0 {
-                    spec.minus = true;
-                    Some(w.unsigned_abs() as usize)
-                } else {
-                    Some(w as usize)
-                }
-            } else {
-                spec.width
-            };
-            let precision = if spec.prec_star {
-                let p = value_as_i64(&take(&mut ai)?);
-                (p >= 0).then_some(p as usize) // negative precision is omitted
-            } else if spec.has_precision {
-                Some(spec.precision)
-            } else {
-                None
-            };
-
-            match spec.conv {
-                'd' | 'i' => {
-                    let n = value_as_i64(&take(&mut ai)?);
-                    let sign = if n < 0 {
-                        "-"
-                    } else if spec.plus {
-                        "+"
-                    } else if spec.space {
-                        " "
-                    } else {
-                        ""
-                    };
-                    let digits = n.unsigned_abs().to_string();
-                    out.push_str(&render_int(&spec, width, precision, sign, "", &digits));
-                }
-                'u' => {
-                    let u = value_as_i64(&take(&mut ai)?) as u64;
-                    out.push_str(&render_int(&spec, width, precision, "", "", &u.to_string()));
-                }
-                'x' | 'X' => {
-                    let u = value_as_i64(&take(&mut ai)?) as u64;
-                    let digits = if spec.conv == 'x' {
-                        format!("{u:x}")
-                    } else {
-                        format!("{u:X}")
-                    };
-                    let alt = match (spec.hash && u != 0, spec.conv) {
-                        (true, 'x') => "0x",
-                        (true, _) => "0X",
-                        _ => "",
-                    };
-                    out.push_str(&render_int(&spec, width, precision, "", alt, &digits));
-                }
-                'o' => {
-                    let u = value_as_i64(&take(&mut ai)?) as u64;
-                    let mut digits = format!("{u:o}");
-                    let mut precision = precision;
-                    if spec.hash {
-                        if !digits.starts_with('0') {
-                            digits.insert(0, '0');
-                        }
-                        // `#` octal keeps a leading `0` even for `%#.0o` of 0, where
-                        // precision 0 would otherwise drop the digit (C semantics).
-                        if precision == Some(0) && digits == "0" {
-                            precision = Some(1);
-                        }
-                    }
-                    out.push_str(&render_int(&spec, width, precision, "", "", &digits));
-                }
-                'c' => {
-                    // libc's `%c` takes the low byte of the argument.
-                    let ch = value_as_i64(&take(&mut ai)?) as u8 as char;
-                    out.push_str(&render_str(&spec, width, None, &ch.to_string()));
-                }
-                's' => {
-                    let v = take(&mut ai)?;
-                    let body = match &v {
-                        Value::Str(s) => s.to_string(),
-                        // A pointer or array into a byte buffer: read its bytes up to
-                        // the NUL terminator, as `%s` does in C.
-                        Value::Ptr(Some(_)) | Value::Array(_) => {
-                            String::from_utf8_lossy(&self.cstr_bytes(&v, pos)?).into_owned()
-                        }
-                        Value::Ptr(None) => "(null)".to_string(),
-                        other => format!("{other:?}"),
-                    };
-                    out.push_str(&render_str(&spec, width, precision, &body));
-                }
-                'f' | 'e' | 'E' | 'g' | 'G' => {
-                    let v = value_as_f64(&take(&mut ai)?);
-                    // The sign comes from the IEEE sign bit, so negative zero prints
-                    // with a `-`, matching libc and the freestanding bignum
-                    // formatters. A plain `v < 0.0` would drop `-0.0`'s sign.
-                    let neg = v.is_sign_negative();
-                    let mag = v.abs();
-                    let body = match spec.conv {
-                        // C's default `%f` precision is 6; match libc exactly.
-                        'f' => format!("{mag:.*}", precision.unwrap_or(6)),
-                        'e' | 'E' => {
-                            crate::fmt::render_exp(mag, precision.unwrap_or(6), spec.conv == 'E')
-                        }
-                        _ => crate::fmt::render_g(
-                            mag,
-                            precision.unwrap_or(6),
-                            spec.conv == 'G',
-                            spec.hash,
-                        ),
-                    };
-                    let sign = float_sign(neg, &spec);
-                    out.push_str(&render_int(&spec, width, None, sign, "", &body));
-                }
-                'p' => {
-                    // Addresses can't match the native backend, so keep a stable form.
-                    let body = match take(&mut ai)? {
-                        Value::Ptr(None) => "0x0".to_string(),
-                        Value::Ptr(Some(_)) => "0x(ptr)".to_string(),
-                        other => format!("{other:?}"),
-                    };
-                    out.push_str(&render_str(&spec, width, None, &body));
-                }
-                '\0' => out.push('%'),
-                other => {
-                    out.push('%');
-                    out.push(other);
-                }
-            }
-        }
-        Ok(out)
-    }
 }
 
-/// Type-check and run a program, returning everything it printed. This is the safe
-/// "compile and run" entry point. It runs semantic analysis first, so the typed AST
-/// the interpreter needs is in place, and reports the first semantic error if any.
 pub fn run_to_string(program: &Program) -> Result<String, CodegenError> {
     if let Some(e) = crate::sema::check_program(program).into_iter().next() {
         return Err(CodegenError::at(
@@ -3353,20 +3195,6 @@ fn is_signed_int(ty: &Type) -> bool {
 /// signed, matching HolyC's default `I64`.
 fn expr_is_signed(e: &Expr) -> bool {
     e.ty().as_ref().is_none_or(is_signed_int)
-}
-
-/// The sign prefix for a float conversion: `-` for a negative, else `+` or a space
-/// per the flags, else empty.
-fn float_sign(neg: bool, spec: &crate::fmt::Spec) -> &'static str {
-    if neg {
-        "-"
-    } else if spec.plus {
-        "+"
-    } else if spec.space {
-        " "
-    } else {
-        ""
-    }
 }
 
 /// Coerce a scalar value to the type of the lvalue it is being stored into,

@@ -137,7 +137,7 @@ fn math_erf_and_gamma() {
     // output by the conformance suites.
     let out = run_with_stdlib(
         r#"
-        #include <special.hc>
+        #include <math.hc>
         U0 Main() {
           "%.10f %.10f %.10f\n", Erf(0.5), Erf(1.0), Erf(2.0);
           "%.10g %.10g\n", Erfc(2.0), Erfc(3.0);
@@ -168,7 +168,7 @@ fn math_bessel() {
     // range.
     let out = run_with_stdlib(
         r#"
-        #include <special.hc>
+        #include <math.hc>
         U0 Main() {
           "%.10f %.10f %.10f\n", J0(1.0), J0(5.0), J0(20.0);
           "%.10f %.10f %.10f\n", J1(1.0), J1(5.0), J1(20.0);
@@ -193,12 +193,12 @@ fn math_bessel() {
 
 #[test]
 fn rand_seed_controls_the_stream() {
-    // `rand.hc`: the generator is deterministic. `SeedRand` makes the stream
+    // `RandU64` (in `<stdlib.hc>`): the generator is deterministic. `SeedRand` makes the stream
     // reproducible — the same seed gives the same value — and seed-dependent: a
     // different seed gives a different value.
     let out = run_with_stdlib(
         r#"
-        #include <rand.hc>
+        #include <stdlib.hc>
         U0 Main() {
           SeedRand(1); I64 a = RandU64();
           SeedRand(1); I64 b = RandU64();
@@ -221,7 +221,7 @@ fn strtof64_parses_correctly_rounded() {
     // against Python over a 438-input random battery.
     let out = run_with_stdlib(
         r#"
-        #include <cstr.hc>
+        #include <stdlib.hc>
         U0 Main() {
           "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
           "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");
@@ -246,7 +246,7 @@ fn strtof64_parses_correctly_rounded() {
 
 #[test]
 fn holyc_float_f_formatter_matches_rust() {
-    // The pure-HolyC `%f` formatter (`lib/fltfmt.hc`) must match Rust's `{:.P}`
+    // The pure-HolyC `%f` formatter (`lib/stdio.hc`) must match Rust's `{:.P}`
     // byte-for-byte. It is the portable replacement for the hand-emitted bignum.
     // Coverage includes round-half-to-even ties, subnormals, the 2^53 boundary,
     // extremes, and -0.0. Each value is reconstructed from its exact bits via
@@ -293,7 +293,8 @@ fn holyc_float_f_formatter_matches_rust() {
     ];
     let precs: &[usize] = &[0, 1, 2, 3, 6, 10, 15, 17, 20];
 
-    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src =
+        String::from("#include <stdio.hc>\n#include <math.hc>\nU0 Main(){\nU8 b[2048];\n");
     let mut expected = String::new();
     for &v in values {
         for &p in precs {
@@ -326,14 +327,58 @@ fn holyc_float_f_formatter_matches_rust() {
     }
 }
 
+/// Render `mag` (non-negative) in C `%e`/`%E` form: a single leading digit, a
+/// `precision`-digit fraction, then `e`/`E`, a sign, and an exponent of at least two
+/// digits. Rust's correctly-rounded `{:e}` does the mantissa; this only restyles the
+/// exponent to match libc. It is the **independent Rust oracle** the HolyC `%e`/`%g`
+/// formatter is checked against — kept local to the test crate now that the
+/// interpreter renders through the HolyC `FmtFloat` body rather than any Rust formatter.
+fn render_exp(mag: f64, precision: usize, upper: bool) -> String {
+    let s = format!("{:.*e}", precision, mag);
+    let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let e = if upper { 'E' } else { 'e' };
+    let sign = if exp < 0 { '-' } else { '+' };
+    format!("{mant}{e}{sign}{:02}", exp.unsigned_abs())
+}
+
+/// Render `mag` (non-negative) in C `%g`/`%G` form: `precision` significant digits,
+/// choosing `%e` or `%f` by the post-rounding exponent and trimming trailing zeros
+/// unless `alt` (the `#` flag) is set. The companion oracle to [`render_exp`].
+fn render_g(mag: f64, precision: usize, upper: bool, alt: bool) -> String {
+    let p = precision.max(1);
+    // Format as %e at p-1 fractional digits to learn the rounded exponent X.
+    let es = format!("{:.*e}", p - 1, mag);
+    let (mant, exp) = es.split_once('e').unwrap_or((es.as_str(), "0"));
+    let x: i32 = exp.parse().unwrap_or(0);
+    let mut body = if x >= -4 && (x as i64) < p as i64 {
+        // %f style with precision p-1-X.
+        let fp = (p as i32 - 1 - x).max(0) as usize;
+        format!("{:.*}", fp, mag)
+    } else {
+        let e = if upper { 'E' } else { 'e' };
+        let sign = if x < 0 { '-' } else { '+' };
+        format!("{mant}{e}{sign}{:02}", x.unsigned_abs())
+    };
+    if !alt {
+        // Trim trailing zeros (and a bare `.`) from the mantissa, not the exponent.
+        let (m, e) = match body.find(['e', 'E']) {
+            Some(i) => (body[..i].to_string(), body[i..].to_string()),
+            None => (body.clone(), String::new()),
+        };
+        if m.contains('.') {
+            body = format!("{}{e}", m.trim_end_matches('0').trim_end_matches('.'));
+        }
+    }
+    body
+}
+
 #[test]
 fn holyc_float_e_g_formatter_matches_rust() {
-    // The pure-HolyC `%e`/`%g` formatters (`lib/fltfmt.hc`) must match the
-    // interpreter's renderers `fmt::render_exp`/`render_g` byte-for-byte. Those
-    // renderers are Rust's correctly-rounded `{:.Pe}` restyled to libc. Coverage
-    // includes `%g`'s fixed/scientific choice, trailing-zero trim, and the `#` (alt)
-    // flag.
-    use solomon::fmt::{render_exp, render_g};
+    // The pure-HolyC `%e`/`%g` formatters (`lib/stdio.hc`) must match the local Rust
+    // oracles `render_exp`/`render_g` byte-for-byte. Those renderers are Rust's
+    // correctly-rounded `{:.Pe}` restyled to libc. Coverage includes `%g`'s
+    // fixed/scientific choice, trailing-zero trim, and the `#` (alt) flag.
     let sign = |v: f64| if v.is_sign_negative() { "-" } else { "" };
     // The subnormal / extreme-exponent cases (×5^~1074, extracting ~750 digits) are
     // slow in the tree-walking interp, so they're kept few here. The bignum's
@@ -367,7 +412,8 @@ fn holyc_float_e_g_formatter_matches_rust() {
     ];
     let precs: &[usize] = &[0, 1, 3, 6, 17];
 
-    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src =
+        String::from("#include <stdio.hc>\n#include <math.hc>\nU0 Main(){\nU8 b[2048];\n");
     let mut expected = String::new();
     let emit = |src: &mut String, expected: &mut String, call: String, want: String| {
         src.push_str(&call);
@@ -427,9 +473,9 @@ fn holyc_float_e_g_formatter_matches_rust() {
 #[test]
 fn holyc_float_field_matches_interp() {
     // `FmtFloat` assembles the COMPLETE field: sign, width, and the `- 0 + space #`
-    // flags. It must equal the interpreter's own `%`-rendering byte-for-byte (the
-    // interpreter's magnitude renderer wrapped by `render_int`). Each case prints the
-    // intrinsic and `FmtFloat` on adjacent lines and asserts the pair matches.
+    // flags. The `"%f", v` print form lowers to the same HolyC `Print`/`FmtFloat` path,
+    // so this checks the printf wiring against a direct `FmtFloat` call: each case prints
+    // the intrinsic and `FmtFloat` on adjacent lines and asserts the pair matches.
     // (spec, conv char, packed flag bits, width, precision)
     let cases: &[(&str, char, i64, usize, usize)] = &[
         ("%8.2f", 'f', 0, 8, 2),
@@ -453,7 +499,8 @@ fn holyc_float_field_matches_interp() {
     let values: &[f64] = &[
         3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1e6, -0.001, 42.0, 0.5,
     ];
-    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src =
+        String::from("#include <stdio.hc>\n#include <math.hc>\nU0 Main(){\nU8 b[2048];\n");
     for &(spec, conv, flags, width, prec) in cases {
         for &v in values {
             let bits = v.to_bits();
@@ -484,8 +531,8 @@ fn realloc_preserves_contents() {
     // asserted.
     let out = run_with_stdlib(
         r#"
-        #include <cstr.hc>
-        #include <mem.hc>
+        #include <string.hc>
+        #include <stdlib.hc>
         U0 Main() {
           U8 *p = ReAlloc(NULL, 0, 8);   // == MAlloc(8)
           StrCpy(p, "abcdef");
@@ -506,8 +553,8 @@ fn msize_reports_the_requested_allocation_size() {
     // size header transparently, and tracks through a ReAlloc grow.
     let out = run_with_stdlib(
         r#"
-        #include <cstr.hc>
-        #include <mem.hc>
+        #include <string.hc>
+        #include <stdlib.hc>
         U0 Main() {
           U8 *p = MAlloc(40); "%d ", MSize(p);
           U8 *q = MAlloc(7);  "%d ", MSize(q);

@@ -40,7 +40,7 @@ fn spawn_echo() -> u16 {
 fn echo_program(port: u16) -> String {
     format!(
         r#"
-        #include <net.hc>
+        #include <socket.hc>
         U0 Main() {{
           I64 fd = TcpConnect(ParseIPv4("127.0.0.1"), {port});
           if (fd < 0) {{ "connect failed: %d\n", -fd; return; }}

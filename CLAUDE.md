@@ -59,13 +59,14 @@ mode. Entry points: `parse(src)` (CWD base, embedded stdlib only), `parse_in_dir
 `parse_with(src, dir, search)`; the CLI passes the input file's parent +
 `solomon::stdlib_dirs()` (the `SOLOMON_STDLIB` overrides; `-I DIR` prepends more).
 
-**Float-formatter auto-include.** Float printing is a pure-HolyC function
-(`lib/fltfmt.hc`'s `FmtFloat`) the backends *call*, not emit; with no dead-code
-elimination it can't be linked unconditionally, so `hoist_type_names` also returns
-`uses_float` (set when a format string carries `%f`/`%e`/`%E`/`%g`/`%G`, via the shared
-`crate::fmt::parse`) and the prelude then prepends `#include <fltfmt.hc>`
-(guard-deduped). Interp ignores it (renders via `fmt.rs`), Darwin compiles-but-uses-libc,
-the freestanding/x86/Windows backends call it.
+**Float-formatter auto-include.** Float printing is a pure-HolyC function (`FmtFloat`,
+folded into `<stdio.hc>` next to the printf core) that *every* target runs, not emits;
+with no dead-code elimination it can't be linked unconditionally, so it rides in on the
+same `<stdio.hc>` auto-include any print triggers (`hoist_type_names` sets `uses_print`;
+the prelude prepends `#include <stdio.hc>`, guard-deduped). The interpreter and the
+freestanding/x86/Windows backends compile-and-run the one `FmtFloat` body; Darwin alone
+links the same body but defers the irreducible leaf to libc. There is no separate Rust
+formatter — the printf family is one HolyC implementation on every target.
 
 ### Streaming tokens (a load-bearing constraint)
 Tokens are **never materialized into a list.** `lexer.rs`'s `TokenStream` trait
@@ -139,15 +140,18 @@ transcendentals are absent (they're lib functions, below).
 - **Optimization** — has a real HolyC body a backend may replace with an instruction where
   supported, else calls the body (`Sqrt` → `fsqrt`/`sqrtsd`, else the lib Newton; both
   correctly rounded, so they agree). The interpreter always runs the body.
-- **Primitive** — a body-less lib *prototype* the backend *must* lower (it bundles OS
-  syscalls or the format machinery): the printf family, the heap
-  (`MAlloc`/`Free`/`HeapExtend`/`MSize`), the clock, fd I/O + sockets, fs mutation +
-  process control, threads, atomics.
+- **Primitive** — a body-less lib *prototype* the backend *must* lower (it bundles an OS
+  syscall): the `StdWrite` sink, the heap (`MAlloc`/`Free`/`HeapExtend`/`MSize`), the clock,
+  fd I/O + sockets, fs mutation + process control, threads, atomics. The **printf family is
+  not here** — `Print`/`StrPrint`/`CatPrint`/`MStrPrint` and the `VFmt`/`FmtFloat` core are
+  pure HolyC in `<stdio.hc>` (bottoming out at `StdWrite`), so they are ordinary functions
+  every target compiles and runs.
 
 Dispatch in both backends + interp gates on `intrinsics::is_primitive(name)`. A **compiled
 user function shadows a like-named primitive** (a program's own `Read`/`Join`) — a body in
-`funcs` means "call the body." Bare strings and the `"fmt", args` comma form lower inline
-(not `Print` calls), so they need no include.
+`funcs` means "call the body." A bare string statement prints verbatim (lowered inline); the
+`"fmt", args` comma form lowers to a `Print` call, so it needs `<stdio.hc>` — which the
+print auto-include always supplies.
 
 The only compiler-provided names with **no `lib/*.hc` declaration** are the implicit
 command line `ArgC`/`ArgV`, environment `EnvP`, and a `...` function's `VargC`/`VargV` —
@@ -160,45 +164,58 @@ are conformance-tested by *property* (e.g. monotonic clock, write→read round-t
 interp-vs-native value.
 
 ### Standard library (`lib/*.hc`)
-Each module is includable on its own; the human-readable header in each file is the API
-reference. Map:
+The stdlib mirrors **C/POSIX headers** — filenames and groupings follow `<string.h>`,
+`<stdio.h>`, `<stdlib.h>`, etc., though the function names stay HolyC-PascalCase
+(`StrLen`, `MAlloc`, `Print`). Each public module is includable on its own; the
+human-readable header in each file is the API reference. Map:
+
+Public C-named headers:
 - `builtin.hc` — implicit prelude (no `#include`): `NULL`/`TRUE`/`FALSE`, `MAlloc`/`Free`
-  prototypes, doc for the sema-injected `ArgC`/`ArgV`/`EnvP`/`VargC`/`VargV`.
-- `cstr.hc` — C `U8 *` string ops (`<string.h>` family) + the number<->string pairs
-  `StrToI64`/`I64ToStr` and `StrToF64`/`F64ToStr` + `CmpStr`. `StrToF64` is the
-  correctly-rounded `atof` (over `Bn`); `F64ToStr` is its round-trip inverse (shortest
-  `%g` that `StrToF64` parses back exactly, via `FmtFloat`). So `cstr.hc` now includes
-  `<bignum.hc>` and `<fltfmt.hc>` (neither depends back on it — no cycle; the old `%g`
-  `F64ToStr` lived in `<fmt.hc>` precisely to avoid the printf-core cycle).
-  `mem.hc` — `mem*` family, `HeapExtend`/`MSize` (heap intrinsics), `CAlloc`,
-  `ReAlloc`. `ctype.hc` — ASCII classification (`Is*`/`ToUpper`/`ToLower`, 0/1).
-- `fmt.hc` — printf-family intrinsic prototypes. `stdio.hc` is **gone**: `StdWrite`
-  (portable stdout/stderr sink) + `STDOUT`/`STDERR` now live in `io.hc`. `printf.hc` —
-  private printf core (`Pf` sink, `VFmt`), `#include`s `<io.hc>` for `StdWrite`.
-  `fltfmt.hc` — **private** correctly-rounded float formatter `FmtFloat` (base-2³²
-  bignum `Fbn`); auto-included; matches `fmt.rs` byte-for-byte.
-- `bignum.hc` — `class Bn` minimal nonnegative big integer. `strconv.hc` — a
-  compatibility shim that re-`#include`s `<cstr.hc>` (where `StrToF64`/`F64ToStr` now
-  live).
-- `bits.hc` → `math.hc` → `special.hc` (each includes the prior) — IEEE bit ops;
-  elementary funcs (`Sqrt`/`Fabs`/rounding are optimization intrinsics; transcendentals
-  are *defined* series, reproducible); special funcs (erf/gamma/Bessel). `rand.hc` —
-  deterministic splitmix64 `RandU64`/`SeedRand`.
-- `vec.hc` — `Vec<T>` owning growable typed array (scalar/pointer/class elements);
-  `hmap.hc` — `Hmap<K,V>` hash map (separate chaining; hash/eq fn-ptrs; stock I64/string
-  keys via private `strhash.hc` `Djb2`); `sort.hc` — generic `Sort<T>`/`BSearch<T>`
-  (typed comparator `(T*,T*)`, median-of-three quicksort + typed swap; stock
-  `CmpI64`/`CmpU64`/`CmpF64`).
-- `io.hc` — fd I/O (`Open`/`LSeek`/`Read`/`Write`/`Close` primitives + `StdWrite` +
-  `ReadFile`/`WriteFile`/…); flag `#define`s are canonical Linux values (Darwin/interp
-  translate). `net.hc` — TCP (`Socket`/`Connect` + `TcpConnect`/`HttpGet`). `os.hc` —
-  `Exit`/`Getpid`/…, `Remove`/`Rename`/`Mkdir`/`Chdir`/`Getcwd`, `Getenv`/`Environ` (pure
-  HolyC over `EnvP`). `time.hc` — clock intrinsics + calendar math.
-- `thread.hc` — `Thread`/`Join` (Darwin pthread; freestanding raw `clone(2)` + futex join;
-  interp runs bodies synchronously at spawn). `sync.hc` — atomics (`Atomic*`,
-  width-directed by the pointee) + `Mutex`/`Cond`/`RwLock` (Drepper futex locks in pure
-  HolyC; freestanding globals are 16-byte-aligned since AArch64 exclusive / x86 `lock` ops
-  fault on misalignment).
+  prototypes, `CTask`, doc for the sema-injected `ArgC`/`ArgV`/`EnvP`/`VargC`/`VargV`/`Fs`.
+- `string.hc` (`<string.h>`) — C `U8 *` string ops (`Str*` family) **and** the raw-memory
+  `mem*` family (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`), plus `CmpStr`.
+- `ctype.hc` (`<ctype.h>`) — ASCII classification (`Is*`/`ToUpper`/`ToLower`, 0/1).
+- `stdio.hc` (`<stdio.h>`) — printf family (`Print`/`StrPrint`/`CatPrint`/`MStrPrint`),
+  `Remove`/`Rename`, and path file helpers (`ReadFile`/`WriteFile`/`AppendFile`/`FileSize`).
+  Holds the private printf core (`Pf` sink, `VFmt`) and the correctly-rounded float
+  formatter `FmtFloat` (base-2³² bignum `Fbn`, private `FltBits` punning so it needn't pull
+  `<math.hc>`; cross-checked against a Rust `%e`/`%g` oracle in `tests/stdlib.rs`).
+  `#include`s `<string.hc>`/`<fcntl.hc>`/
+  `<unistd.hc>` only — `MStrPrint` grows via `MAlloc`+`MemCpy`+`Free`, so a plain printing
+  program stays lean. Auto-included when a program prints.
+- `stdlib.hc` (`<stdlib.h>`) — `CAlloc`/`ReAlloc`/`MSize`/`HeapExtend`; the number<->string
+  conversions `StrToI64`/`I64ToStr`/`StrToF64`/`F64ToStr` (`StrToF64` is the
+  correctly-rounded `atof` over the private `Bn` big integer; `F64ToStr` its
+  shortest-round-trip inverse via `<stdio.hc>`'s `FmtFloat`, the one outward dependency);
+  `Sort`/`BSearch` (`qsort`/`bsearch`); `RandU64`/`SeedRand`; `Exit`; `Getenv`.
+  Auto-included when a program uses `F64ToStr`.
+- `math.hc` (`<math.h>`) — opens with the IEEE bit access/classification (`Float64bits`/
+  `IsNaN`/`Signbit`/`Copysign`/`NaN`/`Inf`), then the elementary funcs (`Sqrt`/`Fabs`/
+  rounding are optimization intrinsics; transcendentals are *defined* series,
+  reproducible), then the special funcs (erf/gamma/Bessel). Standalone (no includes).
+- `time.hc` (`<time.h>`) — clock intrinsics + calendar math.
+- `fcntl.hc` (`<fcntl.h>`) — `Open` + the `O_*`/`MODE_0644` flags. `unistd.hc`
+  (`<unistd.h>`) — `Read`/`Write`/`Close`/`LSeek`/`StdWrite`/`WriteAll` + `SEEK_*` +
+  `STDOUT`/`STDERR`; `Getpid`/`Getppid`/`Getuid`/`Getgid`/`Chdir`/`Getcwd`/`Mkdir`. Flag
+  `#define`s are canonical Linux values (Darwin/interp translate).
+- `socket.hc` (`<sys/socket.h>`) — TCP (`Socket`/`Connect` + `TcpConnect`/`HttpGet`).
+- `threads.hc` (`<threads.h>`) — `Thread`/`Join` (Darwin pthread; freestanding raw
+  `clone(2)` + futex join; interp runs bodies synchronously at spawn) **and**
+  `Mutex`/`Cond`/`RwLock` (Drepper futex locks in pure HolyC). `atomic.hc`
+  (`<stdatomic.h>`) — atomics (`Atomic*`, width-directed by the pointee) + `AtomicFence` +
+  `FutexWait`/`FutexWake`. Freestanding sync globals are 16-byte-aligned (AArch64 exclusive
+  / x86 `lock` ops fault on misalignment).
+
+Container extensions (no C equivalent):
+- `vec.hc` — `Vec<T>` owning growable typed array (scalar/pointer/class elements); also
+  hosts `Environ(Vec<U8*>*)` since it builds a `Vec`. `hmap.hc` — `Hmap<K,V>` hash map
+  (separate chaining; hash/eq fn-ptrs; stock I64/string keys via a private `Djb2` string
+  hash defined in the file).
+
+Every other module's internals were folded into the C header that owns them — the lib
+directory is only C-named headers plus the two container extensions. `qsort`/`bsearch`/the
+`Bn` big integer/the heap helpers fold into `<stdlib.hc>`; the printf core + `FmtFloat`
+into `<stdio.hc>`; the IEEE bit ops into `<math.hc>`; the djb2 hash into `<hmap.hc>`.
 
 ## HolyC / implementation semantics worth knowing
 - Default int is `I64`; no `F32` (only `F64`). A bare string statement prints itself;
@@ -282,17 +299,20 @@ reference. Map:
   alignment, declaration order). A class passes/assigns **by value** (deep copy); arrays
   **decay to pointers**. An anonymous `union { … };` promotes its members into the
   enclosing class (`obj.field`); a named `union Name m;` is a member (`obj.m.field`).
-- **Anonymous aggregate types + structural typing.** An anonymous `class { … }` /
+- **Anonymous aggregate types; nominal typing.** An anonymous `class { … }` /
   `union { … }` is a first-class type at any type position; the parser interns it to a
   synthetic `Named($Cls…/$ClsU…)` (deduped, signature-mangled via `anon_aggregate_name`,
   array dims folded into the mangle) and pushes a synthetic `ClassDef` to `pending_types`
-  — like tuple/embedded-union synthesis, so layout/interp/backends are unchanged. Named
-  classes stay **nominal** (so self-referential `class Node { Node *next; }` terminates in
-  layout), but aggregates compare **structurally**: `sema::types_compatible` (a coinductive
-  `compat` with a `seen` cycle guard) accepts two types with the same ordered
-  `(field name, field type)` list + same kind (`is_union` on `TypeDef`), so same-signature
-  named/anon/`typedef class{…}` types interchange in `check_assignable` (assign/return/init;
-  args stay arity-only). Anon-in-generic-template referencing a type param is a parse error.
+  — like tuple/embedded-union synthesis, so layout/interp/backends are unchanged.
+  Aggregates are **nominal**, matching HolyC: `sema::types_compatible`/`compat` accepts two
+  `class`/`union` types only when they are the *same* named type, so two differently-named
+  same-fielded classes never assign across each other (reinterpret via a pointer cast,
+  `union`, or `MemCpy` instead). Identical anonymous/tuple types share one synthetic name,
+  so they still match via the `a == b` fast path. `check_assignable` gates assign/return/
+  init, and `check_arg` checks **aggregate** call arguments the same way (a `class`/`union`
+  value must match its parameter's named type); scalar and pointer arguments stay permissive
+  (int/float/pointer conversions, `NULL`, array decay, and pointer reinterpretation).
+  Anon-in-generic-template referencing a type param is a parse error.
 
 ## The arm64/x86 ABI + shared formatting
 Because solomon functions only call each other, the native backends use an internally
@@ -300,10 +320,12 @@ consistent ABI (not full AAPCS64/System V packing): int/ptr args in `x0–x7`/`r
 `v0–v7`/`xmm0…` (the two classes numbered independently); classes by value carried by
 address (the callee copies; class returns via an sret pointer in `x8`/`r11`); array params
 decay to a by-reference pointer; `&Func` is a self-resolved address and an indirect call
-classes its args off the callee's `Type::FuncPtr`. Print formatting is shared via
-`src/fmt.rs`: it parses each `%[flags][width][.prec]conv` spec once; the interpreter
-renders the value (`render_int`/`render_str`/`render_exp`/`render_g`), the backends compile
-the pure-HolyC `FmtFloat` for floats — byte-identical.
+classes its args off the callee's `Type::FuncPtr`. Print formatting is **one HolyC
+implementation** shared by every target: the printf family (`Print`/`StrPrint`/… → the
+`VFmt` spec parser → `FmtFloat`) lives in `<stdio.hc>`, so the interpreter runs those
+bodies and the backends compile-and-call them — no Rust formatter, byte-identical by
+construction. A bare string prints verbatim; the `"fmt", …` comma form lowers to a `Print`
+call (`gen_print`/`as_print` in the backends, routed through `call("Print", …)` in interp).
 
 ## Generics (monomorphized; `src/mono.rs`)
 The parser never instantiates; it **defers** every generic use to an AST node — `Vec<I64>`
@@ -344,8 +366,17 @@ The backends compile the whole implemented subset: the `offset` keyword, brace +
 designated initializers (nested/partial/out-of-order, arrays of classes — a shared
 `gen_init_into` per backend), member access on a call result (`Mk().x`), function pointers
 end to end (`&Func`, calls through a pointer, fn-ptr class fields/arrays/vtables), and
-`typedef` aliases (incl. function-pointer and anonymous-aggregate aliases
-`typedef class{…} Name`, resolved at parse time, defined before use). `#exe { … }` runs
+`typedef` aliases for scalars, pointers, classes, and the anonymous-aggregate form
+`typedef class{…} Name` (resolved at parse time, defined before use). A **function-pointer
+type** is named two ways, both putting the name *outside* the declarator:
+`typedef I64 (*)(I64) Name;` (an anonymous fn-ptr type with the name after it — the
+consistent `typedef <type> <name>` shape) or the keyword-less bare declarator
+`I64 (*Name)(I64);` (a top-level declarator with no initializer; an initializer makes it an
+ordinary global, and the same shape at local scope stays a variable — `parser.rs`'s
+`top_level` flag gates this). The **C-style `typedef I64 (*Name)(I64);`, with the name
+buried inside the declarator, is a compile error** (`parse_typedef` rejects a named
+`Type::FuncPtr`). The stdlib's `ThreadFn` (`lib/threads.hc`) uses the keyword-less form.
+`#exe { … }` runs
 HolyC at compile time via the interpreter and splices its stdout.
 **Still absent:** most of the TempleOS core/standard library and DolDoc.
 
