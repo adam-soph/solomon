@@ -1,28 +1,28 @@
-//! Type layout: the in-memory size, alignment, and field offsets of every
+//! Computes the in-memory size, alignment, and field offsets of every
 //! `class`/`union`.
 //!
-//! This is a standalone pass (`compute`) consumed by both semantic analysis
-//! (which folds its errors in) and the backends: the interpreter uses it for
-//! `sizeof`, and the AArch64 codegen backend uses offsets/sizes/strides for
-//! field access, array indexing, and pointer arithmetic.
+//! `compute` is a standalone pass. Semantic analysis runs it and folds its
+//! errors in; the backends consume its results. The interpreter uses it for
+//! `sizeof`, and the AArch64 codegen backend uses offsets, sizes, and strides
+//! for field access, array indexing, and pointer arithmetic.
 //!
-//! Layout model — **natural alignment with padding (the x86-64 C ABI)**:
-//!   * scalar alignments equal their sizes (`I8`=1, `I16`=2, `I32`=4,
-//!     `I64`/`U64`/`F64`/pointer=8),
-//!   * each field is placed at the next offset that is a multiple of its
-//!     alignment (inserting padding as needed),
-//!   * a class's alignment is the maximum of its fields' alignments, and its
-//!     size is rounded up to that alignment (trailing padding, so arrays stay
-//!     aligned),
-//!   * a `union` places every field at offset 0; its size is the largest field
-//!     (rounded up to the max alignment),
-//!   * a base class is laid out as a subobject at offset 0, before the derived
+//! The layout model is natural alignment with padding, matching the x86-64 C
+//! ABI:
+//!   * Scalar alignments equal their sizes: `I8`=1, `I16`=2, `I32`=4, and
+//!     `I64`/`U64`/`F64`/pointer=8.
+//!   * Each field is placed at the next offset that is a multiple of its
+//!     alignment, inserting padding as needed.
+//!   * A class's alignment is the maximum of its fields' alignments. Its size is
+//!     rounded up to that alignment, so arrays of it stay aligned.
+//!   * A `union` places every field at offset 0. Its size is the largest field,
+//!     rounded up to the maximum alignment.
+//!   * A base class is laid out as a subobject at offset 0, before the derived
 //!     fields.
 //!
-//! HolyC's exact rules are not authoritatively documented; this matches the
-//! standard x86-64 convention. The whole rule lives in [`align_of_scalar`] /
-//! [`round_up`], so switching to packed layout (alignment 1) is a one-line
-//! change if HolyC turns out to differ.
+//! HolyC's exact rules are not authoritatively documented, so this follows the
+//! standard x86-64 convention. The whole rule lives in [`align_of_scalar`] and
+//! [`round_up`]. Switching to a packed layout (alignment 1) is a one-line change
+//! if HolyC turns out to differ.
 
 use std::collections::{HashMap, HashSet};
 
@@ -104,8 +104,8 @@ impl Layouts {
         }
     }
 
-    /// The per-element stride of `ty` when used as an array element: its size
-    /// padded up to its alignment.
+    /// The per-element stride of `ty` as an array element: its size padded up to
+    /// its alignment.
     pub fn stride_of(&self, ty: &Type) -> u64 {
         round_up(self.size_of(ty), self.align_of(ty))
     }
@@ -118,10 +118,11 @@ impl Layouts {
             .map(|f| f.offset)
     }
 
-    /// The byte offset of a (possibly nested) member `path` within `class`, e.g.
-    /// `["lo", "x"]` is the offset of `lo` plus the offset of `x` within `lo`'s
-    /// type. Returns `None` if any class or field along the path is unknown, or
-    /// if a non-final field is not itself a class/union.
+    /// The byte offset of a possibly nested member `path` within `class`.
+    ///
+    /// For example, `["lo", "x"]` is the offset of `lo` plus the offset of `x`
+    /// within `lo`'s type. Returns `None` if any class or field along the path is
+    /// unknown, or if a non-final field is not itself a class or union.
     pub fn nested_offset_of(&self, class: &str, path: &[String]) -> Option<u64> {
         let mut current = class.to_string();
         let mut total = 0;
@@ -139,15 +140,16 @@ impl Layouts {
     }
 }
 
-/// Compute layouts for every class/union in `program`. Returns the layouts plus
-/// any errors (cyclic by-value types, non-constant field array sizes). The
-/// layout map is still populated on error (with best-effort sizes) so callers
-/// can keep going.
+/// Computes layouts for every class and union in `program`.
+///
+/// Returns the layouts plus any errors, such as cyclic by-value types or
+/// non-constant field array sizes. The layout map is still populated on error,
+/// with best-effort sizes, so callers can keep going.
 pub fn compute(program: &Program) -> (Layouts, Vec<LayoutError>) {
     let mut defs: HashMap<String, (&ClassDef, Pos)> = HashMap::new();
     for item in &program.items {
         if let StmtKind::Class(c) = &item.kind {
-            // On duplicate definitions (already a sema error) keep the first.
+            // On a duplicate definition, keep the first; sema already reports it.
             defs.entry(c.name.clone()).or_insert((c, item.span.pos));
         }
     }
@@ -174,13 +176,13 @@ struct Computer<'p> {
 }
 
 impl<'p> Computer<'p> {
-    /// Lay out a class, memoising the result. Returns `(size, align)`.
+    /// Lays out a class and memoises the result. Returns `(size, align)`.
     fn class_layout(&mut self, name: &str) -> (u64, u64) {
         if let Some(l) = self.out.get(name) {
             return (l.size, l.align);
         }
         let Some(&(def, def_pos)) = self.defs.get(name) else {
-            // Unknown type — semantic analysis reports this; treat as zero-size.
+            // Unknown type. Sema reports this, so treat it as zero-size here.
             return (0, 1);
         };
         if !self.visiting.insert(name.to_string()) {
@@ -217,7 +219,7 @@ impl<'p> Computer<'p> {
                 size: s,
             });
             // An anonymous embedded union promotes its members into this class at
-            // the union's offset, so `obj.member` resolves to the right slot.
+            // the union's offset, so `obj.member` resolves to the correct slot.
             if crate::sema::is_anon_field(&f.name) {
                 if let Type::Named(inner) = &f.ty {
                     self.class_layout(inner);
@@ -294,7 +296,7 @@ impl<'p> Computer<'p> {
 // ---- scalar sizes & alignment (the layout rule lives here) ----
 
 /// The size of a non-aggregate type, or `None` for class/array types.
-fn scalar_size(ty: &Type) -> Option<u64> {
+pub(crate) fn scalar_size(ty: &Type) -> Option<u64> {
     Some(match ty {
         Type::U0 => 0,
         Type::I8 | Type::U8 | Type::Bool => 1,
@@ -302,17 +304,17 @@ fn scalar_size(ty: &Type) -> Option<u64> {
         Type::I32 | Type::U32 => 4,
         Type::I64 | Type::U64 | Type::F64 | Type::Ptr(_) | Type::FuncPtr { .. } => 8,
         Type::Named(_) | Type::Array(..) => return None,
-        // Generic templates are monomorphized away before layout runs.
+        // Generics are monomorphized away before the layout pass runs.
         Type::Param(_) | Type::Generic(..) | Type::Tuple(_) => {
             unreachable!("unresolved generic type reached layout")
         }
     })
 }
 
-/// The alignment of a scalar type. (Aggregates derive theirs from their fields.)
+/// The alignment of a scalar type. Aggregates derive theirs from their fields.
 fn align_of_scalar(ty: &Type) -> u64 {
-    // Natural alignment: equal to the size, minimum 1. Switch this to `1` for a
-    // packed layout.
+    // Natural alignment: equal to the size, with a minimum of 1. Return `1` here
+    // instead for a packed layout.
     scalar_size(ty).unwrap_or(1).max(1)
 }
 
@@ -326,11 +328,14 @@ fn round_up(value: u64, align: u64) -> u64 {
 
 // ---- constant expression evaluation (for field array sizes) ----
 
-/// Evaluate a compile-time constant integer expression. Supports literals,
-/// arithmetic/bitwise/comparison/logical operators, integer casts, and
-/// `sizeof` of a scalar type. Anything else (a variable, a call, `sizeof` of a
-/// class) is rejected.
-fn const_eval(e: &Expr) -> Result<i64, LayoutError> {
+/// Evaluates a compile-time constant integer expression.
+///
+/// Supports literals; arithmetic, bitwise, comparison, and logical operators;
+/// integer casts; and `sizeof` of a scalar type. Anything else is rejected, such
+/// as a variable, a call, or `sizeof` of a class. (`mono` reuses this to evaluate
+/// `int`-parameter value arguments, after it has substituted any value-param
+/// identifiers into `Int` literals.)
+pub(crate) fn const_eval(e: &Expr) -> Result<i64, LayoutError> {
     let err = |msg: &str| LayoutError {
         message: msg.into(),
         pos: e.span.pos,
@@ -389,10 +394,10 @@ fn const_eval(e: &Expr) -> Result<i64, LayoutError> {
                 const_eval(else_)
             }
         }
-        // An integer cast is a no-op for constant folding purposes.
+        // An integer cast is a no-op for constant folding.
         ExprKind::Cast { expr, .. } => const_eval(expr),
-        // Only `sizeof(scalar-type)` is a constant we fold here. `sizeof(expr)`
-        // needs type inference, which the layout pass doesn't run.
+        // Only `sizeof(scalar-type)` folds to a constant here. `sizeof(expr)`
+        // needs type inference, which the layout pass does not run.
         ExprKind::Sizeof(SizeofArg::Type(t)) => scalar_size(t)
             .map(|s| s as i64)
             .ok_or_else(|| err("sizeof of a non-scalar type is not allowed here")),

@@ -1,10 +1,10 @@
 //! File I/O intrinsic tests (`lib/io.hc`).
 //!
-//! File I/O is impure, so these are **property** tests: a HolyC program writes a
-//! known string to a path, reads it back, and prints the content + size. Against a
-//! fresh temp file the interpreter and the native backends all produce the same
-//! stdout, so they double as a conformance check of `Open`/`LSeek`/`Read`/`Write`/
-//! `Close` and the `WriteFile`/`ReadFile`/`FileSize` helpers.
+//! File I/O is impure, so these are **property** tests. A HolyC program writes a
+//! known string to a path, reads it back, and prints the content plus size. Against
+//! a fresh temp file, the interpreter and all native backends produce the same
+//! stdout. So these also serve as a conformance check of `Open`/`LSeek`/`Read`/
+//! `Write`/`Close` and the `WriteFile`/`ReadFile`/`FileSize` helpers.
 
 use std::process::Command;
 
@@ -15,7 +15,7 @@ use solomon::sema::check_program;
 use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
 
 /// A HolyC program that writes `"solomon\n"` to `path`, reads it back, and prints the
-/// content and the file size. Deterministic stdout: `got: solomon\nsize=8\n`.
+/// content and file size. The stdout is deterministic: `got: solomon\nsize=8\n`.
 fn file_program(path: &str) -> String {
     format!(
         r#"
@@ -49,9 +49,9 @@ fn compile(src: &str) -> solomon::Program {
     program
 }
 
-/// A process-unique temp path for the host-run (interp / Darwin) cases. Backslashes
+/// A process-unique temp path for the host-run cases (interp / Darwin). Backslashes
 /// are normalized to `/` so the path embeds cleanly in a HolyC string literal on
-/// Windows (`C:\Users\…` would otherwise read `\U…` as an escape); Windows file APIs
+/// Windows. Otherwise `C:\Users\…` would read `\U…` as an escape. Windows file APIs
 /// accept forward slashes.
 fn tmp_path(tag: &str) -> String {
     std::env::temp_dir()
@@ -72,9 +72,9 @@ fn interp_file_roundtrip() {
 
 /// Reading a nonexistent path fails: the helper returns a negative `-errno`. ENOENT
 /// is 2 on both Linux and macOS, and the interpreter and the Darwin backend both
-/// surface the real errno, so the number is identical across those targets. (Windows
-/// reports a different code — `ERROR_PATH_NOT_FOUND` = 3 — so the value check below is
-/// Unix-only.)
+/// surface the real errno, so the number is identical across those targets. Windows
+/// reports a different code (`ERROR_PATH_NOT_FOUND` = 3), so the value check below is
+/// Unix-only.
 const ERR_PROGRAM: &str = r#"
     #include <io.hc>
     U0 Main() {
@@ -86,7 +86,7 @@ const ERR_PROGRAM: &str = r#"
     Main;
 "#;
 
-// The exact errno (2/ENOENT) is POSIX-specific — Windows surfaces 3 — so pin the value
+// The exact errno (2/ENOENT) is POSIX-specific; Windows surfaces 3. So pin the value
 // on Unix only.
 #[cfg(unix)]
 #[test]
@@ -122,9 +122,9 @@ fn darwin_toolchain() -> bool {
             .unwrap_or(false)
 }
 
-/// The same round-trip through the **native arm64 Darwin** backend: the file
-/// primitives lower to libc `open`/`lseek`/`read`/`write`/`close` (with the
-/// Linux→macOS open-flag translation). Self-skips off an Apple-silicon host.
+/// The same round-trip through the **native arm64 Darwin** backend. The file
+/// primitives lower to libc `open`/`lseek`/`read`/`write`/`close`, with the
+/// Linux→macOS open-flag translation. Self-skips off an Apple-silicon host.
 #[test]
 fn native_arm64_file_roundtrip() {
     if !darwin_toolchain() {
@@ -145,8 +145,8 @@ fn native_arm64_file_roundtrip() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
 
-/// Build `program` with `backend` to a temp ELF and run it **natively** (the static
-/// ELF needs no libc). Only called on a matching Linux host; writes/reads its file in
+/// Build `program` with `backend` to a temp ELF and run it **natively**; the static
+/// ELF needs no libc. Only called on a matching Linux host. Writes/reads its file in
 /// the host's own `/tmp`. Returns stdout.
 fn freestanding_file_stdout(out: &std::path::Path, mut backend: impl Codegen) -> String {
     backend
@@ -159,7 +159,7 @@ fn freestanding_file_stdout(out: &std::path::Path, mut backend: impl Codegen) ->
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// File round-trip through the **freestanding x86-64** backend — raw Linux file
+/// File round-trip through the **freestanding x86-64** backend, using raw Linux file
 /// syscalls (open/lseek/read/write/close). Runs only on a linux/x86_64 host (CI);
 /// self-skips elsewhere.
 #[test]
@@ -173,8 +173,8 @@ fn native_x86_64_freestanding_file() {
     assert_eq!(got, EXPECTED, "x86_64 freestanding");
 }
 
-/// File round-trip through the **freestanding aarch64** backend (raw arm64 Linux
-/// syscalls — `openat`+AT_FDCWD, lseek 62). Runs only on a linux/aarch64 host;
+/// File round-trip through the **freestanding aarch64** backend, using raw arm64
+/// Linux syscalls (`openat`+AT_FDCWD, lseek 62). Runs only on a linux/aarch64 host;
 /// self-skips elsewhere.
 #[test]
 fn native_arm64_freestanding_file() {
@@ -189,9 +189,9 @@ fn native_arm64_freestanding_file() {
 
 // ---- StdWrite: portable stdout/stderr ----
 
-/// Writes a line to stderr (fd 2, a side channel) then a line to stdout (fd 1),
-/// and prints the byte count `StdWrite` returned. Deterministic *stdout*:
-/// `stdout line\nwrote=12\n` — the stderr write must NOT appear there.
+/// Writes a line to stderr (fd 2, a side channel), then a line to stdout (fd 1), and
+/// prints the byte count `StdWrite` returned. The deterministic *stdout* is
+/// `stdout line\nwrote=12\n`. The stderr write must NOT appear there.
 const STDWRITE_PROGRAM: &str = r#"
     #include <io.hc>
     U0 Main() {
@@ -214,7 +214,7 @@ fn interp_stdwrite() {
 }
 
 /// `StdWrite` on native arm64 Darwin (libc `write` with the fd). Only stdout is
-/// captured, so this also confirms the `StdWrite(STDERR, …)` byte goes to fd 2.
+/// captured, so this also confirms the `StdWrite(STDERR, …)` bytes go to fd 2.
 #[test]
 fn native_arm64_stdwrite() {
     if !darwin_toolchain() {
@@ -233,7 +233,7 @@ fn native_arm64_stdwrite() {
 }
 
 /// `StdWrite` through the **freestanding x86-64** backend (raw `write` syscall).
-/// linux/x86_64 host only (CI); self-skips elsewhere.
+/// Runs only on a linux/x86_64 host (CI); self-skips elsewhere.
 #[test]
 fn native_x86_64_freestanding_stdwrite() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -253,7 +253,7 @@ fn native_x86_64_freestanding_stdwrite() {
 }
 
 /// `StdWrite` through the **freestanding aarch64** backend (raw `write` syscall).
-/// linux/aarch64 host only; self-skips elsewhere.
+/// Runs only on a linux/aarch64 host; self-skips elsewhere.
 #[test]
 fn native_arm64_freestanding_stdwrite() {
     if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
@@ -275,7 +275,7 @@ fn native_arm64_freestanding_stdwrite() {
 // ---- filesystem mutation: Mkdir / Rename / Remove ----
 
 /// A program that creates a directory, writes a file in it, renames it, reads it back,
-/// then removes it (the missing-source remove yields -ENOENT = -2 on every target).
+/// then removes it. The missing-source remove yields -ENOENT = -2 on every target.
 fn fsops_program(dir: &str) -> String {
     format!(
         r#"
@@ -300,7 +300,7 @@ fn fsops_program(dir: &str) -> String {
 
 const FSOPS_EXPECTED: &str = "mkdir=0\nwrite=0\nrename=0\nread=3 got=hi\nrm_missing=-2\nrm=0\n";
 
-/// A process-unique directory path for the host-run (interp / Darwin) cases.
+/// A process-unique directory path for the host-run cases (interp / Darwin).
 /// Backslashes are normalized to `/` so the path embeds cleanly in a HolyC string
 /// literal on Windows (see [`tmp_path`]).
 fn tmp_dir(tag: &str) -> String {
@@ -342,8 +342,8 @@ fn native_arm64_fsops() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), FSOPS_EXPECTED);
 }
 
-/// Build the fsops program with `backend` to a temp ELF and run it natively (a clean
-/// fixed dir). Only called on a matching Linux host. Returns stdout.
+/// Build the fsops program with `backend` to a temp ELF and run it natively, using a
+/// clean fixed dir. Only called on a matching Linux host. Returns stdout.
 fn freestanding_fsops_stdout(out: &std::path::Path, mut backend: impl Codegen) -> String {
     let dir = "/tmp/solomon_fsops_test";
     let _ = std::fs::remove_dir_all(dir);
@@ -382,9 +382,10 @@ fn native_arm64_freestanding_fsops() {
 
 // ---- the environment: EnvP ----
 
-/// `EnvP` is a NULL-terminated `U8 **` of "KEY=VALUE" strings. Structural invariants
-/// that hold for any real process environment (non-empty; every entry has a '='), so
-/// the check is deterministic without depending on a specific variable.
+/// `EnvP` is a NULL-terminated `U8 **` of "KEY=VALUE" strings. These are structural
+/// invariants that hold for any real process environment: it is non-empty and every
+/// entry has a '='. So the check is deterministic without depending on a specific
+/// variable.
 const ENV_INVARIANTS: &str = r#"
     #include <cstr.hc>
     U0 Main() {
@@ -423,8 +424,9 @@ fn native_arm64_envp_invariants_and_lookup() {
         "nonempty=1 all_kv=1\n"
     );
 
-    // Value lookup: a specific variable, passed to the child's environment (scoped to
-    // the spawned process, so no parallel-test race on the shared env).
+    // Value lookup of a specific variable, passed to the child's environment. The
+    // variable is scoped to the spawned process, so there's no parallel-test race on
+    // the shared env.
     let lookup = r#"
         #include <cstr.hc>
         U0 Main() {
@@ -450,8 +452,8 @@ fn native_arm64_envp_invariants_and_lookup() {
     assert_eq!(String::from_utf8_lossy(&out2.stdout), "got=hi\n");
 }
 
-/// EnvP invariants through the **freestanding x86-64** backend (envp read off the
-/// initial stack, just past argv's NULL). Linux/x86_64 host only.
+/// EnvP invariants through the **freestanding x86-64** backend. Here envp is read off
+/// the initial stack, just past argv's NULL. Runs only on a linux/x86_64 host.
 #[test]
 fn native_x86_64_freestanding_envp() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -506,7 +508,7 @@ fn native_arm64_getenv_lookup() {
     Arm64Darwin::new(&bin)
         .run(&compile(GETENV_LOOKUP))
         .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
-    // Found (value scoped to the child — no parallel-test env race).
+    // Found. The value is scoped to the child, so there's no parallel-test env race.
     let hit = Command::new(&bin)
         .env("SOLOMON_ENV", "world")
         .output()
@@ -589,9 +591,10 @@ fn native_x86_64_freestanding_getpid() {
 
 // ---- Chdir / Getcwd (os.hc) ----
 
-// Read-only invariants (no successful Chdir, so the interpreter's process cwd is not
-// mutated — race-free under parallel tests): Getcwd succeeds into an absolute path and
-// a bad Chdir fails. Used only by the Unix-only invariants test (the `/`-prefix check).
+// Read-only invariants: Getcwd succeeds into an absolute path, and a bad Chdir fails.
+// There's no successful Chdir, so the interpreter's process cwd is not mutated, making
+// this race-free under parallel tests. Used only by the Unix-only invariants test (the
+// `/`-prefix check).
 #[cfg(unix)]
 const CWD_INVARIANTS: &str = r#"
     #include <os.hc>
@@ -605,8 +608,8 @@ const CWD_INVARIANTS: &str = r#"
     Main;
 "#;
 
-// Deterministic value check (run in an isolated child so the cwd change can't leak):
-// Chdir to root, then Getcwd reports exactly "/".
+// Deterministic value check: Chdir to root, then Getcwd reports exactly "/". Run in an
+// isolated child so the cwd change can't leak.
 const CWD_ROOT: &str = r#"
     #include <os.hc>
     U0 Main() {
@@ -618,7 +621,7 @@ const CWD_ROOT: &str = r#"
     Main;
 "#;
 
-// The `abs` check is `buf[0] == '/'` — a POSIX absolute path. On Windows the cwd is
+// The `abs` check is `buf[0] == '/'`, i.e. a POSIX absolute path. On Windows the cwd is
 // absolute but drive-rooted (`C:\…`), so this invariant is Unix-only.
 #[cfg(unix)]
 #[test]
@@ -669,8 +672,8 @@ const IDS_PROG: &str = r#"
     Main;
 "#;
 
-// Asserts POSIX id semantics (a real parent pid `> 0`); on Windows the interpreter
-// has no POSIX ppid/uid/gid (they report 0), so this is a Unix-only check.
+// Asserts POSIX id semantics (a real parent pid `> 0`). On Windows the interpreter has
+// no POSIX ppid/uid/gid (they report 0), so this is a Unix-only check.
 #[cfg(unix)]
 #[test]
 fn interp_getppid_getuid_are_sane() {

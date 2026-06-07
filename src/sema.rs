@@ -1,10 +1,10 @@
-//! Semantic analysis for HolyC: name resolution, type inference, and a set of
-//! validity checks over the parsed [`Program`].
+//! Semantic analysis for HolyC: name resolution, type inference, and validity
+//! checks over the parsed [`Program`].
 //!
-//! HolyC is a weakly-typed, C-like language: the default integer is `I64`,
-//! pointers and integers convert freely, and comparison/logical results are
-//! `I64`. The analyzer reflects that — it is permissive about scalar
-//! conversions and focuses on catching genuine mistakes:
+//! HolyC is weakly typed and C-like. The default integer is `I64`, pointers and
+//! integers convert freely, and comparison and logical results are `I64`. The
+//! analyzer reflects that: it is permissive about scalar conversions and focuses
+//! on catching genuine mistakes:
 //!
 //!   * use of undeclared variables, unknown types, and unknown fields,
 //!   * redeclaration of variables, parameters, fields, functions, and types,
@@ -14,18 +14,17 @@
 //!   * non-scalar conditions, indexing non-pointers, member access on
 //!     non-aggregates, assigning to non-lvalues, and `&` of non-lvalues.
 //!
-//! Errors are collected (analysis does not stop at the first one) and each
-//! carries a source position.
+//! Analysis does not stop at the first error: all errors are collected, each
+//! carrying a source position.
 //!
-//! Scope note: a call to a name that is neither a user function nor a known
-//! intrinsic (see `seed_builtin_funcs`) is a compile-time error. The core and
-//! standard libraries are not modelled yet; their functions will be registered
-//! as intrinsics when they land.
+//! A call to a name that is neither a user function nor a known intrinsic is a
+//! compile-time error. The core and standard libraries are not modelled yet;
+//! their functions will be registered as intrinsics when they land.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::token::{FileInfo, Pos};
+use crate::token::{FileInfo, Pos, Span};
 
 /// A semantic error with the source position where it was detected.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,7 +39,7 @@ impl std::fmt::Display for SemaError {
     }
 }
 
-/// Type-check and resolve names in `program`. Returns all errors found, or an
+/// Type-checks and resolves names in `program`. Returns every error found, or an
 /// empty `Vec` if the program is well-formed.
 pub fn check_program(program: &Program) -> Vec<SemaError> {
     let mut a = Analyzer::new();
@@ -48,38 +47,47 @@ pub fn check_program(program: &Program) -> Vec<SemaError> {
     a.errors
 }
 
-/// Convenience wrapper returning a `Result`.
+/// Convenience wrapper over [`check_program`] returning a `Result`.
 pub fn analyze(program: &Program) -> Result<(), Vec<SemaError>> {
     let errs = check_program(program);
     if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
-/// A class/union definition, flattened for field lookup. Each field keeps its
+/// A class or union definition, flattened for field lookup. Each field keeps its
 /// source position so type-reference errors can point at it.
 struct TypeDef {
+    /// Whether this is a `union` (vs a `class`). Two same-fielded types of different
+    /// kinds are *not* structurally compatible.
+    is_union: bool,
     fields: Vec<(String, Type, Pos)>,
     base: Option<String>,
     /// Position of the definition, used to locate base-class errors.
     base_pos: Pos,
-    /// The file this type was defined in (`Span::file`), for `_`-directory privacy.
+    /// The file this type was defined in (`Span::file`). With the file-scoped
+    /// visibility default, a non-`public` type is visible only within this file.
     file: u32,
+    /// Whether the type was declared `public` (visible from any file).
+    is_public: bool,
 }
 
 /// A function signature.
 struct FuncSig {
     ret: Type,
-    /// Declared parameter types (for building `&Func` function-pointer types).
+    /// Declared parameter types. Used to build `&Func` function-pointer types.
     params: Vec<Type>,
-    /// Parameter count that must be supplied (those without a default).
+    /// Number of parameters that must be supplied (those without a default).
     required: usize,
     /// Total declared parameter count.
     total: usize,
     varargs: bool,
     /// Whether a definition (not just a prototype) has been seen.
     defined: bool,
-    /// The file this function was first declared in (`Span::file`), for
-    /// `_`-directory privacy.
+    /// The file this function was first declared in (`Span::file`). With the
+    /// file-scoped visibility default, a non-`public` function is callable only
+    /// within this file.
     file: u32,
+    /// Whether any declaration of the function was marked `public`.
+    is_public: bool,
 }
 
 struct Analyzer {
@@ -88,23 +96,28 @@ struct Analyzer {
     funcs: HashMap<String, FuncSig>,
     /// Lexical variable scopes; `scopes[0]` is the global scope.
     scopes: Vec<HashMap<String, Type>>,
-    /// The defining file (`Span::file`) of each global, for `_`-directory privacy —
-    /// a global declared under a `_`-prefixed dir/file is gated like a function.
+    /// The defining file (`Span::file`) of each global, for file-scoped visibility.
     global_files: HashMap<String, u32>,
+    /// Whether each global was declared `public`.
+    global_is_public: HashMap<String, bool>,
     /// Return type of the function currently being checked, if any.
     cur_ret: Option<Type>,
     loop_depth: u32,
     switch_depth: u32,
     /// Stack of label scopes: the labels declared directly in the current block
     /// and each enclosing block. A `goto` is valid iff its target is in one of
-    /// these — the same reachability rule the interpreter resolves gotos by.
+    /// these. This is the same reachability rule the interpreter uses to resolve
+    /// gotos.
     label_scopes: Vec<HashSet<String>>,
-    /// The program's source-file table (indexed by `Span::file`), for
-    /// `_`-directory privacy. Empty until `run` copies it from the program.
+    /// The program's source-file table, indexed by `Span::file`, for `_`-privacy.
+    /// Empty until `run` copies it from the program.
     files: Vec<FileInfo>,
-    /// The file (`Span::file`) of the top-level item currently being checked — the
-    /// reference site for `_`-directory privacy of *type* references.
+    /// The file (`Span::file`) of the top-level item currently being checked. This
+    /// is the reference site for file-scoped visibility of *type* references.
     cur_file: u32,
+    /// Whether the top-level item currently being checked is compiler-generated
+    /// (monomorphized/synthetic). References from such code bypass visibility checks.
+    in_generated: bool,
 }
 
 impl Analyzer {
@@ -115,21 +128,23 @@ impl Analyzer {
             funcs: HashMap::new(),
             scopes: Vec::new(),
             global_files: HashMap::new(),
+            global_is_public: HashMap::new(),
             cur_ret: None,
             loop_depth: 0,
             switch_depth: 0,
             label_scopes: Vec::new(),
             files: Vec::new(),
             cur_file: 0,
+            in_generated: false,
         }
     }
 
     fn run(&mut self, program: &Program) {
         self.files = program.files.clone();
         self.scopes.push(HashMap::new()); // global scope
-        // The command line is exposed as two implicit globals — `I64 ArgC` and
-        // `U8 **ArgV` — captured at the entry. (A `...` function's `VargC`/`VargV`
-        // varargs locals are distinct names, so both remain in scope there.)
+        // The command line is exposed as two implicit globals captured at entry:
+        // `I64 ArgC` and `U8 **ArgV`. A `...` function's `VargC`/`VargV` varargs
+        // locals are distinct names, so both groups stay in scope there.
         self.scopes[0].insert("ArgC".to_string(), Type::I64);
         self.scopes[0].insert(
             "ArgV".to_string(),
@@ -140,12 +155,19 @@ impl Analyzer {
             "EnvP".to_string(),
             Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
         );
+        // The current task/thread context: `CTask *Fs`, holding the exception state
+        // read inside `catch` (`Fs->except_ch`). `CTask` is defined in `builtin.hc`.
+        self.scopes[0].insert(
+            "Fs".to_string(),
+            Type::Ptr(Box::new(Type::Named("CTask".to_string()))),
+        );
         self.collect_types(program);
         self.collect_funcs(program);
         self.validate_type_refs();
+        self.check_public_signatures(program);
         self.check_layouts(program);
         // Top-level statements form an implicit body with their own label scope,
-        // so `goto`/labels work at the top level too.
+        // so `goto` and labels work at the top level too.
         self.label_scopes.push(direct_labels(&program.items));
         for item in &program.items {
             self.check_top_item(item);
@@ -178,10 +200,12 @@ impl Analyzer {
                 self.types.insert(
                     c.name.clone(),
                     TypeDef {
+                        is_union: c.is_union,
                         fields,
                         base: c.base.clone(),
                         base_pos: item.span.pos,
                         file: item.span.file,
+                        is_public: c.is_public,
                     },
                 );
             }
@@ -201,10 +225,14 @@ impl Analyzer {
                         );
                         continue;
                     }
-                    // A prototype followed by a definition (or vice versa) is
-                    // fine; keep the entry, marking it defined if either is.
+                    // A prototype followed by a definition, or vice versa, is
+                    // fine. Keep the entry, marking it defined if either is, and
+                    // public if any declaration was `public`.
                     let defined = existing.defined || has_body;
-                    self.funcs.get_mut(&f.name).unwrap().defined = defined;
+                    let is_public = existing.is_public || f.is_public;
+                    let sig = self.funcs.get_mut(&f.name).unwrap();
+                    sig.defined = defined;
+                    sig.is_public = is_public;
                 } else {
                     self.funcs.insert(
                         f.name.clone(),
@@ -216,6 +244,7 @@ impl Analyzer {
                             varargs: f.varargs,
                             defined: has_body,
                             file: item.span.file,
+                            is_public: f.is_public,
                         },
                     );
                 }
@@ -223,8 +252,8 @@ impl Analyzer {
         }
     }
 
-    /// Run the layout pass and surface its errors (cyclic by-value types,
-    /// non-constant field array sizes) as semantic errors.
+    /// Runs the layout pass and surfaces its errors as semantic errors. Those
+    /// errors are cyclic by-value types and non-constant field array sizes.
     fn check_layouts(&mut self, program: &Program) {
         let (_, errs) = crate::layout::compute(program);
         for e in errs {
@@ -232,13 +261,14 @@ impl Analyzer {
         }
     }
 
-    /// After all types are registered, confirm that field and base-class type
+    /// After all types are registered, confirms that field and base-class type
     /// references actually exist.
+    ///
+    /// Each field or base reference is checked for existence and `_`-privacy
+    /// against the file of the class that declares it.
     fn validate_type_refs(&mut self) {
         // Collect the work first to avoid borrowing `self.types` while pushing
         // errors.
-        // Each field/base reference is checked (existence + `_`-privacy) against the
-        // file of the class that declares it.
         let mut refs: Vec<(Type, Pos, u32)> = Vec::new();
         let mut base_refs: Vec<(String, Pos)> = Vec::new();
         let names: Vec<String> = self.types.keys().cloned().collect();
@@ -252,13 +282,59 @@ impl Analyzer {
             }
         }
         for (ty, pos, file) in refs {
+            // `cur_file` drives nested checks, e.g. a global in an array dimension.
+            // `file` is the field's own file, the type reference site.
             self.cur_file = file;
-            self.resolve_type(&ty, pos);
+            self.resolve_type(&ty, pos, file);
         }
         for (b, pos) in base_refs {
             if !self.types.contains_key(&b) {
                 self.error(pos, format!("unknown base type `{b}`"));
             }
+        }
+    }
+
+    /// A `public` function must not expose a non-`public` type through its return type:
+    /// a caller in another file can call the function but couldn't name the result. The
+    /// return type's underlying named type (peeling pointers/arrays) must be `public`.
+    fn check_public_signatures(&mut self, program: &Program) {
+        for item in &program.items {
+            // Compiler-generated functions (monomorphized generic instances) are
+            // trusted: an instance is always public yet returns the user's type
+            // argument, which may be private — the user already named it at the use
+            // site, so it isn't an API leak. Skip them.
+            if item.span.file == crate::token::GENERATED_FILE {
+                continue;
+            }
+            if let StmtKind::Func(f) = &item.kind {
+                if f.is_public {
+                    if let Some(n) = self.first_private_named(&f.ret) {
+                        self.error(
+                            item.span.pos,
+                            format!(
+                                "`public` function `{}` returns non-`public` type `{n}`; \
+                                 declare `{n}` `public` so callers can name the result",
+                                f.name
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The name of the first non-`public` named class/union reachable in `ty` by peeling
+    /// pointers and arrays, or `None` if every named component is `public` (or built-in).
+    /// Compiler-generated types (synthetic tuples, monomorphized instances) are always
+    /// `public`, so they never trip this.
+    fn first_private_named(&self, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Named(n) => match self.types.get(n) {
+                Some(td) if !td.is_public => Some(n.clone()),
+                _ => None,
+            },
+            Type::Ptr(inner) | Type::Array(inner, _) => self.first_private_named(inner),
+            _ => None,
         }
     }
 
@@ -272,12 +348,16 @@ impl Analyzer {
         self.scopes.pop();
     }
 
-    /// Declare a variable in the current scope, reporting a redeclaration if the
-    /// name already exists at this level.
-    fn declare(&mut self, name: &str, ty: Type, pos: Pos) {
+    /// Declares a variable in the current scope, reporting a redeclaration if the
+    /// name already exists at this level. `is_public` is the global's `public`
+    /// modifier; it is meaningless on locals, so a `public` local is an error.
+    fn declare(&mut self, name: &str, ty: Type, pos: Pos, is_public: bool) {
         // A declaration at the global scope (only `scopes[0]` present) records its
-        // defining file, so a global under a `_`-private dir/file is gated on use.
+        // defining file and publicness, so file-scoped visibility is gated on use.
         let is_global = self.scopes.len() == 1;
+        if is_public && !is_global {
+            self.error(pos, "`public` is only allowed on top-level declarations");
+        }
         let scope = self.scopes.last_mut().unwrap();
         if scope.contains_key(name) {
             self.error(pos, format!("redeclaration of `{name}`"));
@@ -285,6 +365,7 @@ impl Analyzer {
             scope.insert(name.to_string(), ty);
             if is_global {
                 self.global_files.insert(name.to_string(), self.cur_file);
+                self.global_is_public.insert(name.to_string(), is_public);
             }
         }
     }
@@ -295,20 +376,24 @@ impl Analyzer {
 
     // ---- type resolution & predicates ----
 
-    /// Confirm a type's named parts exist; report and continue otherwise.
-    fn resolve_type(&mut self, ty: &Type, pos: Pos) {
+    /// Confirms a type's named parts exist, reporting and continuing otherwise.
+    ///
+    /// `ref_file` is the `Span::file` of the syntactic site that uses the type, so
+    /// `_`-privacy is checked against the exact reference location. This mirrors
+    /// how [`Analyzer::check_call`] handles functions.
+    fn resolve_type(&mut self, ty: &Type, pos: Pos, ref_file: u32) {
         match ty {
             Type::Named(n) => match self.types.get(n) {
                 None => self.error(pos, format!("unknown type `{n}`")),
-                // A type under a `_`-prefixed directory is private to that subtree.
+                // A non-`public` type is visible only within its defining file.
                 Some(td) => {
-                    let def_file = td.file;
-                    self.check_private_access(def_file, self.cur_file, n, pos);
+                    let (is_public, def_file) = (td.is_public, td.file);
+                    self.check_visibility(is_public, def_file, ref_file, n, pos);
                 }
             },
-            Type::Ptr(inner) => self.resolve_type(inner, pos),
+            Type::Ptr(inner) => self.resolve_type(inner, pos, ref_file),
             Type::Array(inner, dim) => {
-                self.resolve_type(inner, pos);
+                self.resolve_type(inner, pos, ref_file);
                 if let Some(d) = dim {
                     let dt = self.check_expr(d);
                     if !is_integer(&dt) {
@@ -320,7 +405,7 @@ impl Analyzer {
         }
     }
 
-    /// An array decays to a pointer in value contexts.
+    /// Decays an array to a pointer, as happens in value contexts.
     fn decay(ty: Type) -> Type {
         decay(ty)
     }
@@ -328,9 +413,10 @@ impl Analyzer {
     // ---- top-level & statements ----
 
     fn check_top_item(&mut self, item: &Stmt) {
-        // Type references inside this item are checked for `_`-directory privacy
-        // against this item's file.
+        // Type references inside this item are checked for file-scoped visibility
+        // against this item's file. A generated (monomorphized) item is trusted.
         self.cur_file = item.span.file;
+        self.in_generated = item.span.file == crate::token::GENERATED_FILE;
         match &item.kind {
             StmtKind::Func(f) => self.check_function(f),
             StmtKind::Class(_) | StmtKind::Include(_) => {}
@@ -342,13 +428,15 @@ impl Analyzer {
         let Some(body) = &f.body else {
             return; // prototype: nothing to check
         };
-        self.resolve_type(&f.ret, Pos::new(0, 0));
+        // The return type's reference site is the function signature, whose file is
+        // the current item's file (set in `check_top_item`).
+        self.resolve_type(&f.ret, Pos::new(0, 0), self.cur_file);
         self.cur_ret = Some(f.ret.clone());
 
         self.label_scopes.push(direct_labels(body));
         self.push_scope();
         for p in &f.params {
-            self.resolve_type(&p.ty, p.span.pos);
+            self.resolve_type(&p.ty, p.span.pos, p.span.file);
             if matches!(p.ty, Type::U0) {
                 self.error(p.span.pos, "parameter cannot have type U0");
             }
@@ -356,15 +444,16 @@ impl Analyzer {
                 self.check_expr(d);
             }
             if let Some(name) = &p.name {
-                self.declare(name, Self::decay(p.ty.clone()), p.span.pos);
+                self.declare(name, Self::decay(p.ty.clone()), p.span.pos, false);
             }
         }
-        // A `...` function gets the implicit HolyC varargs locals: `I64 VargC` (count)
-        // and `I64 *VargV` (the raw 8-byte slots; pun the address for other types).
+        // A `...` function gets the implicit HolyC varargs locals: `I64 VargC` (the
+        // count) and `I64 *VargV` (the raw 8-byte slots; pun the address for other
+        // types).
         if f.varargs {
             let pos = f.params.first().map_or(Pos::new(0, 0), |p| p.span.pos);
-            self.declare("VargC", Type::I64, pos);
-            self.declare("VargV", Type::Ptr(Box::new(Type::I64)), pos);
+            self.declare("VargC", Type::I64, pos, false);
+            self.declare("VargV", Type::Ptr(Box::new(Type::I64)), pos, false);
         }
         for stmt in body {
             self.check_stmt(stmt);
@@ -377,6 +466,7 @@ impl Analyzer {
     fn check_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached sema"),
+            StmtKind::TypeSwitch { .. } => unreachable!("type switch reached sema"),
             StmtKind::Empty | StmtKind::Label(_) | StmtKind::Include(_) => {}
             StmtKind::Expr(e) => {
                 self.check_expr(e);
@@ -488,15 +578,42 @@ impl Analyzer {
                     );
                 }
             }
-            // Nested functions/classes are uncommon in HolyC; check a nested
-            // function body best-effort and ignore nested class registration.
+            StmtKind::Try { body, handler } => {
+                // Each block gets its own scope, like a `Block`.
+                self.label_scopes.push(direct_labels(body));
+                self.push_scope();
+                for s in body {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
+                self.label_scopes.pop();
+                self.label_scopes.push(direct_labels(handler));
+                self.push_scope();
+                for s in handler {
+                    self.check_stmt(s);
+                }
+                self.pop_scope();
+                self.label_scopes.pop();
+            }
+            StmtKind::Throw(val) => {
+                // The thrown value is stored in `I64 Fs->except_ch`, so it must be an
+                // integer (a bare `throw;` re-raises the current value).
+                if let Some(e) = val {
+                    let t = self.check_expr(e);
+                    if !is_integer(&t) {
+                        self.error(e.span.pos, "`throw` value must be an integer");
+                    }
+                }
+            }
+            // Nested functions and classes are uncommon in HolyC. Check a nested
+            // function body best-effort, and ignore nested class registration.
             StmtKind::Func(f) => self.check_function(f),
             StmtKind::Class(_) => {}
         }
     }
 
     fn check_declarator(&mut self, d: &Declarator) {
-        self.resolve_type(&d.ty, d.span.pos);
+        self.resolve_type(&d.ty, d.span.pos, d.span.file);
         if matches!(d.ty, Type::U0) {
             self.error(
                 d.span.pos,
@@ -506,13 +623,14 @@ impl Analyzer {
         if let Some(init) = &d.init {
             self.check_init(init, &d.ty, init.span.pos);
         }
-        self.declare(&d.name, d.ty.clone(), d.span.pos);
+        self.declare(&d.name, d.ty.clone(), d.span.pos, d.is_public);
     }
 
-    /// Check an initialiser against its declared type. A brace `InitList` is
-    /// matched element-by-element against an array's element type or a class's
-    /// fields (in layout order); any other expression is checked for
-    /// assignability, exactly as a plain `=` initialiser.
+    /// Checks an initialiser against its declared type.
+    ///
+    /// A brace `InitList` is matched element-by-element against an array's element
+    /// type or against a class's fields in layout order. Any other expression is
+    /// checked for assignability, exactly like a plain `=` initialiser.
     fn check_init(&mut self, init: &Expr, expected: &Type, pos: Pos) {
         if let ExprKind::DesignatedInit(items) = &init.kind {
             self.check_designated_init(init, items, expected, pos);
@@ -571,9 +689,9 @@ impl Analyzer {
         }
     }
 
-    /// Check a designated initialiser `{.field = value, ...}` against its
-    /// declared type. The target must be a class; each designator must name an
-    /// existing field, and its value is checked against that field's type.
+    /// Checks a designated initialiser `{.field = value, ...}` against its declared
+    /// type. The target must be a class. Each designator must name an existing
+    /// field, and its value is checked against that field's type.
     fn check_designated_init(
         &mut self,
         init: &Expr,
@@ -604,7 +722,7 @@ impl Analyzer {
         }
     }
 
-    /// A class/union's `(name, type)` fields in layout order (inherited first).
+    /// A class or union's `(name, type)` fields in layout order, inherited first.
     fn class_fields(&self, class: &str) -> Vec<(String, Type)> {
         let mut out = Vec::new();
         if let Some(def) = self.types.get(class) {
@@ -620,13 +738,9 @@ impl Analyzer {
         out
     }
 
-    /// The function-pointer type of a named user function (for `&Func`), or
-    /// `None` if `name` is a builtin or not a function. Builtins are excluded
-    /// because they have no address the backends can take.
+    /// The function-pointer type of a named user function, used for `&Func`.
+    /// Returns `None` if `name` is not a function.
     fn func_ptr_type(&self, name: &str) -> Option<Type> {
-        if crate::builtins::is_builtin(name) {
-            return None;
-        }
         let sig = self.funcs.get(name)?;
         Some(Type::FuncPtr {
             ret: Box::new(sig.ret.clone()),
@@ -634,7 +748,7 @@ impl Analyzer {
         })
     }
 
-    /// A class/union's field types in layout order: inherited (base) fields
+    /// A class or union's field types in layout order: inherited (base) fields
     /// first, then the class's own.
     fn class_field_types(&self, class: &str) -> Vec<Type> {
         let mut out = Vec::new();
@@ -654,9 +768,10 @@ impl Analyzer {
         }
     }
 
-    /// Enforce the placement rules for `start:` / `end:` switch sub-labels: at
-    /// most one of each, `start:` before every case, `end:` after every case.
-    /// This keeps the prologue/epilogue partition unambiguous for both backends.
+    /// Enforces the placement rules for the `start:` / `end:` switch sub-labels:
+    /// at most one of each, `start:` before every case, and `end:` after every
+    /// case. This keeps the prologue/epilogue partition unambiguous for both
+    /// backends.
     fn validate_switch_labels(&mut self, body: &Stmt) {
         let StmtKind::Block(stmts) = &body.kind else {
             return;
@@ -698,8 +813,8 @@ impl Analyzer {
                 self.error(pos, "returning a value from a U0 (void) function");
             }
             (Some(rt), Some(e)) if rt != Type::U0 => {
-                // A brace/tuple-literal return (`return a, b;`) is checked against the
-                // (tuple/aggregate) return type, like an initialiser.
+                // A brace or tuple-literal return (`return a, b;`) is checked against
+                // the tuple/aggregate return type, like an initialiser.
                 if matches!(e.kind, ExprKind::InitList(_) | ExprKind::DesignatedInit(_)) {
                     self.check_init(e, &rt, e.span.pos);
                 } else {
@@ -710,7 +825,7 @@ impl Analyzer {
             (Some(rt), None) if rt != Type::U0 => {
                 self.error(pos, "missing return value in non-void function");
             }
-            // U0 with no value, or top-level return: fine.
+            // U0 with no value, or a top-level return: both fine.
             (_, Some(e)) => {
                 self.check_expr(e);
             }
@@ -720,8 +835,8 @@ impl Analyzer {
 
     // ---- expressions: returns the inferred type ----
 
-    /// Infer an expression's type and record it on the node (building the
-    /// typed AST that backends and `sizeof(expr)` rely on).
+    /// Infers an expression's type and records it on the node. This builds the
+    /// typed AST that the backends and `sizeof(expr)` rely on.
     fn check_expr(&mut self, expr: &Expr) -> Type {
         let t = self.infer(expr);
         expr.set_ty(t.clone());
@@ -730,13 +845,14 @@ impl Analyzer {
 
     fn infer(&mut self, expr: &Expr) -> Type {
         match &expr.kind {
-            // Deferred generic calls only live in templates, gone before sema.
+            // Deferred generic calls only live in templates; the mono pass removes
+            // them before sema.
             ExprKind::GenericCall { .. } => unreachable!("generic call reached sema"),
             ExprKind::Int(_) | ExprKind::Char(_) => Type::I64,
             ExprKind::Float(_) => Type::F64,
             // String literals are U8*.
             ExprKind::Str(_) => Type::Ptr(Box::new(Type::U8)),
-            ExprKind::Ident(name) => self.check_ident(name, expr.span.pos),
+            ExprKind::Ident(name) => self.check_ident(name, expr.span),
             ExprKind::Unary { op, expr: inner } => self.check_unary(*op, inner),
             ExprKind::Postfix { op: _, expr: inner } => {
                 let t = self.check_expr(inner);
@@ -759,15 +875,15 @@ impl Analyzer {
                 self.check_member(base, field, *arrow, expr.span.pos)
             }
             ExprKind::Cast { ty, expr: inner } => {
-                self.resolve_type(ty, inner.span.pos);
+                self.resolve_type(ty, inner.span.pos, inner.span.file);
                 self.check_expr(inner);
                 ty.clone()
             }
             ExprKind::Sizeof(arg) => {
                 match arg {
-                    SizeofArg::Type(t) => self.resolve_type(t, expr.span.pos),
-                    // The operand is type-checked so its static type is inferred
-                    // and recorded; the size is read from that type later.
+                    SizeofArg::Type(t) => self.resolve_type(t, expr.span.pos, expr.span.file),
+                    // Type-check the operand so its static type is inferred and
+                    // recorded. The size is read from that type later.
                     SizeofArg::Expr(e) => {
                         self.check_expr(e);
                     }
@@ -779,8 +895,8 @@ impl Analyzer {
                 Type::I64
             }
             ExprKind::InitList(items) => {
-                // A bare initializer list with no target type isn't valid; it is
-                // only meaningful in a declarator (handled by `check_init`).
+                // A bare initializer list with no target type is not valid. It is
+                // only meaningful in a declarator, handled by `check_init`.
                 for it in items {
                     self.check_expr(it);
                 }
@@ -810,16 +926,17 @@ impl Analyzer {
         }
     }
 
-    fn check_ident(&mut self, name: &str, pos: Pos) -> Type {
+    fn check_ident(&mut self, name: &str, span: Span) -> Type {
         if let Some(t) = self.lookup_var(name) {
             // Return the variable's true (undecayed) type so the typed AST is
-            // accurate — e.g. `sizeof(arr)` sees the array, not a pointer. Use
-            // sites (arithmetic, indexing, assignment) apply array-to-pointer
-            // decay themselves.
+            // accurate: e.g. `sizeof(arr)` sees the array, not a pointer. Use sites
+            // (arithmetic, indexing, assignment) apply array-to-pointer decay
+            // themselves.
             let t = t.clone();
-            // If the name resolves to a global (not shadowed by a local in an inner
-            // scope) defined in a `_`-private file, enforce that privacy — like a
-            // function or type reference.
+            // If the name resolves to a global that is not shadowed by a local in an
+            // inner scope, enforce file-scoped visibility like a function or type
+            // reference. The reference file is the identifier's own `span.file`, the
+            // precise site (just as `check_call` uses `callee.span.file`).
             let shadowed = self.scopes[1..].iter().any(|s| s.contains_key(name));
             let def_file = if shadowed {
                 None
@@ -827,16 +944,17 @@ impl Analyzer {
                 self.global_files.get(name).copied()
             };
             if let Some(df) = def_file {
-                self.check_private_access(df, self.cur_file, name, pos);
+                let is_public = self.global_is_public.get(name).copied().unwrap_or(false);
+                self.check_visibility(is_public, df, span.file, name, span.pos);
             }
             return t;
         }
-        // A bare function name acts like a call in HolyC; give it the return
+        // A bare function name acts like a call in HolyC, so give it the return
         // type.
         if let Some(sig) = self.funcs.get(name) {
             return sig.ret.clone();
         }
-        self.error(pos, format!("use of undeclared identifier `{name}`"));
+        self.error(span.pos, format!("use of undeclared identifier `{name}`"));
         Type::I64
     }
 
@@ -870,9 +988,9 @@ impl Analyzer {
                 }
             },
             UnOp::AddrOf => {
-                // `&Func` is a function pointer (a function is addressable even
-                // though it is not an lvalue). A local variable shadows a function
-                // of the same name.
+                // `&Func` is a function pointer: a function is addressable even
+                // though it is not an lvalue. A local variable shadows a function of
+                // the same name.
                 if let ExprKind::Ident(name) = &inner.kind {
                     if self.lookup_var(name).is_none() {
                         if let Some(fp) = self.func_ptr_type(name) {
@@ -908,7 +1026,7 @@ impl Analyzer {
                     );
                     return Type::I64;
                 }
-                // pointer - pointer yields an integer offset.
+                // Pointer minus pointer yields an integer offset.
                 if op == Sub && is_pointer(&lt) && is_pointer(&rt) {
                     return Type::I64;
                 }
@@ -945,52 +1063,82 @@ impl Analyzer {
         tt
     }
 
-    /// Enforce `_`-privacy: a symbol defined in a file under a `_`-prefixed directory
-    /// (or in a `_`-prefixed file) may only be referenced from within that subtree
-    /// (Go's `internal/`, generalized to any `_`-named directory *or* file).
-    fn check_private_access(&mut self, def_file: u32, ref_file: u32, name: &str, pos: Pos) {
-        let msg = {
-            let (Some(def), Some(refr)) = (
-                self.files.get(def_file as usize),
-                self.files.get(ref_file as usize),
-            ) else {
-                return; // missing file info — don't gate
-            };
-            if def.visible_to(refr) {
-                return;
+    /// Enforces file-scoped visibility. A symbol that is not `public` may be
+    /// referenced only from within the file that defines it; a `public` symbol is
+    /// visible everywhere. Same-file references (`def_file == ref_file`) are always
+    /// allowed.
+    fn check_visibility(
+        &mut self,
+        is_public: bool,
+        def_file: u32,
+        ref_file: u32,
+        name: &str,
+        pos: Pos,
+    ) {
+        // `public` symbols are visible everywhere; references from the same directory
+        // are always allowed; and references from compiler-generated code (a
+        // monomorphized instance or a reference carrying the `GENERATED_FILE` sentinel)
+        // are trusted.
+        if is_public
+            || self.same_dir(def_file, ref_file)
+            || self.in_generated
+            || ref_file == crate::token::GENERATED_FILE
+        {
+            return;
+        }
+        let (dir, file) = match self.files.get(def_file as usize) {
+            Some(f) => {
+                let dir = if f.dir.is_empty() {
+                    ".".to_string()
+                } else {
+                    f.dir.join("/")
+                };
+                (dir, f.display())
             }
-            let elem = def.privacy_dir.clone().unwrap_or_default();
-            let root = match &def.privacy_root {
-                Some(r) if r.is_empty() => ".".to_string(),
-                Some(r) => r.join("/"),
-                None => return,
-            };
-            // A `_`-file's privacy root is its own directory (so it equals `def.dir`); a
-            // `_`-dir's root is a strict prefix. Word the diagnostic for each.
-            let what = if def.privacy_root.as_ref() == Some(&def.dir) {
-                format!("the `{elem}` file")
-            } else {
-                format!("the `{elem}/` directory")
-            };
-            format!("`{name}` is private to {what} and can only be used from within `{root}/`")
+            None => ("another".to_string(), "another file".to_string()),
         };
-        self.error(pos, msg);
+        self.error(
+            pos,
+            format!(
+                "`{name}` is not `public`; it is private to the `{dir}` directory \
+                 (defined in `{file}`)"
+            ),
+        );
+    }
+
+    /// Whether files `a` and `b` live in the same directory (directory-scoped privacy).
+    /// The same file trivially qualifies. Missing file info is treated as same-directory
+    /// (lenient), as before.
+    fn same_dir(&self, a: u32, b: u32) -> bool {
+        if a == b {
+            return true;
+        }
+        match (self.files.get(a as usize), self.files.get(b as usize)) {
+            (Some(fa), Some(fb)) => fa.dir == fb.dir,
+            _ => true,
+        }
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Expr]) -> Type {
-        // Resolve argument types first (always check them).
+        // Always resolve the argument types first.
         let argc = args.len();
         for a in args {
             self.check_expr(a);
         }
-        // A direct call to a named function or builtin — unless a local variable
-        // of the same name shadows it (then it's a function-pointer call).
+        // A direct call to a named function or builtin, unless a local variable of
+        // the same name shadows it — in which case it is a function-pointer call.
         if let ExprKind::Ident(name) = &callee.kind {
             if self.lookup_var(name).is_none() {
                 if let Some(sig) = self.funcs.get(name) {
-                    let (required, total, varargs, ret) =
-                        (sig.required, sig.total, sig.varargs, sig.ret.clone());
-                    self.check_private_access(sig.file, callee.span.file, name, callee.span.pos);
+                    let (required, total, varargs, ret, is_public, file) = (
+                        sig.required,
+                        sig.total,
+                        sig.varargs,
+                        sig.ret.clone(),
+                        sig.is_public,
+                        sig.file,
+                    );
+                    self.check_visibility(is_public, file, callee.span.file, name, callee.span.pos);
                     let ok = if varargs {
                         argc >= required
                     } else {
@@ -1019,7 +1167,7 @@ impl Analyzer {
             }
         }
         // Otherwise the callee is a value expression that must be a function
-        // pointer (a `FuncPtr` variable, `&Func`, etc.).
+        // pointer: a `FuncPtr` variable, `&Func`, and so on.
         if let Type::FuncPtr { ret, params } = Self::decay(self.check_expr(callee)) {
             if argc != params.len() {
                 self.error(
@@ -1038,8 +1186,8 @@ impl Analyzer {
 
     fn check_index(&mut self, base: &Expr, index: &Expr) -> Type {
         let bt = Self::decay(self.check_expr(base));
-        // Tuple indexing: a **constant** index selects a positional slot, whose type
-        // depends on the index — so `t[0]` and `t[1]` may differ.
+        // Tuple indexing: a *constant* index selects a positional slot. The result
+        // type depends on the index, so `t[0]` and `t[1]` may differ.
         if let Type::Named(name) = &bt {
             if crate::ast::is_tuple_name(name) {
                 self.check_expr(index);
@@ -1074,7 +1222,7 @@ impl Analyzer {
 
     fn check_member(&mut self, base: &Expr, field: &str, arrow: bool, pos: Pos) -> Type {
         let bt = self.check_expr(base);
-        // Determine the class/union name being accessed.
+        // Determine the class or union name being accessed.
         let class_name = if arrow {
             match Self::decay(bt) {
                 Type::Ptr(inner) => match *inner {
@@ -1115,7 +1263,7 @@ impl Analyzer {
         }
     }
 
-    /// Find a field by name in a class/union, searching base classes.
+    /// Finds a field by name in a class or union, searching base classes.
     fn lookup_field(&self, class: &str, field: &str) -> Option<Type> {
         let def = self.types.get(class)?;
         // A direct field.
@@ -1138,7 +1286,7 @@ impl Analyzer {
             .and_then(|base| self.lookup_field(base, field))
     }
 
-    /// Validate an `offset(Class.field...)` operand: the class must exist and
+    /// Validates an `offset(Class.field...)` operand. The class must exist, and
     /// each member along the path must resolve, descending into nested classes.
     fn check_offset(&mut self, class: &str, path: &[String], pos: Pos) {
         if !self.types.contains_key(class) {
@@ -1172,8 +1320,8 @@ impl Analyzer {
     fn is_lvalue(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::Ident(name) => self.lookup_var(name).is_some(),
-            // `p->x` is always an lvalue; `a.x` is one only if `a` is — so a
-            // member of a temporary (e.g. a class-returning call) is not.
+            // `p->x` is always an lvalue. `a.x` is one only if `a` is, so a member
+            // of a temporary (e.g. a class-returning call) is not.
             ExprKind::Member { base, arrow, .. } => *arrow || self.is_lvalue(base),
             ExprKind::Index { .. } => true,
             ExprKind::Unary {
@@ -1183,17 +1331,86 @@ impl Analyzer {
         }
     }
 
+    /// Whether two types are **structurally compatible** — assignable across each
+    /// other regardless of name.
+    ///
+    /// Aggregates compare by *shape*: same kind (class vs union) and the same ordered
+    /// `(field name, field type)` list, recursively. So a `Pair`, an anonymous
+    /// `class { I64 x; I64 y; }`, and a `typedef` of either are interchangeable, while
+    /// differing field names, field types, arity, or struct-vs-union are not. Scalars
+    /// (and pointers/funcptrs as operands) are handled by [`Self::check_assignable`]'s
+    /// permissive fall-through, not here — `types_compatible` is *exact* about
+    /// non-aggregates so that nested field types are compared faithfully.
+    fn types_compatible(&self, a: &Type, b: &Type) -> bool {
+        let mut seen = HashSet::new();
+        self.compat(&Self::decay(a.clone()), &Self::decay(b.clone()), &mut seen)
+    }
+
+    /// The coinductive core of [`Self::types_compatible`]. `seen` records the
+    /// `(name, name)` aggregate pairs currently being compared; re-encountering one is
+    /// *assumed* compatible, so mutually-recursive types (`class Node { Node *next; }`)
+    /// terminate instead of looping. Inner types are compared raw (no decay), so an
+    /// inline array field never matches a pointer field.
+    fn compat(&self, a: &Type, b: &Type, seen: &mut HashSet<(String, String)>) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a, b) {
+            (Type::Ptr(x), Type::Ptr(y)) => self.compat(x, y, seen),
+            (Type::Array(x, dx), Type::Array(y, dy)) => {
+                array_dims_equal(dx, dy) && self.compat(x, y, seen)
+            }
+            (
+                Type::FuncPtr {
+                    ret: r1,
+                    params: p1,
+                },
+                Type::FuncPtr {
+                    ret: r2,
+                    params: p2,
+                },
+            ) => {
+                p1.len() == p2.len()
+                    && self.compat(r1, r2, seen)
+                    && p1.iter().zip(p2).all(|(x, y)| self.compat(x, y, seen))
+            }
+            (Type::Named(x), Type::Named(y)) => {
+                if seen.contains(&(x.clone(), y.clone())) || seen.contains(&(y.clone(), x.clone()))
+                {
+                    return true; // already comparing this pair — assume compatible
+                }
+                seen.insert((x.clone(), y.clone()));
+                let (Some(dx), Some(dy)) = (self.types.get(x), self.types.get(y)) else {
+                    return x == y; // an unknown type is compatible only with itself
+                };
+                if dx.is_union != dy.is_union {
+                    return false;
+                }
+                let fx = self.class_fields(x);
+                let fy = self.class_fields(y);
+                fx.len() == fy.len()
+                    && fx
+                        .iter()
+                        .zip(&fy)
+                        .all(|((nx, tx), (ny, ty))| nx == ny && self.compat(tx, ty, seen))
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a value of type `from` may be assigned to a slot of type `to`.
-    /// Permissive for scalars (HolyC freely mixes integers, floats, pointers);
-    /// strict only about void and class/union mismatches.
+    /// Permissive for scalars, since HolyC freely mixes integers, floats, and
+    /// pointers. Strict only about aggregate (class/union) mismatches, where
+    /// [`Self::types_compatible`] allows any two **same-signature** types regardless of
+    /// name.
     fn check_assignable(&mut self, to: &Type, from: &Type, pos: Pos) {
         let to = Self::decay(to.clone());
         let from = Self::decay(from.clone());
-        if to == from {
+        if self.types_compatible(&to, &from) {
             return;
         }
         match (&to, &from) {
-            (Type::Named(a), Type::Named(b)) if a != b => {
+            (Type::Named(a), Type::Named(b)) => {
                 self.error(pos, format!("cannot assign `{b}` to `{a}`"));
             }
             (Type::Named(a), _) => {
@@ -1202,15 +1419,30 @@ impl Analyzer {
             (_, Type::Named(b)) => {
                 self.error(pos, format!("cannot assign class type `{b}` to a scalar"));
             }
-            // Any scalar-to-scalar (int/float/pointer) assignment is allowed.
+            // Any scalar-to-scalar assignment (int, float, pointer) is allowed.
             _ => {}
         }
     }
 }
 
-/// The labels declared directly in a statement list (one level — not inside
-/// nested blocks). A `goto` can target these from anywhere within the block or
-/// a nested block, matching the interpreter's label-resume scope.
+/// Whether two array dimensions denote the same length: both unsized, or both
+/// constant-folding to the same value (falling back to structural expression equality
+/// when they aren't constant). Distinguishes `I64 a[4]` from `I64 a[8]` when comparing
+/// aggregate field types structurally.
+fn array_dims_equal(a: &Option<Box<Expr>>, b: &Option<Box<Expr>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => match (crate::layout::const_eval(x), crate::layout::const_eval(y)) {
+            (Ok(m), Ok(n)) => m == n,
+            _ => x == y,
+        },
+        _ => false,
+    }
+}
+
+/// The labels declared directly in a statement list, one level deep, not inside
+/// nested blocks. A `goto` can target these from anywhere within the block or a
+/// nested block, matching the interpreter's label-resume scope.
 fn direct_labels(stmts: &[Stmt]) -> HashSet<String> {
     stmts
         .iter()
@@ -1238,7 +1470,7 @@ fn is_integer(ty: &Type) -> bool {
     )
 }
 
-fn is_arithmetic(ty: &Type) -> bool {
+pub(crate) fn is_arithmetic(ty: &Type) -> bool {
     is_integer(ty) || matches!(ty, Type::F64)
 }
 
@@ -1246,8 +1478,8 @@ pub(crate) fn is_pointer(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_) | Type::Array(..) | Type::FuncPtr { .. })
 }
 
-/// Array-to-pointer decay applied at use sites. Shared with the mono pass's
-/// inference typer so both stages agree on operand types.
+/// Applies array-to-pointer decay, as happens at use sites. Shared with the mono
+/// pass's inference typer so both stages agree on operand types.
 pub(crate) fn decay(ty: Type) -> Type {
     match ty {
         Type::Array(inner, _) => Type::Ptr(inner),
@@ -1256,18 +1488,19 @@ pub(crate) fn decay(ty: Type) -> Type {
 }
 
 /// Whether a field name is the generated placeholder for an anonymous embedded
-/// union, whose members are promoted into the enclosing class.
+/// union. Such a union's members are promoted into the enclosing class.
 pub fn is_anon_field(name: &str) -> bool {
     name.starts_with("$anon")
 }
 
-fn is_scalar(ty: &Type) -> bool {
+pub(crate) fn is_scalar(ty: &Type) -> bool {
     is_arithmetic(ty) || is_pointer(ty)
 }
 
-/// The result type of arithmetic / a ternary over two scalar operands. Floats
-/// win over integers; a pointer operand makes the result that pointer; integer
-/// arithmetic is performed at 64-bit width (HolyC register semantics).
+/// The result type of arithmetic or a ternary over two scalar operands. A float
+/// operand wins over integers. A pointer operand makes the result that pointer.
+/// Integer arithmetic is performed at 64-bit width, matching HolyC register
+/// semantics.
 pub(crate) fn arith_result(a: &Type, b: &Type) -> Type {
     let a = decay(a.clone());
     let b = decay(b.clone());

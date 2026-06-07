@@ -1,12 +1,12 @@
 //! The freestanding `aarch64-unknown-linux` target: a self-contained static ELF
-//! with its own `_start` and raw syscalls — no libc, no linker (the AArch64
-//! analogue of the freestanding `x86_64-unknown-linux` backend).
+//! with its own `_start` and raw syscalls. There is no libc and no linker. This
+//! is the AArch64 analogue of the freestanding `x86_64-unknown-linux` backend.
 //!
 //! The AArch64 instruction encoding and the code generation are shared with the
-//! Darwin backend (the [`asm`](super::asm) module and the parent's `compile`
-//! driver). This module supplies only the ELF-executable container: a single
-//! `PT_LOAD` (R+W+X) over the emitted code, with a trailing zero-filled BSS, and
-//! the entry at the emitted `_start`.
+//! Darwin backend, via the [`asm`](super::asm) module and the parent's `compile`
+//! driver. This module supplies only the ELF-executable container: a single
+//! `PT_LOAD` (R+W+X) over the emitted code, a trailing zero-filled BSS, and the
+//! entry at the emitted `_start`.
 
 use std::path::PathBuf;
 
@@ -14,8 +14,8 @@ use super::ArmTarget;
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
-/// Compiles a HolyC program for `aarch64-unknown-linux` — a freestanding static
-/// ELF (no libc, no linker), the AArch64 analogue of the freestanding
+/// Compiles a HolyC program for `aarch64-unknown-linux`: a freestanding static
+/// ELF with no libc and no linker. The AArch64 analogue of the freestanding
 /// `x86_64-unknown-linux` backend.
 pub struct Arm64Linux {
     out_path: PathBuf,
@@ -28,9 +28,9 @@ impl Arm64Linux {
         }
     }
 
-    /// Emit the freestanding ELF executable for `program` as raw bytes. Exposed so
-    /// structural tests can byte-check the image on any host. (`compile` produces
-    /// the runnable image directly for a freestanding target.)
+    /// Emits the freestanding ELF executable for `program` as raw bytes. Exposed
+    /// so structural tests can byte-check the image on any host. For a freestanding
+    /// target, `compile` produces the runnable image directly.
     pub fn object(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
         super::compile(program, &Linux)
     }
@@ -69,11 +69,11 @@ const VADDR: u64 = 0x40_0000;
 const EHSIZE: u64 = 64;
 const PHENTSIZE: u64 = 56;
 
-/// Wrap freestanding `code` in a minimal static ELF64 executable: an ELF header,
-/// one `PT_LOAD` (R+W+X) covering the whole file plus a trailing zero-filled BSS
-/// region of `bss` bytes, with the entry at the first code byte (the emitted
-/// `_start`). Mirrors the `x86_64-unknown-linux` writer, with `e_machine =
-/// EM_AARCH64`.
+/// Wraps freestanding `code` in a minimal static ELF64 executable. The image is
+/// an ELF header followed by one `PT_LOAD` (R+W+X) covering the whole file, plus a
+/// trailing zero-filled BSS region of `bss` bytes. The entry is the first code
+/// byte, the emitted `_start`. Mirrors the `x86_64-unknown-linux` writer, with
+/// `e_machine = EM_AARCH64`.
 fn write_elf_exec(code: &[u8], bss: u64) -> Vec<u8> {
     let entry = VADDR + EHSIZE + PHENTSIZE;
     let filesz = EHSIZE + PHENTSIZE + code.len() as u64;

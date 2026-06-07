@@ -1,12 +1,13 @@
 //! Abstract syntax tree for HolyC.
 //!
-//! Every expression and statement carries a [`Span`] locating it in the source,
-//! which later passes (type checking, codegen) use for diagnostics. Each
-//! `Expr` also carries an interior-mutable inferred type (`ty`, a
-//! `RefCell<Option<Type>>`) that semantic analysis fills in. To keep the node
-//! shapes the focus of tests, `PartialEq` on AST nodes compares *structure only*
-//! and ignores both spans and `ty` — so tests can build expected trees with
-//! [`Span::dummy`].
+//! Every expression and statement carries a [`Span`] locating it in the source.
+//! Later passes (type checking, codegen) use spans for diagnostics. Each `Expr`
+//! also carries an inferred type (`ty`, a `RefCell<Option<Type>>`) that semantic
+//! analysis fills in via interior mutability.
+//!
+//! `PartialEq` on AST nodes compares structure only; it ignores both spans and
+//! `ty`. This keeps node shapes the focus of tests and lets them build expected
+//! trees with [`Span::dummy`].
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,14 +19,15 @@ use crate::token::{FileInfo, Keyword, Span};
 #[derive(Clone, Debug)]
 pub struct Program {
     pub items: Vec<Stmt>,
-    /// The source files seen during parsing, indexed by `Span::file`. Carries each
-    /// file's directory for `_`-directory privacy checks in sema. Provenance
-    /// metadata, so — like spans — it is ignored by `PartialEq`.
+    /// The source files seen during parsing, indexed by `Span::file`. Each entry
+    /// carries the file's directory, which sema uses for `_`-directory privacy
+    /// checks. This is provenance metadata, so `PartialEq` ignores it, just as it
+    /// ignores spans.
     pub files: Vec<FileInfo>,
-    /// The generic-template registry captured during parsing, the input to the
-    /// [`mono`](crate::mono) pass — which instantiates every deferred generic use and
-    /// then leaves this empty (so a post-`mono` `Program` is fully concrete). Like
-    /// `files`, it is ignored by `PartialEq`.
+    /// The generic-template registry captured during parsing. It is the input to
+    /// the [`mono`](crate::mono) pass, which instantiates every deferred generic
+    /// use and leaves this empty, so a post-`mono` `Program` is fully concrete.
+    /// Like `files`, it is ignored by `PartialEq`.
     pub generics: GenericTemplates,
 }
 
@@ -35,10 +37,11 @@ impl PartialEq for Program {
     }
 }
 
-/// The generic `class`/function templates captured during parsing, carried on the
-/// [`Program`] for the [`mono`](crate::mono) pass to instantiate. The parser leaves
-/// every generic *use* deferred (`Type::Generic`/`Type::Tuple`/`ExprKind::GenericCall`/
-/// `StmtKind::ShortDecl`); `mono` consumes these templates and resolves the uses.
+/// The generic `class` and function templates captured during parsing. They are
+/// carried on the [`Program`] for the [`mono`](crate::mono) pass to instantiate.
+/// The parser leaves every generic *use* deferred, as a `Type::Generic`,
+/// `Type::Tuple`, `ExprKind::GenericCall`, or `StmtKind::ShortDecl`. `mono` then
+/// consumes these templates and resolves the deferred uses.
 #[derive(Clone, Debug, Default)]
 pub struct GenericTemplates {
     /// Generic `class`/`union` templates, by name.
@@ -47,16 +50,66 @@ pub struct GenericTemplates {
     pub fns: HashMap<String, GenericFn>,
 }
 
-/// A captured generic-function template: its type-parameter names and the function
+/// A constraint a type parameter must satisfy at instantiation. Currently only
+/// `comparable` (a type orderable by `<`/`>`, i.e. a scalar or pointer); the enum is
+/// a seam for more constraints later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Constraint {
+    /// `comparable T` — `T` must be a type sema accepts as a relational operand.
+    Comparable,
+}
+
+/// A generic parameter declared in a `<...>` list. Either a **type** parameter
+/// (`type T` / bare `T`, optionally `comparable`-constrained) or a **value**
+/// (non-type) parameter (`int N`, an integer constant).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenericParam {
+    /// A type parameter, with an optional constraint.
+    Type(String, Option<Constraint>),
+    /// An integer value parameter (`int N`).
+    Value(String),
+}
+
+impl GenericParam {
+    /// The parameter's name.
+    pub fn name(&self) -> &str {
+        match self {
+            GenericParam::Type(n, _) | GenericParam::Value(n) => n,
+        }
+    }
+}
+
+/// A generic argument at a use site: either a type (`Vec<I64>`) or a value
+/// (`FixedArr<I64, 8>`). The value arm carries an `Expr` because it may reference an
+/// enclosing template's value parameter; it only becomes a literal `Int` once that
+/// template is instantiated and the expression is const-evaluated.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenericArg {
+    Type(Type),
+    Value(Box<Expr>),
+}
+
+/// What a compile-time type switch ([`StmtKind::TypeSwitch`]) dispatches on: either a
+/// type directly (`switch type (T)`) or the static type of an expression
+/// (`switch type (x)`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeSwitchOn {
+    Ty(Type),
+    Val(Box<Expr>),
+}
+
+/// A captured generic-function template. Holds its parameters and the function
 /// parsed once into a `FuncDef` with those parameters left symbolic. The
-/// [`mono`](crate::mono) pass substitutes the parameters in this AST per instantiation
-/// (no token re-parse).
+/// [`mono`](crate::mono) pass substitutes the parameters in this AST for each
+/// instantiation, with no token re-parse.
 #[derive(Clone, Debug)]
 pub struct GenericFn {
-    pub type_params: Vec<String>,
-    /// The template `FuncDef`, with type parameters left symbolic: a `T` type is
-    /// `Type::Param`, a nested `Vec<T>` a deferred `Type::Generic`, a body generic call
-    /// an `ExprKind::GenericCall`, and a `:=` a `StmtKind::ShortDecl`.
+    /// The generic parameters, in order (type and/or value).
+    pub params: Vec<GenericParam>,
+    /// The template `FuncDef`, with parameters left symbolic. A `T` type is a
+    /// `Type::Param`, a nested `Vec<T>` a deferred `Type::Generic`, a value param `N`
+    /// an ordinary `Expr::Ident` (in array dims / expressions), a generic call in the
+    /// body an `ExprKind::GenericCall`, and a `:=` a `StmtKind::ShortDecl`.
     pub def: FuncDef,
 }
 
@@ -64,12 +117,15 @@ pub struct GenericFn {
 #[derive(Clone, Debug)]
 pub struct GenericClass {
     pub is_union: bool,
-    /// The type-parameter names, e.g. `["T"]` or `["K", "V"]`.
-    pub params: Vec<String>,
+    /// The generic parameters, e.g. `[type T]` or `[type K, type V]` or
+    /// `[type T, int N]`.
+    pub params: Vec<GenericParam>,
     pub base: Option<String>,
-    /// The fields, parsed once with the template's parameters left symbolic — a `T`
-    /// field type is `Type::Param("T")` and a nested `Vec<T>` is `Type::Generic(...)`.
-    /// The [`mono`](crate::mono) pass substitutes the parameters in this AST (no re-parse).
+    /// The fields, parsed once with the template's parameters left symbolic. A `T`
+    /// field type is `Type::Param("T")`, a nested `Vec<T>` is `Type::Generic(...)`,
+    /// and a value-param array dim `T data[N]` keeps `N` as an `Expr::Ident`. The
+    /// [`mono`](crate::mono) pass substitutes the parameters in this AST, with no
+    /// re-parse.
     pub fields: Vec<Declarator>,
 }
 
@@ -91,28 +147,30 @@ pub enum Type {
     Named(String),
     /// `T *`
     Ptr(Box<Type>),
-    /// `T[n]` — the size expression is `None` for unsized arrays like `T[]`.
+    /// `T[n]`. The size expression is `None` for unsized arrays like `T[]`.
     Array(Box<Type>, Option<Box<Expr>>),
-    /// A function pointer: `ret (*)(params...)`. An 8-byte scalar like any
-    /// pointer; the signature drives call type-checking and argument classing.
+    /// A function pointer, `ret (*)(params...)`. It is an 8-byte scalar like any
+    /// pointer. The signature drives call type-checking and argument classing.
     FuncPtr {
         ret: Box<Type>,
         params: Vec<Type>,
     },
-    /// A generic **type parameter** (`T`) inside a template body, replaced with a
-    /// concrete type when the template is instantiated. Only ever appears in a generic
-    /// template's AST — the monomorphization pass resolves it away, so sema, layout, and
-    /// the backends never see it.
+    /// A generic type parameter (`T`) inside a template body. It is replaced with
+    /// a concrete type when the template is instantiated. It appears only in a
+    /// generic template's AST: the monomorphization pass resolves it away, so sema,
+    /// layout, and the backends never see it.
     Param(String),
-    /// An **un-instantiated generic application** (`Vec<T>`) inside a template body,
-    /// resolved to a concrete `Named` once its arguments are bound at instantiation.
-    /// Like [`Type::Param`], it never reaches sema/layout/backends.
-    Generic(String, Vec<Type>),
-    /// A **deferred tuple type** `(T0, …, Tn)` inside a template body — its elements may
-    /// be parametric, so it isn't interned into a `$Tup` class until the parameters are
-    /// bound at instantiation (substitution interns the concrete tuple). Outside a
-    /// template, a tuple type is interned immediately to a `Named`, so this never reaches
-    /// sema/layout/backends.
+    /// An un-instantiated generic application (`Vec<T>`, `FixedArr<I64, 8>`) inside a
+    /// template body or use site. Its arguments are [`GenericArg`]s (types and/or
+    /// values). It resolves to a concrete `Named` once the arguments are bound at
+    /// instantiation. Like [`Type::Param`], it never reaches sema, layout, or the
+    /// backends.
+    Generic(String, Vec<GenericArg>),
+    /// A deferred tuple type `(T0, …, Tn)` inside a template body. Its elements may
+    /// be parametric, so it isn't interned into a `$Tup` class until the parameters
+    /// are bound at instantiation; substitution interns the concrete tuple. Outside
+    /// a template a tuple type is interned immediately to a `Named`, so this variant
+    /// never reaches sema, layout, or the backends.
     Tuple(Vec<Type>),
 }
 
@@ -138,14 +196,18 @@ impl Type {
     }
 }
 
-/// A single declared name with its (fully resolved) type and optional
-/// initialiser. Used for variables and class fields.
+/// A single declared name with its fully resolved type and optional initialiser.
+/// Used for variables and class fields.
 #[derive(Clone, Debug)]
 pub struct Declarator {
     pub name: String,
     pub ty: Type,
     pub init: Option<Expr>,
     pub span: Span,
+    /// `public` modifier: a top-level global declared `public` is visible from any
+    /// file; otherwise it is private to its defining file. Meaningless (and ignored)
+    /// for locals and class fields. Like `span`, it is excluded from `PartialEq`.
+    pub is_public: bool,
 }
 
 /// A function parameter.
@@ -169,6 +231,10 @@ pub struct FuncDef {
     pub varargs: bool,
     /// `None` for a prototype (`...;`), `Some(body)` for a definition.
     pub body: Option<Vec<Stmt>>,
+    /// `public` modifier: a `public` function is callable from any file; otherwise it
+    /// is private to its defining file (visibility is file-scoped). Monomorphized
+    /// generic instances are always public.
+    pub is_public: bool,
 }
 
 /// A `class` or `union` definition.
@@ -179,6 +245,10 @@ pub struct ClassDef {
     /// `class Foo : Bar` inheritance.
     pub base: Option<String>,
     pub fields: Vec<Declarator>,
+    /// `public` modifier: a `public` class/union is usable from any file; otherwise it
+    /// is private to its defining file. Compiler-synthesized aggregates (tuples,
+    /// anonymous aggregates) and monomorphized generic instances are always public.
+    pub is_public: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,12 +306,12 @@ pub enum AssignOp {
     Shr,    // >>=
 }
 
-/// An expression node: its shape, its source span, and (after semantic
+/// An expression node. Holds its shape, its source span, and (after semantic
 /// analysis) its inferred type.
 ///
-/// The inferred type is stored in a `RefCell` so the type checker can annotate
-/// the tree in place while passes keep their immutable `&Program` APIs. It is
-/// `None` until semantic analysis has run over this node.
+/// The inferred type lives in a `RefCell` so the type checker can annotate the
+/// tree in place while passes keep their immutable `&Program` APIs. It is `None`
+/// until semantic analysis has run over this node.
 #[derive(Clone, Debug)]
 pub struct Expr {
     pub kind: ExprKind,
@@ -263,7 +333,7 @@ impl Expr {
         self.ty.borrow().clone()
     }
 
-    /// Record this expression's inferred type (called by semantic analysis).
+    /// Record this expression's inferred type. Called by semantic analysis.
     pub fn set_ty(&self, ty: Type) {
         *self.ty.borrow_mut() = Some(ty);
     }
@@ -312,15 +382,16 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
-    /// A **deferred** generic call inside a generic-function template body —
-    /// `VecReserve<T>(v, …)`, or an inferred `VecPush(&v, x)` (`type_args` empty). The
-    /// type parameters aren't bound until the enclosing template is instantiated, so the
-    /// call can't be resolved at parse time; the monomorphization substitution resolves
-    /// it (substituting `type_args`/re-inferring, then rewriting to a concrete `Call`).
-    /// Never reaches sema/layout/backends.
+    /// A deferred generic call inside a generic-function template body, such as
+    /// `VecReserve<T>(v, …)` or an inferred `VecPush(&v, x)` (with `type_args`
+    /// empty). The type parameters aren't bound until the enclosing template is
+    /// instantiated, so the call can't be resolved at parse time. The
+    /// monomorphization substitution resolves it: it substitutes `type_args` (or
+    /// re-infers them), then rewrites the node to a concrete `Call`. Never reaches
+    /// sema, layout, or the backends.
     GenericCall {
         name: String,
-        type_args: Vec<Type>,
+        type_args: Vec<GenericArg>,
         args: Vec<Expr>,
     },
     Index {
@@ -337,30 +408,30 @@ pub enum ExprKind {
         ty: Type,
         expr: Box<Expr>,
     },
-    /// `sizeof(Type)` or `sizeof(expr)`. The size is computed at compile time
-    /// from the type (for an expression, from its statically inferred type).
+    /// `sizeof(Type)` or `sizeof(expr)`. The size is computed at compile time from
+    /// the type. For an expression, it uses the expression's statically inferred type.
     Sizeof(SizeofArg),
-    /// `offset(ClassName.field[.field...])` — the byte offset of a (possibly
-    /// nested) member within a class, computed at compile time. HolyC's
-    /// equivalent of C's `offsetof`.
+    /// `offset(ClassName.field[.field...])`. The byte offset of a member within a
+    /// class, possibly nested, computed at compile time. This is HolyC's equivalent
+    /// of C's `offsetof`.
     Offset {
         class: String,
         path: Vec<String>,
     },
-    /// A brace-enclosed aggregate initializer, e.g. `{1, 2, 3}` or
-    /// `{{1, 2}, {3, 4}}`. Only valid as a variable/field initializer; it is
-    /// type-checked against the declared aggregate type (array or class).
+    /// A brace-enclosed aggregate initializer, e.g. `{1, 2, 3}` or `{{1, 2}, {3, 4}}`.
+    /// Valid only as a variable or field initializer. It is type-checked against the
+    /// declared aggregate type, whether array or class.
     InitList(Vec<Expr>),
-    /// A brace-enclosed designated initializer, e.g. `{.x = 1, .y = 2}`. Each
-    /// item names a field of the target class; fields may appear in any order
-    /// and omitted ones take their default (zero). Only valid for class types.
+    /// A brace-enclosed designated initializer, e.g. `{.x = 1, .y = 2}`. Each item
+    /// names a field of the target class. Fields may appear in any order, and
+    /// omitted ones take their default of zero. Valid only for class types.
     DesignatedInit(Vec<(String, Expr)>),
     /// A comma-separated sequence. At statement level this is also how HolyC's
     /// implicit print works: `"x = %d\n", x` is a `Comma([Str, Ident])`.
     Comma(Vec<Expr>),
 }
 
-/// A statement node: its shape plus its source span.
+/// A statement node. Holds its shape plus its source span.
 #[derive(Clone, Debug)]
 pub struct Stmt {
     pub kind: StmtKind,
@@ -382,14 +453,26 @@ pub enum StmtKind {
     VarDecl {
         decls: Vec<Declarator>,
     },
-    /// A **deferred `:=`** inside a generic-function template body — `a, b := rhs;`
-    /// (or `n := rhs;`) whose element/variable types can't be inferred until the
-    /// template's parameters are bound (e.g. `_, ok := HmapGet<K, V>(m, key)`). The
-    /// monomorphization substitution desugars it to a `VarDecl` once `rhs` is concrete.
-    /// A `None` name is a `_` discard. Never reaches sema/layout/backends.
+    /// A deferred `:=` inside a generic-function template body, such as `a, b := rhs;`
+    /// or `n := rhs;`. Its element or variable types can't be inferred until the
+    /// template's parameters are bound, e.g. `_, ok := HmapGet<K, V>(m, key)`. The
+    /// monomorphization substitution desugars it to a `VarDecl` once `rhs` is
+    /// concrete. A `None` name is a `_` discard. Never reaches sema, layout, or the
+    /// backends.
     ShortDecl {
         names: Vec<Option<String>>,
         rhs: Expr,
+    },
+    /// A deferred compile-time type switch (`switch type (T) { case I64: … }`) inside
+    /// a generic template. The [`mono`](crate::mono) pass resolves the scrutinee to a
+    /// concrete type, keeps only the matching arm (or `default`), and replaces the
+    /// node with that arm's statements — discarding the others before sema. Never
+    /// reaches sema, layout, or the backends.
+    TypeSwitch {
+        on: TypeSwitchOn,
+        /// `(case type, body)` arms, in source order. First match wins.
+        arms: Vec<(Type, Vec<Stmt>)>,
+        default: Option<Vec<Stmt>>,
     },
     If {
         cond: Expr,
@@ -420,11 +503,11 @@ pub enum StmtKind {
         hi: Option<Expr>,
     },
     Default,
-    /// HolyC's `start:` switch sub-label — marks the start of a switch prologue
-    /// (statements that run on entry, before dispatch).
+    /// HolyC's `start:` switch sub-label. Marks the start of a switch prologue:
+    /// statements that run on entry, before dispatch.
     SwitchStart,
-    /// HolyC's `end:` switch sub-label — marks the start of a switch epilogue
-    /// (statements reached by fall-through; a `break` skips them).
+    /// HolyC's `end:` switch sub-label. Marks the start of a switch epilogue:
+    /// statements reached by fall-through. A `break` skips them.
     SwitchEnd,
     Break,
     Continue,
@@ -435,13 +518,24 @@ pub enum StmtKind {
     Class(ClassDef),
     /// `#include "..."`.
     Include(String),
+    /// `try { body } catch { handler }`. If the `body` (or anything it calls) throws,
+    /// control transfers to `handler`, where the thrown value is `Fs->except_ch`. The
+    /// `catch` block takes no parameter (HolyC form).
+    Try {
+        body: Vec<Stmt>,
+        handler: Vec<Stmt>,
+    },
+    /// `throw expr;` raises an exception carrying `expr`'s value (coerced to `I64`),
+    /// unwinding to the nearest enclosing `try`. A bare `throw;` (`None`) re-raises the
+    /// current `Fs->except_ch`.
+    Throw(Option<Expr>),
 }
 
 // ---- structural equality (spans ignored) ----
 //
-// These let tests assert on node shapes without having to predict exact byte
-// offsets. Equality recurses through children, which use these same impls, so
-// the whole tree is compared span-insensitively.
+// These let tests assert on node shapes without predicting exact byte offsets.
+// Equality recurses through children, which use these same impls, so the whole
+// tree is compared span-insensitively.
 
 impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
@@ -469,8 +563,8 @@ impl PartialEq for Param {
 
 /// Whether the program contains a call to any function named in `names`. The
 /// native backends use this to decide whether to emit command-line-argument
-/// capture in the program entry — so a program that never references
-/// `ArgC`/`ArgV` is byte-for-byte unaffected by the feature.
+/// capture in the program entry. A program that never references `ArgC` or `ArgV`
+/// is then byte-for-byte unaffected by the feature.
 pub fn program_calls_any(program: &Program, names: &[&str]) -> bool {
     program.items.iter().any(|s| stmt_calls(s, names))
 }
@@ -521,6 +615,20 @@ fn stmt_calls(s: &Stmt, names: &[&str]) -> bool {
             .body
             .as_ref()
             .is_some_and(|b| b.iter().any(|s| stmt_calls(s, names))),
+        StmtKind::TypeSwitch { on, arms, default } => {
+            matches!(on, TypeSwitchOn::Val(e) if expr_calls(e, names))
+                || arms
+                    .iter()
+                    .any(|(_, b)| b.iter().any(|s| stmt_calls(s, names)))
+                || default
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| stmt_calls(s, names)))
+        }
+        StmtKind::Try { body, handler } => {
+            body.iter().any(|s| stmt_calls(s, names))
+                || handler.iter().any(|s| stmt_calls(s, names))
+        }
+        StmtKind::Throw(e) => e.as_ref().is_some_and(|e| expr_calls(e, names)),
     }
 }
 
@@ -558,10 +666,43 @@ fn expr_calls(e: &Expr, names: &[&str]) -> bool {
     }
 }
 
-/// Whether the program references any of `names` as a bare identifier (used to decide
-/// whether to capture the command line for the implicit `argc`/`argv`).
+/// Whether the program references any of `names` as a bare identifier. Used to
+/// decide whether to capture the command line for the implicit `argc`/`argv`.
 pub fn program_uses_ident(program: &Program, names: &[&str]) -> bool {
     program.items.iter().any(|s| stmt_uses_ident(s, names))
+}
+
+/// Whether the program contains any `try`/`throw`. The backends use this (with a
+/// reference to `Fs`) to decide whether to set up the `CTask`/exception machinery.
+pub fn program_has_exceptions(program: &Program) -> bool {
+    program.items.iter().any(stmt_has_exceptions)
+}
+
+/// Whether any of `stmts` references `Fs` or contains a `try`/`throw`. Backends use
+/// this per function to decide whether to set up that function's `Fs` access.
+pub fn stmts_use_fs_or_exceptions(stmts: &[&Stmt]) -> bool {
+    stmts
+        .iter()
+        .any(|s| stmt_uses_ident(s, &["Fs"]) || stmt_has_exceptions(s))
+}
+
+fn stmt_has_exceptions(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Try { .. } | StmtKind::Throw(_) => true,
+        StmtKind::Block(ss) => ss.iter().any(stmt_has_exceptions),
+        StmtKind::If { then, else_, .. } => {
+            stmt_has_exceptions(then) || else_.as_deref().is_some_and(stmt_has_exceptions)
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Switch { body, .. } => stmt_has_exceptions(body),
+        StmtKind::Func(f) => f
+            .body
+            .as_ref()
+            .is_some_and(|b| b.iter().any(stmt_has_exceptions)),
+        _ => false,
+    }
 }
 
 fn stmt_uses_ident(s: &Stmt, names: &[&str]) -> bool {
@@ -612,6 +753,20 @@ fn stmt_uses_ident(s: &Stmt, names: &[&str]) -> bool {
             .body
             .as_ref()
             .is_some_and(|b| b.iter().any(|s| stmt_uses_ident(s, names))),
+        StmtKind::TypeSwitch { on, arms, default } => {
+            matches!(on, TypeSwitchOn::Val(e) if expr_uses_ident(e, names))
+                || arms
+                    .iter()
+                    .any(|(_, b)| b.iter().any(|s| stmt_uses_ident(s, names)))
+                || default
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| stmt_uses_ident(s, names)))
+        }
+        StmtKind::Try { body, handler } => {
+            body.iter().any(|s| stmt_uses_ident(s, names))
+                || handler.iter().any(|s| stmt_uses_ident(s, names))
+        }
+        StmtKind::Throw(e) => e.as_ref().is_some_and(|e| expr_uses_ident(e, names)),
     }
 }
 
@@ -655,13 +810,13 @@ fn expr_uses_ident(e: &Expr, names: &[&str]) -> bool {
     }
 }
 
-/// Whether `name` is a compiler-synthesized tuple struct (`$Tup…`) — a tuple type
-/// `(T1, …, Tn)` lowered to a positional struct with fields `_0`, `_1`, ….
+/// Whether `name` is a compiler-synthesized tuple struct (`$Tup…`). A tuple type
+/// `(T1, …, Tn)` is lowered to a positional struct with fields `_0`, `_1`, ….
 pub fn is_tuple_name(name: &str) -> bool {
     name.starts_with("$Tup")
 }
 
-/// If `e` is `tuple[k]` (a tuple-typed base with a constant index), return the
+/// If `e` is `tuple[k]` (a tuple-typed base with a constant index), returns the
 /// equivalent member access `tuple._k`, carrying `e`'s already-inferred slot type.
 /// Tuple indexing is positional field access, so every backend rewrites it this way.
 pub fn tuple_index_as_member(e: &Expr) -> Option<Expr> {

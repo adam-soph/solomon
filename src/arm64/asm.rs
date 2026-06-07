@@ -1,13 +1,17 @@
-//! The AArch64 instruction emitter — pure ISA, no OS knowledge.
+//! The AArch64 instruction emitter. It encodes the ISA and knows nothing about
+//! the target OS.
 //!
 //! `Asm` accumulates 32-bit instruction words plus labels, fixups, and symbolic
-//! relocations, runs the post-emission peephole pass, and resolves everything in
-//! [`Asm::finish`] into a [`CodeImage`] (the `__text` bytes + the relocations a
-//! linker must resolve). It is deliberately OS-agnostic: the Mach-O object format
-//! and the `cc` link step live in the `darwin` policy module, reached from the
-//! parent module. Keeping the encoder here means container/OS specifics cannot
-//! leak into code generation. `SymRef`/`RelKind` are ARM64 relocation *kinds*,
-//! not Mach-O encodings — the `darwin` writer maps them to Mach-O reloc numbers.
+//! relocations. It runs the post-emission peephole pass, then resolves everything
+//! in [`Asm::finish`] into a [`CodeImage`]: the `__text` bytes plus the
+//! relocations a linker must resolve.
+//!
+//! The encoder is deliberately OS-agnostic. The Mach-O object format and the `cc`
+//! link step live in the `darwin` policy module, reached from the parent. Keeping
+//! the encoder here keeps OS/container specifics from leaking into code generation.
+//!
+//! `SymRef`/`RelKind` are ARM64 relocation *kinds*, not Mach-O encodings; the
+//! `darwin` writer maps them to Mach-O reloc numbers.
 
 use std::collections::HashMap;
 
@@ -17,20 +21,23 @@ use crate::codegen::CodegenError;
 enum Fixup {
     B26,
     B19,
-    /// ADR rd, label — a PC-relative address of an in-`__text` label (a function
-    /// entry), for taking a function's address (`&Func`).
+    /// ADR rd, label: the PC-relative address of a label in `__text` (a function
+    /// entry). Used to take a function's address (`&Func`).
     Adr,
-    /// A 32-bit jump-table data word: the byte distance from a base label (the
-    /// table start, carried here) to the target label (the tuple's label id).
-    /// `BR (table + word)` then lands on the target — a section-internal offset
-    /// computed at emit time, so it needs no Mach-O relocation.
+    /// A 32-bit jump-table data word: the byte distance from a base label to a
+    /// target label. The base (the table start) is carried in the tuple; the
+    /// target is the fixup's label id. `BR (table + word)` then lands on the
+    /// target. The offset is section-internal and computed at emit time, so it
+    /// needs no Mach-O relocation.
     TableRel(usize),
 }
 
-/// The symbol a relocation refers to. `Extern(name)` is an undefined external
-/// symbol (a libc function such as `_printf`/`_strlen`); its final symbol index
-/// is resolved late, after the symbol-table layout is known. `Sym(i)` is an
-/// already-final symbol index (a global).
+/// The symbol a relocation refers to.
+///
+/// `Extern(name)` is an undefined external symbol, such as a libc function like
+/// `_printf` or `_strlen`. Its final symbol index is resolved late, once the
+/// symbol-table layout is known. `Sym(i)` is an already-final symbol index, used
+/// for a global.
 #[derive(Clone, Copy)]
 pub(super) enum SymRef {
     Extern(&'static str),
@@ -48,9 +55,10 @@ pub(super) struct CodeImage {
     pub(super) text: Vec<u8>,
     /// `(byte offset in __text, symbol, kind)` relocations the linker resolves.
     pub(super) relocs: Vec<(u32, SymRef, RelKind)>,
-    /// Final byte offset of each placed label, indexed by label id (`None` if never
-    /// placed). Read *after* `finish` so it reflects the peephole pass's word removals
-    /// — defined-symbol offsets must come from here, not a pre-`finish` `label_byte`.
+    /// Final byte offset of each placed label, indexed by label id; `None` if the
+    /// label was never placed. Read *after* `finish` so it reflects the peephole
+    /// pass's word removals. Defined-symbol offsets must come from here, not from a
+    /// pre-`finish` `label_byte`.
     pub(super) label_bytes: Vec<Option<u64>>,
 }
 
@@ -61,9 +69,9 @@ pub(super) struct Asm {
     strings: Vec<Vec<u8>>,
     string_dedup: HashMap<Vec<u8>, usize>,
     adr_fixups: Vec<(usize, usize)>,
-    /// Freestanding global-address ADRs: `(word index, BSS byte offset)`. Resolved
-    /// in `finish` to a PC-relative `ADR` pointing at the global's fixed address
-    /// (`text_len + offset`), since the BSS follows the code+strings in the image.
+    /// Freestanding global-address ADRs, as `(word index, BSS byte offset)`.
+    /// Resolved in `finish` to a PC-relative `ADR` pointing at the global's fixed
+    /// address (`text_len + offset`). The BSS follows code+strings in the image.
     global_adr_fixups: Vec<(usize, u64)>,
     relocs: Vec<(usize, SymRef, RelKind)>,
     // Liveness tags, parallel to `words` (one entry per emitted instruction word).
@@ -89,17 +97,18 @@ impl Asm {
         }
     }
 
-    /// Emit a word with conservative tags: defines nothing the peephole can use,
-    /// reads everything, and acts as a barrier. Emitters with known register
-    /// behavior call the tagged variants below so the liveness scan can see
-    /// through them; anything left on this path is simply never optimized across.
+    /// Emits a word with conservative liveness tags: it defines nothing the
+    /// peephole can use, reads everything, and acts as a barrier. Emitters with
+    /// known register behavior call the tagged variants below, so the liveness scan
+    /// can see through them. Anything left on this path is simply never optimized
+    /// across.
     pub(super) fn emit(&mut self, word: u32) {
         self.words.push(word);
         self.inst_def.push(-1);
         self.inst_use.push(GP_ALL);
         self.inst_branch.push(B_BRANCH);
     }
-    /// Emit a word with explicit liveness tags.
+    /// Emits a word with explicit liveness tags.
     pub(super) fn emit_du(&mut self, word: u32, def: i32, uses: u32, branch: u8) {
         self.words.push(word);
         self.inst_def.push(if (0..31).contains(&def) {
@@ -118,15 +127,16 @@ impl Asm {
     pub(super) fn e_rr(&mut self, word: u32, rd: u32, rn: u32) {
         self.emit_du(word, rd as i32, gpb(rn), B_NORMAL);
     }
-    /// rd = constant / from a non-GP source (write-only as far as GP regs go)
+    /// rd = a constant or a value from a non-GP source. Write-only as far as GP
+    /// registers go.
     pub(super) fn e_wr(&mut self, word: u32, rd: u32) {
         self.emit_du(word, rd as i32, 0, B_NORMAL);
     }
-    /// no GP destination; reads `uses` (stores, compares)
+    /// No GP destination; reads `uses`. Used for stores and compares.
     pub(super) fn e_use(&mut self, word: u32, uses: u32) {
         self.emit_du(word, -1, uses, B_NORMAL);
     }
-    /// touches no GP register the peephole tracks (FP-only / SP-only ops)
+    /// Touches no GP register the peephole tracks. Used for FP-only or SP-only ops.
     pub(super) fn e_nogp(&mut self, word: u32) {
         self.emit_du(word, -1, 0, B_NORMAL);
     }
@@ -149,10 +159,11 @@ impl Asm {
         i
     }
 
-    /// Whether GP register `reg` (a caller-saved scratch — x9/x10) is dead
-    /// immediately after `words[m]`: overwritten, clobbered by a call, or unused
-    /// through the function's return, before any read. Conservative — any plain
-    /// branch ends the scan as "live" since the scan only follows fall-through.
+    /// Reports whether GP register `reg` is dead immediately after `words[m]`. The
+    /// register is a caller-saved scratch (x9/x10). It is dead if it is
+    /// overwritten, clobbered by a call, or unused through the function's return,
+    /// all before any read. The scan is conservative: it only follows fall-through,
+    /// so any plain branch ends it with the register treated as live.
     pub(super) fn dead_after(&self, m: usize, reg: u32) -> bool {
         let bit = 1u32 << reg;
         let mut j = m + 1;
@@ -181,19 +192,20 @@ impl Asm {
     }
 
     /// Liveness-driven dead-`mov` elimination, run once before fixups resolve.
+    ///
     /// Removes `mov Xd, Xs` moves that can't change observable behavior, then
-    /// remaps every stored word-index position past the removed words. Restricted
-    /// to the pure scratch temporaries x9 (RES) / x10 (T2), which are never live
-    /// across a call or return and are never ABI registers. Two cases:
-    ///   * removal — Xd is dead after the move, so the copy is pointless;
-    ///   * fusion  — the immediately-preceding instruction produced Xs and Xs is
+    /// remaps every stored word-index position past the removed words. It is
+    /// restricted to the pure scratch temporaries x9 (RES) and x10 (T2). Those are
+    /// never live across a call or return and are never ABI registers. Two cases:
+    ///   * removal: Xd is dead after the move, so the copy is pointless.
+    ///   * fusion: the immediately-preceding instruction produced Xs, and Xs is
     ///     dead after the move, so that instruction can target Xd directly.
     pub(super) fn peephole(&mut self) {
         let n = self.words.len();
         if n == 0 {
             return;
         }
-        // A move a label points at is a branch target — never touch it.
+        // A move a label points at is a branch target; never touch it.
         let mut label_here = vec![false; n + 1];
         for p in self.label_pos.iter().flatten() {
             if *p < label_here.len() {
@@ -201,7 +213,7 @@ impl Asm {
             }
         }
         // Positions carrying a fixup/reloc. A `mov` never does, but a fused-into
-        // predecessor might; skip those to keep the rewrite reasoning simple.
+        // predecessor might, so skip those to keep the rewrite reasoning simple.
         let mut protected = vec![false; n];
         for (at, _, _) in &self.fixups {
             protected[*at] = true;
@@ -251,8 +263,9 @@ impl Asm {
         }
 
         // Compact the word stream and remap every word-index position. Label ids
-        // and `TableRel`'s base are label indices (resolved through label_pos), so
-        // only label_pos entries and the `.0` of fixups/adr_fixups/relocs move.
+        // and `TableRel`'s base are label indices, resolved through label_pos, so
+        // only label_pos entries and the `.0` of fixups/adr_fixups/relocs need to
+        // move.
         let mut shift = vec![0usize; n + 1];
         for i in 0..n {
             shift[i + 1] = shift[i] + remove[i] as usize;
@@ -334,13 +347,14 @@ impl Asm {
             let immhi = ((imm as u32) >> 2) & 0x7_FFFF;
             self.words[*at] |= (immlo << 29) | (immhi << 5);
         }
-        // Freestanding globals live in the BSS that follows code+strings. The BSS base
-        // is the end of code+strings, **16-byte aligned** (the load vaddr is page
-        // aligned, so an aligned base + the per-global aligned offsets give naturally
-        // aligned addresses — required by the AArch64 acquire/exclusive atomics, which
-        // fault on misalignment). The image is zero-padded up to that base.
+        // Freestanding globals live in the BSS that follows code+strings. The BSS
+        // base is the end of code+strings, rounded up to a 16-byte boundary. The
+        // load vaddr is page aligned, so an aligned base plus the per-global aligned
+        // offsets give naturally aligned addresses. That alignment is required by
+        // the AArch64 acquire/exclusive atomics, which fault on misalignment. The
+        // image is zero-padded up to that base.
         let bss_base = if self.global_adr_fixups.is_empty() {
-            cursor // Darwin (relocated globals) / no freestanding globals: unchanged
+            cursor // Darwin (relocated globals) or no freestanding globals: unchanged
         } else {
             cursor.div_ceil(16) * 16
         };
@@ -385,8 +399,8 @@ impl Asm {
         for hw in 1..4u32 {
             let half = ((v >> (16 * hw)) & 0xFFFF) as u32;
             if half != 0 {
-                // movk reads-modifies rd (its source register *is* its destination),
-                // so it must not be a fusion target.
+                // movk read-modifies rd: its source register is also its
+                // destination, so it must not be a fusion target.
                 self.e_rr(0xF280_0000 | (hw << 21) | (half << 5) | rd, rd, rd);
             }
         }
@@ -431,7 +445,7 @@ impl Asm {
     pub(super) fn lslv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
-    /// LDR Wt, [Xn] — load the 32-bit word at `[base, #0]` (zero-extended).
+    /// LDR Wt, [Xn]: loads the 32-bit word at `[base, #0]`, zero-extended.
     pub(super) fn ldr_w(&mut self, rt: u32, base: u32) {
         self.emit_du(
             0xB940_0000 | (base << 5) | rt,
@@ -443,7 +457,7 @@ impl Asm {
     pub(super) fn lsrv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
-    /// ASRV Xd, Xn, Xm — arithmetic (sign-preserving) shift right by a register.
+    /// ASRV Xd, Xn, Xm: arithmetic (sign-preserving) shift right by a register.
     pub(super) fn asrv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_2800 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
@@ -476,15 +490,15 @@ impl Asm {
     }
 
     // scalar double-precision floating point (F64 lives in v-registers)
-    /// FMOV Xd, Dn — move the raw 64 bits of a double into a GPR.
+    /// FMOV Xd, Dn: moves the raw 64 bits of a double into a GPR.
     pub(super) fn fmov_to_gpr(&mut self, xd: u32, dn: u32) {
         self.e_wr(0x9E66_0000 | (dn << 5) | xd, xd);
     }
-    /// FMOV Dd, Xn — move raw 64 bits from a GPR into a double register.
+    /// FMOV Dd, Xn: moves raw 64 bits from a GPR into a double register.
     pub(super) fn fmov_from_gpr(&mut self, dd: u32, xn: u32) {
         self.e_use(0x9E67_0000 | (xn << 5) | dd, gpb(xn));
     }
-    /// FMOV Dd, Dn — copy one double register to another.
+    /// FMOV Dd, Dn: copies one double register to another.
     pub(super) fn fmov_reg(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E60_4000 | (dn << 5) | dd);
     }
@@ -503,19 +517,19 @@ impl Asm {
     pub(super) fn fneg(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E61_4000 | (dn << 5) | dd);
     }
-    /// FSQRT Dd, Dn — scalar double-precision square root, emitted in place of a call
-    /// to the lib `Sqrt` (the [`crate::intrinsics`] optimization).
+    /// FSQRT Dd, Dn: scalar double-precision square root. Emitted in place of a
+    /// call to the lib `Sqrt`, as the [`crate::intrinsics`] optimization.
     pub(super) fn fsqrt(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E61_C000 | (dn << 5) | dd);
     }
-    /// FABS Dd, Dn — scalar double-precision absolute value (lib `Fabs` optimization).
+    /// FABS Dd, Dn: scalar double-precision absolute value (the lib `Fabs` optimization).
     pub(super) fn fabs(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E60_C000 | (dn << 5) | dd);
     }
-    /// The directed-rounding `FRINT*` family (scalar double), emitted in place of the
-    /// lib rounding functions: `Floor`→`frintm` (−∞), `Ceil`→`frintp` (+∞),
-    /// `Trunc`→`frintz` (0), `Round`→`frinta` (ties away), `RoundToEven`→`frintn`
-    /// (ties even).
+    /// The directed-rounding `FRINT*` family (scalar double), emitted in place of
+    /// the lib rounding functions: `Floor`→`frintm` (−∞), `Ceil`→`frintp` (+∞),
+    /// `Trunc`→`frintz` (0), `Round`→`frinta` (ties away), and `RoundToEven`→
+    /// `frintn` (ties even).
     pub(super) fn frintm(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E65_4000 | (dn << 5) | dd);
     }
@@ -531,7 +545,7 @@ impl Asm {
     pub(super) fn frintn(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E64_4000 | (dn << 5) | dd);
     }
-    /// FCMP Dn, Dm — set NZCV for an ordered comparison.
+    /// FCMP Dn, Dm: sets NZCV for an ordered comparison.
     pub(super) fn fcmp(&mut self, dn: u32, dm: u32) {
         self.e_nogp(0x1E60_2000 | (dm << 16) | (dn << 5));
     }
@@ -539,16 +553,17 @@ impl Asm {
     pub(super) fn fcmp_zero(&mut self, dn: u32) {
         self.e_nogp(0x1E60_2008 | (dn << 5));
     }
-    /// SCVTF Dd, Xn — signed 64-bit integer to double.
+    /// SCVTF Dd, Xn: signed 64-bit integer to double.
     pub(super) fn scvtf(&mut self, dd: u32, xn: u32) {
         self.e_use(0x9E62_0000 | (xn << 5) | dd, gpb(xn));
     }
-    /// FCVTZS Xd, Dn — double to signed 64-bit integer (round toward zero).
+    /// FCVTZS Xd, Dn: double to signed 64-bit integer, rounding toward zero.
     pub(super) fn fcvtzs(&mut self, xd: u32, dn: u32) {
         self.e_wr(0x9E78_0000 | (dn << 5) | xd, xd);
     }
-    /// FCVTZU Xd, Dn — convert a double to a 64-bit *unsigned* integer (toward
-    /// zero, saturating). Used when the destination integer type is unsigned.
+    /// FCVTZU Xd, Dn: converts a double to a 64-bit *unsigned* integer, rounding
+    /// toward zero and saturating. Used when the destination integer type is
+    /// unsigned.
     pub(super) fn fcvtzu(&mut self, xd: u32, dn: u32) {
         self.e_wr(0x9E79_0000 | (dn << 5) | xd, xd);
     }
@@ -578,8 +593,8 @@ impl Asm {
         self.e_use(w, gpb(FP) | gpb(LR));
     }
     pub(super) fn ldp_post_fp_lr(&mut self) {
-        // ldp x29, x30, [sp], #16 — writes x29/x30 (neither is a peephole
-        // candidate, so it reads as transparent to the x9/x10 liveness scan).
+        // ldp x29, x30, [sp], #16. It writes x29/x30, neither of which is a
+        // peephole candidate, so it is transparent to the x9/x10 liveness scan.
         self.e_nogp(0xA8C0_0000 | (2 << 15) | (LR << 10) | (SP << 5) | FP);
     }
     pub(super) fn mov_fp_sp(&mut self) {
@@ -597,29 +612,30 @@ impl Asm {
         self.words[idx] |= (imm & 0xFFF) << 10;
     }
 
-    // Atomic / acquire-release memory ops (for `sync.hc`), sized by `sz` = log2(bytes)
-    // — 0=byte (`*b`), 1=half (`*h`), 2=word (32-bit), 3=dword (64-bit) — in bits
-    // 31:30. The narrow loads zero-extend into the 64-bit register; the caller
-    // sign/zero-extends per the pointee type. `emit`'s conservative default tags
-    // (barrier, reads everything) keep the peephole pass from reordering/dropping them.
-    /// LDAR{B,H} <t>, [Xn] — load-acquire.
+    // Atomic / acquire-release memory ops (for `sync.hc`). `sz` = log2(bytes),
+    // placed in bits 31:30: 0=byte (`*b`), 1=half (`*h`), 2=word (32-bit),
+    // 3=dword (64-bit). The narrow loads zero-extend into the 64-bit register; the
+    // caller then sign/zero-extends per the pointee type. These ops use `emit`'s
+    // conservative default tags (barrier, reads everything), which keep the
+    // peephole pass from reordering or dropping them.
+    /// LDAR{B,H} <t>, [Xn]: load-acquire.
     pub(super) fn ldar(&mut self, t: u32, n: u32, sz: u32) {
         self.emit((sz << 30) | 0x08DF_FC00 | (n << 5) | t);
     }
-    /// STLR{B,H} <t>, [Xn] — store-release.
+    /// STLR{B,H} <t>, [Xn]: store-release.
     pub(super) fn stlr(&mut self, t: u32, n: u32, sz: u32) {
         self.emit((sz << 30) | 0x089F_FC00 | (n << 5) | t);
     }
-    /// LDAXR{B,H} <t>, [Xn] — load-acquire exclusive (arms the exclusive monitor).
+    /// LDAXR{B,H} <t>, [Xn]: load-acquire exclusive. Arms the exclusive monitor.
     pub(super) fn ldaxr(&mut self, t: u32, n: u32, sz: u32) {
         self.emit((sz << 30) | 0x085F_FC00 | (n << 5) | t);
     }
-    /// STLXR{B,H} Ws, <t>, [Xn] — store-release exclusive; `Ws` = 0 on success, 1 if
-    /// the monitor was lost (retry).
+    /// STLXR{B,H} Ws, <t>, [Xn]: store-release exclusive. `Ws` is 0 on success, or
+    /// 1 if the monitor was lost (retry).
     pub(super) fn stlxr(&mut self, s: u32, t: u32, n: u32, sz: u32) {
         self.emit((sz << 30) | 0x0800_FC00 | (s << 16) | (n << 5) | t);
     }
-    /// DMB ISH — a full data memory barrier (inner-shareable): `AtomicFence`.
+    /// DMB ISH: a full, inner-shareable data memory barrier. Implements `AtomicFence`.
     pub(super) fn dmb_ish(&mut self) {
         self.emit(0xD503_3BBF);
     }
@@ -631,8 +647,8 @@ impl Asm {
     pub(super) fn store_mem(&mut self, val: u32, addr: u32, size: u32) {
         self.store_mem_off(val, addr, 0, size);
     }
-    /// Width-aware load from `[base, #byte_off]` (the unsigned-offset form, so
-    /// `byte_off` must be a multiple of `size`).
+    /// Width-aware load from `[base, #byte_off]`. This is the unsigned-offset form,
+    /// so `byte_off` must be a multiple of `size`.
     pub(super) fn load_mem_off(
         &mut self,
         dst: u32,
@@ -679,8 +695,8 @@ impl Asm {
         let imm9 = 16u32 & 0x1FF;
         self.e_wr(0xF840_0400 | (imm9 << 12) | (SP << 5) | reg, reg);
     }
-    /// STUR Xt, [Xn, #simm9] — store at an unscaled signed byte offset (used to
-    /// spill a callee-saved register near x29 in one instruction).
+    /// STUR Xt, [Xn, #simm9]: store at an unscaled signed byte offset. Used to
+    /// spill a callee-saved register near x29 in one instruction.
     pub(super) fn stur(&mut self, rt: u32, base: u32, simm9: i32) {
         let imm = (simm9 as u32) & 0x1FF;
         self.e_use(
@@ -688,17 +704,17 @@ impl Asm {
             gpb(rt) | gpb(base),
         );
     }
-    /// LDUR Xt, [Xn, #simm9] — load at an unscaled signed byte offset.
+    /// LDUR Xt, [Xn, #simm9]: load at an unscaled signed byte offset.
     pub(super) fn ldur(&mut self, rt: u32, base: u32, simm9: i32) {
         let imm = (simm9 as u32) & 0x1FF;
         self.e_rr(0xF840_0000 | (imm << 12) | (base << 5) | rt, rt, base);
     }
-    /// STUR Dt, [Xn, #simm9] — spill a callee-saved double register near x29.
+    /// STUR Dt, [Xn, #simm9]: spill a callee-saved double register near x29.
     pub(super) fn fstur(&mut self, dt: u32, base: u32, simm9: i32) {
         let imm = (simm9 as u32) & 0x1FF;
         self.e_use(0xFC00_0000 | (imm << 12) | (base << 5) | dt, gpb(base));
     }
-    /// LDUR Dt, [Xn, #simm9] — reload a callee-saved double register.
+    /// LDUR Dt, [Xn, #simm9]: reload a callee-saved double register.
     pub(super) fn fldur(&mut self, dt: u32, base: u32, simm9: i32) {
         let imm = (simm9 as u32) & 0x1FF;
         self.e_use(0xFC40_0000 | (imm << 12) | (base << 5) | dt, gpb(base));
@@ -713,14 +729,14 @@ impl Asm {
     pub(super) fn cmp_imm0(&mut self, rn: u32) {
         self.e_use(0xF100_0000 | (rn << 5) | XZR, gpb(rn));
     }
-    /// CMP Xn, #imm12 — SUBS XZR, Xn, #imm (sets flags, discards the result).
+    /// CMP Xn, #imm12: SUBS XZR, Xn, #imm. Sets flags and discards the result.
     pub(super) fn cmp_imm(&mut self, rn: u32, imm: u32) {
         self.e_use(
             0xF100_0000 | ((imm & 0xFFF) << 10) | (rn << 5) | XZR,
             gpb(rn),
         );
     }
-    /// LSL/LSR/ASR Xd, Xn, #shift — shift by an immediate (aliases of UBFM/SBFM).
+    /// LSL/LSR/ASR Xd, Xn, #shift: shift by an immediate (aliases of UBFM/SBFM).
     pub(super) fn lsl_imm(&mut self, rd: u32, rn: u32, sh: u32) {
         self.ubfm(rd, rn, (64 - sh) & 63, 63 - sh);
     }
@@ -730,9 +746,9 @@ impl Asm {
     pub(super) fn asr_imm(&mut self, rd: u32, rn: u32, sh: u32) {
         self.sbfm(rd, rn, sh, 63);
     }
-    /// AND Xd, Xn, #(2^k - 1) — mask to the low `k` bits (1..=63). `2^k-1` is a
-    /// run of `k` low ones, which encodes as the logical immediate N=1, immr=0,
-    /// imms=k-1 (`x % 2^k` for unsigned `x`).
+    /// AND Xd, Xn, #(2^k - 1): mask to the low `k` bits, for `k` in 1..=63. `2^k-1`
+    /// is a run of `k` low ones, which encodes as the logical immediate N=1,
+    /// immr=0, imms=k-1. Implements `x % 2^k` for unsigned `x`.
     pub(super) fn and_imm_lowbits(&mut self, rd: u32, rn: u32, k: u32) {
         self.e_rr(0x9240_0000 | ((k - 1) << 10) | (rn << 5) | rd, rd, rn);
     }
@@ -755,49 +771,59 @@ impl Asm {
         self.fixups.push((self.words.len(), label, Fixup::B26));
         self.emit_du(0x9400_0000, -1, 0, B_CALL);
     }
-    /// BLR Xn — call the function whose entry address is in register `rn`.
+    /// BLR Xn: call the function whose entry address is in register `rn`.
     pub(super) fn blr(&mut self, rn: u32) {
         self.emit_du(0xD63F_0000 | (rn << 5), -1, gpb(rn), B_CALL);
     }
-    /// BR Xn — unconditional branch to the address in `rn` (no link). Used to
+    /// BR Xn: unconditional branch to the address in `rn`, with no link. Used to
     /// jump into a branch table.
     pub(super) fn br(&mut self, rn: u32) {
         self.emit(0xD61F_0000 | (rn << 5)); // barrier (default tags)
     }
-    /// SVC #0 — a Linux syscall (number in `x8`, args in `x0..x5`, result in
-    /// `x0`). Only the freestanding Linux target uses it.
+    /// SVC #0: a Linux syscall. The number goes in `x8`, args in `x0..x5`, and the
+    /// result comes back in `x0`. Only the freestanding Linux target uses it.
     pub(super) fn svc(&mut self) {
         self.emit(0xD400_0001); // barrier (default tags)
     }
-    /// LDRSW Xt, [Xn, Xm, LSL #2] — load a 32-bit word at `base + index*4`,
+    /// `mrs Xt, TPIDR_EL0`: read the user thread pointer (the freestanding per-thread
+    /// `Fs` slot). `e_wr` tags it as defining `Xt`.
+    pub(super) fn mrs_tpidr_el0(&mut self, rt: u32) {
+        self.e_wr(0xD53B_D040 | rt, rt);
+    }
+    /// `msr TPIDR_EL0, Xt`: set the user thread pointer to this thread's `CTask`.
+    pub(super) fn msr_tpidr_el0(&mut self, rt: u32) {
+        self.e_use(0xD51B_D040 | rt, gpb(rt));
+    }
+    /// LDRSW Xt, [Xn, Xm, LSL #2]: load a 32-bit word at `base + index*4`,
     /// sign-extended to 64 bits. Used to read a jump-table offset entry.
     pub(super) fn ldrsw_reg(&mut self, rt: u32, base: u32, index: u32) {
         let w = 0xB8A0_7800 | (index << 16) | (base << 5) | rt;
         self.emit_du(w, rt as i32, gpb(base) | gpb(index), B_NORMAL);
     }
-    /// Emit a 32-bit jump-table data word holding the byte distance from `base`
-    /// (the table start) to `target`; resolved in `finish` via `Fixup::TableRel`.
+    /// Emits a 32-bit jump-table data word holding the byte distance from `base`
+    /// (the table start) to `target`. Resolved in `finish` via `Fixup::TableRel`.
     pub(super) fn table_word(&mut self, base: usize, target: usize) {
         self.fixups
             .push((self.words.len(), target, Fixup::TableRel(base)));
         self.emit(0);
     }
-    /// ADR rd, label — load the PC-relative address of an in-`__text` label (a
+    /// ADR rd, label: load the PC-relative address of a label in `__text` (a
     /// function entry) into `rd`.
     pub(super) fn adr_label(&mut self, rd: u32, label: usize) {
         self.fixups.push((self.words.len(), label, Fixup::Adr));
         self.e_wr(0x1000_0000 | rd, rd);
     }
-    /// `bl <extern>` — a call to an undefined external (libc) symbol, resolved by
+    /// `bl <extern>`: a call to an undefined external (libc) symbol, resolved by
     /// the linker via a BRANCH26 relocation.
     pub(super) fn bl_extern(&mut self, sym: &'static str) {
         self.relocs
             .push((self.words.len(), SymRef::Extern(sym), RelKind::Branch26));
         self.emit_du(0x9400_0000, -1, 0, B_CALL);
     }
-    /// ADR rd, <global> — load the PC-relative address of a freestanding global at
-    /// `bss_off` (its byte offset within the BSS that follows code+strings).
-    /// Resolved in `finish`; replaces the hosted `adrp_global`+`add_global` pair.
+    /// ADR rd, <global>: load the PC-relative address of a freestanding global into
+    /// `rd`. `bss_off` is the global's byte offset within the BSS that follows
+    /// code+strings. Resolved in `finish`. This replaces the hosted
+    /// `adrp_global`+`add_global` pair.
     pub(super) fn adr_global_fs(&mut self, rd: u32, bss_off: u64) {
         self.global_adr_fixups.push((self.words.len(), bss_off));
         self.e_wr(0x1000_0000 | rd, rd);

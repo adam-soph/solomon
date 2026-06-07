@@ -1,15 +1,18 @@
-// generic.hc — monomorphized generics: generic classes (`class Vec<T>`) and generic
-// functions (`VecPush<T>(...)`). Each use with a concrete type is stamped out and
-// type-checked at compile time, so you get typed APIs with no casts — one template
-// serves every element type.
+// generic.hc — monomorphized generics, end to end: generic classes and functions
+// with inferred type arguments, the three parameter kinds (`type` / `int` /
+// `comparable`), and a compile-time type switch. Each use with concrete arguments is
+// stamped out and type-checked at compile time, so you get typed APIs with no casts —
+// one template serves every element type.
 
 #include <mem.hc>
 
-class Vec<T> { T *data; I64 len; I64 cap; }
+// ---- generic classes + functions, with inferred type arguments ----
 
-U0 VecInit<T>(Vec<T> *v) { v->data = NULL; v->len = 0; v->cap = 0; }
+class Vec<type T> { T *data; I64 len; I64 cap; }
 
-U0 VecPush<T>(Vec<T> *v, T x)
+U0 VecInit<type T>(Vec<T> *v) { v->data = NULL; v->len = 0; v->cap = 0; }
+
+U0 VecPush<type T>(Vec<T> *v, T x)
 {
   if (v->len >= v->cap) {
     I64 c = v->cap ? v->cap * 2 : 4;
@@ -19,10 +22,40 @@ U0 VecPush<T>(Vec<T> *v, T x)
   v->data[v->len++] = x;
 }
 
-T VecAt<T>(Vec<T> *v, I64 i) { return v->data[i]; }
-U0 VecFree<T>(Vec<T> *v) { if (v->data) Free(v->data); }
+T VecAt<type T>(Vec<T> *v, I64 i) { return v->data[i]; }
+U0 VecFree<type T>(Vec<T> *v) { if (v->data) Free(v->data); }
 
-T Max<T>(T a, T b) { return a > b ? a : b; }   // a free generic function
+// ---- parameter kinds ----
+//   * `type T`       — a type parameter (the explicit spelling of a bare `<T>`).
+//   * `int N`        — a value parameter: a compile-time integer, e.g. an array size.
+//   * `comparable T` — a type parameter constrained to orderable types (a scalar or
+//                      pointer), so the body may use `<` / `>`.
+
+// A fixed-capacity array: `int N` is the compile-time capacity, `type T` the element type.
+class FixedArr<type T, int N> {
+  T data[N];
+  I64 len;
+}
+
+U0 FAInit<type T, int N>(FixedArr<T, N> *a) { a->len = 0; }
+U0 FAPush<type T, int N>(FixedArr<T, N> *a, T x) { a->data[a->len++] = x; }
+T FAAt<type T, int N>(FixedArr<T, N> *a, I64 i) { return a->data[i]; }
+
+// `comparable T` lets the body order `T` values. Instantiating with a non-orderable
+// type (a class) would be a compile-time error.
+T Max<comparable T>(T a, T b) { return a > b ? a : b; }
+
+// ---- compile-time type switch (the analogue of Go's `switch v.(type)`) ----
+// Resolved per instantiation: only the arm matching the concrete `T` survives; the
+// rest are discarded before type-checking.
+U0 Show<type T>(T x) {
+  switch type (T) {
+    case I64:  "I64 %d\n", x;
+    case F64:  "F64 %.2f\n", x;
+    case U8 *: "str %s\n", x;
+    default:   "other\n";
+  }
+}
 
 U0 Main()
 {
@@ -47,6 +80,29 @@ U0 Main()
   "flts: %.1f + %.1f = %.1f\n",
       VecAt(&f, 0), VecAt(&f, 1), VecAt(&f, 0) + VecAt(&f, 1);
   VecFree(&f);
+
+  // `int N` capacity. The array field `T data[N]` becomes `I64 data[8]`.
+  FixedArr<I64, 8> xs;
+  FAInit<I64, 8>(&xs);
+  for (i = 0; i < 5; i++) FAPush<I64, 8>(&xs, i * i);
+  "sizeof = %d\n", sizeof(FixedArr<I64, 8>); // 8*8 + 8 = 72
+  "len=%d first=%d last=%d\n", xs.len, FAAt<I64, 8>(&xs, 0), FAAt<I64, 8>(&xs, 4);
+
+  // A different N (and T) is a distinct, independent type.
+  FixedArr<U8 *, 2> ss;
+  FAInit<U8 *, 2>(&ss);
+  FAPush<U8 *, 2>(&ss, "hello");
+  FAPush<U8 *, 2>(&ss, "world");
+  "%s %s\n", FAAt<U8 *, 2>(&ss, 0), FAAt<U8 *, 2>(&ss, 1);
+
+  // `comparable T`, ordered both as I64 and F64.
+  "max i = %d\n", Max(3, 9);
+  "max f = %.1f\n", Max(2.5, 1.5);
+
+  // The compile-time type switch, dispatched per instantiation.
+  Show(42);
+  Show(3.14);
+  Show("hi");
 }
 
 Main;

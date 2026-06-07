@@ -4,16 +4,17 @@ use solomon::interp::{Interpreter, run_to_string};
 use solomon::parser::{parse, parse_with};
 use solomon::sema::check_program;
 
-/// Parse, semantically check, then interpret `src`, returning captured output. The
-/// reducible builtins live in the HolyC stdlib now (`lib/cstr.hc`/`mem.hc`/`ctype.hc`
-/// for the string/memory/ctype ops, `lib/math.hc` for math + `RandU64`), so the
-/// primitive modules are prepended (resolved against the repo `lib/`); the extra
-/// unused defs don't change a program's output.
+/// Parse, semantically check, then interpret `src`, returning captured output.
+///
+/// The reducible builtins now live in the HolyC stdlib: string/memory/ctype ops in
+/// `lib/cstr.hc`, `lib/mem.hc`, and `lib/ctype.hc`; math and `RandU64` in `lib/math.hc`.
+/// So the primitive modules are prepended (resolved against the repo `lib/`). The extra
+/// unused definitions don't change a program's output.
 fn run(src: &str) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let mut s = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
-    // `math.hc` only when the source uses the moved `RandU64` PRNG — see the note
-    // on `common::with_stdlib_prelude`.
+    // Include `math.hc` only when the source uses the moved math/PRNG functions.
+    // See the note on `common::with_stdlib_prelude`.
     if (src.contains("Abs") || src.contains("Fabs") || src.contains("Sqrt") || src.contains("Sign"))
         && !src.contains("#include <math.hc>")
     {
@@ -21,9 +22,6 @@ fn run(src: &str) -> String {
     }
     if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
         s.push_str("#include <rand.hc>\n");
-    }
-    if src.contains("StrToF64") && !src.contains("#include <strconv.hc>") {
-        s.push_str("#include <strconv.hc>\n");
     }
     if (src.contains("UnixNS") || src.contains("NanoNS") || src.contains("Sleep"))
         && !src.contains("#include <time.hc>")
@@ -45,7 +43,8 @@ fn implicit_string_print() {
 
 #[test]
 fn ctype_classification_predicates() {
-    // Each `Is*` predicate on a representative member and non-member: "10" per pair.
+    // Each `Is*` predicate is tested on a representative member and non-member, so
+    // each pair prints "10".
     let src = r#"
         "%d%d ", IsDigit('5'), IsDigit('x');
         "%d%d ", IsAlpha('x'), IsAlpha('5');
@@ -82,9 +81,9 @@ fn arithmetic_and_precedence() {
 
 #[test]
 fn mixed_operand_arithmetic() {
-    // Stresses the native backend's operand classification (constant folds,
-    // simple variable/literal operands, and complex sub-expressions) — these must
-    // produce the same result as the interpreter (tests/arm64.rs).
+    // Stresses the native backend's operand classification: constant folds, simple
+    // variable/literal operands, and complex sub-expressions. Each must produce the
+    // same result as the interpreter (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             I64 a = 10, b = 3;
@@ -98,11 +97,11 @@ fn mixed_operand_arithmetic() {
 
 #[test]
 fn register_live_range_sharing() {
-    // The native backend shares one callee-saved register across locals whose
-    // live ranges don't overlap: in `Chain`, x/a/b/c are each consumed before the
-    // next is born, so they coalesce onto a single register. `Rotate` is the
-    // soundness foil — a, b and sum are loop-carried (live across the back-edge),
-    // so they must NOT share. Both must match the interpreter (tests/arm64.rs).
+    // The native backend shares one callee-saved register across locals whose live
+    // ranges don't overlap. In `Chain`, x/a/b/c are each consumed before the next is
+    // born, so they coalesce onto a single register. `Rotate` is the soundness foil:
+    // a, b, and sum are loop-carried (live across the back-edge), so they must NOT
+    // share. Both must match the interpreter (see tests/arm64.rs).
     let src = r#"
         I64 Chain(I64 x) { I64 a = x + x; I64 b = a + a; I64 c = b + b; return c + c; }
         I64 Rotate(I64 n) {
@@ -118,10 +117,10 @@ fn register_live_range_sharing() {
 
 #[test]
 fn register_promotable_f64_locals() {
-    // F64 locals the native backend promotes to callee-saved double registers
-    // (d8..d15): a float accumulator updated in a loop, whose value must survive
-    // the call to `Scale` (which itself promotes a float to d8 and so must
-    // save/restore it). The interpreter is the oracle (tests/arm64.rs).
+    // F64 locals that the native backend promotes to callee-saved double registers
+    // (d8..d15). The float accumulator is updated in a loop, and its value must
+    // survive the call to `Scale`. `Scale` itself promotes a float to d8, so it must
+    // save and restore that register. The interpreter is the oracle (see tests/arm64.rs).
     let src = r#"
         F64 Scale(F64 x) { F64 r = x + x; return r * r; }
         F64 Run(I64 n) {
@@ -138,10 +137,11 @@ fn register_promotable_f64_locals() {
 
 #[test]
 fn register_promotable_locals() {
-    // Locals/params the native backend promotes to callee-saved registers: a loop
-    // accumulator + counter (Sum), recursion whose promoted locals must survive
-    // the recursive calls (Fib), and a narrow-width param that wraps (Narrow).
-    // The interpreter is the oracle the native backend matches (tests/arm64.rs).
+    // Locals and params the native backend promotes to callee-saved registers. Three
+    // cases: a loop accumulator plus counter (Sum); recursion whose promoted locals
+    // must survive the recursive calls (Fib); and a narrow-width param that wraps
+    // (Narrow). The interpreter is the oracle the native backend matches (see
+    // tests/arm64.rs).
     let src = r#"
         U8 Narrow(U8 x) { x += 200; return x; }
         I64 Sum(I64 n) { I64 acc = 0, i; for (i = 1; i <= n; i++) acc += i; return acc; }
@@ -155,8 +155,8 @@ fn register_promotable_locals() {
 #[test]
 fn nested_calls_with_computed_args() {
     // Nested calls force argument-setup and return moves through the scratch
-    // temporaries — the native backend's peephole fuses those moves away, so its
-    // output must still match the interpreter (tests/arm64.rs).
+    // temporaries. The native backend's peephole pass fuses those moves away, so its
+    // output must still match the interpreter (see tests/arm64.rs).
     let src = r#"
         I64 Add(I64 a, I64 b) { return a + b; }
         I64 Mul(I64 a, I64 b) { return a * b; }
@@ -251,8 +251,8 @@ fn ternary_and_logical_short_circuit() {
 
 #[test]
 fn chained_range_comparisons() {
-    // HolyC `a < b < c` desugars to `a < b && b < c` (range check); parentheses
-    // disable it. Matches the native backend (tests/arm64.rs).
+    // HolyC `a < b < c` desugars to the range check `a < b && b < c`. Parentheses
+    // disable it. Matches the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             "%d %d %d %d\n", 2 < 3 < 5, 2 < 2 < 5, 1 < 2 < 3 < 4, 5 < 4 < 3;
@@ -274,8 +274,8 @@ fn bitwise_operations() {
 
 #[test]
 fn right_shift_is_signedness_directed() {
-    // `>>` is arithmetic for a signed left operand (default I64) and logical for
-    // an unsigned one — the same rule the native backend uses (tests/arm64.rs).
+    // `>>` is arithmetic for a signed left operand (the default I64) and logical for
+    // an unsigned one. This is the same rule the native backend uses (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             I64 a = -8;
@@ -291,8 +291,8 @@ fn right_shift_is_signedness_directed() {
 
 #[test]
 fn division_is_signedness_directed() {
-    // `/` and `%` are signed for a signed left operand, unsigned otherwise — the
-    // same rule the native backend uses (tests/arm64.rs).
+    // `/` and `%` are signed for a signed left operand, unsigned otherwise. This is
+    // the same rule the native backend uses (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U64 u = 0x8000000000000000;
@@ -309,9 +309,9 @@ fn division_is_signedness_directed() {
 
 #[test]
 fn comparison_is_signedness_directed_and_exact() {
-    // Relational compares are unsigned when either operand is unsigned, and both
-    // `<`-family and `==` compare integers at full 64-bit width (no f64 rounding
-    // past 2^53) — matching the native backend (tests/arm64.rs).
+    // Relational compares are unsigned when either operand is unsigned. Both the
+    // `<`-family and `==` compare integers at full 64-bit width, with no f64 rounding
+    // past 2^53. Matches the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U64 u = 0x8000000000000000;
@@ -328,9 +328,9 @@ fn comparison_is_signedness_directed_and_exact() {
 
 #[test]
 fn narrow_integer_types_wrap_on_store_arg_and_return() {
-    // Narrow types promote to I64 for arithmetic (no mid-expression wrap), then
-    // truncate to width on store, on argument passing, and on return — matching
-    // the native backend (tests/arm64.rs).
+    // Narrow types promote to I64 for arithmetic, so there is no mid-expression wrap.
+    // The value then truncates to width at each boundary: on store, on argument
+    // passing, and on return. Matches the native backend (see tests/arm64.rs).
     let src = r#"
         U8 AddU8(U8 a, U8 b) { return a + b; }
         I8 AddI8(I8 a, I8 b) { return a + b; }
@@ -344,15 +344,15 @@ fn narrow_integer_types_wrap_on_store_arg_and_return() {
         }
         Main;
     "#;
-    // x=44, s=-56, wide=300, AddU8(300,0): arg 300->44 ->44, AddU8(200,100): 300->44,
-    // AddI8(100,100): 200->-56.
+    // x=44, s=-56, wide=300. AddU8(300,0): arg 300 truncates to 44, returns 44.
+    // AddU8(200,100): 300 -> 44. AddI8(100,100): 200 -> -56.
     assert_eq!(run(src), "44 -56 300 44 44 -56\n");
 }
 
 #[test]
 fn strprint_formats_into_a_buffer() {
-    // `StrPrint(dst, fmt, ...)` formats into dst (the full printf grammar) and
-    // returns dst — matching the native `sprintf` lowering (tests/arm64.rs).
+    // `StrPrint(dst, fmt, ...)` formats into dst using the full printf grammar and
+    // returns dst. Matches the native `sprintf` lowering (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *buf = MAlloc(128);
@@ -372,8 +372,8 @@ fn strprint_formats_into_a_buffer() {
 
 #[test]
 fn memsearch_and_number_to_str() {
-    // MemSearch (memmem) locates a byte sequence; I64ToStr / F64ToStr format a
-    // number into a buffer. All match the native backend (tests/arm64.rs).
+    // MemSearch (memmem) locates a byte sequence. I64ToStr and F64ToStr format a
+    // number into a buffer. All match the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *hay = MAlloc(32); StrCpy(hay, "the quick brown fox");
@@ -391,8 +391,8 @@ fn memsearch_and_number_to_str() {
 
 #[test]
 fn strspn_and_strcspn() {
-    // StrSpn/StrCSpn measure the leading run of chars in / not in a set. Matches
-    // the native backend (tests/arm64.rs).
+    // StrSpn and StrCSpn measure the leading run of chars in / not in a set. Matches
+    // the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *a = MAlloc(32); StrCpy(a, "123abc456");
@@ -409,8 +409,9 @@ fn strspn_and_strcspn() {
 
 #[test]
 fn strchr_and_strlastchr() {
-    // StrChr/StrLastChr find the first/last char (the NUL counts, so c==0 finds
-    // the terminator), else NULL. Matches the native backend (tests/arm64.rs).
+    // StrChr and StrLastChr find the first/last occurrence of a char, else NULL. The
+    // NUL counts, so c==0 finds the terminator. Matches the native backend (see
+    // tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *p = MAlloc(32); StrCpy(p, "/usr/local/bin");
@@ -425,8 +426,8 @@ fn strchr_and_strlastchr() {
 
 #[test]
 fn strrev_and_memfind() {
-    // StrRev reverses in place (incl. empty/single-char); MemFind locates a byte
-    // or returns NULL. Both match the native backend (tests/arm64.rs).
+    // StrRev reverses in place, including the empty and single-char cases. MemFind
+    // locates a byte or returns NULL. Both match the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *s = MAlloc(16); StrCpy(s, "Hello");
@@ -444,8 +445,8 @@ fn strrev_and_memfind() {
 
 #[test]
 fn str_case_str2f64_and_memmove() {
-    // StrToF64 (atof-style parse), in-place StrToUpper/StrToLower, and an
-    // overlapping MemMove — all matching the native backend (tests/arm64.rs).
+    // StrToF64 (atof-style parse), in-place StrToUpper/StrToLower, and an overlapping
+    // MemMove. All match the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             "%.3f %.3f %.3f\n", StrToF64("3.14"), StrToF64("-2.5e2"), StrToF64("  6.0x");
@@ -467,9 +468,9 @@ fn str_case_str2f64_and_memmove() {
 
 #[test]
 fn mstrprint_and_str2i64() {
-    // MStrPrint formats into a fresh right-sized buffer; StrToI64 parses base-10
-    // like atoll (whitespace/sign, stops at non-digit). Both match the native
-    // backend (tests/arm64.rs).
+    // MStrPrint formats into a fresh, right-sized buffer. StrToI64 parses base-10 like
+    // atoll: it skips leading whitespace, reads an optional sign, and stops at the
+    // first non-digit. Both match the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *s = MStrPrint("n=%d hex=%x pi=%.2f", 42, 255, 3.14159);
@@ -484,8 +485,8 @@ fn mstrprint_and_str2i64() {
 
 #[test]
 fn catprint_appends_to_a_buffer() {
-    // `CatPrint` appends (formats at dst + StrLen(dst)); matches the native
-    // `sprintf(dst + strlen(dst), ...)` lowering (tests/arm64.rs).
+    // `CatPrint` appends: it formats at dst + StrLen(dst). Matches the native
+    // `sprintf(dst + strlen(dst), ...)` lowering (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *buf = MAlloc(256);
@@ -507,9 +508,9 @@ fn catprint_appends_to_a_buffer() {
 
 #[test]
 fn catprint_appends_into_an_array_buffer() {
-    // Regression: `CatPrint` must append at dst + StrLen(dst) even when `dst` is
-    // an *array* (which decays to a pointer), not just a heap `Ptr`. The native
-    // backends always offset correctly; the interpreter must agree.
+    // Regression test. `CatPrint` must append at dst + StrLen(dst) even when `dst` is
+    // an array (which decays to a pointer), not just a heap `Ptr`. The native backends
+    // always offset correctly, and the interpreter must agree.
     let src = r#"
         U0 Main() {
             U8 b[64];
@@ -525,9 +526,9 @@ fn catprint_appends_into_an_array_buffer() {
 
 #[test]
 fn printf_scientific_and_general_floats() {
-    // `%e`/`%E` (scientific) and `%g`/`%G` (general) match libc / the native
-    // backend (tests/arm64.rs), including rounding carry, style choice, the `#`
-    // flag, and width/justify/sign.
+    // `%e`/`%E` (scientific) and `%g`/`%G` (general) match libc and the native backend
+    // (see tests/arm64.rs). Covers rounding carry, style choice, the `#` flag, and
+    // width/justify/sign.
     let src = r#"
         U0 Main() {
             "[%e][%E][%.2e]\n", 1.5, 1234.5, 9.9999996;
@@ -546,9 +547,9 @@ fn printf_scientific_and_general_floats() {
 
 #[test]
 fn float_to_unsigned_uses_unsigned_conversion() {
-    // A float past I64::MAX converts to U64 via the unsigned path (fcvtzu) — not
-    // signed saturation — across init/cast/assign/return, while a signed target
-    // still saturates and a negative float clamps to 0. Matches tests/arm64.rs.
+    // A float past I64::MAX converts to U64 via the unsigned path (fcvtzu), not signed
+    // saturation. This holds across init, cast, assign, and return. A signed target
+    // still saturates, and a negative float clamps to 0. Matches tests/arm64.rs.
     let src = r#"
         U64 Ret(F64 f) { return f; }
         U0 Main() {
@@ -570,8 +571,8 @@ fn float_to_unsigned_uses_unsigned_conversion() {
 
 #[test]
 fn printf_flags_width_precision_octal() {
-    // The formatter honors flags/width/precision/octal/length and treats values
-    // as 64-bit, matching libc (and the native backend in tests/arm64.rs).
+    // The formatter honors flags, width, precision, octal, and length, and treats
+    // values as 64-bit. Matches libc and the native backend (see tests/arm64.rs).
     let src = r#"
         U0 Main() {
             U8 *s = "hello";
@@ -607,13 +608,13 @@ fn switch_with_fallthrough_and_range() {
         Classify(2);
         Classify(9);
     "#;
-    // v=0 falls through into the 1..3 case; v=2 hits the range; v=9 default.
+    // v=0 falls through into the 1..3 case; v=2 hits the range; v=9 takes the default.
     assert_eq!(run(src), "zero small\nsmall\nother\n");
 }
 
 #[test]
 fn switch_start_end_prologue_and_epilogue() {
-    // HolyC `start:` runs on entry (before dispatch); `end:` is the fall-through
+    // HolyC `start:` runs on entry, before dispatch. `end:` is the fall-through
     // epilogue that a `break` skips.
     let src = r#"
         I64 Classify(I64 n) {
@@ -636,16 +637,17 @@ fn switch_start_end_prologue_and_epilogue() {
         }
         Main;
     "#;
-    // 1: prologue+case1, break -> 101. 2: prologue+case2, fall into epilogue ->
-    // 1102. 9: prologue, no match, jump to epilogue -> 1100.
+    // n=1: prologue + case1, then break -> 101.
+    // n=2: prologue + case2, fall into epilogue -> 1102.
+    // n=9: prologue, no match, jump straight to epilogue -> 1100.
     assert_eq!(run(src), "101 1102 1100\n");
 }
 
 #[test]
 fn switch_dense_cases_with_gaps_and_range() {
-    // A dense switch the native backend lowers to a branch table — exercise a
-    // gap (3), a range (5..7), and out-of-range values (-1, 8, 9) -> default.
-    // The interpreter is the oracle for the native twin in tests/arm64.rs.
+    // A dense switch that the native backend lowers to a branch table. Exercises a
+    // gap (3), a range (5..7), and out-of-range values (-1, 8, 9) that fall to the
+    // default. The interpreter is the oracle for the native twin in tests/arm64.rs.
     let src = r#"
         I64 Name(I64 d) {
             I64 r;
@@ -672,9 +674,9 @@ fn switch_dense_cases_with_gaps_and_range() {
 
 #[test]
 fn switch_with_constant_folded_case_values() {
-    // Case labels built from constant arithmetic must dispatch by their folded
-    // value (the native backend folds these for its jump table; this pins the
-    // expected values the table is checked against in tests/arm64.rs).
+    // Case labels built from constant arithmetic must dispatch by their folded value.
+    // The native backend folds these for its jump table, so this test pins the
+    // expected values the table is checked against in tests/arm64.rs.
     let src = r#"
         I64 Pick(I64 d) {
             I64 r;
@@ -713,7 +715,7 @@ fn structs_and_pointers() {
         }
         Main;
     "#;
-    // The pointer write is visible through `p`.
+    // The write through the pointer is visible through `p`.
     assert_eq!(run(src), "13 4\n");
 }
 
@@ -771,7 +773,7 @@ fn sizeof_type() {
 
 #[test]
 fn sizeof_class_uses_layout() {
-    // Point is two I64s => 16 bytes; the layout pass feeds sizeof.
+    // Point is two I64s, so 16 bytes. The layout pass feeds sizeof.
     let src = r#"
         class Point { I64 x; I64 y; }
         "%d\n", sizeof(Point);
@@ -782,10 +784,10 @@ fn sizeof_class_uses_layout() {
 #[test]
 fn sizeof_expression_uses_inferred_type() {
     // sizeof of an expression resolves via its statically inferred type:
-    //   x       => I64   (8)
-    //   1.5     => F64   (8)
-    //   x > 0   => I64   (8, a comparison)
-    //   p.y     => I32   (4, a struct field)
+    //   x       => I64 (8)
+    //   1.5     => F64 (8)
+    //   x > 0   => I64 (8), a comparison
+    //   p.y     => I32 (4), a struct field
     let src = r#"
         class Rec { U8 tag; I32 y; }
         U0 Main() {
@@ -800,8 +802,8 @@ fn sizeof_expression_uses_inferred_type() {
 
 #[test]
 fn sizeof_array_variable_does_not_decay() {
-    // `sizeof` of an array variable is the whole array (no pointer decay),
-    // while an element is the element size.
+    // `sizeof` of an array variable is the whole array, with no pointer decay. An
+    // element gives the element size.
     let src = r#"
         U0 Main() {
             I64 a[4];
@@ -814,8 +816,8 @@ fn sizeof_array_variable_does_not_decay() {
 
 #[test]
 fn offset_of_class_members() {
-    // `offset(Class.field)` is the byte offset from the layout pass, including
-    // padding and nested member paths.
+    // `offset(Class.field)` is the byte offset from the layout pass. Covers padding
+    // and nested member paths.
     let src = r#"
         class Pt { I64 x; I64 y; }
         class Box { Pt lo; Pt hi; }
@@ -877,7 +879,7 @@ fn designated_initializers() {
             "%d %d\n", q.x, q.y;
             Pt r = {.y = 9};               // partial: x defaults to 0
             "%d %d\n", r.x, r.y;
-            Line l = {.tag = 42, .b = {.x = 5, .y = 6}};  // nested, a left default
+            Line l = {.tag = 42, .b = {.x = 5, .y = 6}};  // nested; .a defaults
             "%d %d %d %d %d\n", l.a.x, l.a.y, l.b.x, l.b.y, l.tag;
         }
         Main;
@@ -901,7 +903,7 @@ fn global_designated_initializers() {
 #[test]
 fn initializer_element_types() {
     // Initializers cover floats, string/pointer fields, char literals, constant
-    // expressions, and a trailing comma — positional and designated alike.
+    // expressions, and a trailing comma, in both positional and designated forms.
     let src = r#"
         class V { F64 x; F64 y; }
         class S { U8 *name; I64 n; }
@@ -927,7 +929,7 @@ fn initializer_element_types() {
 
 #[test]
 fn array_of_structs_designated() {
-    // A positional array whose elements are designated struct initializers.
+    // A positional array whose elements are themselves designated struct initializers.
     let src = r#"
         class Pt { I64 x; I64 y; }
         U0 Main() {
@@ -1001,8 +1003,8 @@ fn function_pointer_dispatch_table_and_vtable() {
 
 #[test]
 fn typedef_aliases() {
-    // A function-pointer typedef (`BinOp`), including a function that returns one
-    // — the readable form of the otherwise-arcane declarator.
+    // A function-pointer typedef (`BinOp`), including a function that returns one.
+    // This is the readable form of the otherwise-arcane declarator.
     let src = r#"
         typedef I64 (*BinOp)(I64, I64);
         typedef U8 *String;
@@ -1023,8 +1025,8 @@ fn typedef_aliases() {
 
 #[test]
 fn unions_share_storage() {
-    // A union's fields overlap a single byte buffer, so writing one field and
-    // reading another sees the same bytes (type punning), matching the native
+    // A union's fields overlap a single byte buffer, so writing one field and reading
+    // another sees the same bytes. This is type punning, and it matches the native
     // backend. Also covers value-semantic copy and brace/designated init.
     let src = r#"
         union U { I64 whole; U8 b[8]; F64 d; }
@@ -1050,8 +1052,8 @@ fn unions_share_storage() {
 
 #[test]
 fn anonymous_union_members_are_promoted() {
-    // An anonymous `union {...}` in a class promotes its members: they are
-    // accessed directly (`r.whole`) and overlap, matching the native layout.
+    // An anonymous `union {...}` in a class promotes its members. They are accessed
+    // directly (`r.whole`) and overlap, matching the native layout.
     let src = r#"
         class Reg {
           I64 tag;
@@ -1076,8 +1078,8 @@ fn anonymous_union_members_are_promoted() {
 
 #[test]
 fn named_union_member_embedded_in_class() {
-    // Named embedded unions: an inline definition with a member, and a member of
-    // a previously-defined union. Accessed as `box.b.field` (not promoted).
+    // Named embedded unions: an inline definition with a member, and a member of a
+    // previously-defined union. Accessed as `box.b.field`, not promoted.
     let src = r#"
         union Val { I64 i; F64 f; }
         class Box {
@@ -1166,7 +1168,7 @@ fn strn_sign_fabs_builtins() {
 
 #[test]
 fn string_literals_index_like_pointers() {
-    // A bare string literal decays to a `U8*`, so it can be indexed/dereferenced.
+    // A bare string literal decays to a `U8*`, so it can be indexed and dereferenced.
     let src = r#"
         I64 SumChars(U8 *s) {
             I64 sum = 0;
@@ -1184,9 +1186,9 @@ fn string_literals_index_like_pointers() {
 
 #[test]
 fn uninitialized_aggregates_read_as_zero() {
-    // A local aggregate with no initializer is zero-filled — every element/field
-    // reads back as 0 until written. The native backend matches this (tests/arm64.rs);
-    // without it, those reads would be stack garbage.
+    // A local aggregate with no initializer is zero-filled: every element and field
+    // reads back as 0 until written. The native backend matches this (see
+    // tests/arm64.rs). Without it, those reads would be stack garbage.
     let src = r#"
         class P { I64 x; I64 y; }
         class B { I64 t; I64 data[3]; }
@@ -1208,10 +1210,10 @@ fn uninitialized_aggregates_read_as_zero() {
 
 #[test]
 fn pointer_increment_and_decrement() {
-    // `++`/`--` on a pointer steps by one element (regression: a pointer holding a
-    // decayed array used to error with "requires a number or pointer"). Covers an
-    // array-decayed local pointer, a pointer parameter walked in a loop, pre/post
-    // forms, a byte-addressed heap pointer (element-scaled), and decrement.
+    // `++`/`--` on a pointer steps by one element. Regression: a pointer holding a
+    // decayed array used to error with "requires a number or pointer". Covers an
+    // array-decayed local pointer, a pointer parameter walked in a loop, the pre and
+    // post forms, a byte-addressed heap pointer (element-scaled), and decrement.
     let src = r#"
         I64 ArrSum(I64 *a, I64 n) {
             I64 *p = a, s = 0, i;
@@ -1237,9 +1239,9 @@ fn pointer_increment_and_decrement() {
 #[test]
 fn string_literal_pointer_identity() {
     // A string literal stored in a pointer decays to one stable buffer, so pointer
-    // identity over it is consistent: walking to the NUL and subtracting yields the
-    // length, and `p == s` / `p == s + 1` behave (regression: each decay used to
-    // mint a fresh buffer, so `p - s` errored as "different objects").
+    // identity over it is consistent. Walking to the NUL and subtracting yields the
+    // length, and `p == s` / `p == s + 1` behave as expected. Regression: each decay
+    // used to mint a fresh buffer, so `p - s` errored as "different objects".
     let src = r#"
         I64 Len(U8 *s) { U8 *p = s; while (*p) p++; return p - s; }
         U0 Main() {
@@ -1254,8 +1256,8 @@ fn string_literal_pointer_identity() {
 
 #[test]
 fn randu64_is_deterministic() {
-    // splitmix64 from a zero seed — the identical sequence the native backend
-    // produces (it shares `builtins::splitmix64`).
+    // splitmix64 from a zero seed. This is the identical sequence the native backend
+    // produces, since it shares `builtins::splitmix64`.
     let src = r#"
         U0 Main() {
             I64 i;
@@ -1320,8 +1322,8 @@ fn string_and_heap_builtins() {
 
 #[test]
 fn malloc_of_typed_structs() {
-    // A heap-allocated array of structs: the buffer holds struct elements, so
-    // `ps[i].field` works (matching the native byte-addressed heap).
+    // A heap-allocated array of structs. The buffer holds struct elements, so
+    // `ps[i].field` works, matching the native byte-addressed heap.
     let src = r#"
         class Pt { I64 x; I64 y; }
         U0 Main() {
@@ -1338,9 +1340,9 @@ fn malloc_of_typed_structs() {
 
 #[test]
 fn malloc_type_punning() {
-    // A byte-addressable heap: an I64 buffer aliased through a U8* reads its
-    // individual bytes (little-endian), matching the native heap. Also exercises
-    // heap pointer arithmetic, which scales by the element size.
+    // A byte-addressable heap. An I64 buffer aliased through a U8* reads its
+    // individual bytes (little-endian), matching the native heap. Also exercises heap
+    // pointer arithmetic, which scales by the element size.
     let src = r#"
         U0 Main() {
             I64 *p = MAlloc(16);
@@ -1440,8 +1442,8 @@ fn cast_truncates_to_width() {
 
 #[test]
 fn sizeof_variable_length_array_matches_allocation() {
-    // The array dimension is a runtime value; sizeof agrees with what was
-    // allocated (4 elements * 8 bytes).
+    // The array dimension is a runtime value. sizeof agrees with what was allocated:
+    // 4 elements * 8 bytes.
     let src = r#"
         U0 Main() {
             I64 n = 4;
@@ -1456,8 +1458,8 @@ fn sizeof_variable_length_array_matches_allocation() {
 
 #[test]
 fn goto_to_label_in_enclosing_block() {
-    // The label is at the function-body level; the goto fires from inside a
-    // nested block and resumes at the enclosing label.
+    // The label is at the function-body level. The goto fires from inside a nested
+    // block and resumes at the enclosing label.
     let src = r#"
         U0 Main() {
             I64 i = 0;
@@ -1477,7 +1479,7 @@ fn goto_to_label_in_enclosing_block() {
 
 #[test]
 fn argc_and_argv_expose_the_command_line() {
-    // `ArgC`/`ArgV` are the implicit command-line globals; `ArgV[i]` is a `U8 *`.
+    // `ArgC`/`ArgV` are the implicit command-line globals. Each `ArgV[i]` is a `U8 *`.
     let src = r#"I64 i; for (i = 0; i < ArgC; i++) "%d=%s\n", i, ArgV[i];"#;
     let program = parse(src).unwrap();
     let mut interp = Interpreter::new(Vec::<u8>::new());
@@ -1499,9 +1501,9 @@ fn division_by_zero_is_a_runtime_error() {
 
 #[test]
 fn extreme_field_width_and_precision_are_clamped() {
-    // A pathological width/precision is clamped at the shared `fmt` layer
-    // (width ≤ 1024, precision ≤ 512) so the fixed-size native scratch buffers
-    // can never overflow. The interpreter clamps identically.
+    // A pathological width or precision is clamped at the shared `fmt` layer: width
+    // is capped at 1024, precision at 512. This keeps the fixed-size native scratch
+    // buffers from ever overflowing. The interpreter clamps identically.
     let w = run(r#""%2000d", 42;"#); // width 2000 -> 1024
     assert_eq!(w.len(), 1024);
     assert!(w.ends_with("   42")); // right-aligned in the clamped field
@@ -1512,8 +1514,8 @@ fn extreme_field_width_and_precision_are_clamped() {
 
 #[test]
 fn variadic_functions_read_their_varargs() {
-    // The implicit `VargC`/`VargV` locals read the trailing `...` args: `VargV[i]` is
-    // the i-th raw slot, punned for F64/pointers.
+    // The implicit `VargC`/`VargV` locals read the trailing `...` args. `VargV[i]` is
+    // the i-th raw slot, punned for F64 and pointer values.
     let out = run(r#"
         I64 SumI(...) {
           I64 s = 0, i = 0;
@@ -1543,9 +1545,9 @@ fn variadic_functions_read_their_varargs() {
 
 #[test]
 fn clock_builtins_have_sane_properties() {
-    // Time is impure, so it can't be value-tested against a fixed expectation —
-    // assert properties instead: the wall clock is positive (well past 1970),
-    // and the monotonic clock does not go backwards across a Sleep.
+    // Time is impure, so it can't be value-tested against a fixed expectation. Assert
+    // properties instead: the wall clock is positive (well past 1970), and the
+    // monotonic clock does not go backwards across a Sleep.
     let out = run(r#"
         I64 a = NanoNS();
         Sleep(2000000); // 2ms
@@ -1557,20 +1559,20 @@ fn clock_builtins_have_sane_properties() {
 
 #[test]
 fn float_division_by_zero_is_infinity() {
-    // Unlike integer `/0` (a runtime error), float division follows IEEE-754:
-    // it yields ±inf / nan rather than trapping, matching the native backends.
+    // Unlike integer `/0`, which is a runtime error, float division follows IEEE-754.
+    // It yields ±inf or nan rather than trapping, matching the native backends.
     assert_eq!(run(r#""%f\n", 1.0 / 0.0;"#), "inf\n");
     assert_eq!(run(r#""%f\n", -1.0 / 0.0;"#), "-inf\n");
-    // `0/0` is NaN; its sign bit is platform-dependent (x86_64 yields a negative
-    // NaN, aarch64 a positive one), and the renderer mirrors it like libc, so
-    // only assert it is *some* NaN rather than pinning the sign.
+    // `0/0` is NaN, but its sign bit is platform-dependent: x86_64 yields a negative
+    // NaN, aarch64 a positive one. The renderer mirrors that sign like libc, so only
+    // assert it is *some* NaN rather than pinning the sign.
     let nan = run(r#""%f\n", 0.0 / 0.0;"#);
     assert!(nan == "NaN\n" || nan == "-NaN\n", "got: {nan:?}");
 }
 
 #[test]
 fn narrow_increment_truncates_to_width() {
-    // `++`/`--` on a narrow integer wraps at its declared width, like a store.
+    // `++`/`--` on a narrow integer wraps at its declared width, just like a store.
     assert_eq!(run(r#"U8 x = 255; x++; "%d\n", x;"#), "0\n");
     assert_eq!(run(r#"U8 x = 0; x--; "%d\n", x;"#), "255\n");
     assert_eq!(run(r#"U16 x = 65535; x++; "%d\n", x;"#), "0\n");
@@ -1578,8 +1580,8 @@ fn narrow_increment_truncates_to_width() {
 
 #[test]
 fn identical_string_literals_share_one_address() {
-    // String literals are interned by content, so two decays of the same text
-    // address one buffer — pointer identity matches the native `__text` dedup.
+    // String literals are interned by content, so two decays of the same text address
+    // one buffer. Pointer identity matches the native `__text` dedup.
     assert_eq!(
         run(r#"U8 *p = "hello"; U8 *q = "hello"; "%d %d\n", p == q, "x" == "x";"#),
         "1 1\n"
@@ -1598,10 +1600,93 @@ fn null_dereference_is_a_runtime_error() {
 }
 
 #[test]
+fn f64_to_str_is_the_round_trip_inverse_of_str_to_f64() {
+    // `F64ToStr` (cstr.hc) is the shortest decimal that `StrToF64` parses back exactly.
+    // Short values keep their familiar `%g` form; high-precision values get full
+    // precision (the old `%g` wrapper would have truncated to 6 significant digits).
+    let out = run(r#"U0 Main() {
+             U8 b[64];
+             "%s\n", F64ToStr(3.14, b);
+             "%s\n", F64ToStr(1000000.0, b);
+             "%s\n", F64ToStr(0.0001, b);
+             "%s\n", F64ToStr(3.141592653589793, b);
+             F64 xs[3]; xs[0] = 2.718281828459045; xs[1] = -0.0; xs[2] = 1.0e-300;
+             I64 i, ok = 1;
+             for (i = 0; i < 3; i++) if (StrToF64(F64ToStr(xs[i], b)) != xs[i]) ok = 0;
+             "roundtrip=%d\n", ok;
+           } Main;"#);
+    assert_eq!(out, "3.14\n1e+06\n0.0001\n3.141592653589793\nroundtrip=1\n");
+}
+
+#[test]
 fn run_to_string_reports_semantic_errors() {
-    // run_to_string type-checks first, so a semantic error surfaces instead of a
-    // confusing runtime fault.
+    // run_to_string type-checks first, so a semantic error surfaces cleanly instead
+    // of a confusing runtime fault.
     let program = parse("U0 Main() { Frobnicate(1); } Main;").unwrap();
     let err = run_to_string(&program).unwrap_err();
     assert!(err.message.contains("Frobnicate"), "got: {err}");
+}
+
+// ---- exceptions: try / catch / throw + Fs ----
+
+#[test]
+fn catch_runs_and_reads_except_ch() {
+    // A throw in the try body transfers to catch, which reads `Fs->except_ch`. The
+    // statement after the throw is skipped.
+    let out = run("U0 Main() {
+           try { throw(99); \"unreached\\n\"; }
+           catch { \"caught %d\\n\", Fs->except_ch; }
+         } Main;");
+    assert_eq!(out, "caught 99\n");
+}
+
+#[test]
+fn no_throw_skips_the_handler() {
+    let out = run("U0 Main() {
+           try { \"body\\n\"; }
+           catch { \"handler (unreached)\\n\"; }
+         } Main;");
+    assert_eq!(out, "body\n");
+}
+
+#[test]
+fn throw_unwinds_through_a_called_function() {
+    // A throw inside a callee propagates out to the caller's enclosing try.
+    let out = run("U0 Risky(I64 n) { if (n > 5) throw(n); \"ok %d\\n\", n; }
+         U0 Main() {
+           I64 i;
+           for (i = 5; i <= 6; i++)
+             try { Risky(i); } catch { \"caught %d\\n\", Fs->except_ch; }
+         } Main;");
+    assert_eq!(out, "ok 5\ncaught 6\n");
+}
+
+#[test]
+fn nested_try_and_bare_rethrow() {
+    // The inner catch re-raises with a bare `throw;`, which the outer try catches.
+    let out = run("U0 Main() {
+           try {
+             try { throw(7); }
+             catch { \"inner %d\\n\", Fs->except_ch; throw; }
+           } catch { \"outer %d\\n\", Fs->except_ch; }
+         } Main;");
+    assert_eq!(out, "inner 7\nouter 7\n");
+}
+
+#[test]
+fn catch_except_flag_is_set_during_handling_then_cleared() {
+    let out = run("U0 Main() {
+           \"pre %d\\n\", Fs->catch_except;
+           try { throw(1); } catch { \"in %d\\n\", Fs->catch_except; }
+           \"post %d\\n\", Fs->catch_except;
+         } Main;");
+    assert_eq!(out, "pre 0\nin 1\npost 0\n");
+}
+
+#[test]
+fn uncaught_throw_finishes_after_pre_throw_output() {
+    // An uncaught throw aborts the run, but the output printed before it survives
+    // (a native run aborts the same way, after the same bytes).
+    let out = run("U0 Main() { \"before\\n\"; throw(5); \"after\\n\"; } Main;");
+    assert_eq!(out, "before\n");
 }

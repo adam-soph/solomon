@@ -20,7 +20,7 @@
 # A native macOS host builds both Apple targets with cargo (after `make targets`)
 # and Linux/Windows targets with cross.
 
-BINS        := hcc hci
+BINS        := hcc
 CARGO       ?= cargo
 CROSS       ?= cross
 CARGO_FLAGS ?= --release --locked

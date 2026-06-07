@@ -1,30 +1,30 @@
 //! The HolyC preprocessor.
 //!
 //! A [`Preprocessor`] wraps any [`TokenStream`] (normally a [`Lexer`]) and is
-//! itself a `TokenStream`, so it slots between the lexer and the parser without
-//! ever materialising the whole token list. As tokens flow through it:
+//! itself a `TokenStream`. It slots between the lexer and the parser and never
+//! materialises the whole token list. As tokens flow through it:
 //!
-//!   * `#define` / `#undef` build and tear down a macro table,
-//!   * object-like and function-like macros are expanded inline (with nested
-//!     expansion and a hide-set guard against runaway self-reference),
-//!   * `#ifdef` / `#ifndef` / `#else` / `#endif` include or drop token ranges,
-//!   * `#include "file"` is resolved: the file is read and pushed onto a source
-//!     stack so its tokens splice in (relative to the including file's
-//!     directory; cycles and runaway nesting are rejected); unknown directives
-//!     are dropped.
-//!   * `#exe { ... }` runs the block as HolyC at **compile time** (via the
-//!     interpreter) and pushes its stdout onto the same source stack, so the
-//!     generated text streams in where `#exe` appeared (TempleOS-style compile-time
-//!     code execution).
+//!   * `#define` / `#undef` build and tear down a macro table.
+//!   * Object-like and function-like macros are expanded inline. Expansion
+//!     nests, with a hide-set guarding against runaway self-reference.
+//!   * `#ifdef` / `#ifndef` / `#else` / `#endif` include or drop token ranges.
+//!   * `#include "file"` reads the file and pushes it onto a source stack, so
+//!     its tokens splice in where the directive appeared. The path resolves
+//!     relative to the including file's directory. Cycles and runaway nesting
+//!     are rejected. Unknown directives are dropped.
+//!   * `#exe { ... }` runs the block as HolyC at **compile time**, via the
+//!     interpreter, and pushes its stdout onto the same source stack. The
+//!     generated text then streams in where `#exe` appeared. This is
+//!     TempleOS-style compile-time code execution.
 //!
 //! Directives run to the end of their line. The lexer discards newlines, but
 //! every token carries `span.pos.line`, so the preprocessor finds line
-//! boundaries from token positions — no newline tokens required.
+//! boundaries from token positions — no newline tokens needed.
 //!
-//! Limitations (documented intentionally): no `#if <expr>` (only def-ness
-//! conditionals), no `#`/`##` operators, no `__VA_ARGS__`, and macro-argument
-//! hide-sets are coarse (good enough to prevent infinite expansion, not fully
-//! C-standard).
+//! Some C features are intentionally absent: there is no `#if <expr>` (only
+//! def-ness conditionals), no `#`/`##` operators, and no `__VA_ARGS__`.
+//! Macro-argument hide-sets are coarse — enough to prevent infinite expansion,
+//! but not fully C-standard.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -34,25 +34,27 @@ use crate::token::{FileInfo, Keyword, Pos, Token, TokenKind};
 
 type LResult<T> = Result<T, LexError>;
 
-/// A hard cap on `#include` nesting, as a backstop beyond the cycle guard.
+/// Hard cap on `#include` nesting, a backstop beyond the cycle guard.
 const MAX_INCLUDE_DEPTH: usize = 64;
 
 /// One open `#include`d file on the source stack.
 struct IncludeFrame {
-    /// The lexer streaming the included file's tokens.
+    /// Lexer streaming the included file's tokens.
     lexer: Lexer,
-    /// The token already read past the `#include` line in the parent; re-queued
-    /// when this file is exhausted so the parent resumes exactly where it left off.
+    /// The token already read past the `#include` line in the parent. It is
+    /// re-queued when this file is exhausted, so the parent resumes exactly
+    /// where it left off.
     resume: Option<Token>,
-    /// The directory of this file, for resolving its own relative `#include`s.
+    /// This file's directory, for resolving its own relative `#include`s.
     dir: PathBuf,
-    /// The canonical path of this file, for cycle detection.
+    /// This file's canonical path, for cycle detection.
     path: PathBuf,
-    /// Conditional-nesting depth when this file was entered, so an unterminated
-    /// `#ifdef` inside it is caught rather than leaking into the parent.
+    /// Conditional-nesting depth when this file was entered. An unterminated
+    /// `#ifdef` inside the file is caught here rather than leaking into the
+    /// parent.
     cond_depth: usize,
-    /// Index into `Preprocessor::files`, stamped onto every token this frame emits
-    /// so `_`-directory privacy can be checked in sema.
+    /// Index into `Preprocessor::files`, stamped onto every token this frame
+    /// emits so sema can check `_`-directory privacy.
     file_id: u32,
 }
 
@@ -66,7 +68,7 @@ enum Macro {
 }
 
 /// A token paired with the set of macro names that must not be re-expanded
-/// within it (the classic preprocessor "hide set").
+/// within it. This is the classic preprocessor "hide set".
 #[derive(Clone)]
 struct PpTok {
     tok: Token,
@@ -77,7 +79,7 @@ struct PpTok {
 struct Cond {
     /// Whether the enclosing context was active when this `#ifdef` was seen.
     parent_eff: bool,
-    /// Whether the current branch is active (and emits tokens).
+    /// Whether the current branch is active and emits tokens.
     eff: bool,
     /// Whether any branch at this level has been taken yet.
     any_taken: bool,
@@ -87,31 +89,32 @@ struct Cond {
 
 pub struct Preprocessor<S: TokenStream> {
     inner: S,
-    /// One-token push-back for the inner stream (used when a directive reads one
-    /// token past its line).
+    /// One-token push-back for the inner stream. A directive sometimes reads one
+    /// token past its line, and parks it here.
     lookahead: Option<Token>,
-    /// Buffered/expanded tokens awaiting output, nearest first.
+    /// Buffered and expanded tokens awaiting output, nearest first.
     pending: VecDeque<PpTok>,
     macros: HashMap<String, Macro>,
     conds: Vec<Cond>,
-    /// Set once we've reported an unterminated-conditional error, to avoid
+    /// Set once an unterminated-conditional error has been reported, to avoid
     /// repeating it on every subsequent Eof read.
     eof_reported: bool,
     /// Directory the top-level source was read from, for resolving its relative
     /// `#include "..."` paths.
     base_dir: PathBuf,
-    /// Standard-library search directories for **angle** includes
-    /// (`#include <math.hc>`), tried in order. Quote includes ignore these.
+    /// Search directories for **angle** includes (`#include <math.hc>`), the
+    /// standard library, tried in order. Quote includes ignore these.
     search: Vec<PathBuf>,
-    /// The stack of currently-open `#include`d files (innermost last). Tokens are
+    /// Stack of currently-open `#include`d files, innermost last. Tokens are
     /// pulled from the top of this stack before the base `inner` stream.
     includes: Vec<IncludeFrame>,
-    /// Append-only table of every source file seen, indexed by `Span::file`
-    /// (entry 0 is the base/top-level source). Carries each file's directory for
-    /// `_`-directory privacy. Never shrinks, so ids stay valid for the whole parse.
+    /// Append-only table of every source file seen, indexed by `Span::file`;
+    /// entry 0 is the base/top-level source. Carries each file's directory for
+    /// `_`-directory privacy. It never shrinks, so ids stay valid for the whole
+    /// parse.
     files: Vec<FileInfo>,
-    /// Counter for `#exe` compile-time blocks, so each generated frame gets a unique
-    /// synthetic path (the include cycle check keys on the path).
+    /// Counter for `#exe` compile-time blocks, giving each generated frame a
+    /// unique synthetic path. The include cycle check keys on the path.
     exe_count: usize,
 }
 
@@ -121,16 +124,16 @@ impl<S: TokenStream> Preprocessor<S> {
     }
 
     /// Build a preprocessor that resolves relative `#include "..."` paths against
-    /// `base_dir` (the directory of the top-level source file).
+    /// `base_dir`, the directory of the top-level source file.
     pub fn with_base_dir(inner: S, base_dir: PathBuf) -> Self {
         Self::with_base_dir_and_search(inner, base_dir, Vec::new())
     }
 
-    /// Stream a synthetic prelude ahead of the base source, so its declarations are
-    /// in scope without an explicit `#include` (used for `builtin.hc`). The prelude
-    /// is the first frame on the include stack — its tokens come first and carry
-    /// their own line numbers — and is a **public** file (privacy-wise), so its
-    /// builtins are callable from user code.
+    /// Stream a synthetic prelude ahead of the base source, so its declarations
+    /// are in scope without an explicit `#include`. This carries `builtin.hc`.
+    /// The prelude is the first frame on the include stack, so its tokens come
+    /// first, carrying their own line numbers. It is a **public** file for
+    /// privacy purposes, so its builtins are callable from user code.
     pub fn with_prelude(mut self, contents: &str) -> Self {
         let file_id = self.files.len() as u32;
         self.files.push(FileInfo::root());
@@ -145,17 +148,19 @@ impl<S: TokenStream> Preprocessor<S> {
         self
     }
 
-    /// As [`with_base_dir`](Self::with_base_dir), plus a list of search
-    /// directories for **angle** includes (`#include <name>`) — the standard
+    /// Like [`with_base_dir`](Self::with_base_dir), plus a list of search
+    /// directories for **angle** includes (`#include <name>`), the standard
     /// library. Each is tried in order; the first that holds the file wins.
     pub fn with_base_dir_and_search(inner: S, base_dir: PathBuf, search: Vec<PathBuf>) -> Self {
         // File 0 is the base/top-level source; its privacy comes from `base_dir`.
-        // Canonicalize it so its directory components line up with the canonicalized
-        // paths of `#include`d files (otherwise `/tmp` vs `/private/tmp` mismatch).
+        // Canonicalize it so its directory components line up with the
+        // canonicalized paths of `#include`d files. Otherwise `/tmp` would not
+        // match `/private/tmp`.
         let canon_base = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
-        // The top-level file's own name isn't known here (the lexer wraps a source
-        // string), so it gets no filename-based privacy — only its directory's. (A
-        // root file is never `#include`d by others, so its own privacy is moot.)
+        // The top-level file's own name isn't known here, since the lexer wraps a
+        // source string, so it gets directory-based privacy only, no
+        // filename-based privacy. A root file is never `#include`d by others, so
+        // its own privacy is moot anyway.
         let base_info = FileInfo::from_dir(dir_components(&canon_base), "");
         Preprocessor {
             inner,
@@ -189,8 +194,8 @@ impl<S: TokenStream> Preprocessor<S> {
         }
         // Tokens come from the innermost open `#include` first, then the base
         // source. A frame's Eof is surfaced to `pull`, which pops the frame. Each
-        // frame stamps its origin onto the tokens it emits (the base source is the
-        // user program, so its lexer's default `User` is correct).
+        // frame stamps its origin onto the tokens it emits. The base source is
+        // the user program, so its lexer's default `User` origin is correct.
         if let Some(frame) = self.includes.last_mut() {
             let file_id = frame.file_id;
             let mut t = frame.lexer.next_token()?;
@@ -202,15 +207,15 @@ impl<S: TokenStream> Preprocessor<S> {
 
     // ---- layer A: directives & conditionals, no macro expansion ----
 
-    /// Pull the next token with directives handled and inactive branches
-    /// skipped. Macro names come through unexpanded.
+    /// Pull the next token, handling directives and skipping inactive branches.
+    /// Macro names come through unexpanded.
     fn pull(&mut self) -> LResult<Token> {
         loop {
             let t = self.inner_next()?;
             match &t.kind {
                 TokenKind::Eof => {
-                    // An included file ended: pop its frame, check its conditionals
-                    // were balanced, and resume the parent stream.
+                    // An included file ended. Pop its frame, check its
+                    // conditionals were balanced, and resume the parent stream.
                     if let Some(frame) = self.includes.pop() {
                         if self.conds.len() != frame.cond_depth {
                             self.conds.truncate(frame.cond_depth);
@@ -235,7 +240,7 @@ impl<S: TokenStream> Preprocessor<S> {
                     if self.active() {
                         return Ok(t);
                     }
-                    // Otherwise drop this token (inactive conditional branch).
+                    // Inactive conditional branch: drop this token.
                 }
             }
         }
@@ -244,8 +249,9 @@ impl<S: TokenStream> Preprocessor<S> {
     /// Handle a directive line introduced by `hash`.
     fn directive(&mut self, hash: Token) -> LResult<()> {
         let line = hash.span.pos.line;
-        // `#exe { ... }` is special: its block spans lines and braces, so it reads its
-        // own brace-balanced body from the stream rather than the line-based collection.
+        // `#exe { ... }` is special: its block spans lines and braces, so it
+        // reads its own brace-balanced body from the stream rather than the
+        // line-based collection below.
         let first = self.inner_next()?;
         let same_line = !matches!(first.kind, TokenKind::Eof) && first.span.pos.line == line;
         if same_line {
@@ -274,8 +280,8 @@ impl<S: TokenStream> Preprocessor<S> {
         }
 
         match directive_name(&toks[0]).as_deref() {
-            // Conditionals are processed even inside an inactive branch, so
-            // nesting stays balanced.
+            // Conditionals are processed even inside an inactive branch, to keep
+            // nesting balanced.
             Some("ifdef") => self.do_ifdef(&toks, true),
             Some("ifndef") => self.do_ifdef(&toks, false),
             Some("else") => self.do_else(hash.span.pos),
@@ -287,24 +293,25 @@ impl<S: TokenStream> Preprocessor<S> {
             Some("define") => self.do_define(&toks),
             Some("undef") => self.do_undef(&toks),
             Some("include") => self.do_include(&toks),
-            // Unknown directive (e.g. `#help_index`): drop it.
+            // Unknown directive, e.g. `#help_index`: drop it.
             _ => Ok(()),
         }
     }
 
-    /// `#exe { … }` — run the block as HolyC at **compile time** and splice its stdout
-    /// back into the token stream (TempleOS's compile-time-execution directive). The
-    /// block's brace-balanced body is read from the stream, reconstructed to source,
-    /// parsed + run through the interpreter, and its output pushed as a source frame
-    /// (the `#include` machinery), so it streams in exactly where `#exe` appeared.
+    /// Run a `#exe { … }` block as HolyC at **compile time** and splice its
+    /// stdout back into the token stream. This is TempleOS's
+    /// compile-time-execution directive. The block's brace-balanced body is read
+    /// from the stream, reconstructed to source, then parsed and run through the
+    /// interpreter. Its output is pushed as a source frame via the `#include`
+    /// machinery, so it streams in exactly where `#exe` appeared.
     fn do_exe(&mut self, pos: Pos) -> LResult<()> {
         // Expect the opening `{`.
         let open = self.inner_next()?;
         if !matches!(open.kind, TokenKind::LBrace) {
             return Err(self.err(open.span.pos, "#exe must be followed by `{`"));
         }
-        // Collect the body tokens up to the matching `}` (strings/chars are single
-        // tokens, so brace counting over tokens is safe).
+        // Collect the body tokens up to the matching `}`. Strings and chars are
+        // single tokens, so brace counting over tokens is safe.
         let mut body = Vec::new();
         let mut depth = 1i32;
         loop {
@@ -325,7 +332,8 @@ impl<S: TokenStream> Preprocessor<S> {
             body.push(t);
         }
         if !self.active() {
-            return Ok(()); // inside an inactive #ifdef branch: consumed, not run
+            // Inside an inactive #ifdef branch: consumed, but not run.
+            return Ok(());
         }
         // Reconstruct source, run it, capture stdout.
         let src = render_tokens(&body);
@@ -333,17 +341,42 @@ impl<S: TokenStream> Preprocessor<S> {
             .map_err(|e| self.err(pos, format!("#exe block failed to parse: {e}")))?;
         let out = crate::interp::run_to_string(&program)
             .map_err(|e| self.err(pos, format!("#exe block failed at runtime: {e}")))?;
-        // Splice the generated source as a frame (a public file, privacy-wise).
+        // Splice the generated source in as a frame that shares the *enclosing*
+        // file's id, so the code it generates is same-file as the surrounding
+        // source for file-scoped visibility (e.g. globals it declares are visible to
+        // the rest of the file without a `public` marker).
         self.exe_count += 1;
         let path = PathBuf::from(format!("<exe#{}>", self.exe_count));
-        self.push_frame(
+        self.push_exe_frame(path, out, "<exe>", pos)
+    }
+
+    /// Push an `#exe`-generated source frame that reuses the enclosing file's id
+    /// (rather than allocating a new file-table entry), so its declarations are
+    /// same-file as the surrounding code. See [`Preprocessor::do_exe`].
+    fn push_exe_frame(
+        &mut self,
+        path: PathBuf,
+        contents: String,
+        display: &str,
+        pos: Pos,
+    ) -> LResult<()> {
+        if self.includes.iter().any(|f| f.path == path) {
+            return Err(self.err(pos, format!("recursive #include of {display}")));
+        }
+        if self.includes.len() >= MAX_INCLUDE_DEPTH {
+            return Err(self.err(pos, "#include nested too deeply"));
+        }
+        let file_id = self.includes.last().map(|f| f.file_id).unwrap_or(0);
+        let resume = self.lookahead.take();
+        self.includes.push(IncludeFrame {
+            lexer: Lexer::new(&contents),
+            resume,
+            dir: self.base_dir.clone(),
             path,
-            self.base_dir.clone(),
-            out,
-            "<exe>",
-            pos,
-            FileInfo::root(),
-        )
+            cond_depth: self.conds.len(),
+            file_id,
+        });
+        Ok(())
     }
 
     fn do_define(&mut self, toks: &[Token]) -> LResult<()> {
@@ -353,7 +386,7 @@ impl<S: TokenStream> Preprocessor<S> {
             None => return Err(self.err(toks[0].span.pos, "#define is missing a macro name")),
         };
 
-        // Function-like only when `(` immediately follows the name with no gap.
+        // Function-like only when `(` immediately follows the name, with no gap.
         if let Some(lparen) = toks.get(2) {
             if matches!(lparen.kind, TokenKind::LParen) && toks[1].span.end == lparen.span.start {
                 let (params, body_start) = self.parse_macro_params(toks)?;
@@ -373,7 +406,7 @@ impl<S: TokenStream> Preprocessor<S> {
     /// begins.
     fn parse_macro_params(&self, toks: &[Token]) -> LResult<(Vec<String>, usize)> {
         let mut params = Vec::new();
-        let mut i = 3; // past name and `(`
+        let mut i = 3; // past the name and `(`
         // Empty list: `NAME()`.
         if matches!(toks.get(i).map(|t| &t.kind), Some(TokenKind::RParen)) {
             return Ok((params, i + 1));
@@ -408,17 +441,18 @@ impl<S: TokenStream> Preprocessor<S> {
         }
     }
 
-    /// Resolve and open a `#include "path"`: read the file and push it onto the
-    /// source stack so its tokens stream in next. The path is resolved relative
-    /// to the directory of the file containing the directive; cycles and runaway
+    /// Resolve and open an include directive: read the file and push it onto the
+    /// source stack so its tokens stream in next. The path resolves relative to
+    /// the directory of the file containing the directive. Cycles and runaway
     /// nesting are rejected.
     fn do_include(&mut self, toks: &[Token]) -> LResult<()> {
         let pos = toks[0].span.pos;
-        // Two forms: `#include "file"` (a single string token, resolved relative
-        // to the including file) and `#include <name>` (an angle path spelled as
-        // separate tokens, resolved against the standard-library search path).
-        // Each file's `_`-directory privacy comes from its *own* path (Go-style: no
-        // inheritance), computed where the path is resolved below.
+        // Two forms. `#include "file"` is a single string token, resolved
+        // relative to the including file. `#include <name>` is an angle path
+        // spelled as separate tokens, resolved against the standard-library
+        // search path. Each file's `_`-directory privacy comes from its *own*
+        // path (Go-style, no inheritance), computed where the path is resolved
+        // below.
         match toks.get(1).map(|t| &t.kind) {
             Some(TokenKind::Str(p)) => {
                 let path_str = p.clone();
@@ -437,8 +471,8 @@ impl<S: TokenStream> Preprocessor<S> {
                 let path_str = angle_path(&toks[1..])
                     .ok_or_else(|| self.err(pos, "malformed #include <...> path"))?;
                 let display = format!("<{path_str}>");
-                // 1. The filesystem search path wins, so `SOLOMON_STDLIB`/`-I` can
-                //    override the bundled stdlib or add angle-includable files.
+                // 1. The filesystem search path wins, so `SOLOMON_STDLIB` or `-I`
+                //    can override the bundled stdlib or add angle-includable files.
                 if let Some(canon) = self
                     .search
                     .iter()
@@ -447,8 +481,8 @@ impl<S: TokenStream> Preprocessor<S> {
                     let info = file_info_for_disk(&canon);
                     return self.open_include(canon, &display, pos, info);
                 }
-                // 2. Otherwise the standard library embedded in the compiler at build
-                //    time (so no `lib/` on disk is required).
+                // 2. Otherwise the standard library embedded in the compiler at
+                //    build time, so no `lib/` on disk is required.
                 if let Some(src) = crate::embedded_stdlib(&path_str) {
                     let path = PathBuf::from(format!("<stdlib:{path_str}>"));
                     let info = file_info_for_embedded(&path_str);
@@ -473,9 +507,9 @@ impl<S: TokenStream> Preprocessor<S> {
         }
     }
 
-    /// Push the already-resolved canonical include path onto the source stack
-    /// (after the cycle and depth checks). `display` is the original spelling, for
-    /// error messages.
+    /// Push an already-resolved canonical include path onto the source stack,
+    /// after the cycle and depth checks. `display` is the original spelling, used
+    /// in error messages.
     fn open_include(
         &mut self,
         canon: PathBuf,
@@ -492,10 +526,11 @@ impl<S: TokenStream> Preprocessor<S> {
         self.push_frame(canon, dir, contents, display, pos, info)
     }
 
-    /// Push an include source (read from disk or supplied from the embedded stdlib)
-    /// onto the source stack, after the cycle and depth checks. `path` identifies the
-    /// frame for the cycle check (a real canonical path, or a `<stdlib:name>`
-    /// sentinel); `dir` is the base for that file's relative (`"..."`) includes.
+    /// Push an include source onto the source stack, after the cycle and depth
+    /// checks. The source may come from disk or from the embedded stdlib. `path`
+    /// identifies the frame for the cycle check — a real canonical path, or a
+    /// `<stdlib:name>` sentinel. `dir` is the base for that file's relative
+    /// (`"..."`) includes.
     fn push_frame(
         &mut self,
         path: PathBuf,
@@ -511,12 +546,12 @@ impl<S: TokenStream> Preprocessor<S> {
         if self.includes.len() >= MAX_INCLUDE_DEPTH {
             return Err(self.err(pos, "#include nested too deeply"));
         }
-        // The token already read past the `#include` line resumes the parent once the
-        // included file is exhausted.
+        // The token already read past the `#include` line resumes the parent
+        // once the included file is exhausted.
         let resume = self.lookahead.take();
-        // Register this file in the (append-only) table; its id is stamped onto the
-        // frame's tokens. The table never shrinks when frames pop, so ids stay valid
-        // for the whole parse.
+        // Register this file in the append-only table; its id is stamped onto the
+        // frame's tokens. The table never shrinks when frames pop, so ids stay
+        // valid for the whole parse.
         let file_id = self.files.len() as u32;
         self.files.push(info);
         self.includes.push(IncludeFrame {
@@ -607,12 +642,13 @@ impl<S: TokenStream> Preprocessor<S> {
                             Macro::Func { params, body } => {
                                 if matches!(self.peek_kind()?, TokenKind::LParen) {
                                     let args = self.collect_args(pt.tok.span.pos)?;
-                                    // Each argument is fully macro-expanded in its own
-                                    // context *before* substitution (the standard macro
-                                    // algorithm). This is what lets a nested call to the
-                                    // same macro inside an argument — `F(F(2))` — expand:
-                                    // the inner call is resolved here, before the outer
-                                    // macro's name is added to the hide-set.
+                                    // Each argument is fully macro-expanded in its
+                                    // own context *before* substitution, per the
+                                    // standard macro algorithm. This lets a nested
+                                    // call to the same macro inside an argument,
+                                    // e.g. `F(F(2))`, expand: the inner call is
+                                    // resolved here, before the outer macro's name
+                                    // joins the hide-set.
                                     let args = args
                                         .into_iter()
                                         .map(|a| self.expand_arg(a))
@@ -640,20 +676,21 @@ impl<S: TokenStream> Preprocessor<S> {
     }
 
     /// Push replacement tokens to the front of the pending queue, each carrying
-    /// the current hide-set plus `mac` to prevent re-expanding `mac`.
+    /// the current hide-set plus `mac` so `mac` is not re-expanded.
     fn expand_into_pending(&mut self, body: Vec<Token>, mac: &str, base_hide: &HashSet<String>) {
         prepend_with_hide(&mut self.pending, body, mac, base_hide);
     }
 
-    /// Fully macro-expand a standalone macro argument in its own context. Unlike
-    /// [`next_expanded`](Self::next_expanded) this never pulls from the underlying
-    /// stream: it expands only the tokens of `arg` to a fixpoint. This implements
-    /// the per-argument pre-expansion of the standard (Prosser) macro algorithm —
-    /// a macro call fully contained in an argument expands here, so a nested call
-    /// to the *same* macro is resolved before the outer macro's name enters the
-    /// hide-set. A function-macro *name* at the very end of the argument is left
-    /// untouched: its `(` (if any) lives in the enclosing stream and is handled by
-    /// the outer rescan.
+    /// Fully macro-expand a standalone macro argument in its own context.
+    ///
+    /// Unlike [`next_expanded`](Self::next_expanded), this never pulls from the
+    /// underlying stream; it expands only the tokens of `arg`, to a fixpoint.
+    /// This is the per-argument pre-expansion of the standard (Prosser) macro
+    /// algorithm: a macro call fully contained in an argument expands here, so a
+    /// nested call to the *same* macro is resolved before the outer macro's name
+    /// enters the hide-set. A function-macro *name* at the very end of the
+    /// argument is left untouched. Its `(`, if any, lives in the enclosing stream
+    /// and is handled by the outer rescan.
     fn expand_arg(&self, arg: Vec<Token>) -> LResult<Vec<Token>> {
         let mut work: VecDeque<PpTok> = arg
             .into_iter()
@@ -674,8 +711,9 @@ impl<S: TokenStream> Preprocessor<S> {
                                 continue;
                             }
                             Macro::Func { params, body } => {
-                                // Only a call if the next *local* token is `(`; if the
-                                // argument ends here, it is an ordinary identifier.
+                                // A call only if the next *local* token is `(`. If
+                                // the argument ends here, it is an ordinary
+                                // identifier.
                                 if matches!(
                                     work.front().map(|p| &p.tok.kind),
                                     Some(TokenKind::LParen)
@@ -706,10 +744,11 @@ impl<S: TokenStream> Preprocessor<S> {
         Ok(out)
     }
 
-    /// Collect a function-like macro's arguments from a local token deque (used by
-    /// [`expand_arg`](Self::expand_arg)). Mirrors [`collect_args`](Self::collect_args),
-    /// which collects from the live stream; this variant consumes only `work` and so
-    /// never reaches past the argument it is expanding. Assumes `work.front()` is `(`.
+    /// Collect a function-like macro's arguments from a local token deque, used
+    /// by [`expand_arg`](Self::expand_arg). This mirrors
+    /// [`collect_args`](Self::collect_args), which collects from the live stream.
+    /// This variant consumes only `work`, so it never reaches past the argument
+    /// it is expanding. Assumes `work.front()` is `(`.
     fn collect_args_from(&self, work: &mut VecDeque<PpTok>, pos: Pos) -> LResult<Vec<Vec<Token>>> {
         work.pop_front(); // consume `(`
         let mut args: Vec<Vec<Token>> = Vec::new();
@@ -771,8 +810,8 @@ impl<S: TokenStream> Preprocessor<S> {
                 _ => cur.push(pt.tok),
             }
         }
-        // The final argument (everything between the last comma and `)`). A bare
-        // `()` yields no arguments.
+        // Push the final argument: everything between the last comma and `)`. A
+        // bare `()` yields no arguments.
         if !cur.is_empty() || !args.is_empty() {
             args.push(cur);
         }
@@ -787,7 +826,7 @@ impl<S: TokenStream> Preprocessor<S> {
         name: &str,
         pos: Pos,
     ) -> LResult<Vec<Token>> {
-        // A single-parameter macro invoked as `NAME()` passes one empty arg.
+        // A single-parameter macro invoked as `NAME()` passes one empty argument.
         if params.len() == 1 && args.is_empty() {
             args.push(Vec::new());
         }
@@ -825,8 +864,6 @@ impl<S: TokenStream> TokenStream for Preprocessor<S> {
     }
 }
 
-/// The directive keyword after `#`. Most directive names lex as identifiers;
-/// `else` is the lone keyword among them.
 /// Push replacement tokens to the front of a pending deque, each carrying
 /// `base_hide` plus `mac` so `mac` is not re-expanded within its own expansion.
 /// Shared by the main expander (over `self.pending`) and the per-argument
@@ -847,16 +884,17 @@ fn prepend_with_hide(
     }
 }
 
-/// Reconstruct HolyC source text from a token slice (for re-parsing an `#exe` block).
-/// Tokens are space-joined; literals are rendered faithfully — strings re-escaped,
-/// floats with a decimal point, char constants as their packed integer value.
+/// Reconstruct HolyC source text from a token slice, for re-parsing an `#exe`
+/// block. Tokens are space-joined. Literals are rendered faithfully: strings
+/// re-escaped, floats with a decimal point, char constants as their packed
+/// integer value.
 fn render_tokens(toks: &[Token]) -> String {
     let mut s = String::new();
     let mut prev_line: Option<u32> = None;
     for t in toks {
-        // Newlines are preserved (line directives like `#include` are line-oriented, so
-        // flattening would let one swallow the rest of the block); same-line tokens are
-        // space-separated.
+        // Preserve newlines. Line directives like `#include` are line-oriented,
+        // so flattening would let one swallow the rest of the block. Same-line
+        // tokens are space-separated.
         match prev_line {
             Some(l) if t.span.pos.line != l => s.push('\n'),
             Some(_) => s.push(' '),
@@ -877,11 +915,11 @@ fn render_kind(k: &TokenKind, out: &mut String) {
             return;
         }
         Float(f) => {
-            let _ = write!(out, "{f:?}"); // {:?} always keeps a `.`/`e`
+            let _ = write!(out, "{f:?}"); // {:?} always keeps a `.` or `e`
             return;
         }
         Char(n) => {
-            let _ = write!(out, "{n}"); // a char constant is its int value
+            let _ = write!(out, "{n}"); // a char constant renders as its int value
             return;
         }
         Str(s) => return render_string(s, out),
@@ -959,6 +997,8 @@ fn render_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// The directive keyword after `#`. Most directive names lex as identifiers;
+/// `else` is the lone keyword among them.
 fn directive_name(tok: &Token) -> Option<String> {
     match &tok.kind {
         TokenKind::Ident(s) => Some(s.clone()),
@@ -967,8 +1007,8 @@ fn directive_name(tok: &Token) -> Option<String> {
     }
 }
 
-/// The `Normal` path components of a directory, as strings (skipping the root,
-/// `.`, and `..`). Used to give each source file a directory for `_`-privacy.
+/// The `Normal` path components of a directory, as strings, skipping the root,
+/// `.`, and `..`. Gives each source file a directory for `_`-privacy.
 fn dir_components(dir: &Path) -> Vec<String> {
     dir.components()
         .filter_map(|c| match c {
@@ -978,8 +1018,9 @@ fn dir_components(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The [`FileInfo`] of a file on disk — its privacy comes from its parent directory
-/// and its own filename (a `_`-prefixed file is private to its directory's subtree).
+/// The [`FileInfo`] of a file on disk. Its privacy comes from its parent
+/// directory and its own filename: a `_`-prefixed file is private to its
+/// directory's subtree.
 fn file_info_for_disk(file: &Path) -> FileInfo {
     let dir = file.parent().map(dir_components).unwrap_or_default();
     let name = file
@@ -989,9 +1030,10 @@ fn file_info_for_disk(file: &Path) -> FileInfo {
     FileInfo::from_dir(dir, &name)
 }
 
-/// The [`FileInfo`] of an embedded-stdlib file, named by its angle-include path
-/// (e.g. `_strhash.hc`). The embedded library is its own root namespace (`<stdlib>`),
-/// so a `_`-prefixed file like `_strhash.hc` is private to that `<stdlib>` subtree.
+/// The [`FileInfo`] of an embedded-stdlib file, named by its angle-include path,
+/// e.g. `strhash.hc`. The embedded library is its own root namespace
+/// (`<stdlib>`), so a `_`-prefixed file like `strhash.hc` is private to that
+/// `<stdlib>` subtree.
 fn file_info_for_embedded(angle_path: &str) -> FileInfo {
     let mut dir = vec!["<stdlib>".to_string()];
     let parts: Vec<&str> = angle_path.split('/').collect();
@@ -1002,11 +1044,11 @@ fn file_info_for_embedded(angle_path: &str) -> FileInfo {
     FileInfo::from_dir(dir, name)
 }
 
-/// Reconstruct an angle-include path from the tokens of `#include <name>` (passed
-/// starting at the opening `<`). A path has no embedded whitespace and is spelled
-/// with the limited filename charset — identifiers, `.`, `/`, `-`, digits — so the
-/// tokens between `<` and the first `>` must be adjacent and map to that text.
-/// Returns `None` on any gap or unexpected token.
+/// Reconstruct an angle-include path from the tokens of `#include <name>`,
+/// passed starting at the opening `<`. A path uses only the limited filename
+/// charset: identifiers, `.`, `/`, `-`, and digits. The path is the
+/// concatenation of the text of the tokens between `<` and the first `>`.
+/// Returns `None` on an empty path or an unexpected token kind.
 fn angle_path(toks: &[Token]) -> Option<String> {
     if !matches!(toks.first().map(|t| &t.kind), Some(TokenKind::Lt)) {
         return None;
@@ -1018,9 +1060,9 @@ fn angle_path(toks: &[Token]) -> Option<String> {
     }
     let mut s = String::new();
     for (_i, t) in inner.iter().enumerate() {
-        // Whitespace between the `<…>` tokens is tolerated (a reconstructed `#exe`
-        // block may render `<math.hc>` as `< math . hc >`); the path is just the
-        // concatenation of the inner tokens' text.
+        // Whitespace between the `<…>` tokens is tolerated. A reconstructed `#exe`
+        // block may render `<math.hc>` as `< math . hc >`, and concatenating the
+        // inner tokens' text recovers the path either way.
         match &t.kind {
             TokenKind::Ident(x) => s.push_str(x),
             TokenKind::Int(n) => s.push_str(&n.to_string()),

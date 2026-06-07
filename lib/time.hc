@@ -2,27 +2,27 @@
 #define _TIME_HC
 // time.hc — the impure OS clock primitives plus calendar math over them.
 //
-// The clock primitives `UnixNS`/`NanoNS`/`Sleep` are **intrinsics** (declared here
-// as prototypes; the compiler lowers them to `clock_gettime`/`nanosleep` syscalls
-// freestanding, libc on Darwin, kernel32 on Windows). They read the OS clock or
-// sleep, so they are the one **non-reproducible** group — conformance for them is by
-// *property* (monotonic across a `Sleep`, wall clock past 1970), never by
+// The clock primitives `UnixNS`/`NanoNS`/`Sleep` are intrinsics: the prototypes are
+// declared here, and the compiler lowers them to `clock_gettime`/`nanosleep` syscalls
+// freestanding, libc on Darwin, and kernel32 on Windows. They read the OS clock or
+// sleep, so they are the one non-reproducible group. Conformance for them is by
+// property (monotonic across a `Sleep`, wall clock past 1970), never by
 // interp-vs-native value comparison.
 //
-// The calendar layer (`FromUnix`/`ToUnix`/`FmtISO`) is pure (a defined algorithm —
-// Howard Hinnant's civil/days conversion, exact for any proleptic-Gregorian date),
-// so it computes the same bits everywhere; only `Now` reads the clock. Include with
+// The calendar layer (`FromUnix`/`ToUnix`/`FmtISO`) is pure: a defined algorithm,
+// Howard Hinnant's civil/days conversion, exact for any proleptic-Gregorian date. It
+// computes the same bits everywhere; only `Now` reads the clock. Include with
 // `#include <time.hc>`.
 
 #include <fmt.hc>    // StrPrint/CatPrint for FmtISO
 
 // --- clock primitives (intrinsics) -------------------------------------------
 
-I64 UnixNS();        // wall-clock nanoseconds since 1970 (CLOCK_REALTIME)
-I64 NanoNS();        // monotonic nanoseconds from an arbitrary origin (CLOCK_MONOTONIC)
-U0 Sleep(I64 ns);    // sleep for `ns` nanoseconds
+public I64 UnixNS();        // wall-clock nanoseconds since 1970 (CLOCK_REALTIME)
+public I64 NanoNS();        // monotonic nanoseconds from an arbitrary origin (CLOCK_MONOTONIC)
+public U0 Sleep(I64 ns);    // sleep for `ns` nanoseconds
 
-class DateTime {
+public class DateTime {
   I64 year, month, day;   // month 1..12, day 1..31
   I64 hour, min, sec;     // 0..23, 0..59, 0..59
   I64 wday;               // day of week, 0 = Sunday
@@ -30,7 +30,7 @@ class DateTime {
 
 // Broken-down UTC time from Unix-epoch seconds. Floor-divides, so pre-1970
 // (negative) seconds work too.
-DateTime FromUnix(I64 secs)
+public DateTime FromUnix(I64 secs)
 {
   DateTime dt;
   I64 days = secs / 86400, tod = secs % 86400;
@@ -54,7 +54,7 @@ DateTime FromUnix(I64 secs)
 }
 
 // The inverse: Unix-epoch seconds from a broken-down date (days_from_civil).
-I64 ToUnix(DateTime dt)
+public I64 ToUnix(DateTime dt)
 {
   I64 y = dt.year - (dt.month <= 2);
   I64 era = (y >= 0 ? y : y - 399) / 400;
@@ -67,13 +67,13 @@ I64 ToUnix(DateTime dt)
 }
 
 // Whether `year` is a Gregorian leap year.
-I64 IsLeap(I64 year)
+public I64 IsLeap(I64 year)
 {
   return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
 }
 
 // "YYYY-MM-DD HH:MM:SS" into buf; returns buf.
-U8 *FmtISO(U8 *buf, DateTime dt)
+public U8 *FmtISO(U8 *buf, DateTime dt)
 {
   StrPrint(buf, "%04d-%02d-%02d %02d:%02d:%02d", dt.year, dt.month, dt.day,
            dt.hour, dt.min, dt.sec);
@@ -81,6 +81,6 @@ U8 *FmtISO(U8 *buf, DateTime dt)
 }
 
 // Current wall-clock UTC time, broken down. Impure (reads the clock).
-DateTime Now() { return FromUnix(UnixNS() / 1000000000); }
+public DateTime Now() { return FromUnix(UnixNS() / 1000000000); }
 
 #endif

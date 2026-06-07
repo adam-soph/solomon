@@ -40,6 +40,21 @@ fn tuples_multireturn_index_and_destructure() {
 }
 
 #[test]
+fn structural_aggregates_interchange_across_names() {
+    // Anonymous aggregates and same-signature named/typedef'd types assign, pass,
+    // and return across each other, and a value copies field-for-field across names.
+    let out = run("structural.hc", include_str!("../examples/structural.hc"));
+    assert_eq!(
+        out,
+        "named->anon->typedef: 7 7 70\n\
+         args: 7 7\n\
+         anon-return: 30 11\n\
+         list: 3\n\
+         union: 99\n"
+    );
+}
+
+#[test]
 fn varargs_vargc_and_vargv() {
     // A `...` function reads `VargC` (count) and `VargV` (raw 8-byte arg slots),
     // including the zero-argument call `Sum()`.
@@ -58,7 +73,8 @@ fn wordcount_generic_containers() {
     // A Vec/Hmap-heavy program with inferred type args throughout: word frequencies
     // (Hmap<U8*,I64>), a length histogram (Hmap<I64,I64>), sorted keys (Vec<U8*>),
     // entries sorted by a custom comparator (Vec<HmapKV<U8*,I64>>), and an
-    // order-independent value sum. Deterministic (all output is sorted or summed).
+    // order-independent value sum. The output is deterministic because everything is
+    // sorted or summed.
     let out = run("wordcount.hc", include_str!("../examples/wordcount.hc"));
     assert_eq!(
         out,
@@ -80,8 +96,8 @@ fn args_reads_argc_argv() {
     assert_eq!(out, "argc=1\n(no extra args)\n");
 }
 
-// ---- container-library edge cases (interpreter-pinned; the source is shared with the
-// arm64-Darwin native-parity tests in tests/arm64_darwin.rs) ----
+// ---- container-library edge cases. Interpreter-pinned; the source is shared with the
+// arm64-Darwin native-parity tests in tests/arm64_darwin.rs. ----
 
 #[test]
 fn sort_handles_edge_inputs_and_bsearch() {
@@ -149,7 +165,15 @@ fn generic_classes_monomorphize() {
     assert_eq!(
         out,
         "ints: len=3 max=30\n\
-         flts: 1.5 + 2.5 = 4.0\n"
+         flts: 1.5 + 2.5 = 4.0\n\
+         sizeof = 72\n\
+         len=5 first=0 last=16\n\
+         hello world\n\
+         max i = 9\n\
+         max f = 2.5\n\
+         I64 42\n\
+         F64 3.14\n\
+         str hi\n"
     );
 }
 
@@ -161,8 +185,8 @@ fn hmap_enumeration_on_empty_map() {
 
 #[test]
 fn exit_halts_execution() {
-    // `Exit` (the ambient builtin) stops the program at the call — output before it is
-    // flushed, nothing after runs.
+    // `Exit` (the ambient builtin) stops the program at the call. Output before it is
+    // flushed; nothing after it runs.
     let out = run(
         "exit",
         "#include <os.hc>\nU0 Main() { \"a\\n\"; Exit(3); \"b\\n\"; } Main;",
@@ -263,8 +287,8 @@ fn hashmap_put_get_and_update() {
 
 #[test]
 fn shuffle_is_deterministic() {
-    // A Fisher-Yates shuffle driven by the seeded RandU64 — the same permutation
-    // every run (and in both backends), still summing to 0+...+9 == 45.
+    // A Fisher-Yates shuffle driven by the seeded RandU64. It produces the same
+    // permutation every run and in both backends, still summing to 0+...+9 == 45.
     let out = run("shuffle.hc", include_str!("../examples/shuffle.hc"));
     assert_eq!(out, "2 6 4 5 8 1 3 9 0 7 \nsum=45\n");
 }
@@ -274,8 +298,8 @@ fn json_parser_round_trips() {
     // A recursive-descent JSON parser builds a heap tree of tagged JVal nodes and
     // queries it: object kind/arity, string and integer fields, an F64 real
     // (`pi` kind 6, 3.14 -> rounded *100 == 314), array access, escape decoding
-    // (`\\` -> `\`, `\"` -> `"`), bool/null tags, and a nested-object lookup —
-    // then re-serializes the whole tree back to JSON (`Dump`).
+    // (`\\` -> `\`, `\"` -> `"`), bool/null tags, and a nested-object lookup. It then
+    // re-serializes the whole tree back to JSON (`Dump`).
     let out = run("json.hc", include_str!("../examples/json.hc"));
     assert_eq!(
         out,

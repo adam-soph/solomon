@@ -2,10 +2,10 @@
 //!
 //! Two layers, mirroring `x86_64_linux.rs`:
 //!
-//! - **Structural checks** byte-inspect the Mach-O *object* the backend emits
-//!   (via [`Arm64Darwin::object`], which stops before the `cc` link step). They
-//!   need no toolchain and run on **every** host — so a green run on a Linux CI
-//!   still exercises the AArch64 emitter, not nothing.
+//! - **Structural checks** byte-inspect the Mach-O *object* the backend emits.
+//!   They go through [`Arm64Darwin::object`], which stops before the `cc` link
+//!   step, so they need no toolchain and run on **every** host. A green run on a
+//!   Linux CI therefore still exercises the AArch64 emitter.
 //! - **End-to-end checks** compile a small HolyC program to a native executable,
 //!   run it, and check the exit status / stdout against the interpreter. These
 //!   shell out to `cc` and execute a Mach-O binary, so they only run on an
@@ -125,10 +125,10 @@ fn produces_a_valid_macho_arm64_object() {
 
 #[test]
 fn main_is_framed_and_returns() {
-    // `_main` opens a frame (`stp x29,x30,[sp,#-16]!`) and ends with `ret`.
-    // Exact runtime behavior is pinned by the execute-it tests below; this is
-    // the host-independent instruction-level guard (the AArch64 analogue of
-    // x86_64's `main_is_framed_and_exits_via_syscall`).
+    // Checks `_main` opens a frame (`stp x29,x30,[sp,#-16]!`) and ends with `ret`.
+    // This is the host-independent, instruction-level guard; the execute-it tests
+    // below pin the exact runtime behavior. It is the AArch64 analogue of x86_64's
+    // `main_is_framed_and_exits_via_syscall`.
     let code = build_object("return 42;");
     let text = text_section(&code);
     assert!(text.len() >= 8, "__text too small: {} bytes", text.len());
@@ -211,10 +211,10 @@ fn native_command_line_args() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // Echo ArgV[1..] (ArgV[0] is the binary path, which varies) and check that
-    // `ArgC`/`ArgV` are the implicit command-line globals, captured from x0/x1 at the
-    // entry; `ArgV[i]` is a `U8 *`. The binary is run with two args (ArgV[0] is the
-    // path), so `ArgC == 3`.
+    // Checks that `ArgC`/`ArgV` are the implicit command-line globals, captured
+    // from x0/x1 at the entry, with each `ArgV[i]` a `U8 *`. The program echoes
+    // ArgV[1..]; ArgV[0] is the binary path, which varies, so it is skipped. The
+    // binary runs with two args, and ArgV[0] is the path, so `ArgC == 3`.
     let src = r#"
         I64 i;
         for (i = 1; i < ArgC; i++) "%s\n", ArgV[i];
@@ -237,14 +237,16 @@ fn native_float_formatting_matches_interp_over_a_hard_battery() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // A hard battery of `%f`/`%e`/`%g` cases — subnormals, the 2^53 integer-precision
-    // boundary, round-half-to-even ties, and extreme magnitudes — formatted by the
-    // native backend (which on Darwin lowers to **libc** `printf`) and the
-    // interpreter (Rust's correctly-rounded `{:.P}`/`fmt.rs`). Asserting they agree
-    // cross-checks the shared format spec against an independent oracle (libc) over
-    // exactly the inputs that stress the correctly-rounded float formatters — the
-    // safety net for sharing the freestanding bignum formatters (which CI exercises;
-    // Darwin uses libc, so the bignum itself runs only under the freestanding tests).
+    // Cross-checks float formatting against an independent oracle. A hard battery of
+    // `%f`/`%e`/`%g` cases stresses the correctly-rounded formatters: subnormals, the
+    // 2^53 integer-precision boundary, round-half-to-even ties, and extreme magnitudes.
+    // The native backend formats them by lowering to **libc** `printf` (on Darwin); the
+    // interpreter formats them with Rust's correctly-rounded `{:.P}` (`fmt.rs`).
+    // Asserting they agree validates the shared format spec against libc.
+    //
+    // This is the safety net for the freestanding backends' shared bignum formatters.
+    // Darwin uses libc here, so the bignum itself only runs under the freestanding
+    // tests, which CI exercises.
     let values: &[&str] = &[
         "0.0",
         "0.5",
@@ -304,10 +306,10 @@ fn native_holyc_float_formatter_matches_interp() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // The pure-HolyC float formatter (`lib/fltfmt.hc`, the eventual replacement for
-    // the hand-emitted bignum) compiled by the **native** backend must match the
-    // interpreter running the same HolyC `_FmtFloat` — the first end-to-end test of
-    // the formatter as real machine code (proving the bignum codegens correctly).
+    // Checks the pure-HolyC float formatter as real machine code. The native backend
+    // compiles `FmtFloat` (in `lib/fltfmt.hc`), and its output must match the
+    // interpreter running the same HolyC `FmtFloat`. This confirms the formatter's
+    // base-2^32 bignum codegens correctly.
     let cases: &[(char, i64, usize, usize)] = &[
         ('f', 0, 0, 6),
         ('f', 8, 8, 2),  // zero-pad after sign
@@ -322,17 +324,17 @@ fn native_holyc_float_formatter_matches_interp() {
     let values: &[f64] = &[
         3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1000000.0, -0.001, 1e300,
     ];
-    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){ U8 b[2048];\n");
+    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){ U8 b[2048];\n");
     for &(conv, flags, width, prec) in cases {
         for &v in values {
             src.push_str(&format!(
-                "_FmtFloat(b, Float64frombits(0x{:016X}), '{conv}', {flags}, {width}, {prec}); \"%s\\n\", b;\n",
+                "FmtFloat(b, Float64frombits(0x{:016X}), '{conv}', {flags}, {width}, {prec}); \"%s\\n\", b;\n",
                 v.to_bits()
             ));
         }
     }
     src.push_str("}\nMain;\n");
-    // `_FmtFloat` is private (it lives in the `_`-prefixed `_fltfmt.hc`), so root the
+    // `FmtFloat` is private (it lives in the `_`-prefixed `fltfmt.hc`), so root the
     // parse in `lib/` — a program inside the stdlib subtree may call it.
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let program = parse_with(&src, &lib, std::slice::from_ref(&lib)).expect("parse failed");
@@ -349,7 +351,7 @@ fn native_holyc_float_formatter_matches_interp() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         interp,
-        "native _FmtFloat != interp"
+        "native FmtFloat != interp"
     );
 }
 
@@ -704,10 +706,11 @@ fn native_uninitialized_aggregates_zero_filled_match_interp() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // A local aggregate without an initializer is zero-filled (gen_zero_slot) so
-    // its untouched elements/fields read as 0, matching the interpreter — covers a
-    // plain array, a class, an array of classes, a class with an array field, and
-    // a union. (Scalars were already zeroed; aggregates were stack garbage.)
+    // Checks that a local aggregate declared without an initializer is zero-filled
+    // (gen_zero_slot), so its untouched elements and fields read as 0, matching the
+    // interpreter. Covers a plain array, a class, an array of classes, a class with
+    // an array field, and a union. Scalars were already zeroed; aggregates used to be
+    // stack garbage.
     assert_native_matches_interp(
         r#"
         class P { I64 x; I64 y; }
@@ -817,10 +820,11 @@ fn native_strength_reduction_matches_interp() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // `* / %` by a constant power of two strength-reduce to `lsl` / (unsigned)
-    // `lsr` / `and #2^k-1`. Signed `*` by a power of two is still a shift (wraps
-    // mod 2^64), but signed `/` / `%` and any non-power-of-two keep the generic
-    // SDIV/UDIV/MUL path. All must stay byte-identical to the interpreter.
+    // Checks strength reduction of `* / %` by a constant power of two: `* 2^k` becomes
+    // `lsl`, and for unsigned operands `/ 2^k` becomes `lsr` and `% 2^k` becomes
+    // `and #2^k-1`. Signed `*` by a power of two is still a shift (it wraps mod 2^64).
+    // Signed `/` and `%`, and any non-power-of-two, keep the generic SDIV/UDIV/MUL
+    // path. All must stay byte-identical to the interpreter.
     assert_native_matches_interp(
         r#"
         U64 Uns(U64 x) { return x * 8 + x / 4 + x % 16 + x % 1; }
@@ -1270,9 +1274,10 @@ fn native_float_to_unsigned_matches_interp() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // Float -> unsigned uses FCVTZU (init/cast/assign/return); signed uses FCVTZS
-    // (saturates); a negative float clamps to 0 — byte-identical to the interp
-    // (float_to_unsigned_uses_unsigned_conversion in tests/interp.rs).
+    // Checks float-to-integer conversion is signedness-directed. An unsigned target
+    // uses FCVTZU at every site (init, cast, assign, return), and a negative float
+    // clamps to 0; a signed target uses FCVTZS, which saturates. Byte-identical to
+    // the interpreter (float_to_unsigned_uses_unsigned_conversion in tests/interp.rs).
     let src = r#"
         U64 Ret(F64 f) { return f; }
         U0 Main() {
@@ -2410,9 +2415,92 @@ fn native_matches_stdlib_showcase() {
     );
 }
 
+/// `try`/`catch`/`throw` lower to the jmp_buf/longjmp handler-frame unwinder and the
+/// `CTask *Fs` task pointer. Each program must run byte-for-byte like the interpreter
+/// (the conformance oracle), which is the real check on the unwinding codegen.
+#[test]
+fn native_exceptions_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // catch reads `Fs->except_ch`; a throw unwinds across a call; the statement after
+    // the throw is skipped; `catch_except` toggles 1 then back to 0.
+    assert_native_matches_interp(
+        r#"
+        U0 Risky(I64 n) { if (n > 5) throw(n * 100); "ok %d\n", n; }
+        U0 Main() {
+          I64 i;
+          for (i = 4; i <= 6; i++)
+            try { Risky(i); "after %d\n", i; }
+            catch { "caught %d flag=%d\n", Fs->except_ch, Fs->catch_except; }
+          "done flag=%d\n", Fs->catch_except;
+        }
+        Main;
+    "#,
+    );
+    // Locals mutated before a deep (recursive) throw survive into the handler — the
+    // reason register promotion is disabled for `try` functions.
+    assert_native_matches_interp(
+        r#"
+        I64 Deep(I64 n) { if (n <= 0) throw(1234); return Deep(n - 1); }
+        U0 Main() {
+          I64 a = 10, sum = 0, i; F64 f = 2.5;
+          try {
+            for (i = 0; i < 5; i++) sum += i;
+            a = 99; f = 7.5; Deep(3); a = 1;
+          } catch { "a=%d sum=%d f=%.1f ch=%d\n", a, sum, f, Fs->except_ch; }
+          "final a=%d sum=%d\n", a, sum;
+        }
+        Main;
+    "#,
+    );
+    // Nested try with a bare `throw;` re-raise.
+    assert_native_matches_interp(
+        r#"
+        U0 Main() {
+          try { try { throw(7); } catch { "inner %d\n", Fs->except_ch; throw; } }
+          catch { "outer %d\n", Fs->except_ch; }
+        }
+        Main;
+    "#,
+    );
+}
+
+/// `Fs` is per-thread (Darwin pthread TLS), so concurrent threads each throw and catch
+/// independently with no shared exception state. Each worker returns the value it
+/// caught through `Join`, so the output is deterministic (no concurrent printing): a
+/// shared global would race and produce wrong/varying pairings.
+#[test]
+fn native_exceptions_are_per_thread() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    let out = build_and_capture(
+        r#"
+        #include <thread.hc>
+        I64 Worker(I64 id) {
+          I64 got = -1;
+          try { throw(id * 100); }
+          catch { got = Fs->except_ch; }
+          return got;
+        }
+        U0 Main() {
+          I64 a = Thread(&Worker, 1);
+          I64 b = Thread(&Worker, 2);
+          I64 c = Thread(&Worker, 7);
+          "a=%d b=%d c=%d\n", Join(a), Join(b), Join(c);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "a=100 b=200 c=700\n");
+}
+
 #[test]
 fn unsupported_constructs_are_rejected() {
-    // Beyond the current milestones must error at build time rather than
+    // Constructs beyond the current milestones must error at build time rather than
     // silently miscompile.
     let out = std::env::temp_dir().join("solomon-arm64-should-not-exist");
     for src in [

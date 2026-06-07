@@ -2,61 +2,61 @@
 #define _SYNC_HC
 // sync.hc — atomics and a mutex for sharing mutable state between threads.
 //
-// `AtomicLoad`/`AtomicStore`/`AtomicAdd`/`AtomicSwap`/`AtomicCas` are **intrinsics**
-// (prototypes here; the compiler lowers them to the hardware atomic instructions —
-// `ldaxr`/`stlxr` loops on AArch64, `lock`-prefixed `xadd`/`xchg`/`cmpxchg` on x86-64,
-// with acquire/release ordering). They operate on a naturally-aligned `I64` in shared
-// memory (a global or a heap/`MAlloc` slot — anything visible to the other thread).
-// `AtomicFence` is a full barrier; `FutexWait`/`FutexWake` are the kernel wait/wake.
-// `Mutex` is a **blocking** futex lock built on them in pure HolyC. Include with
-// `#include <sync.hc>`.
+// `AtomicLoad`/`AtomicStore`/`AtomicAdd`/`AtomicSwap`/`AtomicCas` are intrinsics: the
+// prototypes live here, and the compiler lowers them to the hardware atomic
+// instructions — `ldaxr`/`stlxr` loops on AArch64, `lock`-prefixed
+// `xadd`/`xchg`/`cmpxchg` on x86-64 — with acquire/release ordering. They operate on a
+// naturally-aligned `I64` in shared memory: a global, or a heap/`MAlloc` slot, anything
+// visible to the other thread. `AtomicFence` is a full barrier. `FutexWait`/`FutexWake`
+// are the kernel wait/wake. `Mutex` is a blocking futex lock built on these in pure
+// HolyC. Include with `#include <sync.hc>`.
 //
 // Conformance: the interpreter runs threads synchronously (see `thread.hc`), so it has
-// no real contention — it performs each atomic as a plain read-modify-write, the
+// no real contention. It performs each atomic as a plain read-modify-write, the
 // fence/futex ops are no-ops, and `MutexLock` always acquires on the first try (never
 // blocking). A native run with real threads gets the same answer for race-free use
 // (atomic counters, mutex-guarded sections).
 
 // --- atomic primitives (intrinsics) ------------------------------------------
 
-I64 AtomicLoad(I64 *p);                            // atomic *p
-U0  AtomicStore(I64 *p, I64 v);                    // atomic *p = v
-I64 AtomicAdd(I64 *p, I64 delta);                  // *p += delta, returns the NEW value
-I64 AtomicSwap(I64 *p, I64 v);                     // *p = v, returns the OLD value
-I64 AtomicCas(I64 *p, I64 expected, I64 desired);  // CAS, returns the PREVIOUS value
+public I64 AtomicLoad(I64 *p);                            // atomic *p
+public U0  AtomicStore(I64 *p, I64 v);                    // atomic *p = v
+public I64 AtomicAdd(I64 *p, I64 delta);                  // *p += delta, returns the NEW value
+public I64 AtomicSwap(I64 *p, I64 v);                     // *p = v, returns the OLD value
+public I64 AtomicCas(I64 *p, I64 expected, I64 desired);  // CAS, returns the PREVIOUS value
 
-// A full (sequentially-consistent) memory fence — `dmb ish` / `mfence`. Orders this
-// thread's loads/stores around it; pairs with the acquire/release the atomics already
-// carry. (A no-op in the synchronous interpreter.)
-U0 AtomicFence();
+// A full (sequentially-consistent) memory fence (`dmb ish` / `mfence`). Orders this
+// thread's loads and stores around it, and pairs with the acquire/release the atomics
+// already carry. (A no-op in the synchronous interpreter.)
+public U0 AtomicFence();
 
 // --- low-level futex (intrinsics) --------------------------------------------
 //
-// The kernel wait/wake used to build blocking primitives. They compare/sleep on the
-// **low 32 bits** of the word at `addr` (Linux `futex(2)`; Darwin `__ulock_wait`/
-// `__ulock_wake`). Most code wants `Mutex`, not these directly.
+// The kernel wait/wake used to build blocking primitives. They compare and sleep on
+// the low 32 bits of the word at `addr` (Linux `futex(2)`; Darwin
+// `__ulock_wait`/`__ulock_wake`). Most code wants `Mutex`, not these directly.
 
-I64 FutexWait(I64 *addr, I64 expected);  // sleep while *addr == expected; wakes spuriously
-I64 FutexWake(I64 *addr, I64 n);         // wake up to `n` waiters on `addr`
+public I64 FutexWait(I64 *addr, I64 expected);  // sleep while *addr == expected; wakes spuriously
+public I64 FutexWake(I64 *addr, I64 n);         // wake up to `n` waiters on `addr`
 
 // --- atomic convenience -------------------------------------------------------
 
-I64 AtomicInc(I64 *p) { return AtomicAdd(p, 1); }
-I64 AtomicDec(I64 *p) { return AtomicAdd(p, -1); }
+public I64 AtomicInc(I64 *p) { return AtomicAdd(p, 1); }
+public I64 AtomicDec(I64 *p) { return AtomicAdd(p, -1); }
 
 // --- mutex (a futex-backed 3-state lock; Drepper "Futexes Are Tricky") -------
 
-class Mutex { I64 state; };  // 0 = unlocked, 1 = locked, 2 = locked with waiters
+public class Mutex { I64 state; };  // 0 = unlocked, 1 = locked, 2 = locked with waiters
 
-U0 MutexInit(Mutex *m)
+public U0 MutexInit(Mutex *m)
 {
   AtomicStore(&m->state, 0);
 }
 
-// Acquire the lock, **blocking** in the kernel (no busy spin) while it is held. The
-// state tracks whether there may be waiters so `MutexUnlock` only wakes when needed.
+// Acquire the lock, blocking in the kernel (no busy spin) while it is held. The state
+// tracks whether there may be waiters, so `MutexUnlock` only wakes when needed.
 // Reentrant locking deadlocks, as for any plain mutex.
-U0 MutexLock(Mutex *m)
+public U0 MutexLock(Mutex *m)
 {
   I64 c = AtomicCas(&m->state, 0, 1);  // fast path: 0 -> 1
   if (c != 0) {
@@ -69,12 +69,12 @@ U0 MutexLock(Mutex *m)
 }
 
 // Try to acquire without blocking. Returns 1 if the lock was taken, else 0.
-I64 MutexTryLock(Mutex *m)
+public I64 MutexTryLock(Mutex *m)
 {
   return AtomicCas(&m->state, 0, 1) == 0;
 }
 
-U0 MutexUnlock(Mutex *m)
+public U0 MutexUnlock(Mutex *m)
 {
   if (AtomicSwap(&m->state, 0) == 2)  // there were waiters: wake one
     FutexWake(&m->state, 1);
@@ -82,18 +82,18 @@ U0 MutexUnlock(Mutex *m)
 
 // --- condition variable (a futex over a sequence counter) --------------------
 
-class Cond { I64 seq; };
+public class Cond { I64 seq; };
 
-U0 CondInit(Cond *c)
+public U0 CondInit(Cond *c)
 {
   AtomicStore(&c->seq, 0);
 }
 
 // Atomically release `m` and block until signaled, then re-acquire `m`. Must be called
-// with `m` held; always re-test your predicate in a loop (a wakeup may be spurious).
-// The `seq` snapshot taken *before* unlocking closes the lost-wakeup window: a signal
-// in between bumps `seq`, so `FutexWait` returns at once instead of sleeping.
-U0 CondWait(Cond *c, Mutex *m)
+// with `m` held. Always re-test your predicate in a loop, since a wakeup may be
+// spurious. The `seq` snapshot taken before unlocking closes the lost-wakeup window: a
+// signal in between bumps `seq`, so `FutexWait` returns at once instead of sleeping.
+public U0 CondWait(Cond *c, Mutex *m)
 {
   I64 seq = AtomicLoad(&c->seq);
   MutexUnlock(m);
@@ -103,13 +103,13 @@ U0 CondWait(Cond *c, Mutex *m)
 
 // Wake one waiter / all waiters. (Bump `seq` first so a waiter that hasn't slept yet
 // also observes the change.)
-U0 CondSignal(Cond *c)
+public U0 CondSignal(Cond *c)
 {
   AtomicAdd(&c->seq, 1);
   FutexWake(&c->seq, 1);
 }
 
-U0 CondBroadcast(Cond *c)
+public U0 CondBroadcast(Cond *c)
 {
   AtomicAdd(&c->seq, 1);
   FutexWake(&c->seq, 0x7FFFFFFF);  // wake all
@@ -117,16 +117,16 @@ U0 CondBroadcast(Cond *c)
 
 // --- reader/writer lock (readers-preferred) ----------------------------------
 
-class RwLock { I64 state; };  // 0 = free, N>0 = N readers hold, -1 = a writer holds
+public class RwLock { I64 state; };  // 0 = free, N>0 = N readers hold, -1 = a writer holds
 
-U0 RwLockInit(RwLock *rw)
+public U0 RwLockInit(RwLock *rw)
 {
   AtomicStore(&rw->state, 0);
 }
 
-// Acquire a shared (read) lock — any number of readers may hold it at once, blocking
+// Acquire a shared (read) lock. Any number of readers may hold it at once; it blocks
 // only while a writer holds it.
-U0 RwLockRLock(RwLock *rw)
+public U0 RwLockRLock(RwLock *rw)
 {
   while (1) {
     I64 s = AtomicLoad(&rw->state);
@@ -138,20 +138,21 @@ U0 RwLockRLock(RwLock *rw)
   }
 }
 
-U0 RwLockRUnlock(RwLock *rw)
+public U0 RwLockRUnlock(RwLock *rw)
 {
   if (AtomicAdd(&rw->state, -1) == 0)  // the last reader left
     FutexWake(&rw->state, 1);          // let a waiting writer in
 }
 
-// Acquire the exclusive (write) lock — blocks until no readers and no other writer.
-U0 RwLockWLock(RwLock *rw)
+// Acquire the exclusive (write) lock. Blocks until there are no readers and no other
+// writer.
+public U0 RwLockWLock(RwLock *rw)
 {
   while (AtomicCas(&rw->state, 0, -1) != 0)         // 0 -> -1 (exclusive)
     FutexWait(&rw->state, AtomicLoad(&rw->state));  // wait while not free
 }
 
-U0 RwLockWUnlock(RwLock *rw)
+public U0 RwLockWUnlock(RwLock *rw)
 {
   AtomicStore(&rw->state, 0);
   FutexWake(&rw->state, 0x7FFFFFFF);  // wake all (waiting readers + a writer)

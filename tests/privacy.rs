@@ -1,7 +1,8 @@
-//! `_`-directory privacy (Go's `internal/`, generalized): a symbol defined in a file
-//! under a directory whose name begins with `_` may be referenced only from files in
-//! that directory's *parent* subtree. Enforced in sema; applies to all code — the
-//! standard library and user programs alike.
+//! Directory-scoped visibility via the `public` keyword. A top-level symbol (function,
+//! `class`/`union`, or global) is visible to every file in the **same directory**;
+//! crossing a directory boundary needs `public`. The rule is enforced in sema and
+//! applies to all code — the standard library and user programs alike. (This replaced
+//! the older `_`-prefix directory privacy.)
 
 use solomon::parser::{parse, parse_in_dir};
 use solomon::sema::check_program;
@@ -13,193 +14,200 @@ fn errors(program: &solomon::Program) -> Vec<String> {
         .collect()
 }
 
-/// A program that pulls in `<hmap.hc>` (embedded stdlib) and a body. The stdlib's
-/// `hmap.hc` privately uses `Djb2` from `<_strhash.hc>`.
-fn stdlib_program(body: &str) -> solomon::Program {
-    parse(&format!(
-        "#include <hmap.hc>\nU0 Main() {{ {body} }}\nMain;"
-    ))
-    .unwrap_or_else(|e| panic!("parse failed: {e}"))
+/// Parse a main file that `#include`s a `header` sitting **in the same directory**, then
+/// runs `main_body`. Same-directory references see non-`public` symbols.
+fn same_dir(tag: &str, header: &str, main_body: &str) -> Vec<String> {
+    in_dirs(tag, header, "h.hc", "h.hc", main_body)
 }
+
+/// Parse a main file that `#include`s a `header` in a **subdirectory** (a different
+/// directory), then runs `main_body`. Cross-directory references need `public`.
+fn cross_dir(tag: &str, header: &str, main_body: &str) -> Vec<String> {
+    in_dirs(tag, header, "sub/h.hc", "sub/h.hc", main_body)
+}
+
+fn in_dirs(
+    tag: &str,
+    header: &str,
+    header_path: &str,
+    include: &str,
+    main_body: &str,
+) -> Vec<String> {
+    let dir = std::env::temp_dir().join(format!("solomon-vis-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let hpath = dir.join(header_path);
+    std::fs::create_dir_all(hpath.parent().unwrap()).unwrap();
+    std::fs::write(&hpath, header).unwrap();
+    let src = format!("#include \"{include}\"\nU0 Main() {{ {main_body} }}\nMain;");
+    let program = parse_in_dir(&src, &dir).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = errors(&program);
+    let _ = std::fs::remove_dir_all(&dir);
+    errs
+}
+
+fn is_private_error(errs: &[String], name: &str) -> bool {
+    errs.iter()
+        .any(|m| m.contains(name) && m.contains("not `public`"))
+}
+
+// ---- functions ----------------------------------------------------------------
+
+#[test]
+fn public_function_is_callable_across_directories() {
+    let errs = cross_dir("fn-ok", "public I64 Helper() { return 42; }", "Helper();");
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+}
+
+#[test]
+fn non_public_function_is_visible_within_the_same_directory() {
+    let errs = same_dir("fn-same", "I64 Helper() { return 42; }", "Helper();");
+    assert!(
+        errs.is_empty(),
+        "same-directory use should be allowed: {errs:?}"
+    );
+}
+
+#[test]
+fn non_public_function_is_private_across_directories() {
+    let errs = cross_dir("fn-bad", "I64 Helper() { return 42; }", "Helper();");
+    assert!(
+        is_private_error(&errs, "Helper"),
+        "expected a cross-directory visibility error for `Helper`, got: {errs:?}"
+    );
+}
+
+// ---- types --------------------------------------------------------------------
+
+#[test]
+fn public_type_is_usable_across_directories() {
+    let errs = cross_dir(
+        "ty-ok",
+        "public class Pt { I64 x; I64 y; }",
+        "Pt p; p.x = 1;",
+    );
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+}
+
+#[test]
+fn non_public_type_is_visible_within_the_same_directory() {
+    let errs = same_dir("ty-same", "class Pt { I64 x; I64 y; }", "Pt p; p.x = 1;");
+    assert!(
+        errs.is_empty(),
+        "same-directory use should be allowed: {errs:?}"
+    );
+}
+
+#[test]
+fn non_public_type_is_private_across_directories() {
+    let errs = cross_dir("ty-bad", "class Pt { I64 x; I64 y; }", "Pt p; p.x = 1;");
+    assert!(
+        is_private_error(&errs, "Pt"),
+        "expected a cross-directory visibility error for `Pt`, got: {errs:?}"
+    );
+}
+
+// ---- globals ------------------------------------------------------------------
+
+#[test]
+fn public_global_is_visible_across_directories() {
+    let errs = cross_dir("g-ok", "public I64 G = 7;", "I64 x = G;");
+    assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+}
+
+#[test]
+fn non_public_global_is_visible_within_the_same_directory() {
+    let errs = same_dir("g-same", "I64 G = 7;", "I64 x = G;");
+    assert!(
+        errs.is_empty(),
+        "same-directory use should be allowed: {errs:?}"
+    );
+}
+
+#[test]
+fn non_public_global_is_private_across_directories() {
+    let errs = cross_dir("g-bad", "I64 G = 7;", "I64 x = G;");
+    assert!(
+        is_private_error(&errs, "G"),
+        "expected a cross-directory visibility error for `G`, got: {errs:?}"
+    );
+}
+
+// ---- same-file & misuse -------------------------------------------------------
+
+#[test]
+fn non_public_symbol_is_visible_within_its_own_file() {
+    // No `public` needed for a same-file reference.
+    let src = "I64 Helper() { return 9; }\nU0 Main() { Helper(); }\nMain;";
+    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(
+        errors(&program).is_empty(),
+        "same-file use should be allowed: {:?}",
+        errors(&program)
+    );
+}
+
+#[test]
+fn public_on_a_local_is_an_error() {
+    let src = "U0 Main() { public I64 x; }\nMain;";
+    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = errors(&program);
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("`public`") && m.contains("top-level")),
+        "expected a top-level-only error, got: {errs:?}"
+    );
+}
+
+// ---- standard library ---------------------------------------------------------
 
 #[test]
 fn public_stdlib_symbol_is_callable() {
-    // `HmapStrHash` is public (and bridges to the private `Djb2`) — calling it from
-    // user code is fine.
-    let p = stdlib_program("U8 *k = \"key\"; HmapStrHash(&k);");
-    assert!(errors(&p).is_empty(), "unexpected errors: {:?}", errors(&p));
-}
-
-#[test]
-fn private_stdlib_symbol_is_rejected_from_user_code() {
-    // `Djb2` lives in the stdlib's `_`-prefixed `_strhash.hc`, so a user program may
-    // not call it even though `<hmap.hc>` pulled it in transitively.
-    let p = stdlib_program("Djb2(\"k\");");
-    let errs = errors(&p);
+    // The stdlib's public API is callable from user code across the file boundary.
+    let src = "#include <cstr.hc>\nU0 Main() { U8 *s = \"hi\"; StrLen(s); }\nMain;";
+    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(
-        errs.iter()
-            .any(|m| m.contains("Djb2") && m.contains("private")),
-        "expected a privacy error for `Djb2`, got: {errs:?}"
-    );
-}
-
-/// Build a temp project tree and return its root. Layout:
-///   <root>/_secret/util.hc   — defines `Secret()` (private to <root>/)
-///   <root>/app/main.hc       — in-subtree caller (allowed)
-fn temp_project(tag: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!("solomon-priv-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("_secret")).unwrap();
-    std::fs::create_dir_all(root.join("app")).unwrap();
-    std::fs::write(root.join("_secret/util.hc"), "I64 Secret(){ return 42; }\n").unwrap();
-    root
-}
-
-#[test]
-fn private_dir_allows_callers_in_the_parent_subtree() {
-    let root = temp_project("ok");
-    // app/ is under <root>/, the subtree _secret/ is private to — so this is allowed.
-    let src = "#include \"../_secret/util.hc\"\nU0 Main(){ Secret(); }\nMain;";
-    let p = parse_in_dir(src, &root.join("app")).unwrap_or_else(|e| panic!("parse: {e}"));
-    let errs = errors(&p);
-    let _ = std::fs::remove_dir_all(&root);
-    assert!(
-        errs.is_empty(),
-        "in-subtree caller should be allowed: {errs:?}"
+        errors(&program).is_empty(),
+        "calling a public stdlib symbol should be fine: {:?}",
+        errors(&program)
     );
 }
 
 #[test]
-fn private_dir_protects_types_too() {
-    // A `class` under a `_` directory is private just like a function.
-    let root = std::env::temp_dir().join(format!("solomon-priv-ty-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("_lib")).unwrap();
-    std::fs::create_dir_all(root.join("app")).unwrap();
-    std::fs::write(root.join("_lib/s.hc"), "class Secret { I64 x; }\n").unwrap();
-
-    let inside = parse_in_dir(
-        "#include \"../_lib/s.hc\"\nU0 Main(){ Secret v; v.x = 1; }\nMain;",
-        &root.join("app"),
-    )
-    .unwrap();
+fn private_stdlib_helper_is_rejected_from_user_code() {
+    // `PfPut` is a non-`public` helper in the stdlib's `printf.hc`. User code lives in a
+    // different directory than the embedded `<stdlib>`, so the cross-directory rule
+    // rejects the call.
+    let src = "#include <printf.hc>\nU0 Main() { Pf p; PfPut(&p, \"x\", 1); }\nMain;";
+    let program = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = errors(&program);
     assert!(
-        errors(&inside).is_empty(),
-        "in-subtree type use should be allowed: {:?}",
-        errors(&inside)
-    );
-
-    let outside_dir =
-        std::env::temp_dir().join(format!("solomon-priv-tyout-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&outside_dir);
-    std::fs::create_dir_all(&outside_dir).unwrap();
-    // Forward slashes so the absolute path embeds cleanly in the HolyC `#include`
-    // string on Windows (`C:\…` would read `\U`/`\T`… as escapes); Windows resolves
-    // `/`-separated paths fine.
-    let root_inc = root.display().to_string().replace('\\', "/");
-    let src =
-        format!("#include \"{root_inc}/_lib/s.hc\"\nU0 Main(){{ Secret v; v.x = 1; }}\nMain;");
-    let outside = parse_in_dir(&src, &outside_dir).unwrap();
-    let errs = errors(&outside);
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(&outside_dir);
-    assert!(
-        errs.iter()
-            .any(|m| m.contains("Secret") && m.contains("private")),
-        "outside type use should be rejected, got: {errs:?}"
+        is_private_error(&errs, "PfPut"),
+        "expected a visibility error for `PfPut`, got: {errs:?}"
     );
 }
 
 #[test]
-fn private_dir_rejects_callers_outside_the_subtree() {
-    let root = temp_project("bad");
-    let outside = std::env::temp_dir().join(format!("solomon-priv-out-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&outside);
-    std::fs::create_dir_all(&outside).unwrap();
-    // A program outside <root>/ reaching into <root>/_secret/ — rejected. Forward
-    // slashes so the absolute path embeds cleanly in the HolyC `#include` on Windows.
-    let root_inc = root.display().to_string().replace('\\', "/");
-    let src = format!("#include \"{root_inc}/_secret/util.hc\"\nU0 Main(){{ Secret(); }}\nMain;");
-    let p = parse_in_dir(&src, &outside).unwrap_or_else(|e| panic!("parse: {e}"));
-    let errs = errors(&p);
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(&outside);
+fn public_function_may_not_return_a_non_public_type() {
+    // A `public` function would expose a non-`public` type a cross-file caller can't
+    // name. Flagged for the underlying named type, peeling pointers.
+    for ret in ["Secret", "Secret *"] {
+        let src = format!("class Secret {{ I64 x; }}\npublic {ret} Make() {{ return NULL; }}");
+        let program = parse(&src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let errs = errors(&program);
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("Make") && m.contains("Secret") && m.contains("non-`public`")),
+            "expected a public-return-type error for `{ret}`, got: {errs:?}"
+        );
+    }
+    // A `public` return type is fine; a non-`public` function returning a private type
+    // is also fine (it's not part of the cross-file API surface).
+    let ok = "public class Ok { I64 x; }\npublic Ok MkOk() { Ok s; s.x = 1; return s; }\n\
+              class Hidden { I64 y; }\nHidden MkHidden() { Hidden h; return h; }";
+    let program = parse(ok).unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(
-        errs.iter()
-            .any(|m| m.contains("Secret") && m.contains("private")),
-        "outside caller should be rejected, got: {errs:?}"
-    );
-}
-
-#[test]
-fn private_dir_protects_globals_too() {
-    // A global declared under a `_` directory is private just like a function or type.
-    let root = std::env::temp_dir().join(format!("solomon-priv-g-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("_secret")).unwrap();
-    std::fs::create_dir_all(root.join("app")).unwrap();
-    std::fs::write(root.join("_secret/g.hc"), "I64 SecretG = 7;\n").unwrap();
-
-    // In-subtree (app/ under <root>/, which _secret/ is private to) — allowed.
-    let inside = parse_in_dir(
-        "#include \"../_secret/g.hc\"\nU0 Main(){ I64 x = SecretG; }\nMain;",
-        &root.join("app"),
-    )
-    .unwrap();
-    assert!(
-        errors(&inside).is_empty(),
-        "in-subtree global use should be allowed: {:?}",
-        errors(&inside)
-    );
-
-    // Outside <root>/ — rejected.
-    let outside = std::env::temp_dir().join(format!("solomon-priv-gout-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&outside);
-    std::fs::create_dir_all(&outside).unwrap();
-    let root_inc = root.display().to_string().replace('\\', "/");
-    let src =
-        format!("#include \"{root_inc}/_secret/g.hc\"\nU0 Main(){{ I64 x = SecretG; }}\nMain;");
-    let out = parse_in_dir(&src, &outside).unwrap();
-    let errs = errors(&out);
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(&outside);
-    assert!(
-        errs.iter()
-            .any(|m| m.contains("SecretG") && m.contains("private")),
-        "outside global use should be rejected, got: {errs:?}"
-    );
-}
-
-#[test]
-fn private_file_is_visible_only_within_its_directory() {
-    // A `_`-prefixed *file* (not just a `_` directory) is private to its own
-    // directory's subtree.
-    let root = std::env::temp_dir().join(format!("solomon-priv-f-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("lib")).unwrap();
-    std::fs::write(root.join("lib/_priv.hc"), "I64 Helper(){ return 9; }\n").unwrap();
-
-    // Same directory as `_priv.hc` — allowed.
-    let inside = parse_in_dir(
-        "#include \"_priv.hc\"\nU0 Main(){ Helper(); }\nMain;",
-        &root.join("lib"),
-    )
-    .unwrap();
-    assert!(
-        errors(&inside).is_empty(),
-        "same-dir use of a `_` file should be allowed: {:?}",
-        errors(&inside)
-    );
-
-    // The parent directory <root>/ is outside the `_` file's subtree — rejected.
-    let root_inc = root.display().to_string().replace('\\', "/");
-    let src = format!("#include \"{root_inc}/lib/_priv.hc\"\nU0 Main(){{ Helper(); }}\nMain;");
-    let outside = parse_in_dir(&src, &root).unwrap();
-    let errs = errors(&outside);
-    let _ = std::fs::remove_dir_all(&root);
-    assert!(
-        errs.iter()
-            .any(|m| m.contains("Helper") && m.contains("private")),
-        "use of a `_` file from outside its directory should be rejected, got: {errs:?}"
+        errors(&program).is_empty(),
+        "public->public and private->private should be fine: {:?}",
+        errors(&program)
     );
 }

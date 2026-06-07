@@ -1,34 +1,35 @@
 #ifndef _PRINTF_HC
 #define _PRINTF_HC
-// _printf.hc — the private core of the printf family (`Print`/`StrPrint`/
-// `CatPrint`/`MStrPrint`, declared in `<fmt.hc>`). `_VFmt` walks the format string,
-// pulls the variadic slots, and renders each conversion into a sink (a fd via
-// `StdWrite`, or a buffer). Integers and strings are laid out here, mirroring
-// `crate::fmt::{parse, render_int, render_str}` byte-for-byte; floats delegate to
-// `_FmtFloat`. The interpreter renders the printf family via `crate::fmt` (its
-// independent conformance oracle) and never runs this, so the two cross-check.
+// printf.hc — the private core of the printf family (`Print`/`StrPrint`/
+// `CatPrint`/`MStrPrint`, declared in `<fmt.hc>`).
+//
+// `VFmt` walks the format string, pulls the variadic slots, and renders each
+// conversion into a sink (a fd via `StdWrite`, or a buffer). Integers and strings are
+// laid out here, mirroring `crate::fmt::{parse, render_int, render_str}` byte-for-byte;
+// floats delegate to `FmtFloat`. The interpreter renders the printf family via
+// `crate::fmt`, its independent conformance oracle, and never runs this, so the two
+// cross-check.
 //
 // Private (the `_`-prefixed filename): user code prints via `Print` / `"%f", …`,
 // never by calling these directly.
 
-#include <stdio.hc>         // StdWrite (the fd sink) — NOT <io.hc>, to avoid compiling
-                            // its file helpers (gated on unsupported targets) into every
-                            // printing program (there is no dead-code elimination)
+#include <io.hc>            // StdWrite (the fd sink)
 #include <mem.hc>           // ReAlloc (MStrPrint growth)
 #include <cstr.hc>          // StrLen
-#include <_fltfmt.hc>  // _FmtFloat + the _FLT_* flag bits
+#include <fltfmt.hc>  // FmtFloat + the _FLT_* flag bits
 
 // Width/precision caps matching `crate::fmt::{MAX_WIDTH, MAX_PRECISION}`.
 #define _PF_MAX_WIDTH 1024
 #define _PF_MAX_PREC  512
 
-// A formatted-output sink: a fd (when `dst` is NULL) or a buffer at `dst`, with `len`
-// the bytes emitted so far (and the write cursor). `grow` ⇒ `ReAlloc` `dst` when a
-// write would overflow `cap` (the `MStrPrint` growing buffer).
-class _Pf { U8 *dst; I64 fd; I64 len; I64 cap; I64 grow; }
+// A formatted-output sink: a fd (when `dst` is NULL) or a buffer at `dst`. `len` is
+// the bytes emitted so far, and also the write cursor. When `grow` is set, a write
+// that would overflow `cap` triggers a `ReAlloc` of `dst` (the `MStrPrint` growing
+// buffer).
+class Pf { U8 *dst; I64 fd; I64 len; I64 cap; I64 grow; }
 
 // Append `n` bytes to the sink.
-U0 _PfPut(_Pf *p, U8 *buf, I64 n)
+U0 PfPut(Pf *p, U8 *buf, I64 n)
 {
   if (n <= 0) return;
   if (!p->dst) { StdWrite(p->fd, buf, n); p->len += n; return; }
@@ -45,7 +46,7 @@ U0 _PfPut(_Pf *p, U8 *buf, I64 n)
 
 // Append `n` copies of byte `c` (field padding), batched so the fd sink isn't a
 // syscall per byte.
-U0 _PfFill(_Pf *p, I64 c, I64 n)
+U0 PfFill(Pf *p, I64 c, I64 n)
 {
   U8 buf[64];
   I64 i;
@@ -53,25 +54,25 @@ U0 _PfFill(_Pf *p, I64 c, I64 n)
   while (n > 0) {
     I64 k = n;
     if (k > 64) k = 64;
-    _PfPut(p, buf, k);
+    PfPut(p, buf, k);
     n -= k;
   }
 }
 
-// `_IFld`/`_PfStrField` flag bits.
+// `IFld`/`PfStrField` flag bits.
 #define _PF_MINUS 1
 #define _PF_ZERO  2
 
-// The layout parameters of an integer field, bundled into one struct so `_PfIntField`
+// The layout parameters of an integer field, bundled into one struct so `PfIntField`
 // stays within the x86-64 backend's 6-integer-parameter ABI limit. `sign` is one of
-// "","-","+"," "; `alt` an alternate-form prefix ("","0x","0X"); `width`<0 ⇒ none;
-// `prec`<0 ⇒ none; `flags` packs `_PF_MINUS`/`_PF_ZERO`.
-class _IFld { U8 *sign; U8 *alt; I64 width; I64 prec; I64 flags; }
+// "","-","+"," ". `alt` is an alternate-form prefix ("","0x","0X"). `width`<0 means
+// none, and `prec`<0 means none. `flags` packs `_PF_MINUS`/`_PF_ZERO`.
+class IFld { U8 *sign; U8 *alt; I64 width; I64 prec; I64 flags; }
 
 // Lay out an integer field (mirrors `crate::fmt::render_int`). `dig`/`ndig` are the
 // magnitude digits, MSB-first (`ndig >= 1`, "0" for zero). With a precision the zero
 // flag is ignored, and "0" at precision 0 yields no digits.
-U0 _PfIntField(_Pf *p, U8 *dig, I64 ndig, _IFld *f)
+U0 PfIntField(Pf *p, U8 *dig, I64 ndig, IFld *f)
 {
   I64 minus = f->flags & _PF_MINUS, zero = f->flags & _PF_ZERO;
   I64 prec = f->prec;
@@ -88,34 +89,34 @@ U0 _PfIntField(_Pf *p, U8 *dig, I64 ndig, _IFld *f)
   I64 pad = w - body;
 
   if (pad > 0 && !minus && !(zero && prec < 0))
-    _PfFill(p, ' ', pad);          // right-justified space pad goes first
-  _PfPut(p, f->sign, slen);
-  _PfPut(p, f->alt, alen);
+    PfFill(p, ' ', pad);          // right-justified space pad goes first
+  PfPut(p, f->sign, slen);
+  PfPut(p, f->alt, alen);
   if (pad > 0 && !minus && zero && prec < 0)
-    _PfFill(p, '0', pad);          // zero pad after the sign/prefix
-  _PfFill(p, '0', lead);           // precision leading zeros
-  if (base > 0) _PfPut(p, dig, ndig);
+    PfFill(p, '0', pad);          // zero pad after the sign/prefix
+  PfFill(p, '0', lead);           // precision leading zeros
+  if (base > 0) PfPut(p, dig, ndig);
   if (pad > 0 && minus)
-    _PfFill(p, ' ', pad);          // left-justified: trailing spaces
+    PfFill(p, ' ', pad);          // left-justified: trailing spaces
 }
 
 // Lay out a string/char field (mirrors `crate::fmt::render_str`): truncate `body` to
 // `prec` bytes (prec<0 ⇒ none), then pad to `width` (left-justified with `minus`).
-U0 _PfStrField(_Pf *p, U8 *body, I64 blen, I64 width, I64 prec, I64 minus)
+U0 PfStrField(Pf *p, U8 *body, I64 blen, I64 width, I64 prec, I64 minus)
 {
   I64 len = blen;
   if (prec >= 0 && prec < len) len = prec;
   I64 w = 0;
   if (width > 0) w = width;
   I64 pad = w - len;
-  if (pad > 0 && !minus) _PfFill(p, ' ', pad);
-  _PfPut(p, body, len);
-  if (pad > 0 && minus) _PfFill(p, ' ', pad);
+  if (pad > 0 && !minus) PfFill(p, ' ', pad);
+  PfPut(p, body, len);
+  if (pad > 0 && minus) PfFill(p, ' ', pad);
 }
 
-// The magnitude of `n` (the I64 absolute value, wrapping so I64.MIN works) as an
-// unsigned value.
-U64 _PfMag(I64 n)
+// The magnitude of `n` as an unsigned value (the I64 absolute value, wrapping so
+// I64.MIN works).
+U64 PfMag(I64 n)
 {
   if (n < 0) return -(U64)n;
   return n;
@@ -123,7 +124,7 @@ U64 _PfMag(I64 n)
 
 // Write the digits of `u` in `base` (MSB-first) into `dig`, returning the count.
 // `upper` selects A–F vs a–f for hex.
-I64 _PfDigits(U64 u, I64 base, I64 upper, U8 *dig)
+I64 PfDigits(U64 u, I64 base, I64 upper, U8 *dig)
 {
   U8 tmp[24];
   I64 nd = 0;
@@ -143,14 +144,14 @@ I64 _PfDigits(U64 u, I64 base, I64 upper, U8 *dig)
 // Render `fmt` with the variadic slots `vargv[0..vargc)` into the sink `p`. Each slot
 // is a raw 8-byte value: an I64 for integer/char conversions, the bit pattern of an
 // F64 for `%f`/`%e`/`%g`, a `U8 *` for `%s`. `*` width/precision consume a slot.
-U0 _VFmt(_Pf *p, U8 *fmt, I64 *vargv, I64 vargc)
+U0 VFmt(Pf *p, U8 *fmt, I64 *vargv, I64 vargc)
 {
   I64 ai = 0, i = 0;
   while (fmt[i]) {
     if (fmt[i] != '%') {
       I64 run = i;
       while (fmt[i] && fmt[i] != '%') i++;
-      _PfPut(p, fmt + run, i - run);
+      PfPut(p, fmt + run, i - run);
       continue;
     }
     i++; // past '%'
@@ -198,11 +199,11 @@ U0 _VFmt(_Pf *p, U8 *fmt, I64 *vargv, I64 vargc)
     if (width > _PF_MAX_WIDTH) width = _PF_MAX_WIDTH;
     if (prec > _PF_MAX_PREC) prec = _PF_MAX_PREC;
 
-    if (conv == '%') { _PfFill(p, '%', 1); continue; }
+    if (conv == '%') { PfFill(p, '%', 1); continue; }
 
     // ---- dispatch ----
     // Shared integer-field layout params (sign/alt overridden per conversion).
-    _IFld fld;
+    IFld fld;
     fld.sign = "";
     fld.alt = "";
     fld.width = width;
@@ -215,26 +216,26 @@ U0 _VFmt(_Pf *p, U8 *fmt, I64 *vargv, I64 vargc)
       else if (plus) fld.sign = "+";
       else if (space) fld.sign = " ";
       U8 dig[24];
-      I64 nd = _PfDigits(_PfMag(n), 10, 0, dig);
-      _PfIntField(p, dig, nd, &fld);
+      I64 nd = PfDigits(PfMag(n), 10, 0, dig);
+      PfIntField(p, dig, nd, &fld);
     } else if (conv == 'u') {
       U64 u = 0;
       if (ai < vargc) u = vargv[ai++];
       U8 dig[24];
-      I64 nd = _PfDigits(u, 10, 0, dig);
-      _PfIntField(p, dig, nd, &fld);
+      I64 nd = PfDigits(u, 10, 0, dig);
+      PfIntField(p, dig, nd, &fld);
     } else if (conv == 'x' || conv == 'X') {
       U64 u = 0;
       if (ai < vargc) u = vargv[ai++];
       U8 dig[24];
-      I64 nd = _PfDigits(u, 16, conv == 'X', dig);
+      I64 nd = PfDigits(u, 16, conv == 'X', dig);
       if (hash && u != 0) fld.alt = (conv == 'x') ? "0x" : "0X";
-      _PfIntField(p, dig, nd, &fld);
+      PfIntField(p, dig, nd, &fld);
     } else if (conv == 'o') {
       U64 u = 0;
       if (ai < vargc) u = vargv[ai++];
       U8 dig[26];
-      I64 nd = _PfDigits(u, 8, 0, dig);
+      I64 nd = PfDigits(u, 8, 0, dig);
       if (hash) {
         if (dig[0] != '0') { // prepend a leading 0 (shift right by one)
           I64 k;
@@ -244,16 +245,16 @@ U0 _VFmt(_Pf *p, U8 *fmt, I64 *vargv, I64 vargc)
         }
         if (fld.prec == 0 && nd == 1 && dig[0] == '0') fld.prec = 1; // keep the 0
       }
-      _PfIntField(p, dig, nd, &fld);
+      PfIntField(p, dig, nd, &fld);
     } else if (conv == 'c') {
       U8 ch = 0;
       if (ai < vargc) ch = vargv[ai++];
-      _PfStrField(p, &ch, 1, width, -1, minus); // %c ignores precision
+      PfStrField(p, &ch, 1, width, -1, minus); // %c ignores precision
     } else if (conv == 's') {
       U8 *str = "(null)";
       if (ai < vargc) { str = *(U8 **)(&vargv[ai]); ai++; }
       if (!str) str = "(null)";
-      _PfStrField(p, str, StrLen(str), width, prec, minus);
+      PfStrField(p, str, StrLen(str), width, prec, minus);
     } else if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G') {
       F64 v = 0.0;
       if (ai < vargc) { v = *(F64 *)(&vargv[ai]); ai++; }
@@ -265,8 +266,8 @@ U0 _VFmt(_Pf *p, U8 *fmt, I64 *vargv, I64 vargc)
       if (hash) flags |= _FLT_HASH;
       I64 fp = (prec >= 0) ? prec : 6; // float default precision is 6
       U8 fbuf[2400];
-      I64 flen = _FmtFloat(fbuf, v, conv, flags, width < 0 ? 0 : width, fp);
-      _PfPut(p, fbuf, flen);
+      I64 flen = FmtFloat(fbuf, v, conv, flags, width < 0 ? 0 : width, fp);
+      PfPut(p, fbuf, flen);
     }
     // an unknown conversion is silently dropped (matches a no-op spec)
   }

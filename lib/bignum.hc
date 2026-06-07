@@ -1,23 +1,24 @@
 #ifndef _BIGNUM_HC
 #define _BIGNUM_HC
-// bignum.hc — `Bn`, a minimal arbitrary-precision **nonnegative** integer.
+// bignum.hc — `Bn`, a minimal arbitrary-precision nonnegative integer.
 //
-// Little-endian base-2^32 limbs: `d[i] < 2^32`, `n` active limbs, and `d[i] == 0`
-// for every `i >= n` (the invariant every operation preserves). The fixed `d[72]`
-// holds ~2300 bits — enough for the full normal-double range, which is what
-// `<strconv.hc>`'s correctly-rounded `atof` needs. It is deliberately small: just
-// the operations that decimal→binary conversion requires — build from digits
-// (`BnMulAddSmall`), scale by powers of two (`BnShlBitsTo`/`BnShl1`), compare, and
-// subtract. No division (the parser extracts a quotient by shift/compare/subtract)
-// and no general multiply.
+// The representation is little-endian base-2^32 limbs: `d[i] < 2^32`, `n` active
+// limbs, and `d[i] == 0` for every `i >= n`. Every operation preserves that
+// invariant. The fixed `d[72]` holds ~2300 bits, enough for the full normal-double
+// range, which is what `<cstr.hc>`'s correctly-rounded `StrToF64` (`atof`) needs.
 //
-// `Bn` values are caller-owned locals (zero-initialised, so a fresh `Bn` is 0);
-// methods take `Bn *`.
+// The type is deliberately small: it provides only the operations that decimal→binary
+// conversion requires. Those are build from digits (`BnMulAddSmall`), scale by powers
+// of two (`BnShlBitsTo`/`BnShl1`), compare, and subtract. There is no division (the
+// parser extracts a quotient by shift/compare/subtract) and no general multiply.
+//
+// `Bn` values are caller-owned locals; they are zero-initialised, so a fresh `Bn` is
+// 0. Methods take `Bn *`.
 
-class Bn { I64 n; I64 d[72]; }
+public class Bn { I64 n; I64 d[72]; }
 
 // b = v (a 64-bit value, treated as unsigned bits).
-U0 BnSetU64(Bn *b, I64 v)
+public U0 BnSetU64(Bn *b, I64 v)
 {
   I64 i;
   for (i = 0; i < 72; i++) b->d[i] = 0;
@@ -28,10 +29,10 @@ U0 BnSetU64(Bn *b, I64 v)
   else if (b->d[0]) b->n = 1;
 }
 
-I64 BnIsZero(Bn *b) { return b->n == 0; }
+public I64 BnIsZero(Bn *b) { return b->n == 0; }
 
 // b = b*m + add, with small 0 <= m, add < 2^32 (so each limb product fits in I64).
-U0 BnMulAddSmall(Bn *b, I64 m, I64 add)
+public U0 BnMulAddSmall(Bn *b, I64 m, I64 add)
 {
   I64 carry = add, i = 0;
   while (i < b->n || carry) {
@@ -43,7 +44,7 @@ U0 BnMulAddSmall(Bn *b, I64 m, I64 add)
   b->n = i;
 }
 
-U0 BnCopy(Bn *dst, Bn *src)
+public U0 BnCopy(Bn *dst, Bn *src)
 {
   I64 i;
   for (i = 0; i < 72; i++) dst->d[i] = src->d[i];
@@ -51,7 +52,7 @@ U0 BnCopy(Bn *dst, Bn *src)
 }
 
 // dst = src << bits (bits >= 0). Writes every limb, so `dst` needs no pre-clear.
-U0 BnShlBitsTo(Bn *dst, Bn *src, I64 bits)
+public U0 BnShlBitsTo(Bn *dst, Bn *src, I64 bits)
 {
   I64 limbs = bits / 32, sh = bits % 32, carry = 0, i;
   for (i = 0; i < 72; i++) dst->d[i] = 0;
@@ -71,7 +72,7 @@ U0 BnShlBitsTo(Bn *dst, Bn *src, I64 bits)
 }
 
 // b *= 2, in place.
-U0 BnShl1(Bn *b)
+public U0 BnShl1(Bn *b)
 {
   I64 carry = 0, i;
   for (i = 0; i < b->n; i++) {
@@ -83,7 +84,7 @@ U0 BnShl1(Bn *b)
 }
 
 // Compare: -1 if a<b, 0 if a==b, 1 if a>b.
-I64 BnCmp(Bn *a, Bn *b)
+public I64 BnCmp(Bn *a, Bn *b)
 {
   if (a->n != b->n) { if (a->n > b->n) return 1; return -1; }
   I64 i;
@@ -93,7 +94,7 @@ I64 BnCmp(Bn *a, Bn *b)
 }
 
 // a -= b, in place. Requires a >= b.
-U0 BnSub(Bn *a, Bn *b)
+public U0 BnSub(Bn *a, Bn *b)
 {
   I64 borrow = 0, i;
   for (i = 0; i < a->n; i++) {

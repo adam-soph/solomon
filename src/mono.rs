@@ -1,7 +1,9 @@
-//! Monomorphization — the **`mono` pass**. It resolves the generic constructs the
-//! parser defers, turning them into ordinary concrete AST, *after* parsing and
-//! *before* sema/layout/codegen. The parser emits four deferred node kinds and
-//! never instantiates anything itself:
+//! The `mono` pass: monomorphization. It runs after parsing and before
+//! sema/layout/codegen, resolving the generic constructs the parser defers into
+//! ordinary concrete AST.
+//!
+//! The parser never instantiates anything itself. Instead it emits four deferred
+//! node kinds:
 //!
 //! * `Type::Generic(name, args)` — a generic-class use (`Vec<I64>`),
 //! * `Type::Tuple(elems)` — a tuple type (`(I64, F64)`),
@@ -9,25 +11,27 @@
 //!   (explicit `Id<I64>(x)` or inferred `Id(x)`),
 //! * `StmtKind::ShortDecl { names, rhs }` — a `:=` short declaration / unpack.
 //!
-//! This pass owns the whole monomorphization worklist *and* a real, scoped,
-//! recursive typer ([`Mono::type_expr`]) over the already-parsed program. Because
-//! it runs after the full parse it sees forward declarations, ternaries,
-//! function-pointer results, and inherited (base-class) fields — closing the gaps
-//! of the old parse-time, "seen so far" inference (`arg_type`).
+//! This pass owns the monomorphization worklist. It also includes a full scoped,
+//! recursive typer ([`Mono::type_expr`]) over the already-parsed program. Running
+//! after the full parse means it sees forward declarations, ternaries,
+//! function-pointer results, and inherited (base-class) fields. That closes the
+//! gaps of the old parse-time `arg_type` inference, which could only see types
+//! declared so far.
 //!
-//! Synthetic definitions it generates (instantiated classes/functions, interned
-//! tuple structs, unpack temporaries) are stamped with `file: 0` spans — the
-//! public program root — so `_`-directory privacy never rejects a monomorphized
-//! instance of a public template.
+//! The synthetic definitions it generates — instantiated classes/functions,
+//! interned tuple structs, unpack temporaries — are stamped with the
+//! `GENERATED_FILE` sentinel span. Sema treats references originating from generated
+//! code as trusted, so file-scoped visibility never rejects a monomorphized instance
+//! (e.g. `Vec<Pt>` over a user's non-`public` `Pt`).
 
 use crate::ast::*;
 use crate::parser::{mangle_generic, tuple_type_name};
 use crate::token::{Pos, Span};
 use std::collections::{HashMap, HashSet};
 
-/// An error raised while monomorphizing (an un-inferable type argument, a generic
-/// arity mismatch, a non-inferable `:=`). Mirrors `ParseError`'s shape so the CLIs
-/// can report it the same way.
+/// An error raised while monomorphizing: an un-inferable type argument, a generic
+/// arity mismatch, or a non-inferable `:=`. Its shape mirrors `ParseError` so the
+/// CLIs can report it the same way.
 #[derive(Debug, Clone)]
 pub struct MonoError {
     pub message: String,
@@ -36,9 +40,48 @@ pub struct MonoError {
 
 type MResult<T> = Result<T, MonoError>;
 
+/// A bound generic parameter during instantiation: a concrete type (for a `type`/
+/// `comparable` parameter) or an integer (for an `int` value parameter).
+#[derive(Clone, Debug)]
+enum Bind {
+    Type(Type),
+    Value(i64),
+}
+
+/// Build the substitution environment for one instantiation from a template's
+/// parameters and its (already-normalized) arguments. Value args have been
+/// const-evaluated to `Int` literals by resolution time, so this just reads them.
+fn binds_of(params: &[GenericParam], args: &[GenericArg]) -> HashMap<String, Bind> {
+    params
+        .iter()
+        .zip(args.iter())
+        .filter_map(|(p, a)| match (p, a) {
+            (GenericParam::Type(n, _), GenericArg::Type(t)) => {
+                Some((n.clone(), Bind::Type(t.clone())))
+            }
+            (GenericParam::Value(n), GenericArg::Value(e)) => match e.kind {
+                ExprKind::Int(v) => Some((n.clone(), Bind::Value(v))),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// A readable type name for diagnostics (e.g. the `comparable` constraint error).
+fn type_name(t: &Type) -> String {
+    match t {
+        Type::Named(n) => n.clone(),
+        Type::Ptr(inner) => format!("{} *", type_name(inner)),
+        Type::Array(inner, _) => format!("{}[]", type_name(inner)),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Expand every deferred generic construct in `program`, returning a fully concrete
-/// program — no `Type::Generic`/`Type::Tuple`/`GenericCall`/`ShortDecl` remain, so
-/// sema, layout, the interpreter, and the backends only ever see ordinary AST.
+/// program. No `Type::Generic`, `Type::Tuple`, `GenericCall`, or `ShortDecl`
+/// remains, so sema, layout, the interpreter, and the backends only ever see
+/// ordinary AST.
 pub fn expand(mut program: Program) -> MResult<Program> {
     let templates = std::mem::take(&mut program.generics);
     let mut m = Mono::new(templates);
@@ -49,9 +92,13 @@ pub fn expand(mut program: Program) -> MResult<Program> {
     Ok(program)
 }
 
-/// A synthetic span for generated definitions: the public program root (`file: 0`).
+/// A synthetic span for generated definitions, stamped with the `GENERATED_FILE`
+/// sentinel so sema treats references originating from monomorphized code as trusted
+/// (always visible).
 fn syn_span() -> Span {
-    Span::dummy()
+    let mut s = Span::dummy();
+    s.file = crate::token::GENERATED_FILE;
+    s
 }
 
 struct Mono {
@@ -59,26 +106,26 @@ struct Mono {
     classes: HashMap<String, GenericClass>,
     /// Generic function templates, by name.
     fns: HashMap<String, GenericFn>,
-    /// Mangled names of class instances already generated (dedup).
+    /// Mangled names of class instances already generated. Deduplicates instantiation.
     class_done: HashSet<String>,
-    /// Mangled names of function instances already generated (dedup).
+    /// Mangled names of function instances already generated. Deduplicates instantiation.
     fn_done: HashSet<String>,
-    /// Class-instance mangled name → `(template, type-args)`, so a `Vec<T>` parameter
-    /// can be unified against a `Vec_I64` argument to bind `T`.
-    instances: HashMap<String, (String, Vec<Type>)>,
+    /// Class-instance mangled name -> `(template, args)`. Lets a `Vec<T>`
+    /// parameter unify against a `Vec_I64` argument to bind `T`.
+    instances: HashMap<String, (String, Vec<GenericArg>)>,
     /// Concrete class/union/tuple field types, by type name, for the typer.
     class_fields: HashMap<String, Vec<(String, Type)>>,
-    /// Each concrete class/union's base (for inherited-field lookup in the typer).
+    /// Each concrete class/union's base class, for inherited-field lookup in the typer.
     class_bases: HashMap<String, Option<String>>,
     /// Concrete function/instance return types, for the typer.
     fn_rets: HashMap<String, Type>,
-    /// Canonical names of tuple structs already interned (dedup).
+    /// Canonical names of tuple structs already interned. Deduplicates interning.
     tuple_types: HashSet<String>,
-    /// Pending class instantiations `(template, type-args)`.
-    pending_classes: Vec<(String, Vec<Type>)>,
-    /// Pending function instantiations `(template, type-args)`.
-    pending_fns: Vec<(String, Vec<Type>)>,
-    /// Generated concrete definitions (instances + interned tuples), appended to the
+    /// Pending class instantiations `(template, args)`.
+    pending_classes: Vec<(String, Vec<GenericArg>)>,
+    /// Pending function instantiations `(template, args)`.
+    pending_fns: Vec<(String, Vec<GenericArg>)>,
+    /// Generated concrete definitions: instances and interned tuples. Appended to the
     /// program's items at the end.
     generated: Vec<Stmt>,
     /// Lexical scope stack of variable types, for the typer (innermost last).
@@ -115,8 +162,9 @@ impl Mono {
     /// worklists to a fixpoint.
     fn run(&mut self, items: &mut [Stmt]) -> MResult<()> {
         self.scopes.push(HashMap::new()); // global scope
-        // Pass 1: resolve all top-level signatures (function ret/params, class fields)
-        // and record them, so forward references resolve during body resolution.
+        // Pass 1: resolve and record all top-level signatures (function return type
+        // and params, class fields). This lets forward references resolve when
+        // bodies are processed in pass 2.
         for it in items.iter_mut() {
             self.resolve_sig(it)?;
         }
@@ -156,8 +204,8 @@ impl Mono {
         Ok(())
     }
 
-    /// Resolve a top-level item's body / executable part. Functions get their own
-    /// scope (parameters); everything else is an ordinary top-level statement.
+    /// Resolve a top-level item's body or executable part. A function gets its own
+    /// scope for its parameters; everything else is an ordinary top-level statement.
     fn resolve_top(&mut self, s: &mut Stmt) -> MResult<()> {
         match &mut s.kind {
             StmtKind::Func(f) => {
@@ -167,7 +215,7 @@ impl Mono {
                         self.scope_insert(pname.clone(), p.ty.clone());
                     }
                 }
-                // Resolve any parameter default expressions (in the function scope).
+                // Resolve any parameter default expressions, in the function scope.
                 let pos = s.span.pos;
                 for p in &mut f.params {
                     if let Some(d) = &mut p.default {
@@ -183,7 +231,7 @@ impl Mono {
                 self.scopes.pop();
                 Ok(())
             }
-            StmtKind::Class(_) => Ok(()), // fields already resolved in the sig pass
+            StmtKind::Class(_) => Ok(()), // fields already resolved in resolve_sig
             _ => self.resolve_stmt(s),
         }
     }
@@ -288,9 +336,71 @@ impl Mono {
                 }
                 Ok(())
             }
-            // A nested function/class definition isn't supported (sema and the backends
-            // reject it), but `mono` still resolves it so the rejection is theirs to
-            // make — it isn't `mono`'s place to gate it.
+            // A compile-time type switch: resolve the scrutinee's type, keep the
+            // matching arm (or `default`), and drop the rest. The unselected arms are
+            // never resolved or sema-checked.
+            StmtKind::TypeSwitch { .. } => {
+                let (on, arms, default) = match std::mem::replace(&mut s.kind, StmtKind::Empty) {
+                    StmtKind::TypeSwitch { on, arms, default } => (on, arms, default),
+                    _ => unreachable!(),
+                };
+                let pos = s.span.pos;
+                let scrut = match on {
+                    TypeSwitchOn::Ty(t) => self.resolve_type(&t, pos)?,
+                    TypeSwitchOn::Val(e) => {
+                        let mut ex = *e;
+                        self.resolve_expr(&mut ex)?;
+                        match self.type_expr(&ex) {
+                            Some(t) => self.resolve_type(&t, pos)?,
+                            None => {
+                                return self.err(
+                                    pos,
+                                    "type switch: cannot determine the type of the scrutinee",
+                                );
+                            }
+                        }
+                    }
+                };
+                let mut chosen: Option<Vec<Stmt>> = None;
+                for (casety, body) in arms {
+                    if self.resolve_type(&casety, pos)? == scrut {
+                        chosen = Some(body);
+                        break;
+                    }
+                }
+                match chosen.or(default) {
+                    // Re-run as a block so the chosen arm gets its own scope and its
+                    // statements are resolved normally.
+                    Some(body) => {
+                        s.kind = StmtKind::Block(body);
+                        self.resolve_stmt(s)?;
+                    }
+                    None => s.kind = StmtKind::Empty,
+                }
+                Ok(())
+            }
+            StmtKind::Try { body, handler } => {
+                self.scopes.push(HashMap::new());
+                for st in body.iter_mut() {
+                    self.resolve_stmt(st)?;
+                }
+                self.scopes.pop();
+                self.scopes.push(HashMap::new());
+                for st in handler.iter_mut() {
+                    self.resolve_stmt(st)?;
+                }
+                self.scopes.pop();
+                Ok(())
+            }
+            StmtKind::Throw(e) => {
+                if let Some(e) = e {
+                    self.resolve_expr(e)?;
+                }
+                Ok(())
+            }
+            // Nested function/class definitions aren't supported; sema and the
+            // backends reject them. `mono` still resolves them rather than gating
+            // them here, leaving the rejection to those later passes.
             StmtKind::Func(_) | StmtKind::Class(_) => {
                 self.resolve_sig(s)?;
                 self.resolve_top(s)
@@ -340,24 +450,34 @@ impl Mono {
                         } => (name, type_args, args),
                         _ => unreachable!(),
                     };
-                // Resolve the explicit type arguments and the value arguments first.
-                let mut targs = Vec::with_capacity(type_args.len());
-                for t in &type_args {
-                    targs.push(self.resolve_type(t, pos)?);
-                }
+                // Resolve the value arguments first (they may contain nested generics).
                 for a in args.iter_mut() {
                     self.resolve_expr(a)?;
                 }
-                // Infer the type arguments from the (resolved) argument types if none
-                // were given.
-                let targs = if targs.is_empty() {
+                let params = match self.fns.get(&name) {
+                    Some(f) => f.params.clone(),
+                    None => return self.err(pos, format!("`{name}` is not a generic function")),
+                };
+                // With explicit `<...>` args, resolve them per the parameter kinds.
+                // Otherwise infer the type parameters from the argument types — but a
+                // value (`int`) parameter can't be inferred, so it must be explicit.
+                let cargs = if type_args.is_empty() {
+                    if params.iter().any(|p| matches!(p, GenericParam::Value(_))) {
+                        return self.err(
+                            pos,
+                            format!(
+                                "generic function `{name}` has value parameter(s); \
+                                 call it explicitly as `{name}<...>(...)`"
+                            ),
+                        );
+                    }
                     self.infer(&name, &args, pos)?
                 } else {
-                    targs
+                    self.resolve_args(&name, &params, &type_args, pos)?
                 };
-                let mangled = mangle_generic(&name, &targs);
-                self.record_instance_ret(&name, &targs, &mangled, pos)?;
-                self.pending_fns.push((name, targs));
+                let mangled = mangle_generic(&name, &cargs);
+                self.record_instance_ret(&name, &cargs, &mangled, pos)?;
+                self.pending_fns.push((name, cargs));
                 e.kind = ExprKind::Call {
                     callee: Box::new(Expr::new(ExprKind::Ident(mangled), e.span)),
                     args,
@@ -393,16 +513,17 @@ impl Mono {
         }
     }
 
-    /// Resolve a type: a `Type::Generic` instantiates its class (queuing it) and
-    /// becomes the mangled `Named`; a `Type::Tuple` interns its struct; pointer/array/
-    /// function-pointer wrappers recurse.
+    /// Resolve a type. A `Type::Generic` instantiates its class — queuing it — and
+    /// becomes the mangled `Named`. A `Type::Tuple` interns its struct. Pointer,
+    /// array, and function-pointer wrappers recurse into their inner types.
     fn resolve_type(&mut self, ty: &Type, pos: Pos) -> MResult<Type> {
         Ok(match ty {
             Type::Generic(name, args) => {
-                let cargs = args
-                    .iter()
-                    .map(|a| self.resolve_type(a, pos))
-                    .collect::<MResult<Vec<_>>>()?;
+                let params = match self.classes.get(name) {
+                    Some(c) => c.params.clone(),
+                    None => return self.err(pos, format!("`{name}` is not a generic type")),
+                };
+                let cargs = self.resolve_args(name, &params, args, pos)?;
                 self.instantiate_class_ref(name, cargs, pos)?
             }
             Type::Tuple(elems) => {
@@ -433,26 +554,96 @@ impl Mono {
         })
     }
 
-    /// Record a class instantiation request (deduped), returning its mangled `Named`
-    /// type. The concrete definition is generated later, in `drain`.
-    fn instantiate_class_ref(&mut self, name: &str, args: Vec<Type>, pos: Pos) -> MResult<Type> {
-        let nparams = self
-            .classes
-            .get(name)
-            .map(|t| t.params.len())
-            .ok_or_else(|| MonoError {
-                message: format!("`{name}` is not a generic type"),
-                pos,
-            })?;
-        if args.len() != nparams {
+    /// Resolve a generic argument list against a template's parameter kinds: each
+    /// position parses a type or a value, matching the parameter. Type args are
+    /// resolved (instantiating any nested generics) and `comparable` constraints are
+    /// enforced; value args are const-evaluated to an `Int` literal.
+    fn resolve_args(
+        &mut self,
+        name: &str,
+        params: &[GenericParam],
+        args: &[GenericArg],
+        pos: Pos,
+    ) -> MResult<Vec<GenericArg>> {
+        if args.len() != params.len() {
             return self.err(
                 pos,
                 format!(
-                    "generic `{name}` expects {nparams} type argument(s), got {}",
+                    "generic `{name}` expects {} argument(s), got {}",
+                    params.len(),
                     args.len()
                 ),
             );
         }
+        let mut out = Vec::with_capacity(args.len());
+        for (p, a) in params.iter().zip(args.iter()) {
+            out.push(self.resolve_arg(name, p, a, pos)?);
+        }
+        Ok(out)
+    }
+
+    /// Resolve one generic argument against its parameter. Reports a clear error on a
+    /// kind mismatch (a value where a type is expected, or vice versa) or an unmet
+    /// `comparable` constraint.
+    fn resolve_arg(
+        &mut self,
+        gen_name: &str,
+        param: &GenericParam,
+        arg: &GenericArg,
+        pos: Pos,
+    ) -> MResult<GenericArg> {
+        match (param, arg) {
+            (GenericParam::Type(_, constraint), GenericArg::Type(t)) => {
+                let rt = self.resolve_type(t, pos)?;
+                if *constraint == Some(Constraint::Comparable) && !crate::sema::is_scalar(&rt) {
+                    return self.err(
+                        pos,
+                        format!(
+                            "type argument `{}` for parameter `{}` of `{gen_name}` is not \
+                             comparable (needs a scalar or pointer type)",
+                            type_name(&rt),
+                            param.name()
+                        ),
+                    );
+                }
+                Ok(GenericArg::Type(rt))
+            }
+            (GenericParam::Value(_), GenericArg::Value(e)) => {
+                let v = crate::layout::const_eval(e).map_err(|le| MonoError {
+                    message: le.message,
+                    pos: le.pos,
+                })?;
+                Ok(GenericArg::Value(Box::new(Expr::new(
+                    ExprKind::Int(v),
+                    syn_span(),
+                ))))
+            }
+            (GenericParam::Type(..), GenericArg::Value(_)) => self.err(
+                pos,
+                format!(
+                    "parameter `{}` of `{gen_name}` expects a type, not a value",
+                    param.name()
+                ),
+            ),
+            (GenericParam::Value(_), GenericArg::Type(_)) => self.err(
+                pos,
+                format!(
+                    "parameter `{}` of `{gen_name}` expects a value, not a type",
+                    param.name()
+                ),
+            ),
+        }
+    }
+
+    /// Record a class instantiation request, deduped, and return its mangled `Named`
+    /// type. The arguments are already resolved/validated. The concrete definition is
+    /// generated later, in [`Mono::drain`].
+    fn instantiate_class_ref(
+        &mut self,
+        name: &str,
+        args: Vec<GenericArg>,
+        _pos: Pos,
+    ) -> MResult<Type> {
         let mangled = mangle_generic(name, &args);
         self.instances
             .insert(mangled.clone(), (name.to_string(), args.clone()));
@@ -462,8 +653,8 @@ impl Mono {
         Ok(Type::Named(mangled))
     }
 
-    /// Intern the canonical tuple struct for `elems`, generating the synthetic
-    /// `class $Tup…` once, and return its type name.
+    /// Intern the canonical tuple struct for `elems` and return its type name. The
+    /// synthetic `class $Tup…` is generated only on the first request.
     fn intern_tuple(&mut self, elems: &[Type]) -> String {
         let name = tuple_type_name(elems);
         if self.tuple_types.insert(name.clone()) {
@@ -481,6 +672,7 @@ impl Mono {
                     ty: t,
                     init: None,
                     span: syn_span(),
+                    is_public: false,
                 })
                 .collect();
             self.generated.push(Stmt::new(
@@ -489,6 +681,8 @@ impl Mono {
                     name: name.clone(),
                     base: None,
                     fields,
+                    // Synthetic tuple aggregate: never privacy-gated.
+                    is_public: true,
                 }),
                 syn_span(),
             ));
@@ -498,9 +692,9 @@ impl Mono {
 
     // ---- instantiation (parameter substitution + resolution) ----
 
-    /// Drain the instantiation worklists to a fixpoint. Generating one instance may
-    /// request more of either (a body's nested generic use/call), so loop until both
-    /// queues empty.
+    /// Drain the instantiation worklists to a fixpoint. Generating one instance can
+    /// request more class or function instances, since a body may use or call other
+    /// generics. The loop runs until both queues are empty.
     fn drain(&mut self) -> MResult<()> {
         let mut guard = 0usize;
         loop {
@@ -525,14 +719,9 @@ impl Mono {
         Ok(())
     }
 
-    fn instantiate_class(&mut self, name: &str, args: &[Type]) -> MResult<Stmt> {
+    fn instantiate_class(&mut self, name: &str, args: &[GenericArg]) -> MResult<Stmt> {
         let tmpl = self.classes.get(name).expect("generic class").clone();
-        let binds: HashMap<String, Type> = tmpl
-            .params
-            .iter()
-            .cloned()
-            .zip(args.iter().cloned())
-            .collect();
+        let binds = binds_of(&tmpl.params, args);
         let mangled = mangle_generic(name, args);
         let mut fields = Vec::with_capacity(tmpl.fields.len());
         for f in &tmpl.fields {
@@ -541,6 +730,7 @@ impl Mono {
                 ty: subst_type(&f.ty, &binds),
                 init: None,
                 span: f.span,
+                is_public: false,
             });
         }
         let mut stmt = Stmt::new(
@@ -549,31 +739,29 @@ impl Mono {
                 name: mangled,
                 base: tmpl.base.clone(),
                 fields,
+                // Monomorphized generic instance: always public (its definition file is
+                // synthetic, so it must not be privacy-gated against use sites).
+                is_public: true,
             }),
             syn_span(),
         );
-        self.resolve_sig(&mut stmt)?; // resolve the substituted field types + record
+        self.resolve_sig(&mut stmt)?; // resolve the substituted field types and record them
         Ok(stmt)
     }
 
-    fn instantiate_fn(&mut self, name: &str, args: &[Type], mangled: &str) -> MResult<Stmt> {
+    fn instantiate_fn(&mut self, name: &str, args: &[GenericArg], mangled: &str) -> MResult<Stmt> {
         let tmpl = self.fns.get(name).expect("generic fn").clone();
-        if args.len() != tmpl.type_params.len() {
+        if args.len() != tmpl.params.len() {
             return self.err(
                 Pos::new(0, 0),
                 format!(
-                    "generic function `{name}` expects {} type argument(s), got {}",
-                    tmpl.type_params.len(),
+                    "generic function `{name}` expects {} argument(s), got {}",
+                    tmpl.params.len(),
                     args.len()
                 ),
             );
         }
-        let binds: HashMap<String, Type> = tmpl
-            .type_params
-            .iter()
-            .cloned()
-            .zip(args.iter().cloned())
-            .collect();
+        let binds = binds_of(&tmpl.params, args);
         let params = tmpl
             .def
             .params
@@ -597,6 +785,8 @@ impl Mono {
                 params,
                 varargs: tmpl.def.varargs,
                 body,
+                // Monomorphized generic instance: always public (see instantiate_class).
+                is_public: true,
             }),
             syn_span(),
         );
@@ -605,13 +795,13 @@ impl Mono {
         Ok(stmt)
     }
 
-    /// Record a generic-function instance's concrete return type, so a call site
-    /// (and `:=`) can see through it. Substitutes the bound type arguments into the
+    /// Record a generic-function instance's concrete return type, so a call site and
+    /// a `:=` can see through it. Substitutes the bound type arguments into the
     /// template's return type, then resolves it.
     fn record_instance_ret(
         &mut self,
         name: &str,
-        args: &[Type],
+        args: &[GenericArg],
         mangled: &str,
         pos: Pos,
     ) -> MResult<()> {
@@ -619,22 +809,17 @@ impl Mono {
             message: format!("`{name}` is not a generic function"),
             pos,
         })?;
-        if args.len() != tmpl.type_params.len() {
+        if args.len() != tmpl.params.len() {
             return self.err(
                 pos,
                 format!(
-                    "generic function `{name}` expects {} type argument(s), got {}",
-                    tmpl.type_params.len(),
+                    "generic function `{name}` expects {} argument(s), got {}",
+                    tmpl.params.len(),
                     args.len()
                 ),
             );
         }
-        let binds: HashMap<String, Type> = tmpl
-            .type_params
-            .iter()
-            .cloned()
-            .zip(args.iter().cloned())
-            .collect();
+        let binds = binds_of(&tmpl.params, args);
         let ret = self.resolve_type(&subst_type(&tmpl.def.ret, &binds), pos)?;
         self.fn_rets.insert(mangled.to_string(), ret);
         Ok(())
@@ -642,10 +827,10 @@ impl Mono {
 
     // ---- call-site type-argument inference ----
 
-    /// Infer a generic function's type arguments from its (resolved) argument
-    /// expressions, by unifying each parameter's template type against the argument's
+    /// Infer a generic function's type arguments from its resolved argument
+    /// expressions. Each parameter's template type is unified against the argument's
     /// static type.
-    fn infer(&self, name: &str, args: &[Expr], pos: Pos) -> MResult<Vec<Type>> {
+    fn infer(&self, name: &str, args: &[Expr], pos: Pos) -> MResult<Vec<GenericArg>> {
         let tmpl = self.fns.get(name).ok_or_else(|| MonoError {
             message: format!("`{name}` is not a generic function"),
             pos,
@@ -658,27 +843,46 @@ impl Mono {
                 }
             }
         }
-        let mut type_args = Vec::with_capacity(tmpl.type_params.len());
-        for tp in &tmpl.type_params {
-            match binds.get(tp) {
-                Some(t) => type_args.push(t.clone()),
-                None => {
-                    return self.err(
-                        pos,
-                        format!(
-                            "cannot infer type argument `{tp}` for generic `{name}`; \
-                             call it as `{name}<...>(...)`"
-                        ),
-                    );
+        let mut out = Vec::with_capacity(tmpl.params.len());
+        for tp in &tmpl.params {
+            match tp {
+                GenericParam::Type(n, constraint) => match binds.get(n) {
+                    Some(t) => {
+                        if *constraint == Some(Constraint::Comparable) && !crate::sema::is_scalar(t)
+                        {
+                            return self.err(
+                                pos,
+                                format!(
+                                    "inferred type argument `{}` for parameter `{n}` of `{name}` \
+                                     is not comparable (needs a scalar or pointer type)",
+                                    type_name(t)
+                                ),
+                            );
+                        }
+                        out.push(GenericArg::Type(t.clone()));
+                    }
+                    None => {
+                        return self.err(
+                            pos,
+                            format!(
+                                "cannot infer type argument `{n}` for generic `{name}`; \
+                                 call it as `{name}<...>(...)`"
+                            ),
+                        );
+                    }
+                },
+                // The caller rejects inference when any value parameter is present.
+                GenericParam::Value(_) => {
+                    unreachable!("value parameters require an explicit argument list")
                 }
             }
         }
-        Ok(type_args)
+        Ok(out)
     }
 
-    /// The static type of an expression — a complete, scoped, recursive typer over
-    /// the resolved program. `None` when a type can't be determined (then a generic
-    /// call must give explicit type arguments). Used for type-argument inference and
+    /// The static type of an expression: a complete, scoped, recursive typer over the
+    /// resolved program. Returns `None` when a type can't be determined; a generic
+    /// call then needs explicit type arguments. Used for type-argument inference and
     /// `:=` declarations.
     fn type_expr(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
@@ -697,8 +901,8 @@ impl Mono {
                 Type::Ptr(inner) | Type::Array(inner, _) => Some(*inner),
                 _ => None,
             },
-            // Logical-not yields a boolean-valued I64 regardless of operand type;
-            // the other unary/postfix ops (`-`, `~`, `++`, `--`) preserve it.
+            // Logical-not yields a boolean-valued I64 regardless of operand type.
+            // The other unary/postfix ops (`-`, `~`, `++`, `--`) preserve the type.
             ExprKind::Unary { op: UnOp::Not, .. } => Some(Type::I64),
             ExprKind::Unary { expr, .. } | ExprKind::Postfix { expr, .. } => self.type_expr(expr),
             ExprKind::Cast { ty, .. } => Some(ty.clone()),
@@ -714,15 +918,15 @@ impl Mono {
             ExprKind::Binary { op, lhs, rhs } => {
                 use BinOp::*;
                 match op {
-                    // Comparisons, logicals, and bitwise/shift ops are I64-valued
-                    // (mirrors sema::check_binary).
+                    // Comparisons, logicals, and bitwise/shift ops are I64-valued.
+                    // Mirrors sema::check_binary.
                     Eq | Ne | Lt | Gt | Le | Ge | And | Or | BitAnd | BitOr | BitXor | Shl
                     | Shr => Some(Type::I64),
                     // Arithmetic follows the shared `arith_result` rule so pointer
-                    // arithmetic types correctly (e.g. `arr + 1` is `T*`, not I64);
-                    // pointer-minus-pointer is an integer offset. When an operand
-                    // can't be typed yet, fall back to the float-or-int heuristic so
-                    // inference stays as permissive as before.
+                    // arithmetic types correctly: `arr + 1` is `T*`, not I64.
+                    // Pointer-minus-pointer is an integer offset. If an operand
+                    // can't be typed yet, fall back to a float-or-int heuristic,
+                    // keeping inference as permissive as before.
                     Add | Sub | Mul | Div | Mod => {
                         let lt = self.type_expr(lhs).map(crate::sema::decay);
                         let rt = self.type_expr(rhs).map(crate::sema::decay);
@@ -746,9 +950,9 @@ impl Mono {
                     }
                 }
             }
-            // A ternary's type is its arms' common type via the shared `arith_result`
-            // rule (so `c ? 1 : 1.0` is F64, matching sema); if only one arm types,
-            // fall back to it.
+            // A ternary's type is its arms' common type, via the shared
+            // `arith_result` rule, so `c ? 1 : 1.0` is F64, matching sema. If only
+            // one arm types, fall back to that arm.
             ExprKind::Ternary { then, else_, .. } => {
                 match (self.type_expr(then), self.type_expr(else_)) {
                     (Some(a), Some(b)) => Some(crate::sema::arith_result(&a, &b)),
@@ -760,21 +964,23 @@ impl Mono {
         }
     }
 
-    /// The return type of a call whose callee is `callee`: a named function (or
-    /// generic instance), or a function-pointer value (a variable or a class field).
+    /// The return type of a call with the given `callee`. The callee may be a named
+    /// function (including a generic instance), or a function-pointer value such as a
+    /// variable or a class field.
     fn call_ret(&self, callee: &Expr) -> Option<Type> {
         match &callee.kind {
             ExprKind::Ident(n) => {
                 if let Some(ret) = self.fn_rets.get(n) {
                     return Some(ret.clone());
                 }
-                // A function-pointer variable.
+                // Otherwise it may be a function-pointer variable.
                 match self.lookup_var(n)? {
                     Type::FuncPtr { ret, .. } => Some(*ret),
                     _ => None,
                 }
             }
-            // A function-pointer field/result: type the callee, expect a `FuncPtr`.
+            // A function-pointer field or call result: type the callee and expect a
+            // `FuncPtr`.
             _ => match self.type_expr(callee)? {
                 Type::FuncPtr { ret, .. } => Some(*ret),
                 _ => None,
@@ -782,7 +988,8 @@ impl Mono {
         }
     }
 
-    /// The class/union name a value's type names (a `Named`, or a pointer to one).
+    /// The class/union name that a value's type refers to: a `Named`, or a pointer to
+    /// one.
     fn class_name_of(&self, ty: &Type) -> Option<String> {
         match ty {
             Type::Named(n) => Some(n.clone()),
@@ -794,8 +1001,8 @@ impl Mono {
         }
     }
 
-    /// A field's type in class `cname`, walking the base-class chain for an inherited
-    /// field.
+    /// A field's type in class `cname`. Walks the base-class chain to find an
+    /// inherited field.
     fn field_type(&self, cname: &str, field: &str) -> Option<Type> {
         let mut cur = Some(cname.to_string());
         while let Some(c) = cur {
@@ -825,8 +1032,9 @@ impl Mono {
     }
 
     /// Unify a template parameter type `pat` against a concrete argument type `ty`,
-    /// binding type parameters. A `Generic` parameter (`Vec<T>`) is matched against a
-    /// concrete instance argument (`Vec_I64`) via the instance map.
+    /// binding type parameters along the way. A `Generic` parameter such as `Vec<T>`
+    /// is matched against a concrete instance argument such as `Vec_I64` through the
+    /// instance map.
     fn unify(&self, pat: &Type, ty: &Type, out: &mut HashMap<String, Type>) {
         match pat {
             Type::Param(p) => {
@@ -840,8 +1048,12 @@ impl Mono {
                 if let Type::Named(n) = ty {
                     if let Some((iname, iargs)) = self.instances.get(n) {
                         if iname == g {
+                            // Only type positions carry type parameters to bind; value
+                            // positions are skipped.
                             for (pa, ta) in gargs.iter().zip(iargs.iter()) {
-                                self.unify(pa, ta, out);
+                                if let (GenericArg::Type(pt), GenericArg::Type(tt)) = (pa, ta) {
+                                    self.unify(pt, tt, out);
+                                }
                             }
                         }
                     }
@@ -853,8 +1065,8 @@ impl Mono {
 
     // ---- `:=` short declaration / unpack ----
 
-    /// Desugar a collected `:=` (names + a resolved `rhs`) into a declaration: one
-    /// name → an inferred-type `VarDecl`; two or more → a tuple unpack.
+    /// Desugar a collected `:=` (its names plus a resolved `rhs`) into a declaration.
+    /// One name becomes an inferred-type `VarDecl`; two or more become a tuple unpack.
     fn build_unpack(
         &mut self,
         mut names: Vec<Option<String>>,
@@ -879,6 +1091,7 @@ impl Mono {
                     ty,
                     init: Some(rhs),
                     span,
+                    is_public: false,
                 }],
             });
         }
@@ -903,9 +1116,9 @@ impl Mono {
         self.desugar_destructure(slots, rhs, span)
     }
 
-    /// Best-effort tuple element types of an unpack's right-hand side: a tuple literal
-    /// `(e0, …)` (each element typed), or any expression whose static type is a known
-    /// tuple struct.
+    /// Best-effort tuple element types of an unpack's right-hand side. Handles a tuple
+    /// literal `(e0, …)`, typing each element, or any expression whose static type is
+    /// a known tuple struct.
     fn tuple_elem_types(&self, rhs: &Expr) -> Option<Vec<Type>> {
         if let ExprKind::InitList(items) = &rhs.kind {
             return items.iter().map(|e| self.type_expr(e)).collect();
@@ -925,9 +1138,9 @@ impl Mono {
         )
     }
 
-    /// Lower a tuple unpack into the tuple-struct machinery: bind `rhs` to a hidden
-    /// tuple temp, then declare each named slot from its field. A `None` name (`_`)
-    /// keeps its place but binds nothing.
+    /// Lower a tuple unpack into the tuple-struct machinery. Binds `rhs` to a hidden
+    /// tuple temp, then declares each named slot from the corresponding field. A `None`
+    /// name (`_`) keeps its position but binds nothing.
     fn desugar_destructure(
         &mut self,
         slots: Vec<(Type, Option<String>)>,
@@ -946,6 +1159,7 @@ impl Mono {
             ty: Type::Named(tup),
             init: Some(rhs),
             span,
+            is_public: false,
         }];
         for (i, (ty, name)) in celems.iter().zip(slots.iter().map(|(_, n)| n)).enumerate() {
             let Some(name) = name else { continue };
@@ -954,13 +1168,14 @@ impl Mono {
                 ty: ty.clone(),
                 init: Some(tuple_field(&tmp, i, span)),
                 span,
+                is_public: false,
             });
         }
         Ok(StmtKind::VarDecl { decls })
     }
 }
 
-/// `<var>._<i>` — read field `i` of a tuple-typed variable.
+/// Build `<var>._<i>`: a read of field `i` of a tuple-typed variable.
 fn tuple_field(var: &str, i: usize, span: Span) -> Expr {
     Expr::new(
         ExprKind::Member {
@@ -972,23 +1187,29 @@ fn tuple_field(var: &str, i: usize, span: Span) -> Expr {
     )
 }
 
-// ---- pure parameter substitution (template → param-free, still deferred) ----
+// ---- pure parameter substitution (template -> param-free, still deferred) ----
 
-/// Substitute a template's bound type parameters in `ty`, leaving the deferred node
-/// *kinds* (`Generic`/`Tuple`) intact for the resolver to handle.
-fn subst_type(ty: &Type, binds: &HashMap<String, Type>) -> Type {
+/// Substitute a template's bound parameters in `ty`. A type parameter becomes its
+/// bound type; a value parameter referenced in an array dimension becomes its bound
+/// `Int`. Leaves the deferred node kinds (`Generic`, `Tuple`) intact for the resolver.
+fn subst_type(ty: &Type, binds: &HashMap<String, Bind>) -> Type {
     match ty {
-        Type::Param(n) => binds
-            .get(n)
-            .cloned()
-            .unwrap_or_else(|| Type::Param(n.clone())),
+        Type::Param(n) => match binds.get(n) {
+            Some(Bind::Type(t)) => t.clone(),
+            _ => Type::Param(n.clone()),
+        },
         Type::Generic(name, args) => Type::Generic(
             name.clone(),
-            args.iter().map(|a| subst_type(a, binds)).collect(),
+            args.iter().map(|a| subst_arg(a, binds)).collect(),
         ),
         Type::Tuple(elems) => Type::Tuple(elems.iter().map(|a| subst_type(a, binds)).collect()),
         Type::Ptr(inner) => Type::Ptr(Box::new(subst_type(inner, binds))),
-        Type::Array(inner, dim) => Type::Array(Box::new(subst_type(inner, binds)), dim.clone()),
+        // Substitute the dimension expression too, so a value-param dim `T data[N]`
+        // becomes `T data[8]` (`Ident("N")` → `Int(8)`).
+        Type::Array(inner, dim) => Type::Array(
+            Box::new(subst_type(inner, binds)),
+            dim.as_ref().map(|e| Box::new(subst_expr(e, binds))),
+        ),
         Type::FuncPtr { ret, params } => Type::FuncPtr {
             ret: Box::new(subst_type(ret, binds)),
             params: params.iter().map(|p| subst_type(p, binds)).collect(),
@@ -997,7 +1218,16 @@ fn subst_type(ty: &Type, binds: &HashMap<String, Type>) -> Type {
     }
 }
 
-fn subst_stmt(s: &Stmt, binds: &HashMap<String, Type>) -> Stmt {
+/// Substitute in one generic argument: a type arg recurses through [`subst_type`], a
+/// value arg through [`subst_expr`] (turning a value-param `Ident` into its `Int`).
+fn subst_arg(a: &GenericArg, binds: &HashMap<String, Bind>) -> GenericArg {
+    match a {
+        GenericArg::Type(t) => GenericArg::Type(subst_type(t, binds)),
+        GenericArg::Value(e) => GenericArg::Value(Box::new(subst_expr(e, binds))),
+    }
+}
+
+fn subst_stmt(s: &Stmt, binds: &HashMap<String, Bind>) -> Stmt {
     let kind = match &s.kind {
         StmtKind::Empty
         | StmtKind::Default
@@ -1022,6 +1252,7 @@ fn subst_stmt(s: &Stmt, binds: &HashMap<String, Type>) -> Stmt {
                     ty: subst_type(&d.ty, binds),
                     init: d.init.as_ref().map(|e| subst_expr(e, binds)),
                     span: d.span,
+                    is_public: d.is_public,
                 })
                 .collect(),
         },
@@ -1058,19 +1289,46 @@ fn subst_stmt(s: &Stmt, binds: &HashMap<String, Type>) -> Stmt {
             hi: hi.as_ref().map(|e| subst_expr(e, binds)),
         },
         StmtKind::Return(e) => StmtKind::Return(e.as_ref().map(|e| subst_expr(e, binds))),
+        StmtKind::TypeSwitch { on, arms, default } => StmtKind::TypeSwitch {
+            on: match on {
+                TypeSwitchOn::Ty(t) => TypeSwitchOn::Ty(subst_type(t, binds)),
+                TypeSwitchOn::Val(e) => TypeSwitchOn::Val(Box::new(subst_expr(e, binds))),
+            },
+            arms: arms
+                .iter()
+                .map(|(t, body)| {
+                    (
+                        subst_type(t, binds),
+                        body.iter().map(|s| subst_stmt(s, binds)).collect(),
+                    )
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|body| body.iter().map(|s| subst_stmt(s, binds)).collect()),
+        },
+        StmtKind::Try { body, handler } => StmtKind::Try {
+            body: body.iter().map(|s| subst_stmt(s, binds)).collect(),
+            handler: handler.iter().map(|s| subst_stmt(s, binds)).collect(),
+        },
+        StmtKind::Throw(e) => StmtKind::Throw(e.as_ref().map(|e| subst_expr(e, binds))),
         StmtKind::Func(_) | StmtKind::Class(_) => s.kind.clone(),
     };
     Stmt::new(kind, s.span)
 }
 
-fn subst_expr(e: &Expr, binds: &HashMap<String, Type>) -> Expr {
+fn subst_expr(e: &Expr, binds: &HashMap<String, Bind>) -> Expr {
     let bx = |e: &Expr| Box::new(subst_expr(e, binds));
     let kind = match &e.kind {
+        // A value (`int`) parameter referenced in the body becomes its bound literal.
+        ExprKind::Ident(n) => match binds.get(n) {
+            Some(Bind::Value(v)) => ExprKind::Int(*v),
+            _ => e.kind.clone(),
+        },
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
         | ExprKind::Char(_)
-        | ExprKind::Ident(_)
         | ExprKind::Offset { .. } => e.kind.clone(),
         ExprKind::Unary { op, expr } => ExprKind::Unary {
             op: *op,
@@ -1105,7 +1363,7 @@ fn subst_expr(e: &Expr, binds: &HashMap<String, Type>) -> Expr {
             args,
         } => ExprKind::GenericCall {
             name: name.clone(),
-            type_args: type_args.iter().map(|t| subst_type(t, binds)).collect(),
+            type_args: type_args.iter().map(|a| subst_arg(a, binds)).collect(),
             args: args.iter().map(|a| subst_expr(a, binds)).collect(),
         },
         ExprKind::Index { base, index } => ExprKind::Index {

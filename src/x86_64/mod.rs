@@ -1,75 +1,96 @@
-//! A minimal x86-64 / ELF code-generation backend (Linux).
+//! Minimal x86-64 code-generation backend for Linux.
 //!
 //! A second native target alongside the [AArch64 backend](super::arm64). It
-//! hand-emits x86-64 machine code and writes a **self-contained static ELF
-//! executable** — its own `_start` runs the program and calls the `exit` syscall,
-//! so there is no linker, no libc, and no relocations. The interpreter remains
-//! the conformance oracle.
+//! hand-emits x86-64 machine code and writes a self-contained static ELF
+//! executable: its own `_start` runs the program and calls the `exit` syscall, so
+//! there is no linker, no libc, and no relocations. The interpreter remains the
+//! conformance oracle.
 //!
-//! Implemented: top-level code and **functions** (recursion, up to six integer/
-//! pointer args via the System V registers), **function pointers** (`&Func` is a
-//! RIP-relative `lea`; an indirect call `fp(args)` — incl. fn-pointer params,
-//! array elements `ops[i](..)`, class fields `s.m(..)`, and a returned pointer —
-//! evaluates the target, spills it, and `call`s through the register, with arg
-//! classing driven by the callee's `Type::FuncPtr`), **locals** (a `rbp` frame,
-//! `[rbp - off]`), **control flow** (`if`/`else`, `while`, `for`, `do`, `break`,
-//! `continue`, `switch`/`case`/`default` incl. `lo ... hi` ranges and the
-//! `start:`/`end:` sub-labels via a compare-chain, and `goto`/labels),
-//! **comparisons** and short-circuit `&&`/`||`/`!`, the
-//! unary `- + ~ ++ --`, the binary `+ - * / % & | ^ << >>` (with `>>`/`/`/`%`
-//! and the relational operators **signedness-directed** — `sar`/`idiv` vs
-//! `shr`/`div`, signed vs unsigned condition codes), **pointers & arrays**
-//! (`&x`, `*p`, `a[i]` incl. 2-D, pointer arithmetic (pointee-scaled) and
-//! difference, width-aware narrow loads/stores via `movsx`/`movzx`, array
-//! parameters that decay to a by-reference pointer), **classes & unions**
-//! (`repr(C)` layout from the shared `layout` pass: member access `a.x` and
-//! `p->x`, nested fields, `sizeof`, whole-class assignment, **by-value**
-//! parameters as a callee-side `rep movsb` copy, **by-value returns** (sret: the
-//! caller hands a result-temp pointer to the callee in r11), member access on a
-//! class-returning call (`Mk().x`), arrays of classes, and union aliasing —
-//! anonymous-embedded unions resolve through the promoted offset),
-//! **brace/designated aggregate initializers** (`gen_init_into`: positional,
-//! `.field =` designated/out-of-order, nested, partial, and arrays of classes —
-//! for locals and globals alike),
-//! **globals** (top-level variables live in a zero-filled BSS region and are
-//! reachable from any function), **F64** (SSE2: `xmm0`/`xmm1` as the float
-//! result/temp, args in `xmm0..xmm7` and returns in `xmm0`; arithmetic, `-`,
-//! comparisons, int↔float conversions (signedness-directed), literals, locals,
-//! globals, arrays, params/returns), **printing** — a bare string prints
-//! verbatim, `"fmt", …` and `Print("fmt", …)` are printf-style with the full
-//! `%[flags][width][.prec]conv` grammar for `%d %i %u %x %X %o %c %s %%`
-//! (flags `-0+ #`, `*` width/precision), **`%f`/`%e`/`%g` float printing** —
-//! correctly-rounded via a bignum (matches Rust's `{:.P}`/`{:.Pe}` byte-for-byte,
-//! including round-half-to-even ties) — and the irreducible **core-library
-//! builtins**, lowered with no libc: `MAlloc`/`Free` (an `mmap`-backed bump
-//! allocator), SSE `Sqrt`/`Fabs`, and the **sprintf family**
-//! (`StrPrint`/`CatPrint`/`MStrPrint` — printf into a buffer via an
-//! output sink, see below; the lone string routine still emitted is `StrLen`, used
-//! internally by `CatPrint`'s append). The reducible string/memory/ctype/PRNG ops
-//! are pure HolyC in `lib/*.hc` now and compile as ordinary functions. The
-//! transcendental math builtins
-//! (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…) are **deliberately absent**: a freestanding
-//! static ELF has no libm, and — like Rust's `core` (which omits them; they live
-//! in `std` for the platform libm) — we don't fake them with approximations,
-//! since libm results aren't bit-identical across platforms anyway (IEEE 754
-//! doesn't require correctly-rounded transcendentals). Otherwise the core-library
-//! builtins are complete here. Anything unimplemented is a build-time error.
+//! # Implemented
 //!
-//! Expression evaluation is a stack machine: a value lands in `rax` (or `xmm0`
-//! for an F64-typed expression), a binary op's left operand is spilled to the
-//! machine stack while the right is computed (so values survive nested calls);
-//! an lvalue's address is computed by `gen_addr`, with width-aware load/store
-//! through it. Printing needs no libc: a
-//! tiny emitted runtime (`fmt_int`/`fmt_str`, mirroring [`crate::fmt`]) formats
-//! integers/strings into a BSS scratch buffer and hands them to a single output
-//! sink (`out_write`) — which goes to the `write` syscall when the `out_ptr`
-//! global is 0, or appends to a destination buffer otherwise, so the same format
-//! machinery serves both `Print` and `StrPrint`/`CatPrint` — and `MStrPrint`,
-//! whose buffer the sink *grows* (reallocs) on overflow, like libc `vasprintf`.
-//! String literals live
-//! after the code (RIP-relative addressed). ELF layout:
-//! `[ELF header | one PT_LOAD | code | strings | BSS]`, mapped R+W+X at
-//! `0x400000` (`p_memsz > p_filesz` reserves the zero-filled BSS), `_start` first.
+//! Top-level code and **functions** — recursion, up to six integer/pointer args
+//! via the System V registers.
+//!
+//! **Function pointers**: `&Func` is a RIP-relative `lea`. An indirect call
+//! `fp(args)` evaluates the target, spills it, and `call`s through the register,
+//! with arg classing driven by the callee's `Type::FuncPtr`. This covers
+//! fn-pointer params, array elements `ops[i](..)`, class fields `s.m(..)`, and a
+//! returned pointer.
+//!
+//! **Locals**: an `rbp` frame, `[rbp - off]`.
+//!
+//! **Control flow**: `if`/`else`, `while`, `for`, `do`, `break`, `continue`,
+//! `goto`/labels, and `switch`/`case`/`default` (including `lo ... hi` ranges and
+//! the `start:`/`end:` sub-labels), lowered to a compare-chain.
+//!
+//! **Operators**: comparisons and short-circuit `&&`/`||`/`!`, unary
+//! `- + ~ ++ --`, and binary `+ - * / % & | ^ << >>`. `>>`, `/`, `%` and the
+//! relational operators are signedness-directed: `sar`/`idiv` vs `shr`/`div`, and
+//! signed vs unsigned condition codes.
+//!
+//! **Pointers & arrays**: `&x`, `*p`, `a[i]` (including 2-D), pointer arithmetic
+//! (pointee-scaled) and difference, width-aware narrow loads/stores via
+//! `movsx`/`movzx`, and array parameters that decay to a by-reference pointer.
+//!
+//! **Classes & unions** use `repr(C)` layout from the shared `layout` pass:
+//! member access `a.x` and `p->x`, nested fields, `sizeof`, whole-class
+//! assignment, member access on a class-returning call (`Mk().x`), arrays of
+//! classes, and union aliasing (anonymous-embedded unions resolve through the
+//! promoted offset). Class **parameters** are passed by value as a callee-side
+//! `rep movsb` copy. Class **returns** use sret: the caller hands a result-temp
+//! pointer to the callee in r11.
+//!
+//! **Brace/designated aggregate initializers** (`gen_init_into`): positional,
+//! `.field =` designated/out-of-order, nested, partial, and arrays of classes, for
+//! locals and globals alike.
+//!
+//! **Globals**: top-level variables live in a zero-filled BSS region and are
+//! reachable from any function.
+//!
+//! **F64** (SSE2): `xmm0`/`xmm1` are the float result/temp, args go in `xmm0..xmm7`
+//! and returns in `xmm0`. Covers arithmetic, `-`, comparisons, int↔float
+//! conversions (signedness-directed), literals, locals, globals, arrays, and
+//! params/returns.
+//!
+//! **Printing**: a bare string prints verbatim; `"fmt", …` and `Print("fmt", …)`
+//! are printf-style with the full `%[flags][width][.prec]conv` grammar for
+//! `%d %i %u %x %X %o %c %s %%` (flags `-0+ #`, `*` width/precision). The float
+//! conversions `%f`/`%e`/`%g` are correctly-rounded via a bignum, matching Rust's
+//! `{:.P}`/`{:.Pe}` byte-for-byte including round-half-to-even ties.
+//!
+//! **Core-library builtins** (the irreducible ones), lowered with no libc:
+//! `MAlloc`/`Free` (an `mmap`-backed bump allocator), SSE `Sqrt`/`Fabs`, and the
+//! sprintf family `StrPrint`/`CatPrint`/`MStrPrint` (printf into a buffer via the
+//! output sink described below). The one string routine still emitted is `StrLen`,
+//! used internally by `CatPrint`'s append. The reducible string/memory/ctype/PRNG
+//! ops are pure HolyC in `lib/*.hc` and compile as ordinary functions.
+//!
+//! The transcendental math builtins (`Sin`/`Cos`/`Pow`/`Exp`/`Ln`/…) are
+//! deliberately absent. A freestanding static ELF has no libm, and we don't fake
+//! them with approximations — like Rust's `core`, which omits them and leaves them
+//! to `std` over the platform libm. libm results aren't bit-identical across
+//! platforms anyway, since IEEE 754 doesn't require correctly-rounded
+//! transcendentals. Otherwise the core-library builtins are complete here.
+//! Anything unimplemented is a build-time error.
+//!
+//! # Evaluation and runtime
+//!
+//! Expression evaluation is a stack machine. A value lands in `rax`, or `xmm0` for
+//! an F64-typed expression. A binary op spills its left operand to the machine
+//! stack while the right is computed, so values survive nested calls. An lvalue's
+//! address is computed by `gen_addr`, with a width-aware load/store through it.
+//!
+//! Printing needs no libc. A tiny emitted runtime (`fmt_int`/`fmt_str`, mirroring
+//! [`crate::fmt`]) formats integers/strings into a BSS scratch buffer and hands
+//! them to a single output sink, `out_write`. The sink writes via the `write`
+//! syscall when the `out_ptr` global is 0, otherwise it appends to a destination
+//! buffer — so the same format machinery serves both `Print` and
+//! `StrPrint`/`CatPrint`. For `MStrPrint` the sink *grows* the buffer (reallocs)
+//! on overflow, like libc `vasprintf`.
+//!
+//! String literals live after the code, RIP-relative addressed. The ELF layout is
+//! `[ELF header | one PT_LOAD | code | strings | BSS]`, mapped R+W+X at `0x400000`
+//! (`p_memsz > p_filesz` reserves the zero-filled BSS), with `_start` first.
 
 use std::collections::HashMap;
 
@@ -86,15 +107,16 @@ use asm::Asm;
 pub use linux::X64Linux;
 pub use windows::X64Windows;
 
-/// The OS-specific policy for the shared x86-64 code generator — the handful of
-/// points where the emitted program touches the operating system. Everything
-/// else in [`Cg`]/[`Asm`] is OS-agnostic (the same instruction set). The Linux
-/// target ([`X64Linux`]) uses raw syscalls and a freestanding static ELF; the
+/// OS-specific policy for the shared x86-64 code generator: the handful of points
+/// where the emitted program touches the operating system. Everything else in
+/// [`Cg`]/[`Asm`] is OS-agnostic, since the instruction set is the same. The Linux
+/// target ([`X64Linux`]) uses raw syscalls in a freestanding static ELF; the
 /// Windows target ([`X64Windows`]) calls `kernel32` imports from a self-contained
-/// PE. Each seam is a small instruction sequence with a fixed register contract
+/// PE. Each seam is a small instruction sequence with a fixed register contract,
 /// so the shared `Cg` can drive it without knowing the OS.
 ///
-/// A file fd primitive, dispatched through [`OsTarget::emit_fileop`].
+/// [`FileOp`] is a file-descriptor primitive, dispatched through
+/// [`OsTarget::emit_fileop`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileOp {
     Open,
@@ -105,84 +127,89 @@ enum FileOp {
 }
 
 trait OsTarget {
-    /// Emit process exit. The exit status is in `rax` (its low 32 bits).
+    /// Emit process exit. The exit status is the low 32 bits of `rax`.
     fn emit_exit(&mut self, asm: &mut Asm);
 
-    /// Emit "allocate `rsi` zeroed, page-aligned bytes; base address → `rax`;
-    /// `rsi` preserved" — the fresh-chunk grab inside the `MAlloc` bump allocator.
+    /// Emit the fresh-chunk grab inside the `MAlloc` bump allocator: allocate `rsi`
+    /// zeroed, page-aligned bytes, return the base address in `rax`, and preserve
+    /// `rsi`.
     fn emit_page_alloc(&mut self, asm: &mut Asm);
 
     /// Emit the body of the `StdWrite(fd, buf, n)` primitive: write the `rdx` bytes
-    /// at `rsi` to the standard stream named by `rdi` (1 = stdout, 2 = stderr),
-    /// returning the bytes written in `rax`. Linux is a `write` syscall (fd passes
-    /// straight through); Windows maps fd → `GetStdHandle(STD_OUTPUT/ERROR)` + a
-    /// `WriteFile`.
+    /// at `rsi` to the standard stream named by `rdi` (1 = stdout, 2 = stderr), and
+    /// return the bytes written in `rax`. Linux uses a `write` syscall, with the fd
+    /// passing straight through. Windows maps the fd to
+    /// `GetStdHandle(STD_OUTPUT/ERROR)` and a `WriteFile`.
     fn emit_std_write(&mut self, asm: &mut Asm);
 
-    /// Whether this is a POSIX target (Linux). The Windows PE has no Linux syscalls,
-    /// so the syscall-group primitives (sockets, filesystem mutation, process ids,
-    /// working dir, threads, futex) that lack a Windows lowering are gated on this and
-    /// rejected with a clear error rather than emitting an invalid `syscall`.
+    /// Whether this is a POSIX target (Linux). The Windows PE has no Linux syscalls.
+    /// The syscall-group primitives that lack a Windows lowering — sockets,
+    /// filesystem mutation, process ids, working dir, threads, futex — are gated on
+    /// this flag and rejected with a clear error rather than emitting an invalid
+    /// `syscall`.
     fn is_posix(&self) -> bool {
         true
     }
 
     /// Lower a file fd primitive (`Open`/`Read`/`Write`/`Close`/`LSeek`). Arguments
-    /// are already in the System V registers (`Open`: rdi=path, rsi=flags, rdx=mode;
-    /// `Read`/`Write`: rdi=fd, rsi=buf, rdx=n; `Close`: rdi=fd; `LSeek`: rdi=fd,
-    /// rsi=off, rdx=whence). The result (an fd/HANDLE, byte count, offset, 0, or a
-    /// negative error) lands in `rax`. Linux is the raw syscall; Windows is the
-    /// matching `kernel32` call (`CreateFileA`/`ReadFile`/`WriteFile`/`CloseHandle`/
-    /// `SetFilePointerEx`), with the `io.hc` open flags translated to Win32.
+    /// arrive in the System V registers: `Open` takes rdi=path, rsi=flags, rdx=mode;
+    /// `Read`/`Write` take rdi=fd, rsi=buf, rdx=n; `Close` takes rdi=fd; `LSeek`
+    /// takes rdi=fd, rsi=off, rdx=whence. The result lands in `rax` — an fd/HANDLE,
+    /// byte count, offset, 0, or a negative error. Linux uses the raw syscall.
+    /// Windows uses the matching `kernel32` call
+    /// (`CreateFileA`/`ReadFile`/`WriteFile`/`CloseHandle`/`SetFilePointerEx`), with
+    /// the `io.hc` open flags translated to Win32.
     fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp);
 
-    /// Read the wall clock into `rax` as nanoseconds since the Unix epoch.
-    /// `scratch` is a 16-byte BSS slot for the OS time structure. Linux uses
-    /// `clock_gettime(CLOCK_REALTIME)`; Windows `GetSystemTimePreciseAsFileTime`.
+    /// Read the wall clock into `rax` as nanoseconds since the Unix epoch. `scratch`
+    /// is a 16-byte BSS slot for the OS time structure. Linux uses
+    /// `clock_gettime(CLOCK_REALTIME)`; Windows uses
+    /// `GetSystemTimePreciseAsFileTime`.
     fn emit_unix_ns(&mut self, asm: &mut Asm, scratch: i32);
 
-    /// Read the monotonic clock into `rax` as nanoseconds (unspecified origin).
-    /// Linux `clock_gettime(CLOCK_MONOTONIC)`; Windows `GetTickCount64`.
+    /// Read the monotonic clock into `rax` as nanoseconds; its origin is
+    /// unspecified. Linux uses `clock_gettime(CLOCK_MONOTONIC)`; Windows uses
+    /// `GetTickCount64`.
     fn emit_mono_ns(&mut self, asm: &mut Asm, scratch: i32);
 
-    /// Suspend the thread for the nanosecond count in `rax`. Linux `nanosleep`,
-    /// Windows `Sleep` (millisecond granularity).
+    /// Suspend the thread for the nanosecond count in `rax`. Linux uses `nanosleep`;
+    /// Windows uses `Sleep`, which has millisecond granularity.
     fn emit_sleep(&mut self, asm: &mut Asm, scratch: i32);
 
     /// Emit the entry preamble that captures the command line into the BSS slots
-    /// at `argc_off` / `argv_off` (argv there is a pointer to the argv array).
-    /// Runs just after the entry's frame is set up, so the frame pointer `rbp` is
-    /// valid. Only emitted when the program uses `ArgC`/`ArgV`. Linux reads them
-    /// off the initial stack; Windows builds them from `GetCommandLineA`.
+    /// `argc_off` and `argv_off`. The `argv_off` slot holds a pointer to the argv
+    /// array. Runs just after the entry frame is set up, so the frame pointer `rbp`
+    /// is valid, and only when the program uses `ArgC`/`ArgV`. Linux reads them off
+    /// the initial stack; Windows builds them from `GetCommandLineA`.
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32);
 
     /// Capture the environment pointer (`U8 **envp`) into the BSS slot `envp_off`.
-    /// Runs just after the entry frame is set up (so `rbp` is valid), only when the
-    /// program references `EnvP`. Linux computes `&envp[0]` from the initial stack
-    /// (just past the argv NULL terminator); Windows has no `envp` array, so it
-    /// stores a NULL (env access there is unsupported for now).
+    /// Runs just after the entry frame is set up, so `rbp` is valid, and only when
+    /// the program references `EnvP`. Linux computes `&envp[0]` from the initial
+    /// stack, just past the argv NULL terminator. Windows has no `envp` array, so it
+    /// stores a NULL; env access there is unsupported for now.
     fn emit_capture_env(&mut self, asm: &mut Asm, envp_off: i32);
 
     /// Package the emitted program into a runnable executable. Takes ownership of
-    /// the `Asm` so a policy can read its layout (and, on Windows, append an import
-    /// table) before calling [`Asm::finish`]; `bss` is the zero-filled BSS that
+    /// the `Asm` so a policy can read its layout — and, on Windows, append an import
+    /// table — before calling [`Asm::finish`]. `bss` is the zero-filled BSS that
     /// follows the image in memory. Linux finishes with no imports and wraps the
-    /// blob in an ELF; Windows builds a kernel32 import table, finishes with it,
-    /// and wraps the blob in a PE.
+    /// blob in an ELF. Windows builds a kernel32 import table, finishes with it, and
+    /// wraps the blob in a PE.
     fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError>;
 }
 
 /// Compile a type-checked program to a runnable executable image. This driver is
-/// **OS-independent** — it lays out functions and globals, emits the entry, the
-/// function bodies, and the print/builtin runtime, then resolves fixups — and
-/// defers the four OS-specific steps (exit, page allocation, the stdout sink, and
-/// the container format) to `os`. The concrete targets ([`X64Linux`],
+/// OS-independent: it lays out functions and globals, emits the entry, the function
+/// bodies, and the print/builtin runtime, then resolves fixups. The four
+/// OS-specific steps — exit, page allocation, the stdout sink, and the container
+/// format — are deferred to `os`. The concrete targets ([`X64Linux`],
 /// [`X64Windows`]) just pick the policy and write the returned bytes to disk.
 fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenError> {
     let (layouts, _) = layout::compute(program);
     let mut cg = Cg::new(layouts, os);
 
-    // Pre-assign a label to every defined function (so calls can forward-ref).
+    // Pre-assign a label to every defined function, so calls can forward-reference.
     for item in &program.items {
         if let StmtKind::Func(f) = &item.kind {
             if f.body.is_some() {
@@ -195,8 +222,8 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
         }
     }
 
-    // Top-level variable declarations are globals (BSS-allocated, accessible
-    // from any function); collect them before emitting any code.
+    // Top-level variable declarations are globals: BSS-allocated and accessible
+    // from any function. Collect them before emitting any code.
     for item in &program.items {
         if let StmtKind::VarDecl { decls } = &item.kind {
             for d in decls {
@@ -205,23 +232,32 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
         }
     }
 
-    // `MSize` makes `MAlloc` prepend an 8-byte size header; gate it so programs that
+    // `MSize` makes `MAlloc` prepend an 8-byte size header. Gate it so programs that
     // never call `MSize` keep the lean, header-free heap byte-for-byte.
     cg.uses_msize = crate::ast::program_calls_any(program, &["MSize"]);
-    // The command line is exposed as the implicit globals `ArgC`/`ArgV` (the entry
-    // captures them into these BSS slots; a `...` function's `VargC`/`VargV` varargs
-    // locals are distinct names). Only when the program references them, so arg-free
-    // programs stay byte-for-byte unchanged.
+    // The command line is exposed as the implicit globals `ArgC`/`ArgV`; the entry
+    // captures them into these BSS slots. (A `...` function's `VargC`/`VargV` varargs
+    // locals are distinct names.) Reserved only when the program references them, so
+    // arg-free programs stay byte-for-byte unchanged.
     if crate::ast::program_uses_ident(program, &["ArgC", "ArgV"]) {
         cg.uses_args = true;
         cg.argc_off = Some(cg.alloc_bss(8, 8));
         cg.argv_off = Some(cg.alloc_bss(8, 8));
     }
     // The environment `U8 **EnvP`, captured at the entry. Gated independently of the
-    // command line so an `EnvP`-free program is byte-for-byte unchanged.
+    // command line, so an `EnvP`-free program is byte-for-byte unchanged.
     if crate::ast::program_uses_ident(program, &["EnvP"]) {
         cg.uses_env = true;
         cg.envp_off = Some(cg.alloc_bss(8, 8));
+    }
+    // The implicit task `CTask *Fs` (exception state). A single zero-initialized BSS
+    // region whose address is `Fs`; reserved only when the program uses `Fs`/exceptions.
+    if crate::ast::program_uses_ident(program, &["Fs"])
+        || crate::ast::program_has_exceptions(program)
+    {
+        cg.uses_exc = true;
+        let size = cg.size_of(&Type::Named("CTask".to_string())).max(8);
+        cg.ctask_off = Some(cg.alloc_bss(size, 8));
     }
 
     // The entry runs the top-level statements; a top-level `return` exits with it.
@@ -237,8 +273,8 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
         }
     }
 
-    // Builtin runtime routines (MAlloc, string/mem ops, …), only those used. (The
-    // print runtime is gone — the printf family is pure HolyC, an ordinary function.)
+    // Builtin runtime routines (MAlloc, string/mem ops, …), only the ones used. The
+    // print runtime is gone: the printf family is pure HolyC, an ordinary function.
     cg.emit_rt_routines();
 
     let bss = cg.bss as u64;
@@ -250,9 +286,9 @@ fn compile(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenE
 /// Number of System V integer argument registers (`gen_call` / parameter setup).
 const ARG_REGS: usize = 6;
 
-/// A local's frame location. Its lowest byte is at `[rbp - off]`. An array
-/// parameter decays to a pointer, so its slot holds the *address* of the caller's
-/// data (`indirect`) rather than the data itself.
+/// A local's frame location; its lowest byte is at `[rbp - off]`. An array
+/// parameter decays to a pointer, so when `indirect` is set the slot holds the
+/// *address* of the caller's data rather than the data itself.
 #[derive(Clone)]
 struct VarLoc {
     off: i32,
@@ -260,7 +296,6 @@ struct VarLoc {
     indirect: bool,
 }
 
-/// A routine in the tiny print runtime (emitted once, on demand).
 // Register numbers for the generic encoders.
 const RAX: u8 = 0;
 const RCX: u8 = 1;
@@ -274,9 +309,17 @@ const R9: u8 = 9;
 const R10: u8 = 10;
 const R11: u8 = 11;
 const R15: u8 = 15;
+const RBP: u8 = 5;
+const R12: u8 = 12;
+const R13: u8 = 13;
+const R14: u8 = 14;
+/// `ExcFrame` size on x86-64: prev, saved_rsp, saved_rbp, landing_pad (4×8=32) plus
+/// the System V callee-saved set saved at `try` / restored by `throw` — rbx, r12, r13,
+/// r14, r15 (5×8=40). 72 bytes total.
+const EXC_FRAME_SIZE_X86: i32 = 72;
 
-/// A global variable's location: a byte offset into the BSS region. Its address
-/// is RIP-relative (resolved like a string reference, but past the file image).
+/// A global variable's location: a byte offset into the BSS region. Its address is
+/// RIP-relative, resolved like a string reference but past the file image.
 #[derive(Clone)]
 struct GlobalLoc {
     off: i32,
@@ -303,13 +346,9 @@ struct Cg {
     funcs_sig: HashMap<String, (Vec<Type>, Type)>, // name -> (param types, return type)
     funcs_va: HashMap<String, bool>, // name -> is variadic (`...`)
     rt_routines: HashMap<&'static str, usize>, // builtin runtime routine -> label (on first use)
-    // Growing-sink globals (set only when a program uses `MStrPrint`): the base of
-    // the owned, reallocating buffer and its current capacity end. `out_limit != 0`
-    // is what tells the sink it may grow rather than blindly append (the StrPrint
-    // path leaves it 0). `out_limit_off.is_some()` gates the grow branch in the sink.
     // Command-line args: BSS slots holding argc and the argv array pointer, set
-    // when the program uses `ArgC`/`ArgV` (the entry captures them). `None`/false
-    // for arg-free programs, which are then byte-for-byte unchanged.
+    // when the program uses `ArgC`/`ArgV` (the entry captures them). `None` and
+    // false for arg-free programs, which then stay byte-for-byte unchanged.
     argc_off: Option<i32>,
     argv_off: Option<i32>,
     uses_args: bool,
@@ -319,6 +358,11 @@ struct Cg {
     envp_off: Option<i32>,
     uses_env: bool,
     uses_msize: bool, // program calls `MSize` ⇒ `MAlloc` prepends a size header
+    // Exceptions: a BSS slot holding the process-global `CTask` (the implicit `Fs`),
+    // set when the program uses `Fs`/`try`/`throw`. Single-task for now (per-thread TLS
+    // via `%fs`/`arch_prctl` is future work, mirroring the freestanding arm64 gap).
+    ctask_off: Option<i32>,
+    uses_exc: bool,
 }
 
 impl Cg {
@@ -349,6 +393,8 @@ impl Cg {
             envp_off: None,
             uses_env: false,
             uses_msize: false,
+            ctask_off: None,
+            uses_exc: false,
         }
     }
 
@@ -362,8 +408,8 @@ impl Cg {
         l
     }
 
-    /// Reserve `size` bytes of zero-initialised BSS at `align`, returning the
-    /// offset of its first byte (its address is the BSS base + this offset).
+    /// Reserve `size` bytes of zero-initialised BSS at `align`, returning the offset
+    /// of its first byte. Its address is the BSS base plus this offset.
     fn alloc_bss(&mut self, size: i32, align: i32) -> i32 {
         let a = align.max(1);
         let off = (self.bss + a - 1) / a * a;
@@ -396,8 +442,9 @@ impl Cg {
         let a = align.max(1);
         let total = self.depth + size;
         self.depth = (total + a - 1) / a * a; // round up to `a`
-        // `max_depth` is the high-water mark — the frame is sized to it, so reclaiming
-        // `depth` (a call's transient variadic buffer) never shrinks the frame.
+        // `max_depth` is the high-water mark the frame is sized to. Reclaiming
+        // `depth` (a call's transient variadic buffer) therefore never shrinks the
+        // frame.
         self.max_depth = self.max_depth.max(self.depth);
         self.depth
     }
@@ -433,12 +480,26 @@ impl Cg {
             let e = self.envp_off.unwrap();
             self.os.emit_capture_env(&mut self.asm, e);
         }
+        // Per-thread exception state (Linux): point the main thread's FS base at the
+        // global `CTask` and store its self-pointer, so `Fs` reads it via `fs:[0]`.
+        // Spawned threads get their own via the `clone` CLONE_SETTLS path. Gated on
+        // use, so non-exception programs are unchanged.
+        if self.uses_exc && self.os.is_posix() {
+            let off = self.ctask_off.unwrap();
+            self.asm.lea_global(RAX, off); // rax = &CTask
+            self.asm.lea_global(RCX, off); // rcx = &CTask
+            self.asm.store_through(8); // CTask.self = &CTask
+            self.asm.mov_ri(RDI, 0x1002); // ARCH_SET_FS
+            self.asm.lea_global(RSI, off); // rsi = &CTask
+            self.asm.mov_ri(RAX, 158); // SYS_arch_prctl
+            self.asm.syscall();
+        }
         for item in items {
             match &item.kind {
                 // Function/type definitions aren't statements that run here.
                 StmtKind::Func(_) | StmtKind::Class(_) => {}
-                // A top-level declaration is a global: its storage is in BSS
-                // (already zeroed); only its initialiser runs, in program order.
+                // A top-level declaration is a global. Its storage is in BSS,
+                // already zeroed, so only its initialiser runs, in program order.
                 StmtKind::VarDecl { decls } => {
                     for d in decls {
                         if let Some(init) = &d.init {
@@ -469,8 +530,8 @@ impl Cg {
         self.collect_labels(body);
         self.asm.place(label);
         let frame = self.asm.prologue();
-        // A class-returning function received its result buffer's address in r11;
-        // save it to a frame slot before any code can clobber r11.
+        // A class-returning function received its result buffer's address in r11.
+        // Save it to a frame slot before any code can clobber r11.
         if matches!(ret, Type::Named(_)) {
             let off = self.alloc(8, 8);
             self.asm.mov_rr(RAX, R11);
@@ -478,10 +539,11 @@ impl Cg {
             self.sret_off = Some(off);
         }
         // System V classing: integer/pointer/class-pointer args in rdi.., F64 args
-        // in xmm0.. — the two classes counted independently. Pass 1 spills every
-        // incoming argument register to a slot using only `rax` (no `rep movsb`,
-        // which would clobber later args still in rsi/rdi/rcx); pass 2 then copies
-        // each by-value class from the saved pointer into its local slot.
+        // in xmm0.., the two classes counted independently. Pass 1 spills every
+        // incoming argument register to a slot using only `rax`. It can't use
+        // `rep movsb` yet, which would clobber later args still in rsi/rdi/rcx.
+        // Pass 2 then copies each by-value class from the saved pointer into its
+        // local slot.
         let mut gpr = 0usize;
         let mut fpr = 0usize;
         let mut class_copies: Vec<(i32, i32, i32)> = Vec::new(); // (dest slot, ptr temp, size)
@@ -506,8 +568,8 @@ impl Cg {
                 ));
             }
             if matches!(p.ty, Type::Named(_)) {
-                // A class is passed by value as a pointer; stash the pointer now
-                // (only `rax` touched) and copy it in pass 2.
+                // A class is passed by value as a pointer. Stash the pointer now,
+                // touching only `rax`, and copy it in pass 2.
                 let off = self.declare(name, p.ty.clone(), false);
                 let ptr_tmp = self.alloc(8, 8);
                 self.asm.mov_rax_argreg(gpr);
@@ -516,12 +578,12 @@ impl Cg {
                 gpr += 1;
                 continue;
             }
-            // An array parameter decays to a pointer (passed by reference); its
-            // slot holds the incoming pointer (8 bytes), marked indirect.
+            // An array parameter decays to a pointer (passed by reference). Its
+            // slot holds the incoming 8-byte pointer and is marked indirect.
             let indirect = matches!(p.ty, Type::Array(..));
             let off = self.declare(name, p.ty.clone(), indirect);
             self.asm.mov_rax_argreg(gpr);
-            // Spill at the slot's width: a narrow scalar (`U8`/`U32`/…) has a
+            // Spill at the slot's width. A narrow scalar (`U8`/`U32`/…) has a
             // sub-8-byte slot, so an 8-byte store would run past it and clobber the
             // adjacent local. The caller already truncated the value to the param
             // width, and reads sign/zero-extend it back, so the low bytes suffice.
@@ -541,10 +603,10 @@ impl Cg {
             self.asm.mov_rcx_imm32(size);
             self.asm.rep_movsb();
         }
-        // A variadic function takes two hidden integer params after the named ones
-        // (in argreg[gpr], argreg[gpr+1]): the caller's vararg buffer pointer and the
-        // count. Spill them to slots and expose them as the implicit HolyC varargs
-        // locals `I64 *VargV` (the buffer) and `I64 VargC` (the count).
+        // A variadic function takes two hidden integer params after the named ones,
+        // in argreg[gpr] and argreg[gpr+1]: the caller's vararg buffer pointer and
+        // the count. Spill them to slots and expose them as the implicit HolyC
+        // varargs locals `I64 *VargV` (the buffer) and `I64 VargC` (the count).
         if varargs {
             if gpr + 1 >= ARG_REGS {
                 return Err(CodegenError::at(
@@ -688,8 +750,8 @@ impl Cg {
                                 self.gen_memcpy_to_local(off, size);
                             }
                             // Brace initialiser (positional or designated): zero the
-                            // slot, then store the provided elements/fields (recursing
-                            // for nested aggregates) so a partial init leaves the rest 0.
+                            // slot, then store the provided elements/fields, recursing
+                            // for nested aggregates. A partial init leaves the rest 0.
                             Some(init) if is_brace_init(init) => {
                                 self.gen_zero(off, size);
                                 self.gen_init_into(Place::Local(off), &d.ty, 0, init)?;
@@ -743,10 +805,10 @@ impl Cg {
                     match val {
                         Some(e) => {
                             self.gen_int_expr(e, &ret)?;
-                            // C truncates the return value to the declared width (a
-                            // narrow `U8`/`I16`/… return); there is no store to do it,
-                            // so narrow the register in place, matching the interpreter
-                            // and the arm64 backend.
+                            // C truncates the return value to the declared width for
+                            // a narrow `U8`/`I16`/… return. There is no store to do
+                            // it, so narrow the register in place, matching the
+                            // interpreter and the arm64 backend.
                             self.asm
                                 .cast_rax(self.size_of(&ret), !is_unsigned_int(&ret));
                         }
@@ -799,6 +861,8 @@ impl Cg {
                 })?;
                 self.asm.jmp(id);
             }
+            StmtKind::Try { body, handler } => self.gen_try(body, handler)?,
+            StmtKind::Throw(val) => self.gen_throw(val)?,
             other => {
                 return Err(CodegenError::at(
                     s.span.pos,
@@ -809,17 +873,169 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower a `switch`. Evaluates the discriminant once into a frame slot, then a
-    /// linear compare-chain dispatches to each `case` label (single value or a
-    /// `lo ... hi` range), falling through to `default`/the epilogue/the exit when
-    /// nothing matches. The optional `start:`/`end:` sub-labels partition the body
-    /// into a prologue (runs before dispatch) and epilogue (reached by fall-through,
-    /// skipped by `break`). Mirrors the arm64 backend's compare-chain.
-    /// Lower a `switch`. The control structure is the shared
-    /// [`crate::backend::gen_switch`] driver; this backend supplies the leaf emits via
-    /// [`SwitchEmitter`] (and uses the default no-jump-table compare-chain path).
+    /// Lower a `switch` via the shared [`crate::backend::gen_switch`] driver; this
+    /// backend supplies the leaf emits through [`crate::backend::Emitter`] and uses
+    /// the default no-jump-table compare-chain path.
+    ///
+    /// The discriminant is evaluated once into a frame slot, then a linear
+    /// compare-chain dispatches to each `case` label (a single value or a
+    /// `lo ... hi` range), falling through to `default`, the epilogue, or the exit
+    /// when nothing matches. The optional `start:`/`end:` sub-labels partition the
+    /// body into a prologue (runs before dispatch) and an epilogue (reached by
+    /// fall-through, skipped by `break`). Mirrors the arm64 backend's compare-chain.
     fn gen_switch(&mut self, cond: &Expr, body: &Stmt, pos: Pos) -> Result<(), CodegenError> {
         crate::backend::gen_switch(self, cond, body, pos)
+    }
+
+    /// Byte offset of a `CTask` field (`except_ch`/`catch_except`/`exc_top`).
+    fn ctask_field(&self, field: &str) -> i32 {
+        self.layouts.offset_of("CTask", field).unwrap_or(0) as i32
+    }
+
+    /// Load the current task pointer (`CTask *Fs`) into `reg`. On Linux (freestanding)
+    /// it is per-thread: the FS base points at this thread's `CTask`, whose
+    /// self-pointer is `fs:[0]` (set at `_start` via `arch_prctl` for the main thread,
+    /// and by the `clone` `CLONE_SETTLS` for spawned threads). On Windows (no threads)
+    /// it is the address of the process-global `CTask` region.
+    fn gen_fs_addr(&mut self, reg: u8) {
+        if self.os.is_posix() {
+            self.asm.mov_reg_fs0(reg);
+        } else {
+            self.asm
+                .lea_global(reg, self.ctask_off.expect("CTask region"));
+        }
+    }
+
+    /// Lower `try { body } catch { handler }`. Mirrors the arm64 unwinder: build an
+    /// on-stack `ExcFrame` (prev, saved rsp/rbp, landing-pad address, callee-saved set
+    /// rbx/r12..r15), push it on `Fs->exc_top`, run the body, and on normal completion
+    /// pop it and skip the catch. The `catch` block is the longjmp landing pad. The
+    /// `ExcFrame` is a frame local, so its fields are rbp-relative (`store_local`).
+    fn gen_try(&mut self, body: &[Stmt], handler: &[Stmt]) -> Result<(), CodegenError> {
+        let ef = self.alloc(EXC_FRAME_SIZE_X86, 16); // &ExcFrame = rbp - ef
+        let exctop = self.ctask_field("exc_top");
+        let catchex = self.ctask_field("catch_except");
+        let catch_l = self.asm.new_label();
+        let after_l = self.asm.new_label();
+
+        // frame.prev = Fs->exc_top
+        self.gen_fs_addr(RAX);
+        self.asm.add_rax_imm32(exctop);
+        self.asm.load_through(8, false);
+        self.asm.store_local(ef, 8);
+        // frame.saved_rsp / saved_rbp / landing_pad
+        self.asm.mov_rr(RAX, RSP);
+        self.asm.store_local(ef - 8, 8);
+        self.asm.mov_rr(RAX, RBP);
+        self.asm.store_local(ef - 16, 8);
+        self.asm.lea_rax_label(catch_l);
+        self.asm.store_local(ef - 24, 8);
+        // Save the callee-saved set so a `throw` can restore the caller's values.
+        for (i, &r) in [RBX, R12, R13, R14, R15].iter().enumerate() {
+            self.asm.mov_rr(RAX, r);
+            self.asm.store_local(ef - 32 - 8 * i as i32, 8);
+        }
+        // Fs->exc_top = &ExcFrame
+        self.gen_fs_addr(RCX);
+        self.asm.add_imm32(RCX, exctop);
+        self.asm.lea_local(ef); // rax = &ExcFrame
+        self.asm.store_through(8);
+
+        for s in body {
+            self.gen_stmt(s)?;
+        }
+
+        // Normal completion: Fs->exc_top = frame.prev; skip the catch.
+        self.asm.load_local(ef, 8, false); // rax = frame.prev
+        self.gen_fs_addr(RCX);
+        self.asm.add_imm32(RCX, exctop);
+        self.asm.store_through(8);
+        self.asm.jmp(after_l);
+
+        // Landing pad: `throw` jumps here with rsp/rbp/callee-saved already restored,
+        // exc_top popped, except_ch set, and catch_except = 1.
+        self.asm.place(catch_l);
+        for s in handler {
+            self.gen_stmt(s)?;
+        }
+        self.asm.mov_rax_imm(0); // clear catch_except after the handler
+        self.gen_fs_addr(RCX);
+        self.asm.add_imm32(RCX, catchex);
+        self.asm.store_through(8);
+
+        self.asm.place(after_l);
+        Ok(())
+    }
+
+    /// Lower `throw expr;` (or bare `throw;`): set `Fs->except_ch`, then unwind to the
+    /// top handler — restore its callee-saved set / rsp / rbp from the `ExcFrame`, pop
+    /// it, set `catch_except` = 1, and `jmp` to its landing pad. An empty chain means
+    /// the exception is uncaught, which exits the process. `r11` holds the handler
+    /// frame across the restores (it is never a restore target).
+    fn gen_throw(&mut self, val: &Option<Expr>) -> Result<(), CodegenError> {
+        let except = self.ctask_field("except_ch");
+        let exctop = self.ctask_field("exc_top");
+        let catchex = self.ctask_field("catch_except");
+
+        // rax = value to raise (a bare `throw;` re-raises the current except_ch).
+        match val {
+            Some(e) => self.gen_int_expr(e, &Type::I64)?,
+            None => {
+                self.gen_fs_addr(RAX);
+                self.asm.add_rax_imm32(except);
+                self.asm.load_through(8, false);
+            }
+        }
+        // Fs->except_ch = rax
+        self.gen_fs_addr(RCX);
+        self.asm.add_imm32(RCX, except);
+        self.asm.store_through(8);
+        // r11 = f = Fs->exc_top
+        self.gen_fs_addr(RAX);
+        self.asm.add_rax_imm32(exctop);
+        self.asm.load_through(8, false);
+        self.asm.mov_rr(R11, RAX);
+        // Uncaught (f == NULL): exit with the thrown value as the code.
+        let live = self.asm.new_label();
+        self.asm.test_rr(R11, R11);
+        self.asm.jne(live);
+        self.gen_fs_addr(RAX);
+        self.asm.add_rax_imm32(except);
+        self.asm.load_through(8, false);
+        self.os.emit_exit(&mut self.asm);
+        self.asm.place(live);
+        // Restore the callee-saved set from the handler frame, then rsp and rbp.
+        for (i, &r) in [RBX, R12, R13, R14, R15].iter().enumerate() {
+            self.asm.mov_rr(RAX, R11);
+            self.asm.add_rax_imm32(32 + 8 * i as i32);
+            self.asm.load_through(8, false);
+            self.asm.mov_rr(r, RAX);
+        }
+        self.asm.mov_rr(RAX, R11);
+        self.asm.add_rax_imm32(8); // saved_rsp
+        self.asm.load_through(8, false);
+        self.asm.mov_rr(RSP, RAX);
+        self.asm.mov_rr(RAX, R11);
+        self.asm.add_rax_imm32(16); // saved_rbp
+        self.asm.load_through(8, false);
+        self.asm.mov_rr(RBP, RAX);
+        // Fs->exc_top = f.prev (offset 0)
+        self.asm.mov_rr(RAX, R11);
+        self.asm.load_through(8, false);
+        self.gen_fs_addr(RCX);
+        self.asm.add_imm32(RCX, exctop);
+        self.asm.store_through(8);
+        // catch_except = 1
+        self.asm.mov_rax_imm(1);
+        self.gen_fs_addr(RCX);
+        self.asm.add_imm32(RCX, catchex);
+        self.asm.store_through(8);
+        // Jump to the handler's landing pad (offset 24).
+        self.asm.mov_rr(RAX, R11);
+        self.asm.add_rax_imm32(24);
+        self.asm.load_through(8, false);
+        self.asm.jmp_reg(RAX);
+        Ok(())
     }
 
     /// Emit the initialiser store for a top-level global. Storage is BSS (zeroed),
@@ -872,8 +1088,8 @@ impl Cg {
     fn gen_expr(&mut self, e: &Expr) -> Result<(), CodegenError> {
         let pos = e.span.pos;
         // An F64-typed expression evaluates in the SSE file. Reaching `gen_expr`
-        // means integer context, so convert toward zero (signed; `gen_int_expr`
-        // handles an unsigned target).
+        // means integer context, so convert toward zero (signed). `gen_int_expr`
+        // handles an unsigned target.
         if is_f64(&self.expr_ty(e)) {
             self.gen_fexpr(e)?;
             self.asm.cvttsd2si(RAX, 0);
@@ -884,7 +1100,8 @@ impl Cg {
             ExprKind::Cast { expr, .. } => {
                 // F64-target casts go through gen_fexpr; here the target is
                 // integer/pointer. A float source needs a real conversion; an
-                // integer source just evaluates (width handled at use/store sites).
+                // integer source just evaluates, with width handled at use/store
+                // sites.
                 if is_f64(&self.expr_ty(expr)) {
                     self.gen_fexpr(expr)?;
                     if is_unsigned_int(&self.expr_ty(e)) {
@@ -924,8 +1141,8 @@ impl Cg {
             ExprKind::Ident(name) => match name.as_str() {
                 "NULL" | "FALSE" => self.asm.mov_rax_imm(0),
                 "TRUE" => self.asm.mov_rax_imm(1),
-                // The command line `ArgC` (count) / `ArgV` (the `U8 **` base) are
-                // implicit globals captured at the entry — unless a user variable
+                // The command line `ArgC` (count) and `ArgV` (the `U8 **` base) are
+                // implicit globals captured at the entry, unless a user variable
                 // shadows them with a local of the same name.
                 "ArgC" | "ArgV" | "EnvP" if self.lookup(name).is_none() => {
                     let off = match name.as_str() {
@@ -935,6 +1152,11 @@ impl Cg {
                     };
                     self.asm.lea_rax_global(off);
                     self.asm.load_through(8, false); // rax = ArgC / ArgV / EnvP base
+                }
+                // `Fs` is the `CTask *` task pointer (per-thread on Linux, global on
+                // Windows), unless shadowed by a local.
+                "Fs" if self.lookup(name).is_none() && self.ctask_off.is_some() => {
+                    self.gen_fs_addr(RAX);
                 }
                 _ => {
                     if let Some(v) = self.lookup(name) {
@@ -949,8 +1171,8 @@ impl Cg {
                     } else if let Some(g) = self.globals.get(name).cloned() {
                         self.asm.lea_rax_global(g.off); // rax = &global
                         if !is_aggregate(&g.ty) {
-                            // a scalar global loads through its address; an aggregate
-                            // decays to the address already in rax.
+                            // A scalar global loads through its address; an
+                            // aggregate decays to the address already in rax.
                             self.asm
                                 .load_through(self.size_of(&g.ty), type_signed(&g.ty));
                         }
@@ -1042,10 +1264,10 @@ impl Cg {
         Ok(())
     }
 
-    /// `++`/`--` on any scalar lvalue (integer or pointer — a pointer steps by its
-    /// pointee size). Addressed through `gen_addr`, so it covers locals, globals,
-    /// `*p`, `a[i]`, and members. Result is the new value (pre) or the preserved
-    /// old value (post).
+    /// `++`/`--` on any scalar lvalue, integer or pointer; a pointer steps by its
+    /// pointee size. Addressed through `gen_addr`, so it covers locals, globals,
+    /// `*p`, `a[i]`, and members. The result is the new value (prefix) or the
+    /// preserved old value (postfix).
     fn gen_incdec(
         &mut self,
         target: &Expr,
@@ -1182,9 +1404,9 @@ impl Cg {
         Ok(())
     }
 
-    /// Apply an arithmetic/bitwise/shift op with `rax = lhs`, `rcx = rhs`. `signed`
-    /// (keyed off the left operand's type) directs `/`, `%`, and `>>`: signed uses
-    /// `idiv`/`sar`, unsigned uses `div`/`shr` (C semantics).
+    /// Apply an arithmetic/bitwise/shift op with `rax = lhs`, `rcx = rhs`. The
+    /// `signed` flag, keyed off the left operand's type, directs `/`, `%`, and `>>`:
+    /// signed uses `idiv`/`sar`, unsigned uses `div`/`shr`, per C semantics.
     fn apply_int_binop(&mut self, op: BinOp, signed: bool) -> Result<(), CodegenError> {
         use BinOp::*;
         match op {
@@ -1281,8 +1503,8 @@ impl Cg {
             return Ok(()); // assignment's value is in rax
         }
         // Compound `x op= value` on a scalar lvalue. A pointer is a scalar and
-        // supports `+=`/`-=` (the rhs is scaled by the pointee size, like `++`);
-        // only aggregates/arrays are rejected.
+        // supports `+=`/`-=`, with the rhs scaled by the pointee size like `++`.
+        // Only aggregates/arrays are rejected.
         if !is_scalar(&tty) {
             return Err(CodegenError::at(
                 pos,
@@ -1424,8 +1646,8 @@ impl Cg {
         }
     }
 
-    /// Copy `size` bytes from the address in rax (source) to `dest` (a local
-    /// offset) — a by-value aggregate copy (`rep movsb`).
+    /// Copy `size` bytes from the source address in rax to the local at offset
+    /// `dest_off` — a by-value aggregate copy via `rep movsb`.
     fn gen_memcpy_to_local(&mut self, dest_off: i32, size: i32) {
         self.asm.mov_rsi_rax(); // rsi = source
         self.asm.lea_local(dest_off);
@@ -1447,9 +1669,10 @@ impl Cg {
     }
 
     /// Emit a brace/designated initialiser into the aggregate at `place`. The
-    /// recursion/dispatch is the shared [`crate::backend::gen_init_into`] driver;
-    /// this backend supplies the leaf stores via [`InitEmitter`]. (Byte offsets are
-    /// non-negative; the driver works in `u32`, this backend's frame math in `i32`.)
+    /// recursion and dispatch come from the shared [`crate::backend::gen_init_into`]
+    /// driver; this backend supplies the leaf stores via [`crate::backend::Emitter`].
+    /// Byte offsets are non-negative, so the driver works in `u32` while this
+    /// backend's frame math is `i32`.
     fn gen_init_into(
         &mut self,
         place: Place,
@@ -1472,11 +1695,12 @@ impl Cg {
         self.gen_indirect_call(callee, args, pos)
     }
 
-    /// Emit a recognized stdlib intrinsic ([`crate::intrinsics`]) inline — a hardware
-    /// instruction in place of a call to the function's lib implementation. Returns
-    /// whether it was handled; an unhandled name falls through to an ordinary call,
-    /// so the lib HolyC body (which the interpreter runs) is the fallback. An
-    /// optimization intrinsic computes the same value, so conformance holds.
+    /// Emit a recognized stdlib intrinsic ([`crate::intrinsics`]) inline as a
+    /// hardware instruction, in place of a call to the function's lib
+    /// implementation. Returns whether it was handled; an unhandled name falls
+    /// through to an ordinary call, so the lib HolyC body (which the interpreter
+    /// runs) is the fallback. An optimization intrinsic computes the same value, so
+    /// conformance holds.
     fn try_intrinsic(
         &mut self,
         name: &str,
@@ -1486,18 +1710,19 @@ impl Cg {
         if crate::intrinsics::kind(name).is_none() || args.len() != 1 {
             return Ok(false);
         }
-        // Only optimize a call that resolves to the lib intrinsic — a single F64 arg,
+        // Only optimize a call that resolves to the lib intrinsic: a single F64 arg,
         // F64 result. A user override with a different signature must be called
-        // normally (the instruction would leave the result in the wrong register).
+        // normally, since the instruction would leave the result in the wrong
+        // register.
         let is_f64_unary = self.funcs_sig.get(name).is_some_and(|(p, r)| {
             matches!(r, Type::F64) && p.len() == 1 && matches!(p[0], Type::F64)
         });
         if !is_f64_unary {
             return Ok(false);
         }
-        // SSE2 single-instruction equivalents. (The `Floor`/`Ceil`/`Trunc`/`Round*`
-        // intrinsics would need SSE4.1 `roundsd`, which isn't baseline x86-64, so they
-        // fall through to the HolyC body in `lib/math.hc`.)
+        // SSE2 single-instruction equivalents. The `Floor`/`Ceil`/`Trunc`/`Round*`
+        // intrinsics would need SSE4.1 `roundsd`, which isn't baseline x86-64, so
+        // they fall through to the HolyC body in `lib/math.hc`.
         match name {
             "Sqrt" => {
                 self.gen_foperand(&args[0])?; // value in xmm0
@@ -1526,19 +1751,19 @@ impl Cg {
         if self.try_intrinsic(name, args, pos)? {
             return Ok(());
         }
-        // A primitive intrinsic (printf family / heap / clock / sockets / threads — a
-        // lib prototype with no body) is lowered like the old builtins, **unless a
-        // compiled user function shadows the name** (a program's own `Join`/`Read`):
-        // `funcs` holds only real definitions, so its presence means "call the body."
-        // (`Print` itself reaches the backend via `as_print`, not here.)
+        // A primitive intrinsic — the printf family, heap, clock, sockets, threads:
+        // a lib prototype with no body — is lowered like the old builtins. The
+        // exception is when a compiled user function shadows the name (a program's
+        // own `Join`/`Read`): `funcs` holds only real definitions, so its presence
+        // means "call the body." (`Print` itself reaches the backend via `as_print`,
+        // not here.)
         if !self.funcs.contains_key(name) && crate::intrinsics::is_primitive(name) {
             return self.gen_builtin(name, args, pos);
         }
-        // A user function shadows nothing; otherwise a builtin is lowered inline
-        // (the x86-64 backend has no libc, so each is emitted from scratch).
+        // Reached for an ordinary defined function. The x86-64 backend has no libc,
+        // so any builtin would have been lowered inline above, emitted from scratch.
         let label = match self.funcs.get(name) {
             Some(&l) => l,
-            None if crate::builtins::is_builtin(name) => return self.gen_builtin(name, args, pos),
             None => {
                 return Err(CodegenError::at(
                     pos,
@@ -1590,12 +1815,12 @@ impl Cg {
         )
     }
 
-    /// The shared call ABI (System V): pass `args` per `param_tys` — integer/pointer
-    /// args in rdi.., F64 args in xmm0.., a class return via an sret pointer in r11 —
-    /// then transfer to `target`. A `Direct` target is a known label; an `Indirect`
-    /// target's function-pointer value is evaluated and spilled up front so it
-    /// survives argument evaluation. `varargs` stages the trailing args into a frame
-    /// buffer passed as a (ptr, count) pair.
+    /// The shared call ABI (System V). Passes `args` per `param_tys`:
+    /// integer/pointer args in rdi.., F64 args in xmm0.., and a class return via an
+    /// sret pointer in r11. Then transfers to `target`. A `Direct` target is a known
+    /// label; an `Indirect` target's function-pointer value is evaluated and spilled
+    /// up front so it survives argument evaluation. `varargs` stages the trailing
+    /// args into a frame buffer passed as a (ptr, count) pair.
     fn emit_call_abi(
         &mut self,
         target: CallTarget,
@@ -1610,9 +1835,9 @@ impl Cg {
         } else {
             None
         };
-        // For a variadic callee only the named params are register-passed; trailing
-        // args become variadic `extra`. A missing param type (a malformed over-long
-        // call) defaults to I64, as before.
+        // For a variadic callee, only the named params are register-passed; trailing
+        // args become the variadic `extra`. A missing param type — a malformed
+        // over-long call — defaults to I64.
         let n_named = if varargs {
             param_tys.len().min(args.len())
         } else {
@@ -1674,21 +1899,21 @@ impl Cg {
         Ok(())
     }
 
-    /// Freestanding `Thread(fn, arg)` → spawn a real `CLONE_THREAD` thread via
+    /// Freestanding `Thread(fn, arg)`: spawn a real `CLONE_THREAD` thread via
     /// `clone(2)` onto an `mmap`'d stack running `fn(arg)`. A 32-byte thread control
-    /// block (TCB) at the stack base — `[retval | ctid futex | fn | arg]` — passes the
-    /// closure in and carries the result back; its address is the handle.
-    /// `CLONE_PARENT_SETTID` writes the new tid into the futex word synchronously (so
-    /// `Join` can't race a not-yet-set word) and `CLONE_CHILD_CLEARTID` zeroes it +
-    /// futex-wakes on exit. The child inherits `rbp`/the shared VM, so it reads the TCB
-    /// pointer back from the frame slot the parent stored it in.
+    /// block (TCB) at the stack base — `[retval | ctid futex | fn | arg]` — passes
+    /// the closure in and carries the result back; its address is the handle.
+    /// `CLONE_PARENT_SETTID` writes the new tid into the futex word synchronously, so
+    /// `Join` can't race a not-yet-set word, and `CLONE_CHILD_CLEARTID` zeroes it and
+    /// futex-wakes on exit. The child inherits `rbp` and the shared VM, so it reads
+    /// the TCB pointer back from the frame slot the parent stored it in.
     fn gen_thread(&mut self, args: &[Expr]) -> Result<(), CodegenError> {
         const SIZE: i32 = 0x2_0000; // 128 KiB stack + TCB
         // The exact flag set glibc's pthread_create uses: CLONE_VM|FS|FILES|SIGHAND|
         // THREAD|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID. The emulated x86-64
-        // runtime (Rosetta/qemu) rejects thread clones without SYSVSEM + a valid TLS
-        // (whose first word self-points), so we set both even though the compiled code
-        // uses no TLS.
+        // runtime (Rosetta/qemu) rejects thread clones without SYSVSEM and a valid
+        // TLS whose first word self-points, so we set both even though the compiled
+        // code uses no TLS.
         const FLAGS: i32 = 0x3D_0F00;
         const TLS_OFF: i32 = 0x40; // a TLS self-pointer slot, just past the 32-byte TCB
         let base_slot = self.alloc(8, 8);
@@ -1719,10 +1944,11 @@ impl Cg {
         self.asm.store_qword_at(RCX, RCX); // [&TLS] = &TLS
         let l_child = self.asm.new_label();
         let l_done = self.asm.new_label();
-        // `base` rides into the child in callee-saved rbx (the child inherits the
-        // register file): the frame slot is shared and the parent overwrites it on the
-        // next spawn, so a concurrent child must NOT re-read base from it. Save the
-        // caller's rbx (a frame slot) and restore it on the parent path.
+        // `base` rides into the child in callee-saved rbx, which the child inherits
+        // along with the register file. The frame slot is shared and the parent
+        // overwrites it on the next spawn, so a concurrent child must NOT re-read
+        // base from it. Save the caller's rbx to a frame slot and restore it on the
+        // parent path.
         let rbx_slot = self.alloc(8, 8);
         self.asm.mov_rr(RAX, RBX);
         self.asm.store_local(rbx_slot, 8); // rbx_slot = caller's rbx
@@ -1743,14 +1969,14 @@ impl Cg {
         self.asm.syscall();
         self.asm.test_rax();
         self.asm.je(l_child);
-        // parent: rax = child tid (the futex tracks liveness). Restore rbx; the result
-        // is `base`.
+        // Parent: rax = child tid (the futex tracks liveness). Restore rbx; the
+        // result is `base`.
         self.asm.load_local(rbx_slot, 8, false);
         self.asm.mov_rr(RBX, RAX); // restore caller's rbx
         self.asm.load_local(base_slot, 8, false); // rax = base (handle)
         self.asm.jmp(l_done);
-        // child: rax == 0, rbx = base. Read fn/arg from the TCB, run it. rbx survives
-        // the call (callee-saved), so it still holds base afterward.
+        // Child: rax == 0, rbx = base. Read fn/arg from the TCB and run it. rbx is
+        // callee-saved, so it survives the call and still holds base afterward.
         self.asm.place(l_child);
         self.asm.mov_rr(RDX, RBX);
         self.asm.add_ri(RDX, 24);
@@ -1767,7 +1993,7 @@ impl Cg {
         Ok(())
     }
 
-    /// Freestanding `Join(handle)` → futex-wait on the TCB's `ctid` word until the
+    /// Freestanding `Join(handle)`: futex-wait on the TCB's `ctid` word until the
     /// kernel clears it (thread exit), then return the stashed `retval`.
     fn gen_join(&mut self, args: &[Expr]) -> Result<(), CodegenError> {
         let base_slot = self.alloc(8, 8);
@@ -1798,11 +2024,11 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` → the Linux `futex(2)`
+    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` to the Linux `futex(2)`
     /// syscall (`FUTEX_WAIT` 0 / `FUTEX_WAKE` 1) on the low 32 bits of `*addr`. A
-    /// `FutexWait` carries a short relative timeout (a `struct timespec` on the stack)
-    /// so a missed wakeup re-checks rather than deadlocks — the documented
-    /// spurious-wakeup contract.
+    /// `FutexWait` carries a short relative timeout (a `struct timespec` on the
+    /// stack), so a missed wakeup re-checks rather than deadlocks — relying on the
+    /// documented spurious-wakeup contract.
     fn gen_futex(&mut self, name: &str, args: &[Expr]) -> Result<(), CodegenError> {
         // ≈1 ms — never reached when wakeups work.
         const FUTEX_TIMEOUT_NS: i32 = 1_000_000;
@@ -1834,10 +2060,10 @@ impl Cg {
     }
 
     /// Lower an atomic op (`sync.hc`), width-directed by the pointer's pointee type
-    /// (1/2/4/8 bytes). Plain (aligned) `mov` already gives an atomic acquire load /
-    /// release store on x86-64; add/swap/cas use the `lock`-prefixed
+    /// (1/2/4/8 bytes). On x86-64 a plain aligned `mov` already gives an atomic
+    /// acquire load / release store; add/swap/cas use the `lock`-prefixed
     /// `xadd`/`xchg`/`cmpxchg`. The loaded value is sign/zero-extended to the pointee
-    /// width (`cast_rax`); the result lands in rax.
+    /// width by `cast_rax`. The result lands in rax.
     fn gen_atomic(&mut self, name: &str, args: &[Expr]) -> Result<(), CodegenError> {
         let pty = match self.expr_ty(&args[0]) {
             Type::Ptr(inner) | Type::Array(inner, _) => *inner,
@@ -1909,13 +2135,13 @@ impl Cg {
     }
 
     /// Lower a builtin call. Integer/pointer/string/memory builtins go to emitted
-    /// runtime routines. (The algebraic float ops `Sqrt`/`Fabs` are pure HolyC in
+    /// runtime routines. The algebraic float ops `Sqrt`/`Fabs` are pure HolyC in
     /// `lib/math.hc` now; the rest — transcendentals, the sprintf family — go through
-    /// the lib or aren't supported without libc.)
+    /// the lib or aren't supported without libc.
     fn gen_builtin(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         match name {
-            // `Free` is a no-op (the bump allocator never reclaims); still evaluate
-            // the argument for its side effects.
+            // `Free` is a no-op, since the bump allocator never reclaims. Still
+            // evaluate the argument for its side effects.
             "Free" => {
                 self.gen_expr(&args[0])?;
                 Ok(())
@@ -1937,23 +2163,24 @@ impl Cg {
                 self.os.emit_sleep(&mut self.asm, scratch);
                 Ok(())
             }
-            // (The printf family `Print`/`StrPrint`/`CatPrint`/`MStrPrint` is pure HolyC
-            // now — `lib/fmt.hc` — so it is compiled and called like any function, not
-            // lowered here.)
+            // The printf family `Print`/`StrPrint`/`CatPrint`/`MStrPrint` is pure
+            // HolyC now (`lib/fmt.hc`), so it is compiled and called like any
+            // function, not lowered here.
             // Portable standard-stream write (fd 1 = stdout, 2 = stderr). Unlike the
-            // raw-syscall `Write` below — Linux-only — this goes through the OS seam so
+            // Linux-only raw-syscall `Write` below, this goes through the OS seam, so
             // it also works on Windows (`WriteFile` via `GetStdHandle`). Args land in
-            // rdi=fd, rsi=buf, rdx=n; `emit_std_write` returns bytes written in rax.
+            // rdi=fd, rsi=buf, rdx=n; `emit_std_write` returns the bytes written in
+            // rax.
             "StdWrite" => {
                 let arg_refs: Vec<&Expr> = args.iter().collect();
                 self.gen_int_args(&arg_refs)?;
                 self.os.emit_std_write(&mut self.asm);
                 Ok(())
             }
-            // File fd primitives — lowered through the OS seam (Linux syscall, Windows
+            // File fd primitives, lowered through the OS seam (Linux syscall, Windows
             // `kernel32`), so they work on both targets. Args are in the System V
-            // registers; the result (fd/HANDLE, byte count, offset, 0, or negative
-            // error) is in rax.
+            // registers; the result is in rax — an fd/HANDLE, byte count, offset, 0,
+            // or a negative error.
             "Open" | "LSeek" | "Read" | "Write" | "Close" => {
                 let op = match name {
                     "Open" => FileOp::Open,
@@ -1967,12 +2194,12 @@ impl Cg {
                 self.os.emit_fileop(&mut self.asm, op);
                 Ok(())
             }
-            // POSIX-only primitives via raw Linux syscalls (x86-64 numbers: socket 41,
-            // connect 42, unlink 87, rename 82, mkdir 83, getpid 39, …). Each takes
-            // ≤3 args, so the System V arg registers (rdi/rsi/rdx) coincide with the
-            // syscall registers; the result is in rax. There is no Windows lowering
-            // for these yet, so reject them with a clear error on the PE target rather
-            // than emitting an invalid `syscall`.
+            // POSIX-only primitives via raw Linux syscalls (x86-64 numbers: socket
+            // 41, connect 42, unlink 87, rename 82, mkdir 83, getpid 39, …). Each
+            // takes ≤3 args, so the System V arg registers (rdi/rsi/rdx) coincide
+            // with the syscall registers, and the result is in rax. There is no
+            // Windows lowering for these yet, so reject them with a clear error on the
+            // PE target rather than emitting an invalid `syscall`.
             "Socket" | "Connect" | "Remove" | "Rename" | "Mkdir" | "Getpid" | "Getppid"
             | "Getuid" | "Getgid" | "Chdir" => {
                 if !self.os.is_posix() {
@@ -2002,9 +2229,9 @@ impl Cg {
                 self.asm.syscall();
                 Ok(())
             }
-            // `Getcwd(buf, size)` — `getcwd` 79 returns the byte length on success or
-            // `-errno`; normalise a non-negative result to 0 (matching the 0/-errno
-            // contract of the other working-dir ops).
+            // `Getcwd(buf, size)`: the `getcwd` syscall (79) returns the byte length
+            // on success or `-errno`. Normalise a non-negative result to 0, matching
+            // the 0/-errno contract of the other working-dir ops.
             "Getcwd" => {
                 if !self.os.is_posix() {
                     return Err(CodegenError::at(
@@ -2063,8 +2290,8 @@ impl Cg {
     /// rdi/rsi/rdx/rcx, result in rax, clobbering only volatile registers.
     fn emit_rt_routines(&mut self) {
         // Only `MAlloc` (heap) and `StrLen` (used internally by the `CatPrint`
-        // append) remain emitted runtime routines; the string/memory/ctype/PRNG
-        // ops are now pure HolyC in `lib/*.hc` and compile as ordinary functions.
+        // append) remain emitted runtime routines. The string/memory/ctype/PRNG ops
+        // are now pure HolyC in `lib/*.hc` and compile as ordinary functions.
         const ORDER: &[&str] = &["MAlloc", "HeapExtend", "MSize", "StrLen"];
         for &name in ORDER {
             let Some(&label) = self.rt_routines.get(name) else {
@@ -2258,8 +2485,8 @@ impl Cg {
     }
 
     /// Convert the double in xmm0 to a u64 in rax, matching Rust's saturating
-    /// `f as u64`: negatives/NaN → 0, and values ≥ 2^63 handled by a bias split
-    /// (extreme saturation beyond 2^64 is not modelled — a documented edge).
+    /// `f as u64`: negatives and NaN give 0, and values ≥ 2^63 are handled by a bias
+    /// split. Extreme saturation beyond 2^64 is not modelled — a documented edge.
     fn gen_f64_to_u64(&mut self) {
         let zero = self.asm.new_label();
         let big = self.asm.new_label();
@@ -2416,15 +2643,12 @@ impl Cg {
 
     // ---- printing ----
 
-    /// Emit a printf-style print of the literal format `fmt` with `args`. Parses
-    /// each `%[flags][width][.prec][len]conv` with the shared [`crate::fmt`] spec
-    /// parser (so it agrees with the interpreter), then lowers integer conversions
-    /// through the `fmt_int` runtime and string/char ones through `fmt_str`, both
-    /// of which apply the flags/width/precision exactly as `fmt::render_*` does.
-    /// Printing is the pure-HolyC `Print` now (auto-included via `<fmt.hc>` when a
-    /// program prints): synthesize `Print(fmt, args…)` and emit it as an ordinary call
-    /// to the compiled body. Target-independent (Linux ELF + Windows PE) — the HolyC
-    /// `Print` ultimately calls `StdWrite`, which the OS seam lowers per target.
+    /// Lower a printf-style print of the literal format `fmt` with `args`. Printing
+    /// is the pure-HolyC `Print` now, auto-included via `<fmt.hc>` when a program
+    /// prints, so this synthesizes `Print(fmt, args…)` and emits it as an ordinary
+    /// call to the compiled body. Target-independent (Linux ELF and Windows PE): the
+    /// HolyC `Print` ultimately calls `StdWrite`, which the OS seam lowers per
+    /// target.
     fn gen_print(&mut self, fmt: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         let fmt_expr = Expr::new(ExprKind::Str(fmt.to_string()), Span::dummy());
         fmt_expr.set_ty(Type::Ptr(Box::new(Type::U8)));
@@ -2434,8 +2658,9 @@ impl Cg {
         self.gen_call_by_name("Print", &call_args, pos)
     }
 
-    /// A bare string statement prints **verbatim** — no `%` processing, matching the
-    /// interpreter — so it lowers to `StdWrite(STDOUT, lit, len)` rather than `Print`.
+    /// A bare string statement prints verbatim — no `%` processing, matching the
+    /// interpreter — so it lowers to `StdWrite(STDOUT, lit, len)` rather than
+    /// `Print`.
     fn gen_bare_str(&mut self, lit: &str, pos: Pos) -> Result<(), CodegenError> {
         if lit.is_empty() {
             return Ok(());
@@ -2515,7 +2740,7 @@ fn is_f64(ty: &Type) -> bool {
 fn is_unsigned_int(ty: &Type) -> bool {
     matches!(ty, Type::U8 | Type::U16 | Type::U32 | Type::U64)
 }
-/// An aggregate is represented by its address (it never lives in a register): an
+/// An aggregate is represented by its address and never lives in a register: an
 /// array (decays to a pointer) or a `class`/`union` (passed/copied by reference).
 fn is_aggregate(ty: &Type) -> bool {
     matches!(ty, Type::Array(..) | Type::Named(_))
@@ -2562,10 +2787,15 @@ enum Place {
     Global(i32),
 }
 
-/// Leaf stores for the shared [`crate::backend::gen_init_into`] initialiser driver.
-/// The driver's `u32` byte offset is cast to this backend's `i32` frame math.
-impl crate::backend::InitEmitter for Cg {
+/// The single shared-driver emitter vtable ([`crate::backend::Emitter`]) for this
+/// backend. It supplies the leaf emits for the initializer lowering
+/// ([`gen_init_into`]), the control-flow drivers (the loops, conditionals, and
+/// `switch` — whose slot is a frame offset, using the default no-jump-table
+/// compare-chain), and the call driver ([`crate::backend::gen_call`]). The driver's
+/// `u32` byte offsets are cast to this backend's `i32` frame math.
+impl crate::backend::Emitter for Cg {
     type Place = Place;
+    type Slot = i32;
 
     fn backend_label(&self) -> &'static str {
         "x86_64 backend"
@@ -2622,17 +2852,7 @@ impl crate::backend::InitEmitter for Cg {
         self.asm.store_through(size); // [rcx] = rax
         Ok(())
     }
-}
 
-/// Leaf emits for the shared control-flow drivers ([`crate::backend::CodeEmitter`]):
-/// `switch` (the slot is a frame offset; this backend uses the default no-jump-table
-/// compare-chain) and the loops/conditionals.
-impl crate::backend::CodeEmitter for Cg {
-    type Slot = i32;
-
-    fn backend_label(&self) -> &'static str {
-        "x86_64 backend"
-    }
     fn new_label(&mut self) -> usize {
         self.asm.new_label()
     }
@@ -2701,15 +2921,10 @@ impl crate::backend::CodeEmitter for Cg {
         }
         Ok(())
     }
-}
 
-/// Leaf emits for the shared call driver ([`crate::backend::gen_call`]). The sret
-/// slot is a frame offset; variadics are marshalled by pushing the buffer
-/// address + count on the stack and popping them into registers before the named
-/// args.
-impl crate::backend::CallEmitter for Cg {
-    type Slot = i32;
-
+    // Call-driver leaves: the sret slot is a frame offset. Variadics are marshalled
+    // by pushing the buffer address and count on the stack, then popping them into
+    // registers before the named args.
     fn spill_callee(&mut self, callee: &Expr) -> Result<(), CodegenError> {
         self.gen_expr(callee)?; // rax = function address
         self.asm.push_rax();
@@ -2746,7 +2961,7 @@ impl crate::backend::CallEmitter for Cg {
             .filter(|c| matches!(c, crate::backend::ArgClass::Int(_)))
             .count();
         // Variadic: stage the trailing args into a frame buffer (8 bytes each, an F64
-        // by its bit pattern), then push va_ptr + va_cnt for the next two int regs.
+        // by its bit pattern), then push va_ptr and va_cnt for the next two int regs.
         // Always staged for a variadic callee (count 0 for none).
         let va = if varargs {
             if gpr + 1 >= ARG_REGS {
@@ -2792,8 +3007,8 @@ impl crate::backend::CallEmitter for Cg {
     }
 
     fn set_sret_reg(&mut self, slot: Option<i32>) {
-        // Hand the result temp's address to the callee in r11 (set last, so nothing
-        // clobbers it before the call).
+        // Hand the result temp's address to the callee in r11, set last so nothing
+        // clobbers it before the call.
         if let Some(off) = slot {
             self.asm.lea_local(off); // rax = &temp
             self.asm.mov_rr(R11, RAX);

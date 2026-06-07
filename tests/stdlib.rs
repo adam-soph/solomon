@@ -1,7 +1,8 @@
-//! Standard-library tests: the `lib/*.hc` HolyC modules, resolved via angle
-//! includes (`#include <math.hc>`) and run through the interpreter (the oracle).
-//! Host-independent — the native backends are held to this output byte-for-byte by
-//! the `stdlib_math_matches_the_interpreter` conformance tests.
+//! Standard-library tests for the `lib/*.hc` HolyC modules. Each module is pulled in
+//! via an angle include (`#include <math.hc>`) and run through the interpreter, the
+//! conformance oracle. These tests are host-independent. The native backends are held
+//! to this output byte-for-byte by the `stdlib_math_matches_the_interpreter`
+//! conformance tests.
 
 use solomon::interp::run_to_string;
 use solomon::parser::parse_with;
@@ -9,9 +10,9 @@ use solomon::sema::check_program;
 
 /// Parse `src` with the repository's `lib/` on the angle-include search path, then
 /// type-check and run it, returning captured output. The base directory is `lib/`
-/// itself, so a test may exercise private `_`-prefixed helpers (`_`-file/dir privacy
-/// is keyed on the file's path — a program rooted in `lib/` is inside the subtree the
-/// stdlib's private modules are visible from).
+/// itself, so a test may exercise private `_`-prefixed helpers. Privacy for a `_`-file
+/// or `_`-dir is keyed on the file's path, and a program rooted in `lib/` sits inside
+/// the subtree from which the stdlib's private modules are visible.
 fn run_with_stdlib(src: &str) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let program = parse_with(src, &lib, std::slice::from_ref(&lib))
@@ -51,7 +52,7 @@ fn math_rounding_and_integer_helpers() {
           "%.1f %.1f %.1f %.1f\n", Round(2.5), Round(-2.5), Round(0.5), Round(-3.5);
           "%.1f %.1f %.1f %.1f\n", Floor(2.7), Floor(-2.3), Ceil(2.1), Ceil(-2.9);
           "%.1f\n", PowI(2.0, 10);
-          "%d %d %d %d\n", Gcd(48, 36), Factorial(6), IMin(3, 9), IMax(3, 9);
+          "%d %d %d %d\n", Gcd(48, 36), Factorial(6), Min(3, 9), Max(3, 9);
         }
         Main;
     "#,
@@ -93,7 +94,7 @@ fn math_extended_functions() {
 #[test]
 fn math_go_style_functions() {
     // The Go-`math`-style additions: IEEE bits/classification, exponent ops, and the
-    // extra elementary functions. Values match a reference `strtod`/libm; the native
+    // extra elementary functions. Values match a reference `strtod`/libm. The native
     // backends are held to this same output by the conformance suites.
     let out = run_with_stdlib(
         r#"
@@ -130,9 +131,10 @@ fn math_go_style_functions() {
 
 #[test]
 fn math_erf_and_gamma() {
-    // The error-function and gamma family. Values match libm/scipy to ~10 decimals
-    // (Taylor + continued-fraction erf, Winitzki+Newton inverses, Lanczos g=7 gamma);
-    // the native backends are held to this exact output by the conformance suites.
+    // The error-function and gamma family. Values match libm/scipy to ~10 decimals.
+    // The implementations are Taylor + continued-fraction erf, Winitzki+Newton
+    // inverses, and a Lanczos g=7 gamma. The native backends are held to this exact
+    // output by the conformance suites.
     let out = run_with_stdlib(
         r#"
         #include <special.hc>
@@ -160,9 +162,10 @@ fn math_erf_and_gamma() {
 
 #[test]
 fn math_bessel() {
-    // J0/J1/Jn and Y0/Y1/Yn, spanning the small-x series and the large-x asymptotic
-    // (the x=20 column crosses the threshold). Values match standard tables to 10
-    // decimals; the Wronskian J1·Y0 − J0·Y1 = 2/(πx) holds to ~1e-12 across the range.
+    // J0/J1/Jn and Y0/Y1/Yn, spanning the small-x series and the large-x asymptotic.
+    // The x=20 column crosses the threshold between them. Values match standard tables
+    // to 10 decimals. The Wronskian J1·Y0 − J0·Y1 = 2/(πx) holds to ~1e-12 across the
+    // range.
     let out = run_with_stdlib(
         r#"
         #include <special.hc>
@@ -190,9 +193,9 @@ fn math_bessel() {
 
 #[test]
 fn rand_seed_controls_the_stream() {
-    // `rand.hc`: the generator is deterministic, and `SeedRand` makes the stream
-    // reproducible (same seed → same value) and seed-dependent (a different seed
-    // gives a different value).
+    // `rand.hc`: the generator is deterministic. `SeedRand` makes the stream
+    // reproducible — the same seed gives the same value — and seed-dependent: a
+    // different seed gives a different value.
     let out = run_with_stdlib(
         r#"
         #include <rand.hc>
@@ -210,15 +213,15 @@ fn rand_seed_controls_the_stream() {
 
 #[test]
 fn strtof64_parses_correctly_rounded() {
-    // The pure-HolyC `atof` (bignum, correctly rounded). Covers the Clinger fast
-    // path, the exact bignum slow path (long significands, large/small exponents,
+    // The pure-HolyC `atof`: a correctly-rounded bignum parser. Covers the Clinger
+    // fast path, the exact bignum slow path (long significands, large/small exponents,
     // the smallest normal double), the `%g`-printed round-trip, atof-style prefix
-    // stopping, and over/underflow. Each value is the IEEE double nearest the
-    // decimal — bit-identical to a reference `strtod` (verified separately against
-    // Python over a 438-input random battery).
+    // stopping, and over/underflow. Each value is the IEEE double nearest the decimal,
+    // bit-identical to a reference `strtod`. That equivalence was verified separately
+    // against Python over a 438-input random battery.
     let out = run_with_stdlib(
         r#"
-        #include <strconv.hc>
+        #include <cstr.hc>
         U0 Main() {
           "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
           "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");
@@ -243,11 +246,11 @@ fn strtof64_parses_correctly_rounded() {
 
 #[test]
 fn holyc_float_f_formatter_matches_rust() {
-    // The pure-HolyC `%f` formatter (`lib/fltfmt.hc`, the portable replacement for
-    // the hand-emitted bignum) must be byte-for-byte Rust's `{:.P}` — including
-    // round-half-to-even ties, subnormals, the 2^53 boundary, extremes, and -0.0.
-    // Each value is reconstructed from its exact bits via `Float64frombits`, so the
-    // lexer's float parsing can't perturb the input.
+    // The pure-HolyC `%f` formatter (`lib/fltfmt.hc`) must match Rust's `{:.P}`
+    // byte-for-byte. It is the portable replacement for the hand-emitted bignum.
+    // Coverage includes round-half-to-even ties, subnormals, the 2^53 boundary,
+    // extremes, and -0.0. Each value is reconstructed from its exact bits via
+    // `Float64frombits`, so the lexer's float parsing can't perturb the input.
     let values: &[f64] = &[
         0.0,
         -0.0,
@@ -290,12 +293,12 @@ fn holyc_float_f_formatter_matches_rust() {
     ];
     let precs: &[usize] = &[0, 1, 2, 3, 6, 10, 15, 17, 20];
 
-    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
     let mut expected = String::new();
     for &v in values {
         for &p in precs {
             src.push_str(&format!(
-                "_FmtFloat(b, Float64frombits(0x{:016X}), 'f', 0, 0, {p}); \"%s\\n\", b;\n",
+                "FmtFloat(b, Float64frombits(0x{:016X}), 'f', 0, 0, {p}); \"%s\\n\", b;\n",
                 v.to_bits()
             ));
             expected.push_str(&format!("{:.*}\n", p, v));
@@ -305,7 +308,7 @@ fn holyc_float_f_formatter_matches_rust() {
     for &v in &[std::f64::consts::PI, 0.1, f64::from_bits(1), 1e300] {
         for &p in &[50usize, 120] {
             src.push_str(&format!(
-                "_FmtFloat(b, Float64frombits(0x{:016X}), 'f', 0, 0, {p}); \"%s\\n\", b;\n",
+                "FmtFloat(b, Float64frombits(0x{:016X}), 'f', 0, 0, {p}); \"%s\\n\", b;\n",
                 v.to_bits()
             ));
             expected.push_str(&format!("{:.*}\n", p, v));
@@ -326,13 +329,14 @@ fn holyc_float_f_formatter_matches_rust() {
 #[test]
 fn holyc_float_e_g_formatter_matches_rust() {
     // The pure-HolyC `%e`/`%g` formatters (`lib/fltfmt.hc`) must match the
-    // interpreter's renderers `fmt::render_exp`/`render_g` (which are Rust's
-    // correctly-rounded `{:.Pe}` restyled to libc) byte-for-byte — including `%g`'s
-    // fixed/scientific choice, trailing-zero trim, and the `#` (alt) flag.
+    // interpreter's renderers `fmt::render_exp`/`render_g` byte-for-byte. Those
+    // renderers are Rust's correctly-rounded `{:.Pe}` restyled to libc. Coverage
+    // includes `%g`'s fixed/scientific choice, trailing-zero trim, and the `#` (alt)
+    // flag.
     use solomon::fmt::{render_exp, render_g};
     let sign = |v: f64| if v.is_sign_negative() { "-" } else { "" };
     // The subnormal / extreme-exponent cases (×5^~1074, extracting ~750 digits) are
-    // slow in the tree-walking interp, so they're kept few here; the bignum's
+    // slow in the tree-walking interp, so they're kept few here. The bignum's
     // subnormal path is already covered cheaply by the `%f` test.
     let values: &[f64] = &[
         0.0,
@@ -363,7 +367,7 @@ fn holyc_float_e_g_formatter_matches_rust() {
     ];
     let precs: &[usize] = &[0, 1, 3, 6, 17];
 
-    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
     let mut expected = String::new();
     let emit = |src: &mut String, expected: &mut String, call: String, want: String| {
         src.push_str(&call);
@@ -378,7 +382,7 @@ fn holyc_float_e_g_formatter_matches_rust() {
                 &mut src,
                 &mut expected,
                 format!(
-                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'e', 0, 0, {p}); \"%s\\n\", b;\n"
+                    "FmtFloat(b, Float64frombits(0x{bits:016X}), 'e', 0, 0, {p}); \"%s\\n\", b;\n"
                 ),
                 format!("{}{}", sign(v), render_exp(v.abs(), p, false)),
             );
@@ -386,7 +390,7 @@ fn holyc_float_e_g_formatter_matches_rust() {
                 &mut src,
                 &mut expected,
                 format!(
-                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'E', 0, 0, {p}); \"%s\\n\", b;\n"
+                    "FmtFloat(b, Float64frombits(0x{bits:016X}), 'E', 0, 0, {p}); \"%s\\n\", b;\n"
                 ),
                 format!("{}{}", sign(v), render_exp(v.abs(), p, true)),
             );
@@ -395,7 +399,7 @@ fn holyc_float_e_g_formatter_matches_rust() {
                 &mut src,
                 &mut expected,
                 format!(
-                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'g', 0, 0, {p}); \"%s\\n\", b;\n"
+                    "FmtFloat(b, Float64frombits(0x{bits:016X}), 'g', 0, 0, {p}); \"%s\\n\", b;\n"
                 ),
                 format!("{}{}", sign(v), render_g(v.abs(), p, false, false)),
             );
@@ -403,7 +407,7 @@ fn holyc_float_e_g_formatter_matches_rust() {
                 &mut src,
                 &mut expected,
                 format!(
-                    "_FmtFloat(b, Float64frombits(0x{bits:016X}), 'G', 64, 0, {p}); \"%s\\n\", b;\n"
+                    "FmtFloat(b, Float64frombits(0x{bits:016X}), 'G', 64, 0, {p}); \"%s\\n\", b;\n"
                 ),
                 format!("{}{}", sign(v), render_g(v.abs(), p, true, true)),
             );
@@ -422,10 +426,10 @@ fn holyc_float_e_g_formatter_matches_rust() {
 
 #[test]
 fn holyc_float_field_matches_interp() {
-    // `_FmtFloat` assembles the COMPLETE field (sign + width + the `- 0 + space #`
-    // flags); it must equal the interpreter's own `%`-rendering (its magnitude
-    // renderer wrapped by `render_int`) byte-for-byte. Each case prints the intrinsic
-    // and `_FmtFloat` on adjacent lines and asserts the pair matches.
+    // `FmtFloat` assembles the COMPLETE field: sign, width, and the `- 0 + space #`
+    // flags. It must equal the interpreter's own `%`-rendering byte-for-byte (the
+    // interpreter's magnitude renderer wrapped by `render_int`). Each case prints the
+    // intrinsic and `FmtFloat` on adjacent lines and asserts the pair matches.
     // (spec, conv char, packed flag bits, width, precision)
     let cases: &[(&str, char, i64, usize, usize)] = &[
         ("%8.2f", 'f', 0, 8, 2),
@@ -449,13 +453,13 @@ fn holyc_float_field_matches_interp() {
     let values: &[f64] = &[
         3.14159, -3.14159, 0.0, -0.0, 2.5, 1234.5, 0.00012345, 9999999.0, 1e6, -0.001, 42.0, 0.5,
     ];
-    let mut src = String::from("#include <_fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
+    let mut src = String::from("#include <fltfmt.hc>\nU0 Main(){\nU8 b[2048];\n");
     for &(spec, conv, flags, width, prec) in cases {
         for &v in values {
             let bits = v.to_bits();
             src.push_str(&format!("\"{spec}\\n\", Float64frombits(0x{bits:016X});\n"));
             src.push_str(&format!(
-                "_FmtFloat(b, Float64frombits(0x{bits:016X}), '{conv}', {flags}, {width}, {prec}); \"%s\\n\", b;\n"
+                "FmtFloat(b, Float64frombits(0x{bits:016X}), '{conv}', {flags}, {width}, {prec}); \"%s\\n\", b;\n"
             ));
         }
     }
@@ -467,16 +471,17 @@ fn holyc_float_field_matches_interp() {
     for pair in lines.chunks(2) {
         assert_eq!(
             pair[0], pair[1],
-            "intrinsic vs _FmtFloat field mismatch (oracle left, _FmtFloat right)"
+            "intrinsic vs FmtFloat field mismatch (oracle left, FmtFloat right)"
         );
     }
 }
 
 #[test]
 fn realloc_preserves_contents() {
-    // ReAlloc keeps the first min(old, new) bytes across a grow and a shrink, and
-    // NULL behaves like MAlloc. (Pointer identity is impl-defined — in-place on a
-    // bump allocator, moved on libc/interp — so only the bytes are asserted.)
+    // ReAlloc keeps the first min(old, new) bytes across a grow and a shrink, and a
+    // NULL argument behaves like MAlloc. Pointer identity is implementation-defined:
+    // in-place on a bump allocator, moved on libc/interp. So only the bytes are
+    // asserted.
     let out = run_with_stdlib(
         r#"
         #include <cstr.hc>
@@ -520,9 +525,9 @@ fn msize_reports_the_requested_allocation_size() {
 #[test]
 fn vec_object_grows_and_clones() {
     // The owning, growable generic `Vec<T>`: push across reallocations, at/ref/pop,
-    // deep clone (independent buffer), monomorphized over every kind of element — I64,
-    // F64, a pointer, and a class value (the class case round-trips a whole value
-    // through the byte heap buffer, both on store `VecPush` and load `VecAt`).
+    // and a deep clone (independent buffer). Monomorphized over every kind of element:
+    // I64, F64, a pointer, and a class value. The class case round-trips a whole value
+    // through the byte heap buffer, both on store (`VecPush`) and load (`VecAt`).
     let out = run_with_stdlib(
         r#"
         #include <vec.hc>
@@ -574,8 +579,8 @@ fn vec_object_grows_and_clones() {
 
 #[test]
 fn time_calendar_math() {
-    // FromUnix/FmtISO/ToUnix over fixed epochs (pure → reproducible). Covers the
-    // epoch, a leap year, and a pre-1970 negative timestamp.
+    // FromUnix/FmtISO/ToUnix over fixed epochs. These are pure, so the output is
+    // reproducible. Covers the epoch, a leap year, and a pre-1970 negative timestamp.
     let out = run_with_stdlib(
         r#"
         #include <time.hc>
@@ -594,4 +599,52 @@ fn time_calendar_math() {
          2001-09-09 01:46:40 w0 L0 r1\n\
          1969-12-31 00:00:00 w3 L0 r1\n"
     );
+}
+
+#[test]
+fn generic_value_param_array_runs() {
+    // `int N` value parameter as an array dimension: `T data[N]` becomes `I64 data[4]`.
+    let out = run_with_stdlib(
+        r#"
+        class Buf<type T, int N> { T data[N]; }
+        U0 Main() {
+            Buf<I64, 4> b;
+            I64 i;
+            for (i = 0; i < 4; i++) b.data[i] = i * 10;
+            I64 s = 0;
+            for (i = 0; i < 4; i++) s += b.data[i];
+            "sum=%d size=%d\n", s, sizeof(Buf<I64, 4>);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "sum=60 size=32\n"); // 4*8 = 32 bytes; 0+10+20+30 = 60
+}
+
+#[test]
+fn generic_type_switch_selects_and_discards() {
+    // Each instantiation keeps only its arm. The `Pt` arm uses `v.x` (valid only when
+    // T = Pt); for the I64/F64/U8* instantiations it is discarded before sema, so it
+    // never errors. `Show("hi")` matches no arm and falls to `default`.
+    let out = run_with_stdlib(
+        r#"
+        class Pt { I64 x; }
+        U0 Show<type T>(T v) {
+            switch type (T) {
+                case I64: "int %d\n", v;
+                case F64: "flt %.1f\n", v;
+                case Pt:  "pt %d\n", v.x;
+                default:  "other\n";
+            }
+        }
+        U0 Main() {
+            Show(7);
+            Show(2.5);
+            Pt p; p.x = 9; Show(p);
+            Show("hi");
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "int 7\nflt 2.5\npt 9\nother\n");
 }

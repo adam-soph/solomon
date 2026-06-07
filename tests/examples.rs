@@ -1,9 +1,9 @@
 //! End-to-end tests over the real HolyC example programs in `examples/`.
 //!
-//! Each example is run twice: first through the lexer on its own (to confirm it
-//! tokenizes cleanly), then through the lexer + parser together (to confirm it
-//! produces an AST). The sources are embedded with `include_str!` so the tests
-//! do not depend on the working directory.
+//! Each example is run twice. First through the lexer on its own, to confirm it
+//! tokenizes cleanly. Then through the lexer and parser together, to confirm it
+//! produces an AST. The sources are embedded with `include_str!` so the tests do not
+//! depend on the working directory.
 
 use solomon::interp::run_to_string;
 use solomon::lexer::tokenize;
@@ -77,8 +77,8 @@ fn samples_pass_semantic_analysis() {
 
 #[test]
 fn samples_run_without_error() {
-    // Every sample should execute to completion. Most define library functions
-    // and produce no output; hello.hc calls Main and prints.
+    // Every sample should execute to completion. Most define library functions and
+    // produce no output. hello.hc calls Main and prints.
     for (name, src) in EXAMPLES {
         let program =
             common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));

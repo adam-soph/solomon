@@ -2,13 +2,13 @@
 #define _NET_HC
 // net.hc — TCP networking over the raw BSD socket primitives.
 //
-// `Socket`/`Connect` are **intrinsics** (prototypes here; the compiler lowers them to
-// socket syscalls on the freestanding targets, libc on Darwin); the fd I/O primitives
-// `Read`/`Write`/`Close` (and `WriteAll`) are shared with files, in `<io.hc>`. They do
-// real, impure network I/O, so a program using them is *not* reproducible —
-// conformance is by property, not by interp-vs-native value. On top of them this
-// module builds `ParseIPv4`, `MakeSockaddr`, `TcpConnect`, and a minimal `HttpGet`.
-// Include with `#include <net.hc>`.
+// `Socket`/`Connect` are intrinsics: the prototypes live here, and the compiler
+// lowers them to socket syscalls on the freestanding targets, or to libc on Darwin.
+// The fd I/O primitives `Read`/`Write`/`Close` (and `WriteAll`) are shared with
+// files, in `<io.hc>`. They do real, impure network I/O, so a program using them is
+// not reproducible; conformance is by property, not by interp-vs-native value. On top
+// of these primitives the module builds `ParseIPv4`, `MakeSockaddr`, `TcpConnect`, and
+// a minimal `HttpGet`. Include with `#include <net.hc>`.
 
 #include <io.hc>     // Read/Write/Close/WriteAll
 #include <fmt.hc>    // StrPrint (for HttpGet)
@@ -18,13 +18,13 @@
 
 // --- raw primitives (intrinsics) ---------------------------------------------
 
-I64 Socket(I64 domain, I64 type, I64 proto);   // a socket fd, or -errno
-I64 Connect(I64 fd, U8 *addr, I64 len);        // 0, or -errno
+public I64 Socket(I64 domain, I64 kind, I64 proto);   // a socket fd, or -errno
+public I64 Connect(I64 fd, U8 *addr, I64 len);        // 0, or -errno
 
 // --- helpers ------------------------------------------------------------------
 
 // Parse a dotted-quad "a.b.c.d" into a host-order U32.
-U32 ParseIPv4(U8 *s)
+public U32 ParseIPv4(U8 *s)
 {
   U32 ip = 0;
   I64 octet = 0;
@@ -38,7 +38,7 @@ U32 ParseIPv4(U8 *s)
 
 // Fill a 16-byte `sockaddr_in` at `sa` for IPv4 `ip` (host order) and `port`:
 // [sin_family (host U16 = 2)][sin_port (big-endian U16)][sin_addr (big-endian U32)][8×0].
-U0 MakeSockaddr(U8 *sa, U32 ip, I64 port)
+public U0 MakeSockaddr(U8 *sa, U32 ip, I64 port)
 {
   I64 i;
   for (i = 0; i < 16; i++) sa[i] = 0;
@@ -52,7 +52,7 @@ U0 MakeSockaddr(U8 *sa, U32 ip, I64 port)
 }
 
 // Open a TCP connection to `ip` (host order) : `port`. Returns the fd, or -errno.
-I64 TcpConnect(U32 ip, I64 port)
+public I64 TcpConnect(U32 ip, I64 port)
 {
   I64 fd = Socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return fd;
@@ -64,9 +64,9 @@ I64 TcpConnect(U32 ip, I64 port)
 }
 
 // HTTP/1.0 GET of `path` from the dotted-quad `ip_str` : `port`. Reads the whole
-// raw response (status line + headers + body) into `buf` (capacity `cap`); returns
+// raw response (status line + headers + body) into `buf` (capacity `cap`). Returns
 // the byte count, or -errno. The caller NUL-terminates / parses it.
-I64 HttpGet(U8 *ip_str, I64 port, U8 *path, U8 *buf, I64 cap)
+public I64 HttpGet(U8 *ip_str, I64 port, U8 *path, U8 *buf, I64 cap)
 {
   I64 fd = TcpConnect(ParseIPv4(ip_str), port);
   if (fd < 0) return fd;

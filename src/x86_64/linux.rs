@@ -1,7 +1,10 @@
 //! The `x86_64-unknown-linux` target: raw Linux syscalls and a freestanding
-//! static ELF executable. The code generation itself is shared (see the parent
-//! module); this module supplies only the [`OsTarget`] policy — the syscall
-//! sequences for exit / page allocation / the stdout sink — and the ELF writer.
+//! static ELF executable.
+//!
+//! Code generation itself is shared with the other x86-64 targets; see the
+//! parent module. This module supplies only the [`OsTarget`] policy — the
+//! syscall sequences for exit, page allocation, and the stdout sink — plus the
+//! ELF writer.
 
 use std::path::PathBuf;
 
@@ -9,8 +12,9 @@ use super::{Asm, FileOp, OsTarget, R8, R9, R10, RAX, RCX, RDI, RDX, RSI};
 use crate::ast::Program;
 use crate::codegen::{Codegen, CodegenError};
 
-/// Compiles a HolyC program to a freestanding static ELF for `x86_64-unknown-linux`
-/// (no libc, no linker — its own `_start` makes raw syscalls).
+/// Compiles a HolyC program to a freestanding static ELF for
+/// `x86_64-unknown-linux`. There is no libc and no linker; its own `_start`
+/// makes raw syscalls.
 pub struct X64Linux {
     out_path: PathBuf,
 }
@@ -46,8 +50,8 @@ impl Codegen for X64Linux {
 struct LinuxTarget;
 
 impl LinuxTarget {
-    /// `clock_gettime(clockid, &ts)` (nr 228) over the 16-byte `ts` BSS slot, then
-    /// fold `tv_sec*1e9 + tv_nsec` into rax.
+    /// Calls `clock_gettime(clockid, &ts)` (nr 228) over the 16-byte `ts` BSS
+    /// slot, then folds `tv_sec*1e9 + tv_nsec` into rax.
     fn emit_clock(asm: &mut Asm, ts: i32, clockid: i32) {
         asm.mov_ri(RDI, clockid);
         asm.lea_global(RSI, ts); // &ts
@@ -93,8 +97,8 @@ impl OsTarget for LinuxTarget {
     }
 
     fn emit_page_alloc(&mut self, asm: &mut Asm) {
-        // mmap(0, rsi, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) — syscall 9.
-        // Returns the base in rax; rsi (length) is preserved across the syscall.
+        // mmap(0, rsi, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0), syscall 9.
+        // Returns the base in rax. rsi (the length) is preserved across the syscall.
         asm.mov_ri(RDI, 0);
         asm.mov_ri(RDX, 3);
         asm.mov_ri(R10, 0x22);
@@ -106,16 +110,18 @@ impl OsTarget for LinuxTarget {
 
     fn emit_std_write(&mut self, asm: &mut Asm) {
         // write(fd, buf, n): rdi=fd, rsi=buf, rdx=n are already in the syscall
-        // registers (they coincide with the System V arg registers); nr 1; the byte
-        // count (or -errno) is left in rax — a single write, matching `Write`.
+        // registers, since those coincide with the System V arg registers. The
+        // syscall number is 1. It leaves the byte count (or -errno) in rax. This
+        // is a single write, matching `Write`.
         asm.emit(&[0xB8, 1, 0, 0, 0]); // mov eax, 1 (SYS_write)
         asm.syscall();
     }
 
     fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp) {
-        // The fd args are already in rdi/rsi/rdx (the System V registers coincide with
-        // the syscall registers), and the `io.hc` open flags are Linux's, so each is a
-        // plain syscall: open 2, read 0, write 1, close 3, lseek 8. Result in rax.
+        // The fd args are already in rdi/rsi/rdx, since the System V registers
+        // coincide with the syscall registers. The `io.hc` open flags are already
+        // Linux's, so each op is a plain syscall: open 2, read 0, write 1, close
+        // 3, lseek 8. The result is left in rax.
         let nr = match op {
             FileOp::Read => 0,
             FileOp::Write => 1,
@@ -128,9 +134,9 @@ impl OsTarget for LinuxTarget {
     }
 
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {
-        // The Linux ELF entry receives `[rsp] = argc`, `[rsp+8] = argv[0]`, …
-        // After the prologue's `push rbp; mov rbp, rsp`, `rbp` = the entry rsp − 8,
-        // so argc is at `[rbp+8]` and the argv array begins at `rbp+16`.
+        // The Linux ELF entry receives `[rsp] = argc`, `[rsp+8] = argv[0]`, and so
+        // on. After the prologue's `push rbp; mov rbp, rsp`, `rbp` is the entry
+        // rsp − 8, so argc is at `[rbp+8]` and the argv array begins at `rbp+16`.
         asm.emit(&[0x48, 0x8B, 0x45, 0x08]); // mov rax, [rbp+8]   (argc)
         asm.lea_global(RCX, argc_off);
         asm.store_qword_at(RCX, RAX); // argc slot = rax
@@ -149,8 +155,9 @@ impl OsTarget for LinuxTarget {
     }
 
     fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError> {
-        // No imports on Linux: finish with an empty import region (byte-identical
-        // to the former `[code | strings | bss]` layout), then wrap in an ELF.
+        // Linux has no imports, so finish with an empty import region. This is
+        // byte-identical to the plain `[code | strings | bss]` layout. Then wrap
+        // it in an ELF.
         let blob = asm.finish(&[], &[])?;
         Ok(write_elf(&blob, bss))
     }
@@ -162,9 +169,10 @@ const VADDR: u64 = 0x40_0000;
 const EHSIZE: u64 = 64;
 const PHENTSIZE: u64 = 56;
 
-/// Wrap `code` in a minimal static ELF64 executable: ELF header + one PT_LOAD
-/// (R+W+X) covering the whole file plus a trailing zero-filled BSS region of
-/// `bss` bytes (globals + print scratch), the entry at the first code byte.
+/// Wraps `code` in a minimal static ELF64 executable. The layout is an ELF
+/// header plus one PT_LOAD segment (R+W+X) covering the whole file, followed by a
+/// trailing zero-filled BSS region of `bss` bytes (globals and print scratch).
+/// The entry point is the first code byte.
 fn write_elf(code: &[u8], bss: u64) -> Vec<u8> {
     let entry = VADDR + EHSIZE + PHENTSIZE;
     let filesz = EHSIZE + PHENTSIZE + code.len() as u64;

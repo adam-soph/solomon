@@ -1,21 +1,26 @@
-//! The [`Codegen`] trait and [`CodegenError`] — the shared interface every native
-//! code generator implements. The generators themselves are per-architecture
-//! sibling modules: [`crate::arm64`] (AArch64 — `aarch64-apple-darwin` Mach-O via
-//! `cc`, and `aarch64-unknown-linux` freestanding ELF) and [`crate::x86_64`]
-//! (`x86_64-unknown-linux` freestanding ELF, `x86_64-pc-windows` PE). A backend is
-//! a **target** — an (architecture, OS) pair — since the object format, syscalls,
-//! and ABI depend on the OS, not just the CPU. (The tree-walking
-//! [interpreter](crate::interp) is not a code generator and lives separately; it
-//! is the conformance oracle these backends match byte-for-byte.)
+//! The [`Codegen`] trait and [`CodegenError`]: the shared interface every native
+//! code generator implements.
+//!
+//! The generators themselves live in per-architecture sibling modules.
+//! [`crate::arm64`] covers AArch64: `aarch64-apple-darwin` (Mach-O via `cc`) and
+//! `aarch64-unknown-linux` (freestanding ELF). [`crate::x86_64`] covers
+//! `x86_64-unknown-linux` (freestanding ELF) and `x86_64-pc-windows` (PE).
+//!
+//! A backend is a target, meaning an (architecture, OS) pair, because the object
+//! format, syscalls, and ABI depend on the OS, not just the CPU.
+//!
+//! The tree-walking [interpreter](crate::interp) is not a code generator and lives
+//! separately. It is the conformance oracle these backends match byte-for-byte.
 
 use std::fmt;
 
 use crate::ast::Program;
 use crate::token::Pos;
 
-/// An error raised while running a program: a runtime fault in the interpreter or
-/// an emission failure in a codegen backend. Carries a source position when one
-/// is available.
+/// An error raised while running a program.
+///
+/// This is either a runtime fault in the interpreter or an emission failure in a
+/// codegen backend. It carries a source position when one is available.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodegenError {
     pub message: String,
@@ -52,7 +57,7 @@ pub trait Codegen {
     /// The target triple this backend emits for, e.g. `"x86_64-unknown-linux"`.
     fn name(&self) -> &'static str;
 
-    /// Compile the (already parsed and type-checked) program, writing the output
-    /// binary. Linking and file I/O are the backend's own concern.
+    /// Compiles the program, which is already parsed and type-checked, and writes
+    /// the output binary. Linking and file I/O are the backend's own concern.
     fn run(&mut self, program: &Program) -> Result<(), CodegenError>;
 }

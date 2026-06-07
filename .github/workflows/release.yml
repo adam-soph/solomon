@@ -58,17 +58,15 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # Stage both binaries named per target (the stdlib is embedded at build time, so
-      # each binary is self-contained — nothing else to ship). `bash` is available on
-      # every runner including Windows, so one script covers all.
-      - name: Stage binaries
+      # Stage the single `hcc` binary named per target (the stdlib is embedded at build
+      # time, so the binary is self-contained — nothing else to ship). `bash` is available
+      # on every runner including Windows, so one script covers all.
+      - name: Stage binary
         shell: bash
         run: |
           mkdir -p dist
-          for b in hcc hci; do
-            cp "target/${{ matrix.target }}/release/$b${{ matrix.ext }}" \
-               "dist/$b-${{ matrix.target }}${{ matrix.ext }}"
-          done
+          cp "target/${{ matrix.target }}/release/hcc${{ matrix.ext }}" \
+             "dist/hcc-${{ matrix.target }}${{ matrix.ext }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -89,10 +87,8 @@ jobs:
       - name: lipo
         run: |
           mkdir -p dist
-          for b in hcc hci; do
-            lipo -create -output "dist/$b-macos-universal" \
-              "arm64/$b-aarch64-apple-darwin" "x86_64/$b-x86_64-apple-darwin"
-          done
+          lipo -create -output "dist/hcc-macos-universal" \
+            "arm64/hcc-aarch64-apple-darwin" "x86_64/hcc-x86_64-apple-darwin"
       - uses: actions/upload-artifact@v4
         with:
           name: bin-macos-universal

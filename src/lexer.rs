@@ -1,9 +1,9 @@
 //! The HolyC lexer: turns source text into a stream of [`Token`]s.
 //!
-//! The lexer works over the raw bytes of the source. HolyC source is ASCII for
-//! all syntactically meaningful characters; any non-ASCII bytes may only appear
-//! inside string/char literals and comments, where we pass them through
-//! untouched so the resulting strings stay UTF-8 valid.
+//! The lexer works over the raw bytes of the source. All syntactically
+//! meaningful HolyC characters are ASCII. Non-ASCII bytes may appear only inside
+//! string/char literals and comments, where they pass through untouched so the
+//! resulting strings stay valid UTF-8.
 
 use crate::token::{FileInfo, Keyword, Pos, Span, Token, TokenKind};
 use std::fmt;
@@ -31,9 +31,9 @@ type LResult<T> = Result<T, LexError>;
 pub trait TokenStream {
     fn next_token(&mut self) -> LResult<Token>;
 
-    /// The source files seen (indexed by `Span::file`), for `_`-directory privacy.
-    /// A bare lexer is a single anonymous root file; the preprocessor overrides this
-    /// with its real include table.
+    /// The source files seen, indexed by `Span::file`, for `_`-directory privacy.
+    /// A bare lexer reports a single anonymous root file. The preprocessor
+    /// overrides this with its real include table.
     fn source_files(&self) -> Vec<FileInfo> {
         vec![FileInfo::root()]
     }
@@ -47,8 +47,8 @@ impl TokenStream for Lexer {
 }
 
 pub struct Lexer {
-    /// The source bytes, owned so a lexer outlives the `&str` it was built from
-    /// (the preprocessor keeps a stack of them for `#include`d files).
+    /// The source bytes. Owned so a lexer outlives the `&str` it was built from;
+    /// the preprocessor keeps a stack of these for `#include`d files.
     src: Vec<u8>,
     /// Current byte offset.
     idx: usize,
@@ -68,8 +68,8 @@ impl Lexer {
         }
     }
 
-    /// Tokenize the whole input, returning the token list (terminated by
-    /// [`TokenKind::Eof`]) or the first error encountered.
+    /// Tokenizes the whole input. Returns the token list, terminated by
+    /// [`TokenKind::Eof`], or the first error encountered.
     pub fn tokenize(mut self) -> LResult<Vec<Token>> {
         let mut tokens = Vec::new();
         loop {
@@ -97,7 +97,7 @@ impl Lexer {
         self.src.get(self.idx + 2).copied()
     }
 
-    /// Advance one byte, maintaining line/column tracking.
+    /// Advances one byte, updating line/column tracking.
     fn bump(&mut self) -> Option<u8> {
         let b = self.peek()?;
         self.idx += 1;
@@ -123,10 +123,10 @@ impl Lexer {
 
     // ---- main dispatch ----
 
-    /// Produce the next token. The parser calls this on demand so that the full
+    /// Produces the next token. The parser calls this on demand, so the full
     /// token list is never materialised in memory. Once the input is exhausted
     /// this returns [`TokenKind::Eof`] and keeps returning it on every further
-    /// call, so it is safe to call past the end.
+    /// call, so calling past the end is safe.
     pub fn next_token(&mut self) -> LResult<Token> {
         self.skip_trivia()?;
 
@@ -250,8 +250,8 @@ impl Lexer {
 
         let mut is_float = false;
 
-        // Fractional part: a '.' followed by a digit. We require a digit so that
-        // `1.foo` / `1..2` are not mis-lexed as floats.
+        // Fractional part: a '.' followed by a digit. The digit is required so
+        // that `1.foo` and `1..2` are not mis-lexed as floats.
         if self.peek() == Some(b'.') && matches!(self.peek2(), Some(b) if b.is_ascii_digit()) {
             is_float = true;
             self.bump(); // .
@@ -286,10 +286,10 @@ impl Lexer {
                 Err(_) => self.err(pos, format!("invalid float literal `{text}`")),
             }
         } else if text.len() > 1 && text.starts_with('0') {
-            // A leading `0` on a multi-digit integer is an **octal** literal (C
-            // semantics) — `0x`/`0b` were handled above and floats took the branch
-            // above, so a `0...` integer here is octal. `08`/`09` (a non-octal digit)
-            // is an error, like C.
+            // A leading `0` on a multi-digit integer means an octal literal, as
+            // in C. `0x`/`0b` and floats were handled above, so a `0...` integer
+            // reaching here is octal. A non-octal digit like `08`/`09` is an
+            // error, also as in C.
             match parse_int_str(text, 8) {
                 Some(v) => Ok(self.tok(TokenKind::Int(v), start, pos)),
                 None => self.err(
@@ -355,8 +355,8 @@ impl Lexer {
 
     // ---- character constants ----
 
-    /// HolyC character constants may contain several characters, which are
-    /// packed little-endian into an I64: `'A'` == 0x41, `'AB'` == 0x4241.
+    /// HolyC character constants may hold several characters, packed
+    /// little-endian into an I64. So `'A'` == 0x41 and `'AB'` == 0x4241.
     fn lex_char(&mut self, start: usize, pos: Pos) -> LResult<Token> {
         self.bump(); // opening '
         let mut value: i64 = 0;
@@ -398,8 +398,8 @@ impl Lexer {
         Ok(())
     }
 
-    /// Consume one escape sequence body (the backslash has already been eaten)
-    /// and return the resulting character.
+    /// Consumes one escape sequence body and returns the resulting character.
+    /// The backslash has already been eaten.
     fn lex_escape(&mut self, pos: Pos) -> LResult<char> {
         let b = match self.bump() {
             None => return self.err(pos, "unterminated escape sequence"),
@@ -441,8 +441,9 @@ impl Lexer {
         })
     }
 
-    /// Consume one UTF-8 encoded character starting at the cursor and return it.
-    /// Assumes a byte is available. Invalid UTF-8 yields the replacement char.
+    /// Consumes one UTF-8 encoded character starting at the cursor and returns
+    /// it. Assumes a byte is available. Invalid UTF-8 yields the replacement
+    /// character.
     fn bump_char(&mut self) -> char {
         let first = self.peek().unwrap();
         let len = utf8_len(first);
@@ -451,7 +452,7 @@ impl Lexer {
             .ok()
             .and_then(|s| s.chars().next())
             .unwrap_or('\u{FFFD}');
-        // Advance through the bytes we consumed, keeping position tracking sane.
+        // Advance through the bytes consumed, keeping position tracking correct.
         for _ in 0..ch.len_utf8() {
             self.bump();
         }
@@ -620,13 +621,13 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
-/// Parse an integer in the given radix into an i64. HolyC integers are 64-bit;
-/// we accept any bit pattern that fits in 64 bits (so 0xFFFFFFFFFFFFFFFF is
-/// valid and wraps to -1), matching C-like unsigned/signed reinterpretation.
+/// Parses an integer in the given radix into an i64. HolyC integers are 64-bit,
+/// so any bit pattern that fits in 64 bits is accepted: 0xFFFFFFFFFFFFFFFF is
+/// valid and wraps to -1. This matches C-like signed/unsigned reinterpretation.
 fn parse_int_str(s: &str, radix: u32) -> Option<i64> {
     match i64::from_str_radix(s, radix) {
         Ok(v) => Some(v),
-        // Out of i64 range but maybe a valid u64 bit pattern (e.g. high bit set).
+        // Out of i64 range, but maybe a valid u64 bit pattern (e.g. high bit set).
         Err(_) => u64::from_str_radix(s, radix).ok().map(|v| v as i64),
     }
 }

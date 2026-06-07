@@ -1,9 +1,9 @@
-//! Conformance for the freestanding `aarch64-unknown-linux` backend: compile every
-//! example to a self-contained static ELF (no libc, no linker) and run it
-//! **natively**, asserting its stdout is byte-for-byte the interpreter's. Execution
-//! runs only on a linux/aarch64 host and self-skips elsewhere — off a Mac a
-//! `cargo test` exercises the AArch64 freestanding *emitter* via the build, not
-//! execution (the shared AArch64 emitter is executed on Darwin by `arm64_darwin`).
+//! Conformance for the freestanding `aarch64-unknown-linux` backend. Compile every
+//! example to a self-contained static ELF (no libc, no linker) and run it natively,
+//! asserting its stdout is byte-for-byte the interpreter's. Execution runs only on a
+//! linux/aarch64 host and self-skips elsewhere. So off a Mac, `cargo test` exercises
+//! the AArch64 freestanding emitter through the build but not execution. (The shared
+//! AArch64 emitter is executed on Darwin by `arm64_darwin`.)
 
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -23,8 +23,8 @@ fn temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("solomon-arm64fs-{}-{id}", std::process::id()))
 }
 
-/// Run each freestanding ELF in `dir` and capture its stdout — **natively**, only on
-/// a linux/aarch64 host (the freestanding ELF runs directly, no emulation). Returns
+/// Run each freestanding ELF in `dir` and capture its stdout, natively and only on a
+/// linux/aarch64 host. The freestanding ELF runs directly, with no emulation. Returns
 /// `None` to skip off a non-matching host; CI covers the Linux targets.
 fn run_stdouts(dir: &std::path::Path, names: &[String]) -> Option<Vec<String>> {
     if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
@@ -75,10 +75,10 @@ fn freestanding_matches_the_interpreter_for_every_example() {
 
 #[test]
 fn extreme_field_width_and_precision_do_not_overflow() {
-    // Pathological width/precision is clamped at the shared `fmt` layer (width
-    // ≤1024, precision ≤512) so the hand-emitted fixed scratch buffers in the
-    // freestanding formatters never overflow. Pre-clamp these segfaulted; they
-    // must now run and match the interpreter byte-for-byte.
+    // Pathological width/precision is clamped at the shared `fmt` layer (width ≤1024,
+    // precision ≤512), so the hand-emitted fixed scratch buffers in the freestanding
+    // formatters never overflow. These cases segfaulted before the clamp. They must
+    // now run and match the interpreter byte-for-byte.
     let cases: &[&str] = &[
         r#"U0 Main(){ "%2000d\n", 42; } Main;"#,
         r#"U0 Main(){ "%.800f\n", 3.14; } Main;"#,
@@ -120,10 +120,10 @@ fn extreme_field_width_and_precision_do_not_overflow() {
 
 #[test]
 fn realloc_extends_the_last_block_in_place() {
-    // The payoff of the `HeapExtend` builtin: growing the heap's *last* allocation
-    // extends it in place on the freestanding bump allocator (the pointer never
-    // moves, so no copy and no leak) — unlike the libc/interp heaps. Also checks the
-    // contents survive the grows.
+    // The payoff of the `HeapExtend` builtin. Growing the heap's last allocation
+    // extends it in place on the freestanding bump allocator: the pointer never moves,
+    // so there's no copy and no leak. This differs from the libc/interp heaps. Also
+    // checks the contents survive the grows.
     let src = r#"
         #include <cstr.hc>
         #include <mem.hc>
@@ -165,10 +165,9 @@ fn realloc_extends_the_last_block_in_place() {
 
 #[test]
 fn dynamic_width_and_precision_match_the_interpreter() {
-    // `*` width/precision (taken from arguments) in the freestanding formatter —
-    // including a negative `*` width (left-justify) and a negative `*` precision
-    // (no precision) — must match the interpreter byte-for-byte, for ints, strings,
-    // and floats.
+    // `*` width/precision (taken from arguments) in the freestanding formatter must
+    // match the interpreter byte-for-byte, for ints, strings, and floats. This covers
+    // a negative `*` width (left-justify) and a negative `*` precision (no precision).
     let cases: &[&str] = &[
         r#"U0 Main(){ "[%*d][%-*d][%*d]\n", 5, 42, 5, 42, -5, 42; } Main;"#,
         r#"U0 Main(){ "[%.*d][%*.*d]\n", 3, 7, 8, 4, 42; } Main;"#,
@@ -214,7 +213,7 @@ fn dynamic_width_and_precision_match_the_interpreter() {
 #[test]
 fn stdlib_math_matches_the_interpreter() {
     // The HolyC standard library (`#include <math.hc>`) compiles freestanding and
-    // prints exactly what the interpreter does — exercising angle includes through
+    // prints exactly what the interpreter does. This exercises angle includes through
     // the native pipeline and the F64 algebraic builtins (`Floor`/`Ceil`/`Round`).
     let src = r#"
         #include <math.hc>
@@ -225,7 +224,7 @@ fn stdlib_math_matches_the_interpreter() {
           "%.6f %.6f %.6f\n", Sinh(1.0), Asin(0.5), Atan2(1.0, -1.0);
           "%.1f %.1f %.1f %.1f\n", Round(2.5), Round(-2.5), Round(0.5), Round(-3.5);
           "%.1f %.1f %.1f %.1f\n", Floor(2.7), Floor(-2.3), Ceil(2.1), Ceil(-2.9);
-          "%d %d %d\n", Gcd(48, 36), Factorial(6), IMax(3, 9);
+          "%d %d %d\n", Gcd(48, 36), Factorial(6), Max(3, 9);
         }
         Main;
     "#;
@@ -255,12 +254,12 @@ fn stdlib_math_matches_the_interpreter() {
 
 #[test]
 fn strtof64_matches_the_interpreter() {
-    // The correctly-rounded `atof` (`#include <strconv.hc>`, over `<bignum.hc>`)
-    // compiles and runs **freestanding** — previously `StrToF64` lowered to a libc
-    // `_atof` the static ELF couldn't resolve. Both paths (Clinger fast + exact
-    // bignum slow) must print byte-for-byte what the interpreter does.
+    // The correctly-rounded `atof` (`#include <cstr.hc>`, over `<bignum.hc>`)
+    // compiles and runs freestanding. Previously `StrToF64` lowered to a libc `_atof`
+    // the static ELF couldn't resolve. Both paths (Clinger fast and exact bignum slow)
+    // must print byte-for-byte what the interpreter does.
     let src = r#"
-        #include <strconv.hc>
+        #include <cstr.hc>
         U0 Main() {
           "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
           "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");
@@ -296,9 +295,9 @@ fn strtof64_matches_the_interpreter() {
 
 #[test]
 fn time_builtins_run_natively() {
-    // Time is impure (non-reproducible), so assert *properties* of the native run
-    // rather than byte-comparing to the interpreter: wall clock past 1970, and a
-    // monotonic clock that doesn't go backwards across a Sleep.
+    // Time is impure (non-reproducible), so assert properties of the native run rather
+    // than byte-comparing to the interpreter: wall clock past 1970, and a monotonic
+    // clock that doesn't go backwards across a Sleep.
     let src = r#"
     #include <time.hc>
     U0 Main() {

@@ -1,25 +1,29 @@
 #ifndef _IO_HC
 #define _IO_HC
-// io.hc — file descriptor I/O: the raw `Read`/`Write`/`Close`/`Open`/`LSeek`
-// primitives plus file-level helpers (`ReadFile`/`WriteFile`/`AppendFile`/`FileSize`).
+// io.hc — file-descriptor I/O.
 //
-// `Read`/`Write`/`Close`/`Open`/`LSeek` are **intrinsics** (prototypes here; the
-// compiler lowers them to the host's file syscalls on the freestanding targets, libc
-// on Darwin). They do real, impure I/O, so a program using them is *not* reproducible
-// — conformance is by property, not by interp-vs-native value. `lib/net.hc` shares the
-// same `Read`/`Write`/`Close` for sockets. Include with `#include <io.hc>`.
+// Provides the raw `Read`/`Write`/`Close`/`Open`/`LSeek` primitives, the portable
+// standard-stream write `StdWrite`, and file-level helpers
+// (`ReadFile`/`WriteFile`/`AppendFile`/`FileSize`).
 //
-// **Errors are the return value**, Unix-style: a successful call returns a
-// non-negative result (an fd, a byte count, an offset); a failure returns a negative
-// `-errno`. There is no out-parameter and no error object — you test the sign:
+// `Read`/`Write`/`Close`/`Open`/`LSeek` are intrinsics: the prototypes live here,
+// and the compiler lowers them to the host's file syscalls on the freestanding
+// targets, or to libc on Darwin. They do real, impure I/O, so a program using them
+// is not reproducible. Conformance is by property, not by interp-vs-native value.
+// `lib/net.hc` shares the same `Read`/`Write`/`Close` for sockets. Include with
+// `#include <io.hc>`.
+//
+// Errors are returned as the value, Unix-style. A successful call returns a
+// non-negative result (an fd, a byte count, an offset); a failure returns a
+// negative `-errno`. There is no out-parameter and no error object, so you test
+// the sign:
 //
 //     I64 n = ReadFile("/cfg", buf, sizeof(buf));
 //     if (n < 0) { "read failed (errno %d)\n", -n; return; }
 
 #include <cstr.hc>    // StrLen
-#include <stdio.hc>   // StdWrite + STDOUT/STDERR (the standard-stream write)
 
-// `Open` flags use the **Linux** `open(2)` values as the canonical set; the Darwin
+// `Open` flags use the Linux `open(2)` values as the canonical set. The Darwin
 // backend and the interpreter translate them to the host's flags, so the same
 // constants work on every target.
 #define O_RDONLY 0
@@ -36,22 +40,28 @@
 // `rw-r--r--` create mode (octal, as conventional for Unix permission bits).
 #define MODE_0644 0644
 
+// The standard stream fds, for `StdWrite`.
+#define STDOUT 1
+#define STDERR 2
+
 // --- raw primitives (intrinsics) ---------------------------------------------
 
-I64 Open(U8 *path, I64 flags, I64 mode);   // a file fd, or -errno
-I64 LSeek(I64 fd, I64 off, I64 whence);    // new absolute offset, or -errno
-I64 Read(I64 fd, U8 *buf, I64 n);          // bytes read (0 = EOF), or -errno
-I64 Write(I64 fd, U8 *buf, I64 n);         // bytes written, or -errno
-I64 Close(I64 fd);                         // 0, or -errno
+public I64 Open(U8 *path, I64 flags, I64 mode);   // a file fd, or -errno
+public I64 LSeek(I64 fd, I64 off, I64 whence);    // new absolute offset, or -errno
+public I64 Read(I64 fd, U8 *buf, I64 n);          // bytes read (0 = EOF), or -errno
+public I64 Write(I64 fd, U8 *buf, I64 n);         // bytes written, or -errno
+public I64 Close(I64 fd);                         // 0, or -errno
 
-// (`StdWrite` — the portable stdout/stderr write — lives in `<stdio.hc>`, included
-// above. Filesystem mutation — `Remove`/`Rename`/`Mkdir` — and process control live in
-// `<os.hc>`.)
+// `StdWrite(fd, buf, n)` writes to a standard stream portably: `fd` 1 (STDOUT) =
+// stdout, 2 (STDERR) = stderr. Unlike `Write` above (a POSIX fd op), it also works on
+// Windows: it lowers to the write syscall or libc on POSIX, and
+// `WriteFile(GetStdHandle(...))` on Windows. The printf machinery is built on it.
+public I64 StdWrite(I64 fd, U8 *buf, I64 n);      // bytes written, or -errno
 
 // --- fd helpers ---------------------------------------------------------------
 
 // Write all `n` bytes to `fd`, looping over partial writes. Returns 0, or -errno.
-I64 WriteAll(I64 fd, U8 *buf, I64 n)
+public I64 WriteAll(I64 fd, U8 *buf, I64 n)
 {
   I64 off = 0;
   while (off < n) {
@@ -66,7 +76,7 @@ I64 WriteAll(I64 fd, U8 *buf, I64 n)
 // --- file helpers -------------------------------------------------------------
 
 // Size of `path` in bytes, or -errno.
-I64 FileSize(U8 *path)
+public I64 FileSize(U8 *path)
 {
   I64 fd = Open(path, O_RDONLY, 0);
   if (fd < 0) return fd;
@@ -77,7 +87,7 @@ I64 FileSize(U8 *path)
 
 // Read up to `cap` bytes of `path` into `buf`. Returns the byte count, or -errno. The
 // caller NUL-terminates / parses the result.
-I64 ReadFile(U8 *path, U8 *buf, I64 cap)
+public I64 ReadFile(U8 *path, U8 *buf, I64 cap)
 {
   I64 fd = Open(path, O_RDONLY, 0);
   if (fd < 0) return fd;
@@ -93,7 +103,7 @@ I64 ReadFile(U8 *path, U8 *buf, I64 cap)
 }
 
 // Create/truncate `path` (mode 0644) and write `n` bytes. Returns 0, or -errno.
-I64 WriteFile(U8 *path, U8 *buf, I64 n)
+public I64 WriteFile(U8 *path, U8 *buf, I64 n)
 {
   I64 fd = Open(path, O_WRONLY | O_CREAT | O_TRUNC, MODE_0644);
   if (fd < 0) return fd;
@@ -103,7 +113,7 @@ I64 WriteFile(U8 *path, U8 *buf, I64 n)
 }
 
 // Append `n` bytes to `path` (creating it, mode 0644). Returns 0, or -errno.
-I64 AppendFile(U8 *path, U8 *buf, I64 n)
+public I64 AppendFile(U8 *path, U8 *buf, I64 n)
 {
   I64 fd = Open(path, O_WRONLY | O_CREAT | O_APPEND, MODE_0644);
   if (fd < 0) return fd;

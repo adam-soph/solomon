@@ -1,29 +1,33 @@
-//! The `hcc` CLI — the HolyC **compiler**. Reads HolyC source from a file (or
-//! stdin) and, by default, compiles a native binary for the host's architecture
-//! and OS. A leading subcommand selects a front-end-only mode. To *run* a program
-//! with the interpreter, use the matching `hci`.
+//! The `hcc` CLI: the HolyC compiler and interpreter.
+//!
+//! Reads HolyC source from a file, or stdin, and by default compiles a native
+//! binary for the host's architecture and OS. `-i` interprets the program with the
+//! tree-walking interpreter (the conformance oracle) instead of compiling, and the
+//! `check`/`ast`/`tokens` subcommands are front-end-only.
 //!
 //! Usage:
 //!   hcc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
+//!   hcc -i     [FILE] [ARGS...]             interpret the program
 //!   hcc check  [FILE]                       parse + semantic analysis, report errors
 //!   hcc ast    [FILE]                       dump the parsed AST
 //!   hcc tokens [FILE]                       dump the raw lexer token stream
 //!
-//! With no subcommand `hcc` builds for the host target (`-o OUT`, default
-//! `a.out`); `--target TRIPLE` cross-compiles instead (`aarch64-apple-darwin` →
-//! Mach-O via `cc`, `x86_64-unknown-linux` / `aarch64-unknown-linux` → a
-//! freestanding static ELF, `x86_64-pc-windows` → a self-contained PE).
+//! With no subcommand, `hcc` builds for the host target (`-o OUT`, default
+//! `a.out`). `--target TRIPLE` cross-compiles instead: `aarch64-apple-darwin` to
+//! Mach-O via `cc`, `x86_64-unknown-linux` and `aarch64-unknown-linux` to a
+//! freestanding static ELF, and `x86_64-pc-windows` to a self-contained PE.
 
 use std::io::Read;
 use std::process::ExitCode;
 
 use solomon::arm64::{Arm64Darwin, Arm64Linux};
 use solomon::codegen::Codegen;
+use solomon::interp::Interpreter;
 use solomon::x86_64::{X64Linux, X64Windows};
 use solomon::{lexer, parser, sema};
 
-/// A code-generation target: an (architecture, OS) pair, since the object format,
-/// syscalls, and ABI all depend on the OS — not just the CPU.
+/// A code-generation target: an (architecture, OS) pair. The object format,
+/// syscalls, and ABI all depend on the OS, not just the CPU.
 #[derive(Clone, Copy)]
 enum Target {
     Arm64Darwin,
@@ -33,7 +37,8 @@ enum Target {
 }
 
 impl Target {
-    /// The target the host machine natively runs, if it is one we can emit.
+    /// The target the host machine natively runs, if it is one this compiler can
+    /// emit.
     fn host() -> Option<Self> {
         if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
             Some(Target::Arm64Darwin)
@@ -45,11 +50,11 @@ impl Target {
             None
         }
     }
-    /// Parse a target triple. Exactly the four supported (arch, OS) triples are
-    /// accepted — one per backend, no aliases. The two Linux targets are
-    /// **freestanding** (no libc, no linker), so the `-gnu`/`-musl` libc suffixes
-    /// are deliberately not accepted; and Darwin is the one libc-linked (hosted)
-    /// target, while Windows imports `kernel32` (neither freestanding nor libc).
+    /// Parses a target triple. Exactly the four supported (arch, OS) triples are
+    /// accepted, one per backend, with no aliases. The two Linux targets are
+    /// freestanding (no libc, no linker), so the `-gnu`/`-musl` libc suffixes are
+    /// deliberately not accepted. Darwin is the one libc-linked, hosted target;
+    /// Windows imports `kernel32`, so it is neither freestanding nor libc.
     fn from_triple(s: &str) -> Option<Self> {
         match s {
             "aarch64-apple-darwin" => Some(Target::Arm64Darwin),
@@ -77,18 +82,25 @@ enum Mode {
 }
 
 fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1).peekable();
+
+    // `-i` interprets the program instead of compiling. It takes the program's own
+    // arguments after FILE, so it has its own argument handling and returns early.
+    if args.peek().map(String::as_str) == Some("-i") {
+        args.next();
+        return run_interp(args.collect());
+    }
+
     // The default action is to compile a native binary for the host target.
     let mut mode = Mode::Build;
     let mut out: Option<String> = None;
     let mut target: Option<Target> = None;
-    // Extra include directories for angle includes (`#include <name>`), searched
-    // before the default standard-library directories.
+    // Extra include dirs for angle includes (`#include <name>`), searched before
+    // the default standard-library directories.
     let mut include_dirs: Vec<std::path::PathBuf> = Vec::new();
 
-    let mut args = std::env::args().skip(1).peekable();
-
-    // An optional leading subcommand selects a non-default mode; anything else
-    // (a file or an option) leaves the default build mode in place.
+    // An optional leading subcommand selects a non-default mode. Anything else,
+    // such as a file or an option, leaves the default build mode in place.
     let is_subcommand = match args.peek().map(String::as_str) {
         Some("build") => {
             mode = Mode::Build;
@@ -116,7 +128,7 @@ fn main() -> ExitCode {
         args.next();
     }
 
-    // The single positional is the input FILE (stdin if omitted).
+    // The single positional is the input FILE, or stdin if omitted.
     let mut path: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -177,7 +189,7 @@ fn main() -> ExitCode {
             }
         },
         None => {
-            // No file given: read HolyC source from stdin.
+            // No file given, so read HolyC source from stdin.
             let mut s = String::new();
             if let Err(e) = std::io::stdin().read_to_string(&mut s) {
                 eprintln!("hcc: cannot read stdin: {e}");
@@ -187,16 +199,12 @@ fn main() -> ExitCode {
         }
     };
 
-    // `#include "..."` paths resolve relative to the input file's directory
-    // (the current directory when reading from stdin).
-    let base_dir = path
-        .as_ref()
-        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // `#include "..."` paths resolve relative to the input file's directory, or
+    // the current directory when reading from stdin.
+    let base_dir = base_dir_of(&path);
 
-    // Angle includes (`#include <name>`) search `-I` dirs first, then the default
-    // standard-library directories.
+    // Angle includes (`#include <name>`) search the `-I` dirs first, then the
+    // default standard-library directories.
     let mut search = include_dirs;
     search.extend(solomon::stdlib_dirs());
 
@@ -285,19 +293,114 @@ fn main() -> ExitCode {
     }
 }
 
+/// Interpret a HolyC program with the tree-walking interpreter, the conformance
+/// oracle for the native backends. `rest` is everything after the `-i` flag: an
+/// optional FILE followed by the program's own arguments.
+///
+/// The first positional is the file; everything after it is a program argument,
+/// even if it looks like an option, and `--` forces that switch early.
+fn run_interp(rest: Vec<String>) -> ExitCode {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut opts_done = false;
+    for arg in rest {
+        if opts_done {
+            positionals.push(arg);
+        } else if arg == "--" {
+            opts_done = true;
+        } else if matches!(arg.as_str(), "-h" | "--help" | "help") {
+            print_usage();
+            return ExitCode::SUCCESS;
+        } else if arg.starts_with('-') {
+            eprintln!("hcc -i: unknown option `{arg}`");
+            return ExitCode::FAILURE;
+        } else {
+            positionals.push(arg);
+            opts_done = true; // file is set; the rest are the program's args
+        }
+    }
+    let path = positionals.first().cloned();
+
+    let src = match &path {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("hcc: cannot read `{path}`: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let mut s = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                eprintln!("hcc: cannot read stdin: {e}");
+                return ExitCode::FAILURE;
+            }
+            s
+        }
+    };
+
+    let base_dir = base_dir_of(&path);
+    let program = match parser::parse_with(&src, &base_dir, &solomon::stdlib_dirs()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Refuse to run a program that fails semantic analysis.
+    let errors = sema::check_program(&program);
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("{e}");
+        }
+        eprintln!("{} error(s)", errors.len());
+        return ExitCode::FAILURE;
+    }
+
+    let stdout = std::io::stdout();
+    let mut interp = Interpreter::new(stdout.lock());
+    // argv[0] is the script name, or "hcc" when reading from stdin. The rest are
+    // the trailing command-line arguments.
+    interp.set_args(if positionals.is_empty() {
+        vec!["hcc".to_string()]
+    } else {
+        positionals
+    });
+    match interp.run(&program) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The base directory for `#include "..."` resolution: the input file's directory,
+/// or the current directory when reading from stdin.
+fn base_dir_of(path: &Option<String>) -> std::path::PathBuf {
+    path.as_ref()
+        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 fn print_usage() {
     print!(
         "\
-hcc — the HolyC compiler
+hcc — the HolyC compiler and interpreter
 
 Usage:
   hcc [--target TRIPLE] [-o OUT] [FILE]   compile a native binary (the default)
+  hcc -i     [FILE] [ARGS...]             interpret the program
   hcc check  [FILE]                       parse + semantic analysis, report errors
   hcc ast    [FILE]                       dump the parsed AST
   hcc tokens [FILE]                       dump the raw lexer token stream
 
 With no subcommand, hcc compiles for the host's architecture and OS. FILE is
-read from stdin when omitted. To run a program, use `hci`.
+read from stdin when omitted.
+
+`hcc -i` executes the program with the tree-walking interpreter. Arguments after
+FILE become the program's argv (read with ArgC/ArgV); `--` ends option parsing so
+option-looking program arguments pass through.
 
 Options:
   -o OUT            output path for the compiled binary (default: a.out)

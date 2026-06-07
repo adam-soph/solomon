@@ -1,11 +1,11 @@
 //! Tests for the x86-64 / ELF backend.
 //!
-//! The structural checks run everywhere (they only inspect the produced ELF
-//! image). The end-to-end "run it and check the exit code" tests execute the
-//! emitted Linux/x86-64 static ELF **natively**, so they run only on a
-//! linux/x86_64 host (CI's `ubuntu-latest`) and self-skip elsewhere — off a Mac a
-//! `cargo test` therefore exercises the x86-64 *emitter* via the structural
-//! checks, not execution.
+//! The structural checks run everywhere, since they only inspect the produced
+//! ELF image. The end-to-end "run it and check the exit code" tests execute the
+//! emitted Linux/x86-64 static ELF natively, so they run only on a linux/x86_64
+//! host (CI's `ubuntu-latest`) and self-skip elsewhere. Off a Mac, a `cargo
+//! test` therefore exercises the x86-64 emitter via the structural checks, but
+//! not execution.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -27,16 +27,16 @@ fn temp_out() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("solomon-x64-{}-{id}", std::process::id()))
 }
 
-/// Parse a program/source with the standard library available (so `#include
-/// <cstr.hc>` etc. resolve). Examples carry their own includes; inline sources don't,
-/// so the primitive modules (`cstr`/`mem`/`ctype`, plus `math.hc` for `RandU64`) are
-/// prepended; the extra unused defs don't change a program's output.
+/// Parse a program/source with the standard library available, so `#include
+/// <cstr.hc>` and friends resolve. Examples carry their own includes, but inline
+/// sources don't, so the primitive modules (`cstr`/`mem`/`ctype`) are prepended.
+/// The extra unused definitions don't change a program's output.
 fn parse_src(src: &str) -> solomon::Program {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let mut s = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
-    // `math.hc` only when the source uses the moved `RandU64` PRNG — see the note
-    // on `common::with_stdlib_prelude` (prepending the rest collides with the
-    // examples that define their own `Pow`/`Floor`/…).
+    // Add `math.hc` only when the source needs it. We don't prepend it
+    // unconditionally because that collides with examples that define their own
+    // `Pow`/`Floor`/etc. See the note on `common::with_stdlib_prelude`.
     if (src.contains("Abs") || src.contains("Fabs") || src.contains("Sqrt") || src.contains("Sign"))
         && !src.contains("#include <math.hc>")
     {
@@ -44,9 +44,6 @@ fn parse_src(src: &str) -> solomon::Program {
     }
     if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
         s.push_str("#include <rand.hc>\n");
-    }
-    if src.contains("StrToF64") && !src.contains("#include <strconv.hc>") {
-        s.push_str("#include <strconv.hc>\n");
     }
     if (src.contains("UnixNS") || src.contains("NanoNS") || src.contains("Sleep"))
         && !src.contains("#include <time.hc>")
@@ -119,17 +116,17 @@ fn produces_a_valid_elf64_x86_64_executable() {
     );
     // `return 42;` has no globals, so the BSS is empty and p_memsz == p_filesz.
     assert_eq!(le_u64(&elf, 104), elf.len() as u64, "p_memsz (no BSS here)");
-    // p_vaddr ≡ p_offset (mod p_align), so the segment maps cleanly.
+    // p_vaddr and p_offset are congruent mod p_align, so the segment maps cleanly.
     assert_eq!(le_u64(&elf, 112), 0x1000, "p_align");
     assert_eq!(VADDR % 0x1000, le_u64(&elf, 72) % 0x1000);
 }
 
 #[test]
 fn main_is_framed_and_exits_via_syscall() {
-    // `_start` opens a `rbp` frame and the program exits through the `exit`
-    // syscall (`mov rax, 60; syscall`). Exact instruction-level behavior is
-    // pinned by `programs_run_with_the_expected_exit_code` (which actually runs
-    // the binary); this is the host-independent structural guard.
+    // Checks that `_start` opens an `rbp` frame and that the program exits through
+    // the `exit` syscall (`mov rax, 60; syscall`). This is the host-independent
+    // structural guard. Exact instruction-level behavior is pinned separately by
+    // `programs_run_with_the_expected_exit_code`, which actually runs the binary.
     let code = &build_elf("return 42;")[CODE_OFFSET..];
     #[rustfmt::skip]
     let prologue: &[u8] = &[
@@ -154,11 +151,11 @@ fn main_is_framed_and_exits_via_syscall() {
     );
 }
 
-/// Run ELFs `names` in `dir` and return their exit codes — **natively**, only on a
-/// linux/x86_64 host (the freestanding ELF runs directly, no libc, no emulation).
-/// Returns `None` to skip off a non-matching host; the Linux targets are covered by
-/// CI (`ubuntu-latest`), so a Mac run exercises the *emitter* via the structural
-/// checks, not execution.
+/// Runs the ELFs `names` in `dir` and returns their exit codes. It runs them
+/// natively, only on a linux/x86_64 host: the freestanding ELF runs directly, with
+/// no libc and no emulation. Returns `None` to skip off a non-matching host. The
+/// Linux targets are covered by CI (`ubuntu-latest`), so a Mac run exercises the
+/// emitter via the structural checks rather than execution.
 fn run_exit_codes(dir: &std::path::Path, names: &[String]) -> Option<Vec<i32>> {
     use std::process::Command;
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -177,9 +174,9 @@ fn run_exit_codes(dir: &std::path::Path, names: &[String]) -> Option<Vec<i32>> {
 
 #[test]
 fn programs_run_with_the_expected_exit_code() {
-    // (source, expected 8-bit exit status). Covers integer expressions, locals
-    // and control flow, comparisons / short-circuit logic, and functions
-    // (calls, recursion, mutual recursion, six arguments).
+    // Each case is (source, expected 8-bit exit status). The set covers integer
+    // expressions, locals and control flow, comparisons and short-circuit logic,
+    // and functions: calls, recursion, mutual recursion, and six arguments.
     let cases: &[(&str, i32)] = &[
         ("return 0;", 0),
         ("return 2 + 3 * 4 - 5;", 9),
@@ -235,9 +232,9 @@ fn programs_run_with_the_expected_exit_code() {
              I64 IsOdd(I64 n){if(n==0)return 0;return IsEven(n-1);} return IsEven(10);",
             1,
         ),
-        // Pointers and arrays: address-of / deref / write-through, indexing in a
-        // loop, pointer arithmetic and difference, width-aware narrow elements,
-        // 2-D arrays, and array/pointer parameters (by reference).
+        // Pointers and arrays: address-of, deref, and write-through; indexing in a
+        // loop; pointer arithmetic and difference; width-aware narrow elements;
+        // 2-D arrays; and array/pointer parameters (passed by reference).
         ("I64 x = 5; I64 *p = &x; *p = 7; return x;", 7),
         (
             "I64 a[4]; a[0]=10; a[1]=20; a[2]=30; a[3]=40; I64 *p=&a[0]; return *(p+2);",
@@ -278,11 +275,11 @@ fn programs_run_with_the_expected_exit_code() {
              I64 *p=a; I64 *q=a+4; I64 s=0; while(p<=q){ s+=*p; p++; } return s;",
             10,
         ),
-        // Classes and unions: member access, pointer-to-class (`->`), packed
-        // narrow fields + sizeof, nested classes, whole-class assignment and
-        // by-value parameters (a deep copy the callee can't observe outside),
-        // arrays of classes / heap-free linked lists, and union aliasing
-        // (named and anonymous-embedded).
+        // Classes and unions: member access; pointer-to-class (`->`); packed
+        // narrow fields and sizeof; nested classes; whole-class assignment; and
+        // by-value parameters (a deep copy the callee can't observe outside). Also
+        // arrays of classes, heap-free linked lists, and union aliasing (both named
+        // and anonymous-embedded).
         (
             "class P{I64 x; I64 y;} P p; p.x=3; p.y=4; return p.x+p.y;",
             7,
@@ -334,7 +331,7 @@ fn programs_run_with_the_expected_exit_code() {
             42,
         ),
         // Globals: top-level variables live in BSS and are reachable from any
-        // function (read, write, `++`, compound-assign, arrays, classes).
+        // function. Covers read, write, `++`, compound-assign, arrays, and classes.
         (
             "I64 g; U0 Set(){ g = 42; } I64 Get(){ return g; } Set(); return Get();",
             42,
@@ -359,8 +356,9 @@ fn programs_run_with_the_expected_exit_code() {
             "I64 g = 100; U0 Half(){ g /= 2; } Half(); Half(); return g;",
             25,
         ),
-        // F64: arithmetic, comparisons, casts, params/returns, globals, arrays —
-        // results truncate to an integer exit code (float printing is separate).
+        // F64: arithmetic, comparisons, casts, params/returns, globals, and arrays.
+        // Results truncate to an integer exit code; float printing is tested
+        // separately.
         ("F64 x = 3.5; F64 y = 2.0; return x + y;", 5),
         ("F64 x = 10.0; F64 y = 4.0; return x / y * 20.0;", 50),
         ("F64 x = 2.5; return x * x * 8.0;", 50),
@@ -399,7 +397,7 @@ fn programs_run_with_the_expected_exit_code() {
             64,
         ),
         ("F64 x = 5e18; U64 u = x; return u % 250;", 0), // unsigned float → int
-        // Signedness-directed integer ops (results chosen to fit an 8-bit code).
+        // Signedness-directed integer ops. Results are chosen to fit an 8-bit code.
         ("I64 a = -8; return a >> 1;", 0xFC), // arithmetic shift: -4 & 0xFF
         ("U8 a = 200; return a >> 1;", 100),  // logical shift on unsigned
         ("I64 a = -9; return a / 2;", 0xFC),  // signed div toward zero: -4
@@ -408,7 +406,7 @@ fn programs_run_with_the_expected_exit_code() {
         ("I64 a = -1; U64 b = 1; return a > b;", 1), // unsigned compare: a huge
         ("I64 a = -1; return a > 1;", 0),     // signed compare
         // Class return by value (sret): a function returns a class through a
-        // caller-allocated temp whose address it gets in r11.
+        // caller-allocated temp whose address it receives in r11.
         (
             "class P{I64 x; I64 y;} P Mk(I64 a, I64 b){ P p; p.x=a; p.y=b; return p; } \
              P q = Mk(3, 4); return q.x + q.y;",
@@ -425,8 +423,8 @@ fn programs_run_with_the_expected_exit_code() {
             15,
         ),
         (
-            // Class param followed by another param — exercises the arg-register
-            // save order (a class copy must not clobber later args).
+            // A class param followed by another param. Exercises the arg-register
+            // save order: a class copy must not clobber later args.
             "class P{I64 v;} I64 F(I64 a, P p, I64 b){ return a + p.v + b; } \
              P p; p.v=5; return F(10, p, 100);",
             115,
@@ -475,7 +473,7 @@ fn programs_run_with_the_expected_exit_code() {
             "I64 x = 5; if (x > 0) goto pos; return 1; pos: return 2;",
             2,
         ),
-        // Builtins (no libc — each lowered inline or to an emitted routine).
+        // Builtins, with no libc. Each is lowered inline or to an emitted routine.
         (
             "U8 *p = MAlloc(64); I64 i; for(i=0;i<64;i++) p[i]=i; \
              I64 s=0; for(i=0;i<64;i++) s+=p[i]; Free(p); return s & 255;",
@@ -502,7 +500,8 @@ fn programs_run_with_the_expected_exit_code() {
              return b[0] + b[7] + MemCmp(a, b, 8);",
             14,
         ),
-        // RandU64 is a deterministic splitmix64 (seed 0) — same value as the interp.
+        // RandU64 is a deterministic splitmix64 (seed 0), so it gives the same value
+        // as the interpreter.
         ("return RandU64() & 255;", 175), // first splitmix64(0) low byte
         ("return (I64)Sqrt(169.0) + (I64)Fabs(-7.0);", 20),
     ];
@@ -535,7 +534,7 @@ fn programs_run_with_the_expected_exit_code() {
     }
 }
 
-/// Run each ELF in `dir` and capture its stdout — **natively**, only on a
+/// Runs each ELF in `dir` and captures its stdout. Runs natively, only on a
 /// linux/x86_64 host. Returns `None` to skip off a non-matching host.
 fn run_stdouts(dir: &std::path::Path, names: &[String]) -> Option<Vec<String>> {
     use std::process::Command;
@@ -555,10 +554,10 @@ fn run_stdouts(dir: &std::path::Path, names: &[String]) -> Option<Vec<String>> {
 
 #[test]
 fn printing_matches_the_interpreter() {
-    // The payoff of `Print`/strings: the native backend's stdout must be
-    // byte-for-byte the interpreter's (the conformance oracle) — `%d %i %u %x %c
-    // %s %%`, a bare string printed verbatim, string-literal args, and printing
-    // interleaved with locals/loops/function calls.
+    // Checks that the native backend's stdout is byte-for-byte the interpreter's
+    // (the conformance oracle) for `Print` and strings. Covers `%d %i %u %x %c %s
+    // %%`, a bare string printed verbatim, string-literal args, and printing
+    // interleaved with locals, loops, and function calls.
     let cases: &[&str] = &[
         r#"U0 Main(){ "Hello, World!\n"; } Main;"#,
         r#"U0 Main(){ "%d %d %d\n", 1, 2, 42; } Main;"#,
@@ -583,43 +582,45 @@ fn printing_matches_the_interpreter() {
         r#"U0 Main(){ "[%10s][%-10s][%.3s]\n", "hi", "hi", "hello"; } Main;"#,
         // Printing through a global variable read inside a function.
         r#"I64 g; U0 Show(){ "g=%d\n", g; } U0 Main(){ g = 99; Show(); g++; Show(); } Main;"#,
-        // F64 values reaching `%d` convert to int (the float→int path); float math
-        // matches the interpreter bit-for-bit.
+        // F64 values reaching `%d` convert to int via the float-to-int path. The
+        // float math matches the interpreter bit-for-bit.
         r#"U0 Main(){ F64 x = 3.5; F64 y = 2.0; "%d %d %d\n", (I64)(x+y), (I64)(x*y), (I64)(x/y); } Main;"#,
         r#"F64 Avg(F64 a, F64 b){ return (a+b)/2.0; } U0 Main(){ "%d\n", (I64)(Avg(3.0, 8.0)*10); } Main;"#,
         r#"U0 Main(){ F64 r = 1.0; I64 i; for(i=0;i<10;i++) r *= 1.5; "%d\n", (I64)r; } Main;"#,
-        // Signedness-directed `>>` `/` `%` (off the left operand) and relational
-        // compares (unsigned if either operand is unsigned) — the high-bit cases
-        // diverge between `sar`/`shr`, `idiv`/`div`, and the signed/unsigned ccs.
+        // Signedness-directed `>>` `/` `%` (keyed off the left operand) and
+        // relational compares (unsigned if either operand is unsigned). The
+        // high-bit cases diverge between `sar`/`shr`, `idiv`/`div`, and the
+        // signed/unsigned condition codes.
         r#"U0 Main(){ I64 a = -8; U64 b = 0x8000000000000000; "%d %x\n", a >> 1, b >> 4; } Main;"#,
         r#"U0 Main(){ I64 a = -9; U64 b = 0x8000000000000000; "%d %x\n", a / 2, b / 2; } Main;"#,
         r#"U0 Main(){ I64 a = -7; U64 b = 0x8000000000000001; "%d %d\n", a % 3, b % 2; } Main;"#,
         r#"U0 Main(){ I64 a = -1; U64 b = 1; "%d %d\n", a > b, (-1 > 1); } Main;"#,
         r#"U0 Main(){ U32 a = 4000000000; "%u %u\n", a / 7, a % 7; } Main;"#,
         r#"U0 Main(){ U64 x = 0x8000000000000000; x >>= 4; x /= 2; "%x\n", x; } Main;"#,
-        // Builtins through printed output: strings, memory, char/int helpers, RNG.
+        // Builtins exercised through printed output: strings, memory, char/int
+        // helpers, and the RNG.
         r#"U0 Main(){ U8 b[32]; StrCpy(b,"Hello, "); StrCat(b,"World"); "%s (%d)\n", b, StrLen(b); } Main;"#,
         r#"U0 Main(){ U8 b[16]; StrCpy(b,"MixedCase"); StrToUpper(b); "%s ", b; StrToLower(b); "%s\n", b; } Main;"#,
         r#"U0 Main(){ U8 b[16]; StrCpy(b,"abcdef"); StrRev(b); "%s\n", b; } Main;"#,
         r#"U0 Main(){ U8 *p=MAlloc(256); I64 i; for(i=0;i<10;i++) p[i]='A'+i; p[10]=0; "%s\n", p; Free(p); } Main;"#,
         r#"U0 Main(){ I64 i; for(i=0;i<8;i++) "%d ", RandU64() % 100; "\n"; } Main;"#,
         // The sprintf family: format into a buffer (StrPrint), append (CatPrint),
-        // and I64ToStr — all via the output sink, then printed back.
+        // and I64ToStr. All go through the output sink, then are printed back.
         r#"U0 Main(){ U8 b[64]; StrPrint(b, "x=%d [%05d] %s", 3, 42, "ok"); "%s\n", b; } Main;"#,
         r#"U0 Main(){ U8 b[64]; StrCpy(b,"sum:"); I64 i; for(i=1;i<=4;i++) CatPrint(b," +%d", i); "%s\n", b; } Main;"#,
         r#"U0 Main(){ U8 a[32]; U8 b[32]; "%s|%s\n", I64ToStr(123456, a), I64ToStr(-7, b); } Main;"#,
         r#"U0 Main(){ U8 a[32]; U8 b[64]; StrPrint(a,"v%d",7); StrPrint(b,"[%s] then plain", a); "%s\n", b; "stdout still works\n"; } Main;"#,
-        // MStrPrint (asprintf into a fresh right-sized buffer) and F64ToStr (`%g`).
+        // MStrPrint (asprintf into a fresh, right-sized buffer) and F64ToStr (`%g`).
         r#"U0 Main(){ U8 *s = MStrPrint("[%d:%s:%.2f]", 7, "hi", 3.14159); "%s\n", s; Free(s); } Main;"#,
-        // MStrPrint with output far past the 64-byte initial capacity: forces the
-        // growing sink through several reallocations in a single format pass.
+        // MStrPrint with output far past the 64-byte initial capacity. This forces
+        // the growing sink through several reallocations in a single format pass.
         r#"U0 Main(){ U8 *s = MStrPrint("%s/%s/%s", "0123456789ABCDEF0123456789ABCDEF", "0123456789ABCDEF0123456789ABCDEF", "0123456789ABCDEF0123456789ABCDEF"); "%s (%d)\n", s, StrLen(s); Free(s); } Main;"#,
         r#"U0 Main(){ U8 b[64]; F64ToStr(2.71828,b); "%s ",b; F64ToStr(1000000.0,b); "%s ",b; F64ToStr(0.0001,b); "%s\n",b; } Main;"#,
-        // The `Is*` ctype predicates — classify each byte of a mixed string; the
+        // The `Is*` ctype predicates, classifying each byte of a mixed string. The
         // inline range-check routines must match the interpreter byte-for-byte.
         r#"U0 Main(){ U8 *s = "a1 B!~\t"; I64 i; for(i=0;s[i];i++){ "%d%d%d%d%d ", IsAlpha(s[i]), IsDigit(s[i]), IsSpace(s[i]), IsPunct(s[i]), IsCntrl(s[i]); } "\n"; } Main;"#,
-        // %f float printing — correctly rounded (bignum), matching the interpreter
-        // (Rust `{:.P}`) byte-for-byte, incl. round-half-to-even ties.
+        // %f float printing. Correctly rounded via the bignum, matching the
+        // interpreter (Rust `{:.P}`) byte-for-byte, including round-half-to-even ties.
         r#"U0 Main(){ "%f %f %f\n", 3.14159, 0.1, 39.566371; } Main;"#,
         r#"U0 Main(){ "%.2f %.0f %.0f %.0f\n", 2.675, 3.7, 2.5, 3.5; } Main;"#,
         r#"U0 Main(){ "%f %f\n", -3.14, -0.0; } Main;"#,
@@ -627,60 +628,64 @@ fn printing_matches_the_interpreter() {
         r#"U0 Main(){ "[%10.2f][%-10.2f][%010.2f][%+.2f]\n", 3.14, 3.14, 3.14, 3.14; } Main;"#,
         r#"U0 Main(){ F64 a=10.0,b=3.0; "%f\n", a/b; } Main;"#,
         r#"U0 Main(){ F64 s=0.0; I64 i; for(i=0;i<10;i++) s+=1.1; "%.10f\n", s; } Main;"#,
-        // %e / %g scientific & general — significant-digit rounding via the exact
-        // decimal expansion, matching the interpreter (Rust `{:.Pe}`) byte-for-byte.
+        // %e / %g scientific and general forms. Significant-digit rounding via the
+        // exact decimal expansion, matching the interpreter (Rust `{:.Pe}`)
+        // byte-for-byte.
         r#"U0 Main(){ "%e %E %.2e %.0e\n", 1.5, 1234.5, 9.9999996, 9.6; } Main;"#,
         r#"U0 Main(){ "%e %e\n", 1.0e300, 1.0e-300; } Main;"#,
         r#"U0 Main(){ "%g %g %g %g\n", 1.5, 1000000.0, 0.0001, 0.00001; } Main;"#,
         r#"U0 Main(){ "%g %.3g %#g %G\n", 1234567.0, 1234567.0, 1.5, 0.00001; } Main;"#,
         r#"U0 Main(){ "[%12.3e][%-12.3e][%+g][%015.2e]\n", 1.5, 1.5, 2.5, 42.0; } Main;"#,
-        // Negative zero keeps its IEEE sign across every conversion (the bignum's
-        // sign bit, matching the interpreter / libc / Rust): `-0.000000`, not `0`.
+        // Negative zero keeps its IEEE sign across every conversion, from the
+        // bignum's sign bit. So it prints `-0.000000`, not `0`, matching the
+        // interpreter, libc, and Rust.
         r#"U0 Main(){ "%f %e %g %E %G %.0f\n", -0.0, -0.0, -0.0, -0.0, -0.0, -0.0; } Main;"#,
-        // Pathological width/precision: clamped at the shared `fmt` layer (width
-        // ≤1024, precision ≤512) so the hand-emitted fixed scratch buffers never
-        // overflow. Pre-clamp these segfaulted; they must now match the interpreter.
+        // Pathological width/precision. These are clamped at the shared `fmt` layer
+        // (width <= 1024, precision <= 512) so the hand-emitted fixed scratch
+        // buffers never overflow. Before the clamp these segfaulted; they must now
+        // match the interpreter.
         r#"U0 Main(){ "%2000d\n", 42; } Main;"#,
         r#"U0 Main(){ "%.800f\n", 3.14; } Main;"#,
         r#"U0 Main(){ "%.100d\n", 7; } Main;"#,
         r#"U0 Main(){ "[%2000s]\n", "tail"; } Main;"#,
         r#"U0 Main(){ "%.700e\n", 1.5; } Main;"#,
-        // Brace/designated aggregate initializers (local and global): partial array
-        // (rest zeroed), positional & out-of-order designated class init, nested
-        // class-in-class, array of classes, and a float array — each must match the
-        // interpreter byte-for-byte.
+        // Brace/designated aggregate initializers, both local and global: a partial
+        // array (rest zeroed), positional and out-of-order designated class init,
+        // nested class-in-class, an array of classes, and a float array. Each must
+        // match the interpreter byte-for-byte.
         r#"U0 Main(){ I64 a[5] = {1, 2, 3}; I64 i; for(i=0;i<5;i++) "%d ", a[i]; "\n"; } Main;"#,
         r#"class Pt{I64 x;I64 y;} U0 Main(){ Pt p = {11, 22}; Pt q = {.y=5,.x=4}; "%d %d %d %d\n", p.x,p.y,q.x,q.y; } Main;"#,
         r#"class Pt{I64 x;I64 y;} class Ln{Pt a;Pt b;I64 t;} U0 Main(){ Ln l = {{1,2},{3,4},7}; "%d %d %d %d %d\n", l.a.x,l.a.y,l.b.x,l.b.y,l.t; } Main;"#,
         r#"class Pt{I64 x;I64 y;} U0 Main(){ Pt ps[3] = {{1,2},{3,4}}; "%d %d %d %d %d %d\n", ps[0].x,ps[0].y,ps[1].x,ps[1].y,ps[2].x,ps[2].y; } Main;"#,
         r#"U0 Main(){ F64 f[3] = {1.5, 2.5}; "%.1f %.1f %.1f\n", f[0], f[1], f[2]; } Main;"#,
         r#"class Pt{I64 x;I64 y;} I64 g[] = {10,20,30}; Pt gp = {.y=7}; U0 Main(){ "%d %d %d %d %d\n", g[0],g[1],g[2],gp.x,gp.y; } Main;"#,
-        // `offset()` (simple, nested, and a field after padding) — a compile-time
-        // byte offset, matching the interpreter / arm64.
+        // `offset()`: simple, nested, and a field after padding. A compile-time byte
+        // offset, matching the interpreter and arm64.
         r#"class In{I64 a;I64 b;} class Out{I64 t;In n;U8 f;} U0 Main(){ "%d %d %d %d\n", offset(Out.t), offset(Out.n), offset(Out.n.b), offset(Out.f); } Main;"#,
-        // Pointer compound assignment `p += n` / `p -= n` — pointee-scaled for I64*
-        // (stride 8), U8* (stride 1), and a class* (stride = sizeof), plus a cursor
+        // Pointer compound assignment `p += n` / `p -= n`, pointee-scaled for I64*
+        // (stride 8), U8* (stride 1), and a class* (stride = sizeof). Also a cursor
         // driven by `c += 1` in a loop.
         r#"U0 Main(){ I64 a[6]={0,10,20,30,40,50}; I64 *p=a; p+=3; I64 x=*p; p-=2; "%d %d\n", x, *p; } Main;"#,
         r#"U0 Main(){ U8 *s="abcdef"; s+=4; "%c", *s; s-=1; "%c\n", *s; } Main;"#,
         r#"class Pt{I64 x;I64 y;} U0 Main(){ Pt arr[3]={{1,2},{3,4},{5,6}}; Pt *q=arr; q+=2; "%d %d\n", q->x, q->y; } Main;"#,
         r#"U0 Main(){ I64 a[5]={1,2,3,4,5}; I64 s=0; I64 *c=a; I64 i; for(i=0;i<5;i++){ s+=*c; c+=1; } "%d\n", s; } Main;"#,
         // String-literal array initializers: size-inferred `[]`, zero-padded `[N]`,
-        // exact fit (keeps NUL), truncation (drops NUL), a global, and a plain
-        // pointer (left as a pointer to the literal, not desugared).
+        // exact fit (keeps the NUL), truncation (drops the NUL), a global, and a
+        // plain pointer (left as a pointer to the literal, not desugared).
         r#"U0 Main(){ U8 s[] = "hello"; "%s|", s; "%c%c\n", s[4], s[5]; } Main;"#,
         r#"U0 Main(){ U8 p[8] = "hi"; "%c%c%d%d\n", p[0], p[1], p[2], p[7]; } Main;"#,
         r#"U0 Main(){ U8 t[3] = "abc"; "%c%c%c\n", t[0], t[1], t[2]; } Main;"#,
         r#"U8 g[] = "global"; U0 Main(){ U8 *q = "ptr"; "%s %s\n", g, q; } Main;"#,
-        // Narrow (sub-8-byte) scalar parameters: a `U32`/`U8` param sits in a
-        // 4-/1-byte frame slot, so the prologue must spill it at the slot width —
-        // an 8-byte spill ran past the slot and clobbered the adjacent pointer
-        // param, corrupting `sa` and faulting on the store (the `MakeSockaddr` bug).
+        // Narrow (sub-8-byte) scalar parameters. A `U32`/`U8` param sits in a
+        // 4-/1-byte frame slot, so the prologue must spill it at the slot width.
+        // The `MakeSockaddr` bug: an 8-byte spill ran past the slot, clobbered the
+        // adjacent pointer param, corrupted `sa`, and faulted on the store.
         r#"U0 Fill(U8 *sa, U32 ip, I64 port){ I64 i; for(i=0;i<16;i++) sa[i]=0; sa[2]=(port>>8)&0xFF; sa[3]=port&0xFF; sa[4]=(ip>>24)&0xFF; sa[7]=ip&0xFF; } U0 Main(){ U8 sa[16]; Fill(sa, 0x7F000001, 8080); "%d %d %d %d %d\n", sa[2],sa[3],sa[4],sa[5],sa[7]; } Main;"#,
         r#"I64 Lo(U8 a, U16 b, U32 c, I64 d){ return (a ^ b ^ c ^ d) & 0xFF; } U0 Main(){ "%d\n", Lo(0x11, 0x2233, 0x44556677, 0x8899AABBCCDDEEFF); } Main;"#,
-        // Narrow (sub-8-byte) return values are truncated to the declared width — C
-        // semantics — sign- or zero-extended per signedness, in a register (there's no
-        // store to do it). `U8 300 -> 44`, `I8 200 -> -56`, `I16 40000 -> -25536`, …
+        // Narrow (sub-8-byte) return values are truncated to the declared width per C
+        // semantics, sign- or zero-extended per signedness. This happens in a
+        // register, since there's no store to do it. `U8 300 -> 44`, `I8 200 -> -56`,
+        // `I16 40000 -> -25536`, and so on.
         r#"U8 A(){return 300;} I8 B(){return 200;} U16 C(){return 70000;} I16 D(){return 40000;} U32 E(){return 0x1FFFFFFFF;} I32 F(){return 0xFFFFFFFF;} U0 Main(){ "%d %d %d %d %u %d\n", A(), B(), C(), D(), E(), F(); } Main;"#,
     ];
 
@@ -713,11 +718,59 @@ fn printing_matches_the_interpreter() {
 }
 
 #[test]
+fn exceptions_match_the_interpreter() {
+    // `try`/`catch`/`throw` + `Fs` lower to the jmp_buf/longjmp `ExcFrame` unwinder.
+    // Each must run byte-for-byte like the interpreter (the oracle). The build runs on
+    // any host (structural); execution runs under docker on a linux/x86_64 host.
+    let cases: &[&str] = &[
+        // catch reads Fs->except_ch; a throw unwinds across a call; the post-throw
+        // statement is skipped; catch_except toggles 1 then back to 0.
+        r#"U0 R(I64 n){ if(n>5) throw(n*100); "ok %d\n", n; }
+           U0 Main(){ I64 i; for(i=4;i<=6;i++) try { R(i); "after %d\n", i; }
+             catch { "caught %d flag=%d\n", Fs->except_ch, Fs->catch_except; }
+             "done %d\n", Fs->catch_except; } Main;"#,
+        // Locals mutated before a deep (recursive) throw survive into the handler.
+        r#"I64 Deep(I64 n){ if(n<=0) throw(1234); return Deep(n-1); }
+           U0 Main(){ I64 a=10,s=0,i; for(i=0;i<5;i++) s+=i;
+             try { a=99; Deep(3); a=1; } catch { "a=%d s=%d ch=%d\n", a, s, Fs->except_ch; }
+             "fin %d %d\n", a, s; } Main;"#,
+        // Nested try with a bare `throw;` re-raise.
+        r#"U0 Main(){ try { try { throw(7); } catch { "in %d\n", Fs->except_ch; throw; } }
+             catch { "out %d\n", Fs->except_ch; } } Main;"#,
+    ];
+    let dir = temp_out();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for (idx, src) in cases.iter().enumerate() {
+        let program = parse_src(src);
+        let errs = check_program(&program);
+        assert!(errs.is_empty(), "sema errors for `{src}`: {errs:?}");
+        let want = run_to_string(&program).unwrap_or_else(|e| panic!("interp error: {e}"));
+        let name = format!("e{idx}");
+        X64Linux::new(dir.join(&name))
+            .run(&program)
+            .unwrap_or_else(|e| panic!("build failed for `{src}`: {e}"));
+        names.push(name);
+        expected.push(want);
+    }
+    let got = run_stdouts(&dir, &names);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping x86-64 exception conformance: needs a linux/x86_64 host");
+        return;
+    };
+    for ((src, want), out) in cases.iter().zip(&expected).zip(&got) {
+        assert_eq!(out, want, "stdout mismatch for `{src}`");
+    }
+}
+
+#[test]
 fn buildable_examples_match_the_interpreter() {
-    // Whole example programs that fall within the implemented subset (integers,
-    // control flow, functions, pointers/arrays, printing) compile natively and
-    // print exactly what the interpreter does — the same conformance the arm64
-    // backend's `native_matches_interp_for_every_example` enforces.
+    // Whole example programs within the implemented subset (integers, control flow,
+    // functions, pointers/arrays, printing) compile natively and print exactly what
+    // the interpreter does. This is the same conformance the arm64 backend's
+    // `native_matches_interp_for_every_example` enforces.
     let examples: &[(&str, &str)] = &[
         ("fib", include_str!("../examples/fib.hc")),
         ("mathlib", include_str!("../examples/mathlib.hc")),
@@ -767,11 +820,11 @@ fn buildable_examples_match_the_interpreter() {
 
 #[test]
 fn stdlib_math_matches_the_interpreter() {
-    // The HolyC standard library (`#include <math.hc>`) compiles through the
-    // native pipeline and prints exactly what the interpreter does — exercising
-    // angle includes end-to-end and the F64 algebraic builtins this backend lowers
-    // (`Floor`/`Ceil`/`Round` via `roundsd`, `Round` matching the interpreter's
-    // round-half-away tie-break byte-for-byte).
+    // The HolyC standard library (`#include <math.hc>`) compiles through the native
+    // pipeline and prints exactly what the interpreter does. This exercises angle
+    // includes end-to-end and the F64 algebraic builtins this backend lowers:
+    // `Floor`/`Ceil`/`Round` via `roundsd`, with `Round` matching the interpreter's
+    // round-half-away tie-break byte-for-byte.
     let src = r#"
         #include <math.hc>
         U0 Main() {
@@ -781,7 +834,7 @@ fn stdlib_math_matches_the_interpreter() {
           "%.6f %.6f %.6f\n", Sinh(1.0), Asin(0.5), Atan2(1.0, -1.0);
           "%.1f %.1f %.1f %.1f\n", Round(2.5), Round(-2.5), Round(0.5), Round(-3.5);
           "%.1f %.1f %.1f %.1f\n", Floor(2.7), Floor(-2.3), Ceil(2.1), Ceil(-2.9);
-          "%d %d %d\n", Gcd(48, 36), Factorial(6), IMax(3, 9);
+          "%d %d %d\n", Gcd(48, 36), Factorial(6), Max(3, 9);
         }
         Main;
     "#;
@@ -808,13 +861,13 @@ fn stdlib_math_matches_the_interpreter() {
 
 #[test]
 fn strtof64_matches_the_interpreter() {
-    // The correctly-rounded `atof` (`#include <strconv.hc>`, over `<bignum.hc>`)
-    // compiles and runs **freestanding** — previously `StrToF64` lowered to a libc
-    // `_atof` the static ELF couldn't resolve. Both the Clinger fast path and the
-    // exact bignum slow path (long significands, large/small exponents, the
+    // The correctly-rounded `atof` (`#include <cstr.hc>`, over `<bignum.hc>`)
+    // compiles and runs freestanding. Previously `StrToF64` lowered to a libc
+    // `_atof` that the static ELF couldn't resolve. Both the Clinger fast path and
+    // the exact bignum slow path (long significands, large/small exponents, the
     // smallest normal double) must print byte-for-byte what the interpreter does.
     let src = r#"
-        #include <strconv.hc>
+        #include <cstr.hc>
         U0 Main() {
           "%.17g %.17g %.17g\n", StrToF64("0.1"), StrToF64("0.2"), StrToF64("0.3");
           "%.17g %.17g\n", StrToF64("1e30"), StrToF64("123456789012345678");
@@ -847,9 +900,10 @@ fn strtof64_matches_the_interpreter() {
 
 #[test]
 fn time_builtins_run_natively() {
-    // Time is impure (non-reproducible), so it can't be byte-compared to the
-    // interpreter — run the native binary and assert *properties*: the wall clock
-    // is past 1970 and the monotonic clock doesn't go backwards across a Sleep.
+    // Time is impure and non-reproducible, so it can't be byte-compared to the
+    // interpreter. Instead, run the native binary and assert properties: the wall
+    // clock is past 1970, and the monotonic clock doesn't go backwards across a
+    // Sleep.
     let src = r#"U0 Main() {
         I64 a = NanoNS();
         Sleep(2000000);
@@ -875,8 +929,8 @@ fn time_builtins_run_natively() {
 
 #[test]
 fn variadic_functions_match_the_interpreter() {
-    // Varargs are deterministic, so the native vararg ABI (a caller-frame buffer +
-    // two hidden args) is held byte-for-byte to the interpreter.
+    // Varargs are deterministic, so the native vararg ABI (a caller-frame buffer
+    // plus two hidden args) is held byte-for-byte to the interpreter.
     let src = r#"
         I64 SumI(...) { I64 s=0,i=0; while(i<VargC){s+=VargV[i];i++;} return s; }
         F64 AvgF(...) { F64 s=0.0; I64 i=0; while(i<VargC){s+=*(F64*)&VargV[i];i++;} return s/VargC; }
@@ -908,10 +962,10 @@ fn variadic_functions_match_the_interpreter() {
 
 #[test]
 fn function_pointers_match_the_interpreter() {
-    // Indirect calls in every form — a fn-pointer variable, a fn-pointer parameter,
-    // an F64-returning pointer, an array of pointers, a pointer class field, a
-    // pointer returning a class (sret), and calling a returned pointer — must match
-    // the interpreter byte-for-byte.
+    // Indirect calls in every form must match the interpreter byte-for-byte: a
+    // fn-pointer variable, a fn-pointer parameter, an F64-returning pointer, an
+    // array of pointers, a pointer class field, a pointer returning a class (sret),
+    // and calling a returned pointer.
     let src = r#"
         I64 Add(I64 a, I64 b) { return a + b; }
         I64 Sub(I64 a, I64 b) { return a - b; }
@@ -960,7 +1014,7 @@ fn function_pointers_match_the_interpreter() {
 #[test]
 fn msize_matches_the_interpreter() {
     // `MSize` (the gated size-header path) returns the requested allocation size
-    // byte-for-byte with the interpreter, with the data unaffected by the header.
+    // byte-for-byte with the interpreter, and the data is unaffected by the header.
     let src = r#"
         U0 Main() {
           U8 *p = MAlloc(40); "%d ", MSize(p);
@@ -993,10 +1047,11 @@ fn msize_matches_the_interpreter() {
 
 #[test]
 fn vec_object_matches_the_interpreter() {
-    // The owning, growable generic `Vec<T>` from lib/vec.hc (heap buffer via ReAlloc,
-    // reallocation on growth), monomorphized over I64, pointer, and class-value
-    // elements — held byte-for-byte to the interpreter, including the interp's pointer
-    // serialisation and whole-class element (de)serialisation through the byte buffer.
+    // The owning, growable generic `Vec<T>` from lib/vec.hc (a heap buffer via
+    // ReAlloc, reallocated on growth), monomorphized over I64, pointer, and
+    // class-value elements. Held byte-for-byte to the interpreter, including the
+    // interp's pointer serialisation and whole-class element (de)serialisation
+    // through the byte buffer.
     let src = r#"
         #include <vec.hc>
         class Pt { I64 x; I64 y; }
@@ -1050,8 +1105,8 @@ fn vec_object_matches_the_interpreter() {
 
 #[test]
 fn time_calendar_math_matches_the_interpreter() {
-    // The pure calendar math in lib/time.hc (class-by-value return + StrPrint with
-    // class fields) is held byte-for-byte to the interpreter.
+    // The pure calendar math in lib/time.hc (class-by-value return plus StrPrint
+    // with class fields) is held byte-for-byte to the interpreter.
     let src = r#"
         #include <time.hc>
         U0 Show(I64 s) {

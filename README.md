@@ -17,11 +17,10 @@ A full compiler front end, a tree-walking interpreter, and four hand-rolled nati
 
 ---
 
-solomon takes HolyC source through a full compiler front end (lexer →
-preprocessor → parser → semantic analysis → type layout) and then either
-**interprets** it with a tree-walking interpreter or **compiles** it with one of
-several hand-rolled native code generators (behind a small `Codegen` trait), each
-named for its target:
+solomon takes HolyC source through a full compiler front end — lexer, preprocessor,
+parser, semantic analysis, and type layout. It then either **interprets** the program
+with a tree-walking interpreter or **compiles** it with one of several hand-rolled
+native code generators behind a small `Codegen` trait, each named for its target:
 
 | Target | Output | Linker / libc |
 | ------ | ------ | ------------- |
@@ -36,9 +35,9 @@ no libc, no linker, raw syscalls — with their own `_start`; the Windows target
 likewise emits a self-contained PE with hand-built `kernel32` imports and no
 linker. (Darwin is the one hosted target: macOS has no stable syscall ABI, so it
 links libSystem via `cc`.)
-The interpreter is the conformance oracle, which the three executable backends
-match byte-for-byte on all 18 example programs (the Windows PE is verified by
-byte-scanning its emitted code, since it can't run on the test host).
+The interpreter is the conformance oracle, and the three executable backends match
+it byte-for-byte on all 18 example programs. The Windows PE can't run on the test
+host, so it is verified by byte-scanning its emitted code instead.
 
 ```holyc
 U0 Main()
@@ -51,7 +50,7 @@ Main;
 ```
 
 ```console
-$ hci hello.hc
+$ hcc -i hello.hc
 Hello, World!
 x=42 y=255
 ```
@@ -99,15 +98,54 @@ x=42 y=255
 
 **Not yet implemented:** most of the TempleOS core/standard library and DolDoc.
 
+## Installation
+
+The fastest way to get `hcc` is the install script, which downloads the prebuilt
+binary for your platform from the latest GitHub release and puts it on your PATH.
+The standard library is embedded in the binary, so that single file is the whole
+install.
+
+**Linux / macOS** (and Windows under Git Bash / MSYS2 / WSL):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/adam-soph/solomon/main/install.sh | sh
+```
+
+**Windows** (native PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/adam-soph/solomon/main/install.ps1 | iex
+```
+
+Each script detects your OS and architecture and picks the matching release asset
+— the universal binary on macOS (Apple silicon + Intel), a static `musl`/`gnu` ELF
+on Linux (x86_64 / aarch64), or the `.exe` on Windows (x86_64 / i686; ARM64 uses
+the x86_64 build under emulation).
+
+Both accept the same options — a release tag and an install directory — as flags or
+via the `HCC_VERSION` / `HCC_INSTALL_DIR` environment variables:
+
+```sh
+./install.sh --version v0.1.0 --dir ~/.local/bin       # POSIX
+```
+```powershell
+.\install.ps1 -Version v0.1.0 -Dir C:\tools\bin        # PowerShell
+```
+
+`install.sh` installs to `/usr/local/bin` when that's writable without `sudo`,
+otherwise `~/.local/bin`, and prints the `export` line if the directory isn't on
+your `PATH`. `install.ps1` installs to `%LOCALAPPDATA%\hcc\bin` and adds it to your
+user `PATH` automatically. To build from source instead, see below.
+
 ## Building
 
 Requires **Rust 1.85+** (2024 edition).
 
 ```sh
-cargo build --release             # binaries at target/release/{hcc,hci}
+cargo build --release             # binary at target/release/hcc
 cargo test                        # run the test suite
-cargo run --bin hci -- FILE.hc    # interpret a HolyC file
-cargo run --bin hcc -- FILE.hc -o app   # compile it to a native binary
+cargo run -- -i FILE.hc           # interpret a HolyC file
+cargo run -- FILE.hc -o app       # compile it to a native binary
 ```
 
 ### Cross-compiling
@@ -134,34 +172,34 @@ cargo install cross --git https://github.com/cross-rs/cross
 make all
 ```
 
-The `hcc`/`hci` binaries are built for the host platform; **every** build can
-*interpret* HolyC (`hci`), with the interpreter's POSIX-flavoured
-fds/files/process-ids emulated cross-platform (so the tools run on Windows too).
-Native code *generation* (`hcc`) is a separate axis — the targets with a backend
-are listed in the table above. **Releases** are published by the `Release` GitHub
-Actions workflow: push a version tag (`git tag v0.1.0 && git push --tags`) and it
-builds every target on a matching native runner.
+The `hcc` binary is built for the host platform, and **every** build can *interpret*
+HolyC (`hcc -i`). The interpreter emulates its POSIX-flavoured fds, files, and
+process IDs cross-platform, so the tool runs on Windows too. Native code
+*generation* is a separate axis; the targets with a backend are listed in the table
+above. **Releases** are published by the `Release` GitHub Actions workflow: push a
+version tag (`git tag v0.1.0 && git push --tags`) and it builds every target on a
+matching native runner.
 
 ## Usage
 
-There are two binaries: **`hci`** runs a HolyC program, **`hcc`** compiles one.
-Both read from `FILE`, or from stdin if no file is given.
+There is one binary, **`hcc`**: with no subcommand it compiles a HolyC program, and
+`hcc -i` interprets one. It reads from `FILE`, or from stdin if no file is given.
 
 ```text
-hci [FILE] [ARGS...]                     run with the tree-walking interpreter
 hcc [--target TRIPLE] [-o OUT] [FILE]    compile a native binary (the default)
+hcc -i [FILE] [ARGS...]                  run with the tree-walking interpreter
 hcc <subcommand> [FILE]
 ```
 
-`hci` runs the program; arguments after `FILE` become its `argv` (read via
-`ArgC`/`ArgV`). `hcc` with no subcommand compiles a native binary for the host
-(`-o OUT`, default `a.out`); `--target TRIPLE` cross-compiles. Its subcommands are
-front-end tools:
+`hcc` with no subcommand compiles a native binary for the host (`-o OUT`, default
+`a.out`); `--target TRIPLE` cross-compiles. `hcc -i` executes the program with the
+interpreter; arguments after `FILE` become its `argv` (read via `ArgC`/`ArgV`). The
+front-end subcommands are:
 
 | Command      | Does                                                       |
 | ------------ | ---------------------------------------------------------- |
-| `hci FILE`   | type-check then execute with the tree-walking interpreter  |
 | `hcc FILE`   | compile a native binary for the host target (`-o OUT`)     |
+| `hcc -i`     | type-check then execute with the tree-walking interpreter  |
 | `hcc check`  | parse + semantic analysis; report errors, run nothing      |
 | `hcc ast`    | parse and dump the AST                                      |
 | `hcc tokens` | run the lexer only and dump the token stream               |
@@ -176,7 +214,7 @@ $ hcc check broken.hc
 semantic error at 2:3: call to undeclared function `DrawRect`
 1 error(s)
 
-$ echo 'I64 Sq(I64 x){ return x*x; } "%d\n", Sq(9);' | hci
+$ echo 'I64 Sq(I64 x){ return x*x; } "%d\n", Sq(9);' | hcc -i
 81
 ```
 
@@ -250,7 +288,7 @@ Main;
 ```
 
 The library is **embedded into the compiler at build time** (each `lib/*.hc` is
-`include_str!`'d into the binary), so `hcc`/`hci` are self-contained — no `lib/`
+`include_str!`'d into the binary), so `hcc` is self-contained — no `lib/`
 directory is needed at runtime. `#include <name>` resolves first against an
 optional override path (`SOLOMON_STDLIB` env var or `hcc -I DIR`), then the
 embedded copy.
@@ -295,7 +333,6 @@ src/
   mono.rs       monomorphization pass (generics)
   sema.rs       semantic analysis / type checking
   layout.rs     type size/alignment/offset pass
-  builtins.rs   built-in function registry
   intrinsics.rs lib-declared functions the backends lower specially
   interp.rs     tree-walking interpreter (the conformance oracle)
   codegen.rs    the Codegen trait + CodegenError (the shared backend interface)
@@ -303,7 +340,7 @@ src/
                 (Mach-O + cc), linux.rs (freestanding static ELF)
   x86_64/       x86-64 backend — asm.rs (encoder), mod.rs (codegen + OsTarget),
                 linux.rs (static ELF), windows.rs (self-contained PE)
-  bin/          the executables: hcc.rs (compiler), hci.rs (interpreter)
+  main.rs       the hcc CLI: compile (default) + the `-i` interpreter mode
 tests/          lexer, parser, sema, preproc, layout, interpreter, the native
                 backends, and whole-program tests
 ```

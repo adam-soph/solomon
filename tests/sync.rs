@@ -1,11 +1,11 @@
 //! Atomics + mutex tests (`lib/sync.hc`).
 //!
-//! Concurrency is impure, so these are **property** tests: threads hammer a shared
-//! counter — once via `AtomicAdd`, once under a `Mutex` — and the final total is
+//! Concurrency is impure, so these are **property** tests. Threads hammer a shared
+//! counter, once via `AtomicAdd` and once under a `Mutex`. The final total is
 //! deterministic (`threads × iterations`) only if the synchronization actually works.
-//! The interpreter (synchronous threads, no contention) and the native backends
-//! (real threads + hardware atomics) must agree, so they double as a conformance
-//! check. Direct `AtomicSwap`/`AtomicCas`/`AtomicLoad` semantics are checked too.
+//! The interpreter (synchronous threads, no contention) and the native backends (real
+//! threads plus hardware atomics) must agree, so they double as a conformance check.
+//! Direct `AtomicSwap`/`AtomicCas`/`AtomicLoad` semantics are checked too.
 
 use std::process::Command;
 
@@ -15,8 +15,8 @@ use solomon::parser::parse_with;
 use solomon::sema::check_program;
 use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
 
-// The portable program (runs on all four targets): a *single* shared atomic counter
-// under real threads, the mutex exercised on its *uncontended* fast path
+// The portable program, which runs on all four targets. It exercises a *single* shared
+// atomic counter under real threads, the mutex on its *uncontended* fast path
 // (single-threaded, no kernel block), a fence, and the full width matrix.
 const PROGRAM: &str = r#"
     #include <sync.hc>
@@ -50,16 +50,16 @@ const PROGRAM: &str = r#"
 "#;
 
 // acount: 4 threads × 2000 = 8000. mcount: 8000 single-threaded mutex round-trips.
-// The direct I64 line: swap returns old 5 (x=42), first CAS fails (returns 42), second
-// swaps 42→7 (42), load 7. Widths: U32 0xFFFFFFFF+2 wraps to 1; U8 250+10 truncates to
-// 4; I16 CAS witnesses -1 and sets -50.
+// Direct I64 line: swap returns old 5 (x=42); the first CAS fails (returns 42); the
+// second swaps 42→7 (returns 42); load reads 7. Widths: U32 0xFFFFFFFF+2 wraps to 1;
+// U8 250+10 truncates to 4; I16 CAS witnesses -1 and sets -50.
 const EXPECTED: &str =
     "acount=8000 mcount=8000\nx=7 sw=5 c1=42 c2=42 load=7\nw=1 nw=1 b=4 nb=4 cs=-1 s=-50\n";
 
-// The *blocking* mutex under real contention — 4 threads incrementing a shared counter
-// in a critical section, so the futex wait/wake path runs. Verified on the native
-// runners (arm64 Darwin here; the freestanding Linux path on a native linux/aarch64
-// or linux/x86_64 host, e.g. CI).
+// The *blocking* mutex under real contention: 4 threads increment a shared counter in a
+// critical section, so the futex wait/wake path runs. Verified on the native runners —
+// arm64 Darwin here, and the freestanding Linux path on a native linux/aarch64 or
+// linux/x86_64 host (e.g. CI).
 const CONTENDED: &str = r#"
     #include <sync.hc>
     #include <thread.hc>
@@ -78,8 +78,8 @@ const CONTENDED: &str = r#"
 const CONTENDED_EXPECTED: &str = "mcount=8000\n";
 
 // Condition variable: 4 workers block in `CondWait` until the main thread sets the
-// predicate and `CondBroadcast`s, then each bumps `done`. (The synchronous interpreter
-// can't model a consumer that waits for a later producer, so this is native-only.)
+// predicate and `CondBroadcast`s, then each bumps `done`. The synchronous interpreter
+// can't model a consumer that waits for a later producer, so this is native-only.
 const CONDVAR: &str = r#"
     #include <sync.hc>
     #include <time.hc>
@@ -108,9 +108,9 @@ const CONDVAR: &str = r#"
 "#;
 const CONDVAR_EXPECTED: &str = "done=4\n";
 
-// Reader/writer lock: 4 threads each do 1000 (write-locked increment + read-locked
-// read). The writes are mutually exclusive, so the counter is exactly 4000. This is
-// interleaving-independent, so the synchronous interpreter handles it too.
+// Reader/writer lock: 4 threads each do 1000 iterations of (write-locked increment,
+// read-locked read). The writes are mutually exclusive, so the counter is exactly 4000.
+// This is interleaving-independent, so the synchronous interpreter handles it too.
 const RWLOCK: &str = r#"
     #include <sync.hc>
     #include <thread.hc>
@@ -161,8 +161,8 @@ fn darwin_toolchain() -> bool {
             .unwrap_or(false)
 }
 
-/// Atomics + mutex through the **native arm64 Darwin** backend (`ldaxr`/`stlxr` loops,
-/// `ldar`/`stlr`) with real pthreads. Self-skips off an Apple-silicon host.
+/// Atomics + mutex through the **native arm64 Darwin** backend (`ldaxr`/`stlxr` loops
+/// and `ldar`/`stlr`), with real pthreads. Self-skips off an Apple-silicon host.
 #[test]
 fn native_arm64_sync() {
     if !darwin_toolchain() {
@@ -180,8 +180,8 @@ fn native_arm64_sync() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
 
-/// Build `src` with `backend` to a temp ELF and run it **natively** (only on a
-/// matching Linux host); the atomics/futex ops hit the real kernel. Returns stdout.
+/// Build `src` with `backend` to a temp ELF and run it **natively**. Only called on a
+/// matching Linux host. The atomics/futex ops hit the real kernel. Returns stdout.
 fn freestanding_sync_stdout(out: &std::path::Path, mut backend: impl Codegen, src: &str) -> String {
     backend
         .run(&compile(src))
@@ -194,7 +194,7 @@ fn freestanding_sync_stdout(out: &std::path::Path, mut backend: impl Codegen, sr
 }
 
 /// Atomics + mutex through the **freestanding x86-64** backend (`lock`-prefixed
-/// `xadd`/`xchg`/`cmpxchg`) with real `clone(2)` threads. Runs only on a linux/x86_64
+/// `xadd`/`xchg`/`cmpxchg`), with real `clone(2)` threads. Runs only on a linux/x86_64
 /// host (CI); self-skips elsewhere.
 #[test]
 fn native_x86_64_freestanding_sync() {
@@ -241,7 +241,7 @@ fn native_arm64_contended_mutex() {
 
 /// The blocking futex mutex under real contention through the **freestanding aarch64**
 /// backend (the Linux `futex(2)` wait/wake path). Runs only on a linux/aarch64 host;
-/// self-skips elsewhere (the Darwin path above covers the arm64 logic on the Mac).
+/// self-skips elsewhere. The Darwin path above covers the arm64 logic on the Mac.
 #[test]
 fn native_arm64_freestanding_contended_mutex() {
     if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {
@@ -269,8 +269,8 @@ fn arm64_darwin_stdout(src: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// The reader/writer lock on the **interpreter** — interleaving-independent, so the
-/// synchronous threads still give the exact count.
+/// The reader/writer lock on the **interpreter**. It is interleaving-independent, so
+/// the synchronous threads still give the exact count.
 #[test]
 fn interp_rwlock() {
     let out = run_to_string(&compile(RWLOCK)).unwrap_or_else(|e| panic!("interp error: {e}"));
@@ -278,8 +278,8 @@ fn interp_rwlock() {
 }
 
 /// Condition variable + reader/writer lock under real contention on the native arm64
-/// runners (Darwin `__ulock`, freestanding `futex`). Native-only — the producer/
-/// consumer condvar can't run on the synchronous interpreter.
+/// runners (Darwin `__ulock`, freestanding `futex`). Native-only: the producer/consumer
+/// condvar can't run on the synchronous interpreter.
 #[test]
 fn native_arm64_condvar_rwlock() {
     if darwin_toolchain() {

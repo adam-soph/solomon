@@ -2,14 +2,17 @@
 //! executable.
 //!
 //! The x86-64 code generation is shared with the Linux target through the parent
-//! module's [`OsTarget`] seam; this module supplies only the Windows policy. The
-//! three OS seams lower to `kernel32` calls through the import address table
-//! (`ExitProcess`, `VirtualAlloc`, `GetStdHandle`+`WriteFile`), marshaled into the
-//! Microsoft x64 ABI (args in `rcx/rdx/r8/r9`, a 32-byte shadow area, 16-byte
-//! alignment at the call). The container is a hand-built PE — no linker, like the
-//! Linux ELF — with a `kernel32.dll` import directory. Code, strings, the import
-//! table, and the BSS share one R+W+X section that maps 1:1 with the file, so the
-//! encoder's RIP-relative `target - (pos+4)` references resolve unchanged.
+//! module's [`OsTarget`] seam; this module supplies only the Windows policy.
+//!
+//! The three OS seams lower to `kernel32` calls through the import address table:
+//! `ExitProcess`, `VirtualAlloc`, and `GetStdHandle` plus `WriteFile`. Calls are
+//! marshaled into the Microsoft x64 ABI — args in `rcx`/`rdx`/`r8`/`r9`, a
+//! 32-byte shadow area, and 16-byte stack alignment at the call.
+//!
+//! The container is a hand-built PE with a `kernel32.dll` import directory, and
+//! no linker, like the Linux ELF. Code, strings, the import table, and the BSS
+//! share one R+W+X section that maps 1:1 with the file, so the encoder's
+//! RIP-relative `target - (pos+4)` references resolve unchanged.
 
 use std::path::PathBuf;
 
@@ -73,10 +76,10 @@ impl WindowsTarget {
         self.externs.len() - 1
     }
 
-    /// Call a kernel32 import with rsp 16-aligned and a 32-byte shadow area (the
-    /// MS x64 ABI), preserving the caller's rsp in r15 (non-volatile, so it
-    /// survives the call) since the call site's alignment is unknown. Arguments
-    /// must already be in `rcx`/`rdx`/`r8`/`r9`.
+    /// Calls a `kernel32` import with rsp 16-aligned and a 32-byte shadow area,
+    /// as the MS x64 ABI requires. The call site's alignment is unknown, so the
+    /// caller's rsp is saved in r15 first; r15 is non-volatile and survives the
+    /// call. Arguments must already be in `rcx`/`rdx`/`r8`/`r9`.
     fn call_aligned(&mut self, asm: &mut Asm, name: &'static str) {
         let i = self.extern_idx(name);
         asm.mov_rr(R15, super::RSP); // save rsp
@@ -86,13 +89,15 @@ impl WindowsTarget {
         asm.mov_rr(super::RSP, R15); // restore rsp
     }
 
-    /// `Read`/`Write` → `ReadFile`/`WriteFile(hFile=rdi, buf=rsi, n=rdx, &done, NULL)`.
-    /// Returns the byte count, or -1 on failure. Same 72-byte frame as `emit_std_write`
-    /// (the established WriteFile shim), with the handle taken from `rdi`.
+    /// Lowers `Read`/`Write` to `ReadFile`/`WriteFile(hFile=rdi, buf=rsi, n=rdx,
+    /// &done, NULL)`. Returns the byte count, or -1 on failure. Uses the same
+    /// 72-byte frame as `emit_std_write`, the established WriteFile shim, taking
+    /// the handle from `rdi`.
     fn emit_read_write(&mut self, asm: &mut Asm, func: &'static str) {
-        // rsp is force-16-aligned (save it in the non-volatile r15, `and rsp,-16`, then a
-        // 16-multiple frame), so the call lands on a 16-aligned rsp regardless of the
-        // body alignment — some kernel32 functions fault on a misaligned stack.
+        // Force rsp to 16-byte alignment: save it in the non-volatile r15,
+        // `and rsp,-16`, then reserve a 16-multiple frame. The call then lands on
+        // a 16-aligned rsp regardless of the body's alignment. Some kernel32
+        // functions fault on a misaligned stack.
         let wf = self.extern_idx(func);
         asm.mov_rr(R15, super::RSP); // save rsp (non-volatile; survives the call)
         asm.and_ri(super::RSP, -16); // 16-align
@@ -117,10 +122,11 @@ impl WindowsTarget {
         asm.mov_rr(super::RSP, R15); // restore rsp
     }
 
-    /// `Open(path, flags, mode)` → `CreateFileA`. Translates the `io.hc` open flags
-    /// (`O_RDONLY`/`O_WRONLY`/`O_RDWR` + `O_CREAT`/`O_TRUNC`) into the Win32 access mask
-    /// (r10) and creation disposition (r11). `mode` is ignored (no POSIX perm bits on
-    /// Windows). Returns the HANDLE, or `INVALID_HANDLE_VALUE` (-1) on failure.
+    /// Lowers `Open(path, flags, mode)` to `CreateFileA`. Translates the `io.hc`
+    /// open flags (`O_RDONLY`/`O_WRONLY`/`O_RDWR` plus `O_CREAT`/`O_TRUNC`) into
+    /// the Win32 access mask (r10) and creation disposition (r11). `mode` is
+    /// ignored, as Windows has no POSIX permission bits. Returns the HANDLE, or
+    /// `INVALID_HANDLE_VALUE` (-1) on failure.
     fn emit_open(&mut self, asm: &mut Asm) {
         let cf = self.extern_idx("CreateFileA");
         // access (r10d): GENERIC_READ (0x80000000) unless O_WRONLY; GENERIC_WRITE
@@ -168,8 +174,9 @@ impl WindowsTarget {
         asm.mov_ri(R11, 5); // TRUNCATE_EXISTING
         asm.place(dispdone);
         // CreateFileA(path, access, share=3, sec=NULL, disposition, NORMAL=0x80, tmpl=NULL).
-        // Force-16-align rsp (CreateFileA faults on a misaligned stack, unlike the
-        // simpler WriteFile); r10/r11/rdi are registers, unaffected by the rsp moves.
+        // Force rsp to 16-byte alignment. CreateFileA faults on a misaligned
+        // stack, unlike the simpler WriteFile. r10/r11/rdi are registers, so the
+        // rsp moves don't disturb them.
         asm.mov_rr(R15, super::RSP); // save rsp (non-volatile; survives the call)
         asm.and_ri(super::RSP, -16); // 16-align
         asm.emit(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64 (32 shadow + 3 stack args)
@@ -187,9 +194,9 @@ impl WindowsTarget {
 
 impl OsTarget for WindowsTarget {
     fn emit_exit(&mut self, asm: &mut Asm) {
-        // ExitProcess(uExitCode = eax). rsp is 16-aligned here (inside the entry
-        // frame), so a 32-byte shadow area keeps it aligned at the call; the call
-        // does not return.
+        // ExitProcess(uExitCode = eax). rsp is already 16-aligned here, inside the
+        // entry frame, so a 32-byte shadow area keeps it aligned at the call. The
+        // call does not return.
         let i = self.extern_idx("ExitProcess");
         asm.emit(&[0x89, 0xC1]); // mov ecx, eax
         asm.emit(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32 (shadow space)
@@ -211,9 +218,10 @@ impl OsTarget for WindowsTarget {
 
     fn emit_std_write(&mut self, asm: &mut Asm) {
         // StdWrite(fd, buf, n): rdi=fd, rsi=buf, rdx=n. Pick the handle from fd
-        // (2 ⇒ STD_ERROR_HANDLE −12, else STD_OUTPUT_HANDLE −11), then
-        // WriteFile(handle, buf, n, &written, NULL); return the written count in rax.
-        // Same 72-byte frame as emit_write_stdout (rsp stays 16-aligned at each call).
+        // (fd 2 ⇒ STD_ERROR_HANDLE −12, else STD_OUTPUT_HANDLE −11), then call
+        // WriteFile(handle, buf, n, &written, NULL) and return the written count
+        // in rax. Uses the same 72-byte frame as emit_write_stdout, so rsp stays
+        // 16-aligned at each call.
         let gsh = self.extern_idx("GetStdHandle");
         let wf = self.extern_idx("WriteFile");
         asm.emit(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp, 72
@@ -240,10 +248,11 @@ impl OsTarget for WindowsTarget {
     }
 
     fn emit_fileop(&mut self, asm: &mut Asm, op: FileOp) {
-        // The fd args arrive in the System V registers (rdi/rsi/rdx); each op maps to a
-        // `kernel32` call (MS x64 ABI: rcx/rdx/r8/r9, stack args at [rsp+32]+, a 32-byte
-        // shadow area, rsp 16-aligned at the call). The "fd" is a Win32 HANDLE. Results
-        // follow the `io.hc` contract (count/offset/HANDLE, 0, or a negative error).
+        // The fd args arrive in the System V registers (rdi/rsi/rdx). Each op maps
+        // to a `kernel32` call under the MS x64 ABI: args in rcx/rdx/r8/r9, stack
+        // args at [rsp+32] and up, a 32-byte shadow area, and rsp 16-aligned at
+        // the call. The "fd" is a Win32 HANDLE. Results follow the `io.hc`
+        // contract: a count, offset, or HANDLE; 0; or a negative error.
         match op {
             FileOp::Open => self.emit_open(asm), // CreateFileA, with io.hc flag → Win32 translation
             FileOp::Read => self.emit_read_write(asm, "ReadFile"),
@@ -316,19 +325,70 @@ impl OsTarget for WindowsTarget {
     }
 
     fn emit_capture_env(&mut self, asm: &mut Asm, envp_off: i32) {
-        // Windows has no `envp` array (its environment is a NUL-separated block from
-        // GetEnvironmentStringsA, a different shape). Until that's parsed, expose
-        // `EnvP` as NULL — `Environ` is then empty and a future `Getenv` returns NULL.
-        asm.xor_rr(RAX, RAX);
+        // Windows has no `envp` array: its environment is a double-NUL-terminated block
+        // of "KEY=VALUE\0" strings from GetEnvironmentStringsA. Build a NULL-terminated
+        // pointer array (`U8 **EnvP`) over that block — each entry points straight into
+        // the block (already NUL-separated, no copy). This runs at the entry before any
+        // program code, so it may clobber any register. (`os.hc`'s `Environ`/`Getenv`
+        // are pure HolyC over `EnvP`, so they now work on Windows too.)
+        let ges = self.extern_idx("GetEnvironmentStringsA");
+        let va = self.extern_idx("VirtualAlloc");
+
+        // rsi = GetEnvironmentStringsA()  (rsi is non-volatile, so it survives VirtualAlloc)
+        asm.emit(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32 (shadow)
+        asm.call_extern(ges);
+        asm.emit(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
+        asm.mov_rr(RSI, RAX);
+
+        // rdi = VirtualAlloc(NULL, 4096, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+        asm.xor_rr(RCX, RCX);
+        asm.mov_ri(RDX, 0x1000);
+        asm.mov_ri(R8, 0x3000);
+        asm.mov_ri(R9, 4);
+        asm.emit(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32
+        asm.call_extern(va);
+        asm.emit(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
+        asm.mov_rr(RDI, RAX); // rdi = envp array base
+
+        // EnvP slot = &array
         asm.lea_global(RCX, envp_off);
-        asm.store_qword_at(RCX, RAX);
+        asm.store_qword_at(RCX, RDI);
+
+        // Collect a pointer to each "KEY=VALUE" string, up to the empty string (the
+        // second NUL of the double terminator). Strings stay in place — no in-place
+        // edits, since the block is already NUL-separated. The leading-`=` entries
+        // Windows prepends (the per-drive cwd, e.g. `=C:=C:\…`) are skipped, so `EnvP`
+        // matches the interpreter's `std::env` view (POSIX-style "KEY=VALUE").
+        asm.xor_rr(R8, R8); // count = 0
+        let loop_l = asm.new_label();
+        let advance = asm.new_label(); // skip-store target + scan-loop top
+        let done = asm.new_label();
+
+        asm.place(loop_l);
+        asm.load_byte_zx(RAX, RSI); // al = *cursor
+        asm.test_rr(RAX, RAX);
+        asm.je(done); // empty string => end of the block
+        asm.cmp_ri(RAX, 0x3D); // '=' : a per-drive cwd entry — skip it
+        asm.je(advance);
+        asm.store_qword_idx8(RDI, R8, RSI); // envp[count] = cursor
+        asm.inc_r(R8);
+        asm.place(advance); // advance past this string and its NUL
+        asm.load_byte_zx(RAX, RSI);
+        asm.inc_r(RSI);
+        asm.test_rr(RAX, RAX);
+        asm.jne(advance);
+        asm.jmp(loop_l);
+
+        asm.place(done);
+        asm.xor_rr(RAX, RAX);
+        asm.store_qword_idx8(RDI, R8, RAX); // NULL-terminate the array
     }
 
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32) {
-        // Windows hands the entry no argv, so build one from GetCommandLineA: get
+        // Windows hands the entry no argv, so build one from GetCommandLineA. Get
         // the command line, allocate a page for the argv pointer array, then split
-        // the line on spaces in place (NUL-terminating each token). This runs at
-        // the entry before any program code, so it may clobber any register.
+        // the line on spaces in place, NUL-terminating each token. This runs at the
+        // entry before any program code, so it may clobber any register.
         let gcl = self.extern_idx("GetCommandLineA");
         let va = self.extern_idx("VirtualAlloc");
 
@@ -394,21 +454,22 @@ impl OsTarget for WindowsTarget {
 
     fn wrap(&mut self, asm: Asm, bss: u64) -> Result<Vec<u8>, CodegenError> {
         let n = self.externs.len();
-        // The import region is appended after the code and strings; compute where
-        // it will land so its internal RVAs (and the IAT) are correct.
+        // The import region is appended after the code and strings. Compute where
+        // it will land so its internal RVAs (and the IAT) come out correct.
         let import_base = SECTION_RVA as usize + asm.code_len() + asm.strings_total();
 
-        // Layout within the import region: import directory table (one descriptor
-        // + a null terminator), the import lookup table, the import address table
-        // (what the call sites target), then the hint/name table and DLL name.
+        // Layout within the import region: the import directory table (one
+        // descriptor plus a null terminator), the import lookup table, the import
+        // address table (what the call sites target), then the hint/name table and
+        // the DLL name.
         let idt_size = 40usize; // 2 × IMAGE_IMPORT_DESCRIPTOR (kernel32 + null)
         let thunks = (n + 1) * 8; // n names + a null terminator, 8 bytes each (PE32+)
         let ilt_off = idt_size;
         let iat_off = ilt_off + thunks;
         let hn_off = iat_off + thunks;
 
-        // Hint/name entries (2-byte hint + name + NUL, padded to even), recording
-        // each function's RVA for the lookup/address tables.
+        // Hint/name entries: a 2-byte hint, the name, and a NUL, padded to an even
+        // length. Record each function's RVA for the lookup and address tables.
         let mut hn = Vec::new();
         let mut name_rva = Vec::with_capacity(n);
         let mut cur = hn_off;
@@ -465,9 +526,10 @@ impl OsTarget for WindowsTarget {
     }
 }
 
-/// Wrap the finished image (`[code | strings | import]`, with `bss` zero bytes
-/// following it in memory) in a minimal PE32+ executable: one R+W+X section that
-/// maps the image 1:1, plus an import directory pointing at `kernel32.dll`.
+/// Wraps the finished image in a minimal PE32+ executable. The image is
+/// `[code | strings | import]`, with `bss` zero bytes following it in memory.
+/// The PE has one R+W+X section that maps the image 1:1, plus an import directory
+/// pointing at `kernel32.dll`.
 fn build_pe(
     blob: &[u8],
     bss: u64,

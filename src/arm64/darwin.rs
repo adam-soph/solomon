@@ -1,9 +1,11 @@
 //! The `aarch64-apple-darwin` OS/container policy: the Mach-O relocatable-object
-//! writer and the `cc` link step. This is the only Darwin-specific code — the
-//! AArch64 instruction encoding lives in the `asm` module and the code generation
-//! in the parent, both OS-agnostic. The encoder hands up a [`CodeImage`] (machine
-//! code + symbolic `SymRef`/`RelKind` relocations); this module lowers those to
-//! Mach-O relocation numbers and packages them into an object file.
+//! writer and the `cc` link step.
+//!
+//! This is the only Darwin-specific code. The AArch64 instruction encoding lives
+//! in the `asm` module and the code generation in the parent, both OS-agnostic.
+//! The encoder hands up a [`CodeImage`] of machine code plus symbolic
+//! `SymRef`/`RelKind` relocations. This module lowers those to Mach-O relocation
+//! numbers and packages them into an object file.
 
 use std::path::Path;
 use std::process::Command;
@@ -56,7 +58,7 @@ impl ArmTarget for Darwin {
         write_macho_object(&image.text, defined, commons, &externs, &relocs)
     }
 
-    /// Link with the system `cc` (the only place this backend shells out).
+    /// Links with the system `cc`. This is the only place this backend shells out.
     fn link(&self, obj: &Path, out: &Path) -> Result<(), CodegenError> {
         let status = Command::new("cc")
             .arg(obj)
@@ -82,11 +84,11 @@ const RELOC_BRANCH26: u32 = 2;
 const RELOC_PAGE21: u32 = 3;
 const RELOC_PAGEOFF12: u32 = 4;
 
-/// Build the Mach-O object. Symbols are laid out as: defined (`_main` + funcs,
-/// in `__text`), then common globals, then the undefined externals (libc
-/// functions) — matching the indices the relocations were built with. Globals
-/// are *common* symbols (`n_value` = size), so the linker allocates their
-/// storage; no data section is needed.
+/// Builds the Mach-O object. Symbols are laid out in three groups, matching the
+/// indices the relocations were built with: defined symbols first (`_main` plus
+/// functions, in `__text`), then common globals, then the undefined externals
+/// (libc functions). Globals are *common* symbols, with `n_value` set to the
+/// size, so the linker allocates their storage; no data section is needed.
 fn write_macho_object(
     text: &[u8],
     defined: &[(String, u64)],

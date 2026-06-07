@@ -1,23 +1,24 @@
 #ifndef _MEM_HC
 #define _MEM_HC
-// mem.hc — raw memory and heap operations: the `<string.h>` `mem*` family plus
-// `ReAlloc`.
+// mem.hc — raw memory operations (the `<string.h>` `mem*` family) plus the heap
+// helpers `CAlloc` and `ReAlloc`.
 //
-// Pure HolyC built on the irreducible heap primitives (`MAlloc`/`Free`/`HeapExtend`),
-// so it computes identically on the interpreter and every native backend. Include
-// with `#include <mem.hc>` (idempotent via the guard above).
+// Everything here is pure HolyC built on the irreducible heap primitives
+// (`MAlloc`/`Free`/`HeapExtend`), so it computes identically on the interpreter and
+// every native backend. Include with `#include <mem.hc>`; the guard above makes that
+// idempotent.
 //
-// `MAlloc`/`Free` are the universal allocator pair, so they live in the implicit
-// prelude (<builtin.hc>) and need no `#include`. The advanced heap primitives below
-// are **intrinsics** declared here — the compiler is their implementation:
-// `HeapExtend(ptr, old, new)` grows the last block in place or returns NULL; `MSize(ptr)`
-// is the block's requested size (the allocator prepends an 8-byte header when a program
-// uses `MSize`).
+// `MAlloc` and `Free` are the universal allocator pair. They live in the implicit
+// prelude (`<builtin.hc>`) and need no `#include`. The two advanced heap primitives
+// below are intrinsics declared here, with the compiler as their implementation.
+// `HeapExtend(ptr, old, new)` grows the last block in place, or returns NULL.
+// `MSize(ptr)` returns the block's requested size; the allocator prepends an 8-byte
+// header when a program uses `MSize`.
 
-U8 *HeapExtend(U8 *ptr, I64 old, I64 newsz);
-I64 MSize(U8 *ptr);
+public U8 *HeapExtend(U8 *ptr, I64 old, I64 newsz);
+public I64 MSize(U8 *ptr);
 
-U8 *MemCpy(U8 *dst, U8 *src, I64 n)
+public U8 *MemCpy(U8 *dst, U8 *src, I64 n)
 {
   I64 i = 0;
   while (i < n) { dst[i] = src[i]; i++; }
@@ -25,7 +26,7 @@ U8 *MemCpy(U8 *dst, U8 *src, I64 n)
 }
 
 // Overlap-safe: copy backwards when dst is above src within the same region.
-U8 *MemMove(U8 *dst, U8 *src, I64 n)
+public U8 *MemMove(U8 *dst, U8 *src, I64 n)
 {
   if (dst <= src) {
     I64 i = 0;
@@ -37,7 +38,7 @@ U8 *MemMove(U8 *dst, U8 *src, I64 n)
   return dst;
 }
 
-U8 *MemSet(U8 *dst, I64 c, I64 n)
+public U8 *MemSet(U8 *dst, I64 c, I64 n)
 {
   I64 i = 0;
   while (i < n) { dst[i] = c; i++; }
@@ -45,9 +46,9 @@ U8 *MemSet(U8 *dst, I64 c, I64 n)
 }
 
 // Allocate `n` zero-filled bytes (HolyC `CAlloc`). `MAlloc` returns uninitialised
-// memory, so zero it explicitly (correct on every target — the hosted libc heap is
-// not zeroed).
-U8 *CAlloc(I64 n)
+// memory, so this zeroes it explicitly. That is correct on every target, since the
+// hosted libc heap is not zeroed either.
+public U8 *CAlloc(I64 n)
 {
   U8 *p = MAlloc(n);
   if (p) MemSet(p, 0, n);
@@ -55,7 +56,7 @@ U8 *CAlloc(I64 n)
 }
 
 // Sign-normalised to -1/0/1 (bytes compared unsigned), like the old builtin.
-I64 MemCmp(U8 *a, U8 *b, I64 n)
+public I64 MemCmp(U8 *a, U8 *b, I64 n)
 {
   I64 i = 0;
   while (i < n) {
@@ -66,7 +67,7 @@ I64 MemCmp(U8 *a, U8 *b, I64 n)
 }
 
 // First byte equal to `c` in buf[0..n], or NULL (memchr).
-U8 *MemFind(U8 *buf, I64 c, I64 n)
+public U8 *MemFind(U8 *buf, I64 c, I64 n)
 {
   U8 ch = c;
   I64 i = 0;
@@ -76,7 +77,7 @@ U8 *MemFind(U8 *buf, I64 c, I64 n)
 
 // First occurrence of needle[0..nlen] in hay[0..hlen], or NULL (memmem). An empty
 // needle matches at the start.
-U8 *MemSearch(U8 *hay, I64 hlen, U8 *needle, I64 nlen)
+public U8 *MemSearch(U8 *hay, I64 hlen, U8 *needle, I64 nlen)
 {
   if (nlen <= 0) return hay;
   if (nlen > hlen) return NULL;
@@ -90,13 +91,13 @@ U8 *MemSearch(U8 *hay, I64 hlen, U8 *needle, I64 nlen)
   return NULL;
 }
 
-// Resize the block at `p` (originally `oldsz` bytes) to `newsz`, preserving the
-// first min(oldsz, newsz) bytes; returns the (possibly moved) block. A bump
-// allocator extends in place when `p` is its last block (no copy, via `HeapExtend`);
-// otherwise — and always on the libc/interp heaps — it allocates a new block, copies,
-// and frees the old one (`Free` reclaims on libc; a no-op on the bump allocators).
-// `p == NULL` behaves like `MAlloc(newsz)`.
-U8 *ReAlloc(U8 *p, I64 oldsz, I64 newsz)
+// Resize the block at `p` (originally `oldsz` bytes) to `newsz`, preserving the first
+// min(oldsz, newsz) bytes. Returns the block, which may have moved. A bump allocator
+// extends in place via `HeapExtend`, with no copy, when `p` is its last block.
+// Otherwise (and always on the libc and interpreter heaps) it allocates a new block,
+// copies, and frees the old one. `Free` reclaims on libc and is a no-op on the bump
+// allocators. `p == NULL` behaves like `MAlloc(newsz)`.
+public U8 *ReAlloc(U8 *p, I64 oldsz, I64 newsz)
 {
   if (!p) return MAlloc(newsz);
   U8 *grown = HeapExtend(p, oldsz, newsz);

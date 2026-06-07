@@ -1,23 +1,25 @@
 #ifndef _FLTFMT_HC
 #define _FLTFMT_HC
-// _fltfmt.hc — the private internals of the correctly-rounded `F64` formatter.
+// fltfmt.hc — the private internals of the correctly-rounded `F64` formatter.
 //
-// A formatter-sized base-2^32 big integer plus the per-conversion *magnitude*
-// formatters (`%f`/`%e`/`%g`, no sign/width/flags), and the public entry `_FmtFloat`
+// It provides a formatter-sized base-2^32 big integer, the per-conversion *magnitude*
+// formatters (`%f`/`%e`/`%g`, no sign/width/flags), and the public entry `FmtFloat`
 // (below) that assembles the complete field. Private to the standard library via this
-// file's `_`-prefixed name. The algorithm is the portable replacement for the
-// hand-emitted bignum in the native backends, run by the interpreter so it is
-// byte-for-byte the conformance oracle (Rust's `{:.P}`).
+// file's `_`-prefixed name.
 //
-// The big integer is little-endian base-2^32 (each limb < 2^32 so `limb * small`
-// fits in 64 bits), sized for the worst case `%.512f` of `1.8e308` (~820 digits).
+// The algorithm is the portable replacement for the hand-emitted bignum in the native
+// backends. It matches the conformance oracle the interpreter runs byte-for-byte
+// (Rust's `{:.P}`).
+//
+// The big integer is little-endian base-2^32. Each limb is < 2^32, so `limb * small`
+// fits in 64 bits. It is sized for the worst case `%.512f` of `1.8e308` (~820 digits).
 
 #include <bits.hc>
 
-class _Fbn { I64 n; I64 d[120]; }
+class Fbn { I64 n; I64 d[120]; }
 
 // b = v (the low 64 bits as an unsigned magnitude).
-U0 _FbnSet(_Fbn *b, I64 v)
+U0 FbnSet(Fbn *b, I64 v)
 {
   I64 i;
   for (i = 0; i < 120; i++) b->d[i] = 0;
@@ -28,9 +30,9 @@ U0 _FbnSet(_Fbn *b, I64 v)
   else if (b->d[0]) b->n = 1;
 }
 
-I64 _FbnIsZero(_Fbn *b) { return b->n == 0; }
+I64 FbnIsZero(Fbn *b) { return b->n == 0; }
 
-U0 _FbnCopy(_Fbn *dst, _Fbn *src)
+U0 FbnCopy(Fbn *dst, Fbn *src)
 {
   I64 i;
   for (i = 0; i < 120; i++) dst->d[i] = src->d[i];
@@ -38,7 +40,7 @@ U0 _FbnCopy(_Fbn *dst, _Fbn *src)
 }
 
 // b *= m, with 0 < m < 2^32 (so each limb product fits in I64).
-U0 _FbnMulSmall(_Fbn *b, I64 m)
+U0 FbnMulSmall(Fbn *b, I64 m)
 {
   I64 carry = 0, i = 0;
   while (i < b->n || carry) {
@@ -50,21 +52,21 @@ U0 _FbnMulSmall(_Fbn *b, I64 m)
   b->n = i;
 }
 
-// b *= 5^p (p >= 0). Multiply by 5^13 per step — the largest power of five below
-// 2^32 (5^13 = 1220703125, so limb*chunk + carry still fits I64) — to do ~13x fewer
-// bignum multiplies than multiplying by 5 one at a time (P can be up to 512).
-U0 _FbnMul5Pow(_Fbn *b, I64 p)
+// b *= 5^p (p >= 0). Each step multiplies by 5^13, the largest power of five below
+// 2^32 (5^13 = 1220703125, so limb*chunk + carry still fits I64). That does ~13x
+// fewer bignum multiplies than multiplying by 5 one at a time (P can be up to 512).
+U0 FbnMul5Pow(Fbn *b, I64 p)
 {
-  while (p >= 13) { _FbnMulSmall(b, 1220703125); p -= 13; } // 5^13
+  while (p >= 13) { FbnMulSmall(b, 1220703125); p -= 13; } // 5^13
   if (p > 0) {
     I64 m = 1, k;
     for (k = 0; k < p; k++) m *= 5; // 5^p, p in 1..12 (< 2^32)
-    _FbnMulSmall(b, m);
+    FbnMulSmall(b, m);
   }
 }
 
 // dst = src << bits (bits >= 0). Writes every limb, so `dst` needs no pre-clear.
-U0 _FbnShlTo(_Fbn *dst, _Fbn *src, I64 bits)
+U0 FbnShlTo(Fbn *dst, Fbn *src, I64 bits)
 {
   I64 limbs = bits / 32, sh = bits % 32, carry = 0, i;
   for (i = 0; i < 120; i++) dst->d[i] = 0;
@@ -84,7 +86,7 @@ U0 _FbnShlTo(_Fbn *dst, _Fbn *src, I64 bits)
 }
 
 // b = round_half_even(b / 2^bits), in place (bits > 0).
-U0 _FbnShrRound(_Fbn *b, I64 bits)
+U0 FbnShrRound(Fbn *b, I64 bits)
 {
   I64 word = bits / 32, bit = bits % 32, i;
   // Round bit = bit (bits-1); sticky = any set bit strictly below it.
@@ -96,7 +98,7 @@ U0 _FbnShrRound(_Fbn *b, I64 bits)
     if (b->d[i]) sticky = 1;
   if (rword < b->n && (b->d[rword] & ((1 << rbit) - 1))) sticky = 1;
   // Quotient: limb i = (b[i+word] >> bit) | (b[i+word+1] << (32-bit)).
-  _Fbn out;
+  Fbn out;
   for (i = 0; i < 120; i++) out.d[i] = 0;
   i = 0;
   while (i + word < b->n) {
@@ -119,13 +121,14 @@ U0 _FbnShrRound(_Fbn *b, I64 bits)
     }
     if (out.n <= k && k < 120) out.n = k + 1;
   }
-  _FbnCopy(b, &out);
+  FbnCopy(b, &out);
 }
 
-// b /= 10^9, returning the remainder (0 .. 10^9-1). Most-significant limb first.
-// rem < 10^9 < 2^30, so cur = rem*2^32 + limb < 2^62, fits I64. Dividing by 10^9
-// (the largest power of ten below 2^32) extracts 9 decimal digits per O(n) pass.
-I64 _FbnDivPow10_9(_Fbn *b)
+// b /= 10^9, returning the remainder (0 .. 10^9-1). Processes the most-significant
+// limb first. rem < 10^9 < 2^30, so cur = rem*2^32 + limb < 2^62, which fits in I64.
+// Dividing by 10^9 (the largest power of ten below 2^32) extracts 9 decimal digits
+// per O(n) pass.
+I64 FbnDivPow10_9(Fbn *b)
 {
   I64 rem = 0, i;
   for (i = b->n - 1; i >= 0; i--) {
@@ -138,16 +141,16 @@ I64 _FbnDivPow10_9(_Fbn *b)
 }
 
 // Extract every decimal digit of b least-significant-first into `digs` (as ASCII),
-// returning the count; b is consumed (left zero). Uses `_FbnDivPow10_9`, so each
-// O(n) pass yields 9 digits (zero-padded for non-top chunks; the most-significant
-// chunk drops leading zeros). A zero `b` yields the single digit '0'.
-I64 _FbnDigitsLsb(_Fbn *b, U8 *digs)
+// returning the count. b is consumed (left zero). Each `FbnDivPow10_9` pass is O(n)
+// and yields 9 digits: zero-padded for non-top chunks, with leading zeros dropped
+// from the most-significant chunk. A zero `b` yields the single digit '0'.
+I64 FbnDigitsLsb(Fbn *b, U8 *digs)
 {
   I64 nd = 0;
-  if (_FbnIsZero(b)) { digs[nd++] = '0'; return nd; }
-  while (!_FbnIsZero(b)) {
-    I64 rem = _FbnDivPow10_9(b);
-    if (_FbnIsZero(b)) // top chunk: significant digits only
+  if (FbnIsZero(b)) { digs[nd++] = '0'; return nd; }
+  while (!FbnIsZero(b)) {
+    I64 rem = FbnDivPow10_9(b);
+    if (FbnIsZero(b)) // top chunk: significant digits only
       while (rem > 0) { digs[nd++] = '0' + rem % 10; rem /= 10; }
     else { // a full 9-digit group (higher chunks follow)
       I64 k;
@@ -158,9 +161,9 @@ I64 _FbnDigitsLsb(_Fbn *b, U8 *digs)
 }
 
 // The `%f`-style magnitude of `v` (assumed finite) with `prec` fractional digits,
-// NUL-terminated, length returned. Builds J = round(m*5^P*2^(E+P)) exactly, then
-// places the point P digits from the right. Byte-for-byte `format!("{:.P}", |v|)`.
-I64 _FmtFMag(U8 *out, F64 v, I64 prec)
+// NUL-terminated; the length is returned. Builds J = round(m*5^P*2^(E+P)) exactly,
+// then places the point P digits from the right. Byte-for-byte `format!("{:.P}", |v|)`.
+I64 FmtFMag(U8 *out, F64 v, I64 prec)
 {
   I64 bits = Float64bits(v);
   I64 expf = (bits >> 52) & 0x7FF;
@@ -169,22 +172,22 @@ I64 _FmtFMag(U8 *out, F64 v, I64 prec)
   if (expf == 0) { mant = frac; e = -1074; }       // subnormal
   else { mant = frac | (1 << 52); e = expf - 1075; } // normal
 
-  _Fbn bn;
-  _FbnSet(&bn, mant);
+  Fbn bn;
+  FbnSet(&bn, mant);
   if (mant) {
-    _FbnMul5Pow(&bn, prec);
+    FbnMul5Pow(&bn, prec);
     I64 shift = e + prec;
     if (shift >= 0) {
-      _Fbn t;
-      _FbnShlTo(&t, &bn, shift);
-      _FbnCopy(&bn, &t);
+      Fbn t;
+      FbnShlTo(&t, &bn, shift);
+      FbnCopy(&bn, &t);
     } else {
-      _FbnShrRound(&bn, -shift);
+      FbnShrRound(&bn, -shift);
     }
   }
 
   U8 digs[1200];
-  I64 nd = _FbnDigitsLsb(&bn, digs);
+  I64 nd = FbnDigitsLsb(&bn, digs);
 
   I64 pos = 0, i;
   if (nd > prec)
@@ -202,13 +205,13 @@ I64 _FmtFMag(U8 *out, F64 v, I64 prec)
   return pos;
 }
 
-// The significant decimal digits of the magnitude `mag` (>= 0), rounded
-// half-to-even to `nsig` digits (MSB-first in `digs[0..nsig-1]`), with the decimal
-// exponent of the leading digit in `*xout` (so `mag ≈ digs[0].digs[1..] * 10^X`).
-// The mantissa+exponent of Rust's `{:.(nsig-1)e}`: `m*2^e = Dint * 10^pe` with
-// `Dint = m*5^(-e)` (e<0) or `m*2^e` (e>=0), so all decimal digits are exact;
-// rounding to `nsig` may carry and bump `X`.
-U0 _SciDigits(F64 mag, I64 nsig, U8 *digs, I64 *xout)
+// The significant decimal digits of the magnitude `mag` (>= 0), rounded half-to-even
+// to `nsig` digits (MSB-first in `digs[0..nsig-1]`). The decimal exponent of the
+// leading digit is returned in `*xout`, so `mag ≈ digs[0].digs[1..] * 10^X`. This is
+// the mantissa+exponent of Rust's `{:.(nsig-1)e}`: `m*2^e = Dint * 10^pe` with
+// `Dint = m*5^(-e)` (e<0) or `m*2^e` (e>=0), so all decimal digits are exact.
+// Rounding to `nsig` may carry and bump `X`.
+U0 SciDigits(F64 mag, I64 nsig, U8 *digs, I64 *xout)
 {
   I64 bits = Float64bits(mag);
   I64 expf = (bits >> 52) & 0x7FF;
@@ -222,22 +225,22 @@ U0 _SciDigits(F64 mag, I64 nsig, U8 *digs, I64 *xout)
   I64 m, e;
   if (expf == 0) { m = frac; e = -1074; }
   else { m = frac | (1 << 52); e = expf - 1075; }
-  _Fbn bn;
-  _FbnSet(&bn, m);
+  Fbn bn;
+  FbnSet(&bn, m);
   I64 pe;
   if (e >= 0) {
-    _Fbn t;
-    _FbnShlTo(&t, &bn, e);
-    _FbnCopy(&bn, &t);
+    Fbn t;
+    FbnShlTo(&t, &bn, e);
+    FbnCopy(&bn, &t);
     pe = 0;
   } else {
-    _FbnMul5Pow(&bn, -e);
+    FbnMul5Pow(&bn, -e);
     pe = e;
   }
-  // Extract all digits least-significant first; index MSB-first as `lsb[ll-1-k]`
-  // (a single buffer keeps the frame under the backend's 4 KiB local limit).
+  // Extract all digits least-significant first; index them MSB-first as `lsb[ll-1-k]`.
+  // A single buffer keeps the frame under the backend's 4 KiB local limit.
   U8 lsb[1200];
-  I64 ll = _FbnDigitsLsb(&bn, lsb);
+  I64 ll = FbnDigitsLsb(&bn, lsb);
   I64 x0 = (ll - 1) + pe;
   if (ll <= nsig) {
     for (i = 0; i < ll; i++) digs[i] = lsb[ll - 1 - i];
@@ -270,7 +273,7 @@ U0 _SciDigits(F64 mag, I64 nsig, U8 *digs, I64 *xout)
 }
 
 // Append `x` as a libc-style exponent (`e`/`E`, sign, >= 2 digits) at `pos`.
-I64 _PutExp(U8 *out, I64 pos, I64 x, I64 upper)
+I64 PutExp(U8 *out, I64 pos, I64 x, I64 upper)
 {
   out[pos++] = upper ? 'E' : 'e';
   I64 ex = x;
@@ -289,13 +292,13 @@ I64 _PutExp(U8 *out, I64 pos, I64 x, I64 upper)
 
 // The `%e`/`%E` magnitude of `v` (assumed finite): one leading digit, a `prec`-digit
 // fraction, then the exponent. Byte-for-byte `fmt::render_exp`.
-I64 _FmtEMag(U8 *out, F64 v, I64 prec, I64 upper)
+I64 FmtEMag(U8 *out, F64 v, I64 prec, I64 upper)
 {
   I64 bits = Float64bits(v);
   F64 mag = Float64frombits(bits & 0x7FFFFFFFFFFFFFFF);
   U8 digs[600];
   I64 x;
-  _SciDigits(mag, prec + 1, digs, &x);
+  SciDigits(mag, prec + 1, digs, &x);
   I64 pos = 0;
   out[pos++] = digs[0];
   if (prec > 0) {
@@ -303,15 +306,15 @@ I64 _FmtEMag(U8 *out, F64 v, I64 prec, I64 upper)
     I64 i;
     for (i = 1; i <= prec; i++) out[pos++] = digs[i];
   }
-  pos = _PutExp(out, pos, x, upper);
+  pos = PutExp(out, pos, x, upper);
   out[pos] = 0;
   return pos;
 }
 
-// The `%g`/`%G` magnitude of `v` (assumed finite): `prec` significant figures,
-// choosing fixed vs scientific by the rounded exponent and trimming trailing zeros
-// unless `alt`. Byte-for-byte `fmt::render_g`.
-I64 _FmtGMag(U8 *out, F64 v, I64 prec, I64 upper, I64 alt)
+// The `%g`/`%G` magnitude of `v` (assumed finite): `prec` significant figures. It
+// chooses fixed vs scientific by the rounded exponent and trims trailing zeros unless
+// `alt`. Byte-for-byte `fmt::render_g`.
+I64 FmtGMag(U8 *out, F64 v, I64 prec, I64 upper, I64 alt)
 {
   I64 bits = Float64bits(v);
   F64 mag = Float64frombits(bits & 0x7FFFFFFFFFFFFFFF);
@@ -319,20 +322,20 @@ I64 _FmtGMag(U8 *out, F64 v, I64 prec, I64 upper, I64 alt)
   if (p < 1) p = 1;
   U8 digs[600];
   I64 x;
-  _SciDigits(mag, p, digs, &x);
+  SciDigits(mag, p, digs, &x);
   U8 body[2048];
   I64 bn = 0;
   if (x >= -4 && x < p) {
     I64 fp = p - 1 - x;
     if (fp < 0) fp = 0;
-    bn = _FmtFMag(body, mag, fp);
+    bn = FmtFMag(body, mag, fp);
   } else {
     body[bn++] = digs[0];
     if (p > 1) {
       body[bn++] = '.';
       for (i = 1; i < p; i++) body[bn++] = digs[i];
     }
-    bn = _PutExp(body, bn, x, upper);
+    bn = PutExp(body, bn, x, upper);
   }
   body[bn] = 0;
   if (!alt) {
@@ -366,7 +369,7 @@ I64 _FmtGMag(U8 *out, F64 v, I64 prec, I64 upper, I64 alt)
 
 // Write the Inf/NaN *magnitude* ("inf"/"NaN", no sign) for a non-finite `bits`, or
 // return -1 when finite. The caller adds any sign.
-I64 _FmtSpecialMag(U8 *out, I64 bits)
+I64 FmtSpecialMag(U8 *out, I64 bits)
 {
   if (((bits >> 52) & 0x7FF) != 0x7FF) return -1;
   I64 pos = 0;
@@ -386,24 +389,26 @@ I64 _FmtSpecialMag(U8 *out, I64 bits)
 #define _FLT_SPACE 32 // ' ' space before a non-negative
 #define _FLT_HASH  64 // '#' alternate form (keep %g trailing zeros)
 
-// The single entry the native backends' print lowering calls: format `v` into `out`
-// (NUL-terminated), returning the length. `conv` is the conversion char
-// (`'f'`/`'e'`/`'E'`/`'g'`/`'G'`); `flags` is the packed flag bits above; `width`/
-// `prec` are the field width and precision. Byte-for-byte the interpreter's float
-// rendering (its magnitude renderer wrapped by `render_int`'s width/flag layout): the
-// sign comes from the IEEE sign bit (so `-0.0` keeps its `-`) or the `+`/space flag,
-// and zero-padding goes *after* the sign. This is compiler-internal print machinery
-// (private to the stdlib); user code prints floats via `Print`/`"%f", …`.
-I64 _FmtFloat(U8 *out, F64 v, I64 conv, I64 flags, I64 width, I64 prec)
+// The single entry the native backends' print lowering calls. Formats `v` into `out`
+// (NUL-terminated) and returns the length. `conv` is the conversion char
+// (`'f'`/`'e'`/`'E'`/`'g'`/`'G'`). `flags` is the packed flag bits above. `width` and
+// `prec` are the field width and precision. The output is byte-for-byte the
+// interpreter's float rendering: its magnitude renderer wrapped by `render_int`'s
+// width/flag layout. The sign comes from the IEEE sign bit (so `-0.0` keeps its `-`)
+// or the `+`/space flag, and zero-padding goes *after* the sign. User code prints
+// floats via `Print`/`"%f", …`; this is the formatter's entry point and is `public`
+// only so the float-formatter conformance tests can pin it byte-for-byte (the rest of
+// the formatter — `Fbn`, `FmtFMag`, … — stays private to the stdlib directory).
+public I64 FmtFloat(U8 *out, F64 v, I64 conv, I64 flags, I64 width, I64 prec)
 {
   I64 bits = Float64bits(v);
   // Magnitude body: "inf"/"NaN" for non-finite, else the per-conversion formatter.
   U8 body[2048];
-  I64 blen = _FmtSpecialMag(body, bits);
+  I64 blen = FmtSpecialMag(body, bits);
   if (blen < 0) {
-    if (conv == 'f') blen = _FmtFMag(body, v, prec);
-    else if (conv == 'e' || conv == 'E') blen = _FmtEMag(body, v, prec, conv == 'E');
-    else blen = _FmtGMag(body, v, prec, conv == 'G', (flags & _FLT_HASH) != 0);
+    if (conv == 'f') blen = FmtFMag(body, v, prec);
+    else if (conv == 'e' || conv == 'E') blen = FmtEMag(body, v, prec, conv == 'E');
+    else blen = FmtGMag(body, v, prec, conv == 'G', (flags & _FLT_HASH) != 0);
   }
   // Sign: the value's sign bit, else the `+`/space flag.
   U8 sign = 0;

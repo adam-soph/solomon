@@ -1,10 +1,9 @@
-//! Shared test fixtures. (A `tests/common/` subdirectory is *not* compiled as
-//! its own test binary, so this is included via `mod common;` in the test
-//! crates that need it.)
+//! Shared test fixtures. A `tests/common/` subdirectory is not compiled as its own
+//! test binary, so this is included via `mod common;` in the test crates that need it.
 
-/// Every HolyC example program under `examples/`, embedded so the tests don't
-/// depend on the working directory. The single source of truth for the example
-/// list — `tests/examples.rs` runs them through the front end + interpreter, and
+/// Every HolyC example program under `examples/`, embedded so the tests don't depend
+/// on the working directory. This is the single source of truth for the example list.
+/// `tests/examples.rs` runs them through the front end and interpreter, and
 /// `tests/arm64.rs` compiles each natively and checks it against the interpreter.
 #[allow(dead_code)]
 pub const EXAMPLES: &[(&str, &str)] = &[
@@ -28,7 +27,9 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("tuples.hc", include_str!("../examples/tuples.hc")),
     ("sort.hc", include_str!("../examples/sort.hc")),
     ("generic.hc", include_str!("../examples/generic.hc")),
+    ("structural.hc", include_str!("../examples/structural.hc")),
     ("exe.hc", include_str!("../examples/exe.hc")),
+    ("exceptions.hc", include_str!("../examples/exceptions.hc")),
     ("args.hc", include_str!("../examples/args.hc")),
     ("varargs.hc", include_str!("../examples/varargs.hc")),
     ("wordcount.hc", include_str!("../examples/wordcount.hc")),
@@ -36,14 +37,15 @@ pub const EXAMPLES: &[(&str, &str)] = &[
 
 // ---- container-library edge-case programs ----
 //
-// Shared by the interpreter-pinned exact-output tests (`tests/programs.rs`, run on
-// every host) and the arm64-Darwin native-parity tests (`tests/arm64_darwin.rs`, run
-// on an Apple-silicon Mac), so both exercise identical source. They cover the
-// `<sort.hc>`/`<vec.hc>`/`<hmap.hc>` surface beyond the happy path the examples show:
-// empty/single/reverse/duplicate inputs, search boundaries, the quicksort (>cutoff)
-// path, I64 keys, rehash/update/delete, and the `HmapValues`/`HmapEntries` collectors.
-// Sorted bases are **heap** buffers (`MAlloc`/`Vec`): the interpreter byte-addresses
-// heap blocks but not stack arrays, so a raw `I64 a[N]` would not be a valid base.
+// Shared by two test sets so both exercise identical source: the interpreter-pinned
+// exact-output tests (`tests/programs.rs`, run on every host) and the arm64-Darwin
+// native-parity tests (`tests/arm64_darwin.rs`, run on an Apple-silicon Mac). They
+// cover the `<sort.hc>`/`<vec.hc>`/`<hmap.hc>` surface beyond the happy path the
+// examples show: empty/single/reverse/duplicate inputs, search boundaries, the
+// quicksort (>cutoff) path, I64 keys, rehash/update/delete, and the
+// `HmapValues`/`HmapEntries` collectors. Sorted bases are heap buffers
+// (`MAlloc`/`Vec`): the interpreter byte-addresses heap blocks but not stack arrays,
+// so a raw `I64 a[N]` would not be a valid base.
 
 #[allow(dead_code)]
 pub const LIB_SORT_EDGES: &str = r#"
@@ -54,25 +56,25 @@ U0 PrintBuf(I64 *a, I64 n) { I64 i; for (i = 0; i < n; i++) "%d ", a[i]; "\n"; }
 U0 Main()
 {
   I64 *one = MAlloc(sizeof(I64)); one[0] = 42;
-  Sort(one, 1, sizeof(I64), &Cmp); PrintBuf(one, 1); Free(one);
+  Sort(one, 1, &Cmp); PrintBuf(one, 1); Free(one);
 
   I64 i;
   I64 *r = MAlloc(6 * sizeof(I64));
   for (i = 0; i < 6; i++) r[i] = 6 - i;
-  Sort(r, 6, sizeof(I64), &Cmp); PrintBuf(r, 6); Free(r);
+  Sort(r, 6, &Cmp); PrintBuf(r, 6); Free(r);
 
   I64 *d = MAlloc(7 * sizeof(I64));
   d[0]=3; d[1]=1; d[2]=3; d[3]=1; d[4]=2; d[5]=3; d[6]=1;
-  Sort(d, 7, sizeof(I64), &Cmp); PrintBuf(d, 7);
+  Sort(d, 7, &Cmp); PrintBuf(d, 7);
   I64 k;
-  k=2; "f2=%d ",  BSearch(&k, d, 7, sizeof(I64), &Cmp) != NULL;
-  k=9; "f9=%d ",  BSearch(&k, d, 7, sizeof(I64), &Cmp) != NULL;
-  k=0; "f0=%d\n", BSearch(&k, d, 7, sizeof(I64), &Cmp) != NULL;
+  k=2; "f2=%d ",  BSearch(&k, d, 7, &Cmp) != NULL;
+  k=9; "f9=%d ",  BSearch(&k, d, 7, &Cmp) != NULL;
+  k=0; "f0=%d\n", BSearch(&k, d, 7, &Cmp) != NULL;
   Free(d);
 
   I64 n = 50; I64 *big = MAlloc(n * sizeof(I64));
   for (i = 0; i < n; i++) big[i] = (i * 37 + 11) % 100;
-  Sort(big, n, sizeof(I64), &Cmp);
+  Sort(big, n, &Cmp);
   I64 ok = 1;
   for (i = 1; i < n; i++) if (big[i-1] > big[i]) ok = 0;
   "sorted50=%d\n", ok;
@@ -143,11 +145,12 @@ U0 Main()
 Main;
 "#;
 
-/// Parse an example/source with the standard library on the angle-include search
-/// path (so `#include <cstr.hc>` etc. resolve to the repo `lib/`). The reducible
-/// builtins now live in the HolyC standard library — `lib/cstr.hc` (C strings),
-/// `lib/mem.hc` (memory + `ReAlloc`), `lib/ctype.hc` (classification), and the math
-/// + `RandU64` PRNG in `lib/math.hc`. Example files carry their own includes, while
+/// Parse an example/source with the standard library on the angle-include search path,
+/// so `#include <cstr.hc>` and friends resolve to the repo `lib/`. The reducible
+/// builtins now live in the HolyC standard library: `lib/cstr.hc` (C strings),
+/// `lib/mem.hc` (memory + `ReAlloc`), `lib/ctype.hc` (classification), the math
+/// functions in `lib/math.hc`, and the `RandU64` PRNG in `lib/rand.hc`. Example files
+/// carry their own includes, but
 /// the many inline test sources do not, so this prepends the primitive modules. The
 /// extra unused defs don't affect a program's output.
 #[allow(dead_code)]
@@ -158,15 +161,16 @@ pub fn parse_example(src: &str) -> Result<solomon::Program, solomon::ParseError>
 }
 
 /// Prepend the stdlib primitive modules an inline test source may use (`cstr.hc`,
-/// `mem.hc`, `ctype.hc`) plus `math.hc` when it uses `RandU64` and `strconv.hc`
-/// when it uses `StrToF64`.
+/// `mem.hc`, `ctype.hc`), plus `math.hc` when it uses `Abs`/`Fabs`/`Sqrt`/`Sign`,
+/// `rand.hc` when it uses `RandU64`, and `time.hc` for the clock primitives.
 ///
-/// The string/memory/ctype modules are prepended unconditionally — they're guarded
-/// (so re-including is a no-op) and define no name any example/test collides with.
-/// `math.hc` is gated on `Abs`/`Fabs`/`Sqrt`/`Sign` usage, since the rest of it
-/// (`Pow`/`Floor`/`Gcd`/`PI`/…) collides with examples that roll their own; `rand.hc`
-/// on `RandU64`; `strconv.hc` on `StrToF64` (it pulls in the bignum); `time.hc` on the
-/// clock primitives.
+/// The string/memory/ctype modules are prepended unconditionally. They're guarded, so
+/// re-including is a no-op, and they define no name any example/test collides with.
+/// (`cstr.hc` now carries `StrToF64`/`F64ToStr` too, so the number conversions need no
+/// separate include.) The rest are gated on use. `math.hc` is gated on
+/// `Abs`/`Fabs`/`Sqrt`/`Sign`, since the rest of it (`Pow`/`Floor`/`Gcd`/`PI`/…)
+/// collides with examples that roll their own. `rand.hc` is gated on `RandU64`, and
+/// `time.hc` on the clock primitives.
 #[allow(dead_code)]
 pub fn with_stdlib_prelude(src: &str) -> String {
     let mut prelude = String::from("#include <cstr.hc>\n#include <mem.hc>\n#include <ctype.hc>\n");
@@ -177,9 +181,6 @@ pub fn with_stdlib_prelude(src: &str) -> String {
     }
     if src.contains("RandU64") && !src.contains("#include <rand.hc>") {
         prelude.push_str("#include <rand.hc>\n");
-    }
-    if src.contains("StrToF64") && !src.contains("#include <strconv.hc>") {
-        prelude.push_str("#include <strconv.hc>\n");
     }
     // `time.hc` holds the clock intrinsics (and calendar math), gated on use so its
     // `DateTime`/`FromUnix`/… don't collide with tests/examples that roll their own.

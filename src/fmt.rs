@@ -1,10 +1,10 @@
-//! Shared C-`printf` conversion-spec parsing, used by both backends so their
+//! Shared C-`printf` conversion-spec parsing. Both backends use it so their
 //! formatted output agrees.
 //!
 //! A spec is `%[flags][width][.precision][length]conv`. The native backend
-//! reconstructs a libc format string from the parsed spec (injecting the `ll`
-//! length so 64-bit values print correctly); the interpreter renders the value
-//! itself, applying the same flags/width/precision rules libc would.
+//! reconstructs a libc format string from the parsed spec, injecting the `ll`
+//! length so 64-bit values print correctly. The interpreter renders the value
+//! itself, applying the same flags, width, and precision rules libc would.
 
 use std::iter::Peekable;
 use std::str::Chars;
@@ -71,16 +71,16 @@ pub fn parse(chars: &mut Peekable<Chars>) -> Spec {
             s.precision = p.parse().unwrap_or(0);
         }
     }
-    // Length modifiers are parsed and discarded — solomon values are 64-bit.
+    // Length modifiers are parsed and discarded; solomon values are all 64-bit.
     while matches!(chars.peek(), Some('l' | 'h' | 'L' | 'z' | 'j' | 't')) {
         chars.next();
     }
     s.conv = chars.next().unwrap_or('\0');
-    // Clamp the literal width/precision so the native backends' fixed scratch
-    // buffers (sized to these caps) can't overflow. `*` width/precision is rejected
-    // by the freestanding backends, and the interpreter/libc paths are unbounded, so
-    // only the literal forms need clamping. The caps are far beyond any real use, and
-    // `MAX_PRECISION` keeps `%f`'s digit count within the 48-limb bignum.
+    // Clamp the literal width and precision so the native backends' fixed scratch
+    // buffers, sized to these caps, can't overflow. Only the literal forms need
+    // clamping: the freestanding backends reject `*` width/precision, and the
+    // interpreter and libc paths are unbounded. The caps are far beyond any real
+    // use, and `MAX_PRECISION` keeps `%f`'s digit count within the 48-limb bignum.
     if let Some(w) = s.width {
         s.width = Some(w.min(MAX_WIDTH));
     }
@@ -88,8 +88,8 @@ pub fn parse(chars: &mut Peekable<Chars>) -> Spec {
     s
 }
 
-/// Caps on literal field width / precision (see [`parse`]). The native formatters
-/// size their digit/field buffers to hold these.
+/// Caps on literal field width and precision (see [`parse`]). The native formatters
+/// size their digit and field buffers to hold these.
 pub const MAX_WIDTH: usize = 1024;
 pub const MAX_PRECISION: usize = 512;
 
@@ -139,10 +139,10 @@ pub fn to_c_format(s: &Spec) -> String {
     out
 }
 
-/// Lay out an integer conversion: apply `precision` (minimum digits), then the
-/// width/flags. `sign` is "", "-", "+", or " "; `alt` is an alternate-form prefix
-/// such as "0x". Matches libc: with a precision the `0` flag is ignored, and a
-/// zero value with precision 0 produces no digits.
+/// Lay out an integer conversion. Applies `precision` (the minimum digit count),
+/// then the width and flags. `sign` is "", "-", "+", or " ". `alt` is an
+/// alternate-form prefix such as "0x". Matches libc: a precision makes the `0`
+/// flag ignored, and a zero value with precision 0 produces no digits.
 pub fn render_int(
     s: &Spec,
     width: Option<usize>,
@@ -174,9 +174,9 @@ pub fn render_int(
 }
 
 /// Render `mag` (non-negative) in C `%e`/`%E` form: a single leading digit, a
-/// `precision`-digit fraction, then `e`/`E`, a sign, and a >=2-digit exponent
-/// (e.g. `1.500000e+00`). Rust's `{:e}` does the correctly-rounded mantissa; we
-/// only restyle the exponent to match libc.
+/// `precision`-digit fraction, then `e`/`E`, a sign, and an exponent of at least
+/// two digits, e.g. `1.500000e+00`. Rust's `{:e}` does the correctly-rounded
+/// mantissa; this only restyles the exponent to match libc.
 pub fn render_exp(mag: f64, precision: usize, upper: bool) -> String {
     let s = format!("{:.*e}", precision, mag);
     let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
@@ -187,8 +187,8 @@ pub fn render_exp(mag: f64, precision: usize, upper: bool) -> String {
 }
 
 /// Render `mag` (non-negative) in C `%g`/`%G` form: `precision` significant
-/// digits, choosing `%e` or `%f` by the (post-rounding) exponent, and trimming
-/// trailing zeros unless `alt` (the `#` flag) is set.
+/// digits. Chooses `%e` or `%f` by the post-rounding exponent, and trims trailing
+/// zeros unless `alt` (the `#` flag) is set.
 pub fn render_g(mag: f64, precision: usize, upper: bool, alt: bool) -> String {
     let p = precision.max(1);
     // Format as %e at p-1 fractional digits to learn the rounded exponent X.
@@ -218,12 +218,13 @@ pub fn render_g(mag: f64, precision: usize, upper: bool, alt: bool) -> String {
 }
 
 /// Lay out a string/char conversion: truncate to `precision` chars, then pad to
-/// `width` (left-justified with `-`).
+/// `width`. The `-` flag left-justifies.
 pub fn render_str(s: &Spec, width: Option<usize>, precision: Option<usize>, body: &str) -> String {
-    // C `%.Ns` truncates and `%Ns` pads by **bytes** (as the native backends do).
-    // Truncate to ≤ `p` bytes, flooring to a char boundary so the result stays valid
-    // UTF-8 (identical to the native byte truncation except when a precision splits a
-    // multibyte char — vanishingly rare, and only for non-ASCII).
+    // C `%.Ns` truncates and `%Ns` pads by bytes, as the native backends do.
+    // Truncate to at most `p` bytes, flooring to a char boundary so the result
+    // stays valid UTF-8. This matches the native byte truncation except when a
+    // precision splits a multibyte char, which is vanishingly rare and only
+    // happens for non-ASCII.
     let body: &str = match precision {
         Some(p) => {
             let mut end = p.min(body.len());

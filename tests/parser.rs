@@ -9,10 +9,12 @@ use solomon::parser::{Parser, parse};
 use solomon::token::Span;
 
 /// Parse a program, unwrapping the result. Drops the implicit `builtin.hc` prelude
-/// items (`Span::file != 0`) so structural assertions see only the user source.
+/// items so structural assertions see only the user source plus the items mono
+/// generated for it (the latter carry the `GENERATED_FILE` sentinel `Span::file`).
 fn prog(src: &str) -> Program {
     let mut p = parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
-    p.items.retain(|s| s.span.file == 0);
+    p.items
+        .retain(|s| s.span.file == 0 || s.span.file == solomon::token::GENERATED_FILE);
     p
 }
 
@@ -55,8 +57,8 @@ fn ident(name: &str) -> ExprKind {
 
 #[test]
 fn parser_takes_a_lexer() {
-    // The public entry point is "give the parser a lexer"; tokens are pulled on
-    // demand rather than collected up front.
+    // The public entry point takes a lexer. Tokens are pulled on demand rather
+    // than collected up front.
     let lexer = Lexer::new("I64 x = 1;");
     let mut parser = Parser::new(lexer);
     let program = parser.parse_program().unwrap();
@@ -117,7 +119,7 @@ fn comparison_and_logical_precedence() {
 
 #[test]
 fn chained_comparison_desugars_to_conjunction() {
-    // HolyC `a < b < c` parses as `(a < b) && (b < c)` — the interior operand `b`
+    // HolyC `a < b < c` parses as `(a < b) && (b < c)`. The interior operand `b`
     // is duplicated into both comparisons.
     assert_eq!(
         expr("a < b < c"),
@@ -333,6 +335,95 @@ fn self_referential_class() {
 }
 
 #[test]
+fn anonymous_class_in_declaration_synthesizes_a_type() {
+    // `class { … } v;` declares `v` with a synthetic, structurally-named class type,
+    // emitted as a top-level definition before the declaration.
+    let p = prog("class { I64 x; I64 y; } v;");
+    let StmtKind::Class(c) = &p.items[0].kind else {
+        panic!("expected a synthetic class, got {:?}", p.items[0].kind);
+    };
+    assert!(c.name.starts_with("$Cls"), "name was {}", c.name);
+    assert!(!c.is_union);
+    assert_eq!(c.fields.len(), 2);
+    let StmtKind::VarDecl { decls } = &p.items[1].kind else {
+        panic!("expected a var decl");
+    };
+    assert_eq!(decls[0].ty, Type::Named(c.name.clone()));
+}
+
+#[test]
+fn anonymous_union_uses_a_distinct_prefix() {
+    let p = prog("union { I64 i; F64 f; } v;");
+    let StmtKind::Class(c) = &p.items[0].kind else {
+        panic!("expected a synthetic union");
+    };
+    assert!(c.is_union);
+    assert!(c.name.starts_with("$ClsU"), "name was {}", c.name);
+}
+
+#[test]
+fn identical_anonymous_classes_share_one_definition() {
+    // The same field signature in two places dedups to a single synthetic type.
+    let p = prog("class { I64 x; } a; class { I64 x; } b;");
+    let n = p
+        .items
+        .iter()
+        .filter(|s| matches!(&s.kind, StmtKind::Class(_)))
+        .count();
+    assert_eq!(
+        n, 1,
+        "identical anonymous classes should share one definition"
+    );
+}
+
+#[test]
+fn anonymous_classes_differing_in_array_dim_are_distinct() {
+    // The mangled name folds in the array dimension, so `[4]` and `[8]` don't collide.
+    let p = prog("class { I64 a[4]; } x; class { I64 a[8]; } y;");
+    let n = p
+        .items
+        .iter()
+        .filter(|s| matches!(&s.kind, StmtKind::Class(_)))
+        .count();
+    assert_eq!(n, 2, "different array dimensions must name different types");
+}
+
+#[test]
+fn typedef_of_anonymous_class_is_usable() {
+    // `typedef class { … } Name;` makes `Name` a usable alias of the anonymous type.
+    let p = prog("typedef class { I64 x; I64 y; } P; P MakeP() { P p; return p; }");
+    let cls = p
+        .items
+        .iter()
+        .find_map(|s| match &s.kind {
+            StmtKind::Class(c) => Some(c),
+            _ => None,
+        })
+        .expect("expected a synthetic class");
+    let f = p
+        .items
+        .iter()
+        .find_map(|s| match &s.kind {
+            StmtKind::Func(f) => Some(f),
+            _ => None,
+        })
+        .expect("expected a function");
+    assert_eq!(f.ret, Type::Named(cls.name.clone()));
+}
+
+#[test]
+fn anonymous_aggregate_in_template_referencing_param_errors() {
+    let err =
+        parse("class Box<type T> { class { T v; } inner; } U0 M() { Box<I64> b; }").unwrap_err();
+    assert!(
+        err.message
+            .contains("anonymous class/union types are not supported inside a generic template"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[test]
 fn if_else_chain() {
     let StmtKind::If { cond, then, else_ } = stmt("if (x > 0) return 1; else return 0;") else {
         panic!("expected if");
@@ -444,11 +535,11 @@ fn errors_carry_position() {
 
 #[test]
 fn deeply_nested_input_is_an_error_not_a_stack_overflow() {
-    // Pathologically deep nesting must surface as a recoverable parse error
-    // rather than overflowing the native stack and aborting the process. Run on
-    // an 8 MiB stack (matching the real main-thread entry point, the `hcc`/`hci`
-    // CLIs) — the Rust test harness's smaller per-test thread would itself blow
-    // the stack reaching the depth cap, which is exactly the case the guard
+    // Pathologically deep nesting must surface as a recoverable parse error, not
+    // overflow the native stack and abort the process. This runs on an 8 MiB
+    // stack to match the real main-thread entry point (the `hcc`/`hci` CLIs).
+    // The Rust test harness's smaller per-test thread would itself blow the
+    // stack while reaching the depth cap, which is exactly the case the guard
     // converts into a clean error on the production path.
     let handle = std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
@@ -469,10 +560,10 @@ fn deeply_nested_input_is_an_error_not_a_stack_overflow() {
 
 #[test]
 fn generic_class_monomorphizes() {
-    // `class Vec<T>` + a use `Vec<I64>` stamps out a concrete `3VecI64` (the
-    // injective mangling of `Vec<I64>`) with `T` substituted; the template itself
-    // emits no class.
-    let p = prog("class Vec<T> { T *data; I64 len; } Vec<I64> x;");
+    // `class Vec<type T>` plus a use `Vec<I64>` stamps out a concrete class with `T`
+    // substituted. Its name is `3VecI64`, the injective mangling of `Vec<I64>`.
+    // The template itself emits no class.
+    let p = prog("class Vec<type T> { T *data; I64 len; } Vec<I64> x;");
     let classes: Vec<&ClassDef> = p
         .items
         .iter()
@@ -493,7 +584,7 @@ fn generic_class_monomorphizes() {
 
 #[test]
 fn generic_dedups_repeated_instantiations() {
-    let p = prog("class Vec<T> { T *d; } Vec<I64> a; Vec<I64> b;");
+    let p = prog("class Vec<type T> { T *d; } Vec<I64> a; Vec<I64> b;");
     let n = p
         .items
         .iter()
@@ -502,22 +593,103 @@ fn generic_dedups_repeated_instantiations() {
     assert_eq!(n, 1, "Vec<I64> used twice should mint one class");
 }
 
+// ---- generic parameter kinds: `type` / `comparable` / `int` value params ----
+
+/// All generated/concrete class names in a parsed program.
+fn class_names(p: &Program) -> Vec<&str> {
+    p.items
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StmtKind::Class(c) => Some(c.name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn find_class<'a>(p: &'a Program, name: &str) -> Option<&'a ClassDef> {
+    p.items.iter().find_map(|s| match &s.kind {
+        StmtKind::Class(c) if c.name == name => Some(c),
+        _ => None,
+    })
+}
+
+#[test]
+fn value_param_class_monomorphizes() {
+    // `FixedArr<type T, int N>` with `FixedArr<I64, 8>` mints `8FixedArrI64C8E`, whose
+    // `data` field is `I64[8]` — the value param `N` folded into the array dimension.
+    let p = prog("class FixedArr<type T, int N> { T data[N]; I64 len; } FixedArr<I64, 8> x;");
+    let c = find_class(&p, "8FixedArrI64C8E").expect("FixedArr<I64,8> instance");
+    assert_eq!(c.fields[0].name, "data");
+    assert_eq!(
+        c.fields[0].ty,
+        Type::Array(Box::new(Type::I64), Some(Box::new(e(ExprKind::Int(8)))))
+    );
+    assert_eq!(c.fields[1].ty, Type::I64);
+}
+
+#[test]
+fn value_param_distinct_instances_and_dedup() {
+    let p = prog(
+        "class FixedArr<type T, int N> { T data[N]; } \
+         FixedArr<I64, 8> a; FixedArr<I64, 9> b; FixedArr<I64, 8> c;",
+    );
+    let names = class_names(&p);
+    assert!(names.contains(&"8FixedArrI64C8E"));
+    assert!(names.contains(&"8FixedArrI64C9E")); // a different N is a different type
+    assert_eq!(
+        names.iter().filter(|n| **n == "8FixedArrI64C8E").count(),
+        1,
+        "`<I64,8>` used twice should mint one class"
+    );
+}
+
+#[test]
+fn type_keyword_is_synonym_for_bare_param() {
+    // `class Box<type T>` behaves exactly like `class Box<type T>`.
+    let p = prog("class Box<type T> { T v; } Box<I64> x;");
+    let c = find_class(&p, "3BoxI64").expect("Box<I64> instance");
+    assert_eq!(c.fields[0].ty, Type::I64);
+}
+
+#[test]
+fn comparable_constraint_rejects_a_class() {
+    let err = parse(
+        "class Pt { I64 x; } T Max<comparable T>(T a, T b) { return a; } \
+         U0 M() { Pt p; Pt q; Max(p, q); }",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not comparable"), "got: {err}");
+}
+
+#[test]
+fn comparable_constraint_accepts_scalars_and_pointers() {
+    // I64, F64, and a pointer element all satisfy `comparable`.
+    prog(
+        "T Max<comparable T>(T a, T b) { return a > b ? a : b; } \
+         U0 M() { Max(1, 2); Max(1.0, 2.0); U8 *p; U8 *q; Max(p, q); }",
+    );
+}
+
+#[test]
+fn value_param_call_requires_explicit_args() {
+    // A function with a value parameter can't be called by inference.
+    let err = parse("I64 Z<int N>() { return N; } U0 M() { Z(); }").unwrap_err();
+    assert!(err.to_string().contains("value parameter"), "got: {err}");
+}
+
 #[test]
 fn generic_arity_mismatch_is_an_error() {
-    let err = parse("class Pair<K, V> { K k; V v; } Pair<I64> p;").unwrap_err();
-    assert!(
-        err.to_string().contains("expects 2 type argument"),
-        "got: {err}"
-    );
+    let err = parse("class Pair<type K, type V> { K k; V v; } Pair<I64> p;").unwrap_err();
+    assert!(err.to_string().contains("expects 2 argument"), "got: {err}");
 }
 
 // ---- generic functions (monomorphization) ----
 
 #[test]
 fn generic_function_monomorphizes_by_type_arg() {
-    // `T Id<T>(T x){...}` + calls `Id<I64>(..)` / `Id<F64>(..)` generate concrete
-    // `2IdI64` / `2IdF64`, and the call sites resolve to those mangled names.
-    let p = prog("T Id<T>(T x) { return x; } I64 a = Id<I64>(1); F64 b = Id<F64>(2.0);");
+    // `T Id<type T>(T x){...}` plus calls `Id<I64>(..)` and `Id<F64>(..)` generate the
+    // concrete `2IdI64` and `2IdF64`. The call sites resolve to those mangled names.
+    let p = prog("T Id<type T>(T x) { return x; } I64 a = Id<I64>(1); F64 b = Id<F64>(2.0);");
     let funcs: Vec<&FuncDef> = p
         .items
         .iter()
@@ -537,7 +709,7 @@ fn generic_function_monomorphizes_by_type_arg() {
 
 #[test]
 fn generic_function_dedups() {
-    let p = prog("T Id<T>(T x){return x;} I64 a=Id<I64>(1); I64 b=Id<I64>(2);");
+    let p = prog("T Id<type T>(T x){return x;} I64 a=Id<I64>(1); I64 b=Id<I64>(2);");
     let n = p
         .items
         .iter()
@@ -547,10 +719,40 @@ fn generic_function_dedups() {
 }
 
 #[test]
+fn generic_param_requires_a_kind_keyword() {
+    // A generic parameter must be declared with `type` (or `comparable`/`int`). A bare
+    // `<T>` is rejected in both class and function definitions; the explicit form works
+    // (including a `public` generic fn whose return type is a bare type parameter).
+    for src in [
+        "class Box<T> { T v; }",
+        "T Id<T>(T x) { return x; }",
+        "public T Id<T>(T x) { return x; }",
+    ] {
+        let err = parse(src).expect_err("bare <T> must be rejected");
+        assert!(
+            err.to_string().contains("type")
+                && err.to_string().to_lowercase().contains("generic parameter"),
+            "expected a generic-parameter error for `{src}`, got: {err}",
+        );
+    }
+    // The explicit `<type T>` form parses and monomorphizes.
+    let p = prog(
+        "public class Box<type T> { T v; }
+         public T BoxGet<type T>(Box<T> *b) { return b->v; }
+         U0 Main() { Box<I64> b; b.v = 5; BoxGet<I64>(&b); }",
+    );
+    let has_instance = p.items.iter().any(|s| match &s.kind {
+        StmtKind::Func(f) => f.name.contains("BoxGet"),
+        _ => false,
+    });
+    assert!(has_instance, "BoxGet<I64> instance should exist");
+}
+
+#[test]
 fn generic_function_infers_type_args() {
-    // `Id<T>(T)` called as `Id(1)` infers `T=I64`, generating `2IdI64` and resolving
-    // the (un-annotated) call to it.
-    let p = prog("T Id<T>(T x){return x;} I64 a = Id(1);");
+    // `Id<type T>(T)` called as `Id(1)` infers `T=I64`. That generates `2IdI64` and
+    // resolves the un-annotated call to it.
+    let p = prog("T Id<type T>(T x){return x;} I64 a = Id(1);");
     let funcs: Vec<&FuncDef> = p
         .items
         .iter()
@@ -564,10 +766,11 @@ fn generic_function_infers_type_args() {
 
 #[test]
 fn generic_function_infers_from_cast_and_call_result() {
-    // `arg_type` now types an explicit cast (its own type) and a call result (the
-    // callee's recorded return type), so neither needs an explicit `<...>`.
+    // `arg_type` now types both an explicit cast (from its own type) and a call
+    // result (from the callee's recorded return type). Neither argument needs an
+    // explicit `<...>`.
     let p = prog(
-        "T Id<T>(T x){return x;} I64 Mk(){return 7;} F64 MkF(){return 2.5;} \
+        "T Id<type T>(T x){return x;} I64 Mk(){return 7;} F64 MkF(){return 2.5;} \
          I64 a = Id(Mk()); F64 b = Id(MkF()); F64 c = Id((F64)3);",
     );
     let names: Vec<&str> = p
@@ -587,10 +790,11 @@ fn generic_function_infers_from_cast_and_call_result() {
 
 #[test]
 fn generic_inference_resolves_member_index_deref_and_arithmetic() {
-    // The `mono` pass's typer handles member access, indexing, deref, and arithmetic
-    // (using the resolved class-field types), so none of these need an explicit `<...>`.
-    // Each generic `T` here is inferable *only* from the argument (no receiver to recover
-    // it from), so a missing case would be a hard "cannot infer" error.
+    // The `mono` pass's typer handles member access, indexing, deref, and
+    // arithmetic, using the resolved class-field types. None of these need an
+    // explicit `<...>`. Each generic `T` here is inferable only from the
+    // argument, with no receiver to recover it from, so a missing case would be
+    // a hard "cannot infer" error.
     let names = |src: &str| -> Vec<String> {
         prog(src)
             .items
@@ -603,16 +807,16 @@ fn generic_inference_resolves_member_index_deref_and_arithmetic() {
     };
     // member access (I64 field) and a pointer-to-class arrow access
     let n = names(
-        "class Box{I64 v; F64 f;} T Id<T>(T x){return x;} \
+        "class Box{I64 v; F64 f;} T Id<type T>(T x){return x;} \
          Box b; I64 a = Id(b.v); Box *p = &b; I64 c = Id(p->v);",
     );
     assert!(n.contains(&"2IdI64".to_string()), "member access: {n:?}");
     // member access of an F64 field binds T=F64
-    let n = names("class Box{F64 f;} T Id<T>(T x){return x;} Box b; F64 a = Id(b.f);");
+    let n = names("class Box{F64 f;} T Id<type T>(T x){return x;} Box b; F64 a = Id(b.f);");
     assert!(n.contains(&"2IdF64".to_string()), "F64 member: {n:?}");
     // indexing, deref, and arithmetic
     let n = names(
-        "T Id<T>(T x){return x;} I64 arr[3]; I64 a = Id(arr[0]); \
+        "T Id<type T>(T x){return x;} I64 arr[3]; I64 a = Id(arr[0]); \
          I64 q = 1; I64 *pp = &q; I64 b = Id(*pp); I64 c = Id(q + a);",
     );
     assert!(
@@ -623,9 +827,11 @@ fn generic_inference_resolves_member_index_deref_and_arithmetic() {
 
 #[test]
 fn generic_inference_sees_a_forward_declared_function() {
-    // The `mono` pass types the whole (parsed) program, so a call-result argument whose
-    // function is defined *below* the call site infers fine — no special hoisting needed.
-    let p = parse("T Id<T>(T x){return x;} I64 a = Id(Later()); I64 Later(){return 4;}").unwrap();
+    // The `mono` pass types the whole parsed program. So a call-result argument
+    // whose function is defined below the call site infers fine, with no special
+    // hoisting needed.
+    let p =
+        parse("T Id<type T>(T x){return x;} I64 a = Id(Later()); I64 Later(){return 4;}").unwrap();
     assert!(
         p.items
             .iter()
@@ -650,17 +856,17 @@ fn mono_inference_closes_ternary_inherited_and_fnptr_gaps() {
             .collect()
     };
     // a ternary argument
-    let n = names("T Id<T>(T x){return x;} U0 F(){ I64 c=1; I64 a = Id(c ? 1 : 2); }");
+    let n = names("T Id<type T>(T x){return x;} U0 F(){ I64 c=1; I64 a = Id(c ? 1 : 2); }");
     assert!(n.contains(&"2IdI64".to_string()), "ternary: {n:?}");
     // an inherited (base-class) field
     let n = names(
-        "class Base{I64 v;} class Derived:Base{I64 w;} T Id<T>(T x){return x;} \
+        "class Base{I64 v;} class Derived:Base{I64 w;} T Id<type T>(T x){return x;} \
          U0 F(){ Derived d; I64 a = Id(d.v); }",
     );
     assert!(n.contains(&"2IdI64".to_string()), "inherited field: {n:?}");
     // a function-pointer call result
     let n = names(
-        "I64 G(I64 x){return x;} T Id<T>(T x){return x;} \
+        "I64 G(I64 x){return x;} T Id<type T>(T x){return x;} \
          U0 F(){ I64 (*fp)(I64) = &G; I64 a = Id(fp(3)); }",
     );
     assert!(n.contains(&"2IdI64".to_string()), "fnptr result: {n:?}");
@@ -668,13 +874,14 @@ fn mono_inference_closes_ternary_inherited_and_fnptr_gaps() {
 
 #[test]
 fn mono_consumes_templates_and_emits_concrete_instances() {
-    // After parse + the `mono` pass, the program is fully concrete: the generic
-    // templates are consumed (no longer on `Program::generics`) and the instances
-    // appear as ordinary top-level definitions — `Vec<I64>` instantiated and `Id(1)`
-    // inferred + instantiated.
-    let p =
-        parse("class Vec<T> { T *data; } T Id<T>(T x) { return x; } Vec<I64> v; I64 a = Id(1);")
-            .unwrap();
+    // After parse and the `mono` pass, the program is fully concrete. The generic
+    // templates are consumed: they no longer appear on `Program::generics`. The
+    // instances appear as ordinary top-level definitions — `Vec<I64>`
+    // instantiated, and `Id(1)` inferred then instantiated.
+    let p = parse(
+        "class Vec<type T> { T *data; } T Id<type T>(T x) { return x; } Vec<I64> v; I64 a = Id(1);",
+    )
+    .unwrap();
     assert!(p.generics.classes.is_empty(), "templates consumed by mono");
     assert!(p.generics.fns.is_empty(), "templates consumed by mono");
     let has_class = |n: &str| {
@@ -693,9 +900,9 @@ fn mono_consumes_templates_and_emits_concrete_instances() {
 
 #[test]
 fn colon_eq_tuple_unpack() {
-    // `a, b := e;` is the sole unpack syntax: it declares each name (`_` discards) with
-    // the element type inferred from the tuple, desugaring to a hidden tuple temp plus
-    // one declarator per named slot.
+    // `a, b := e;` is the sole unpack syntax. It declares each name with the
+    // element type inferred from the tuple (`_` discards a slot). It desugars to
+    // a hidden tuple temp plus one declarator per named slot.
     let unpack_decls = |src: &str| -> Vec<Declarator> {
         prog(src)
             .items
@@ -727,9 +934,9 @@ fn colon_eq_tuple_unpack() {
 
 #[test]
 fn colon_eq_single_infers_type() {
-    // `n := e;` with ONE name is an inferred-type declaration — one declarator whose
-    // type comes from the right-hand side (no tuple temp).
-    // Find the declarator named `want` (a `:=` with one name produces a single decl).
+    // `n := e;` with ONE name is an inferred-type declaration. It produces one
+    // declarator whose type comes from the right-hand side, with no tuple temp.
+    // The helper finds the declarator named `want`.
     let decl = |src: &str, want: &str| -> Declarator {
         prog(src)
             .items
@@ -751,7 +958,7 @@ fn colon_eq_single_infers_type() {
     assert!(matches!(d.ty, Type::Named(_)), "tuple type: {:?}", d.ty);
     // A pointer-returning generic call infers its pointer return type.
     let d = decl(
-        "T *Id<T>(T *x){return x;} I64 n = 0; p := Id<I64>(&n);",
+        "T *Id<type T>(T *x){return x;} I64 n = 0; p := Id<I64>(&n);",
         "p",
     );
     assert_eq!(
@@ -764,8 +971,9 @@ fn colon_eq_single_infers_type() {
 
 #[test]
 fn colon_eq_through_generic_calls() {
-    // A generic call's tuple return is inferred for `:=`, both inferred and explicit
-    // type-arg forms (the instance's return type is recorded at the call site).
+    // A generic call's tuple return is inferred for `:=`, in both the inferred and
+    // explicit type-arg forms. The instance's return type is recorded at the call
+    // site.
     let unpacks = |src: &str| -> bool {
         parse(src).is_ok_and(|p| {
             p.items
@@ -773,7 +981,7 @@ fn colon_eq_through_generic_calls() {
                 .any(|s| matches!(&s.kind, StmtKind::Func(f) if f.name.contains("Pick")))
         })
     };
-    let prog = "(T, Bool) Pick<T>(T x) { return x, 1; } ";
+    let prog = "(T, Bool) Pick<type T>(T x) { return x, 1; } ";
     // inferred type arg
     assert!(
         unpacks(&format!("{prog} U0 F(){{ v, ok := Pick(5); }}")),

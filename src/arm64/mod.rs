@@ -1,14 +1,14 @@
-//! A code-generation backend for Apple-silicon macOS (`aarch64-apple-darwin`).
+//! Code-generation backend for Apple-silicon macOS (`aarch64-apple-darwin`).
 //!
-//! It lowers the program to **hand-emitted AArch64 machine code**, writes a
-//! Mach-O relocatable object, and links it with the system `cc`. No
-//! LLVM/Cranelift/C — the instruction bytes and the object container are
-//! produced here. The [interpreter](crate::interp) is the conformance
-//! oracle this backend matches byte-for-byte (see `tests/arm64.rs`).
+//! It lowers the program to hand-emitted AArch64 machine code, writes a Mach-O
+//! relocatable object, and links it with the system `cc`. There is no
+//! LLVM/Cranelift/C: both the instruction bytes and the object container are
+//! produced here. This backend matches the [interpreter](crate::interp)
+//! byte-for-byte; the interpreter is the conformance oracle (see `tests/arm64_darwin.rs`).
 //!
 //! ## Scope
 //!
-//! Codegen is **type-directed**: it consults the typed AST (`Expr::ty`) and the
+//! Codegen is type-directed: it reads the typed AST (`Expr::ty`) and the
 //! [layout pass](crate::layout) for field offsets, element strides, and access
 //! widths. It compiles the whole implemented HolyC subset:
 //!
@@ -21,7 +21,7 @@
 //!     extension; `sizeof`/`offset`, integer casts;
 //!   * classes/unions by value (sret returns), arrays (decay to pointers),
 //!     brace/designated aggregate initializers, function pointers (`ADR`+`BLR`);
-//!   * **global variables** (Mach-O common symbols addressed via
+//!   * global variables (Mach-O common symbols addressed via
 //!     `PAGE21`/`PAGEOFF12` relocations) and the built-in library (lowered to
 //!     libc externs via `BRANCH26` relocations).
 //!
@@ -30,13 +30,13 @@
 //! allocator that promotes hot locals to callee-saved registers (see
 //! `plan_registers` / `Asm::peephole`).
 //!
-//! Frame: `stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,#frame`. Locals live
-//! below the frame pointer and are addressed as `x29 - offset`; promoted callee-
-//! saved registers are spilled into the same frame (`stur`/`fstur`, restored in
-//! the epilogue). The epilogue (`mov sp,x29; ldp x29,x30,[sp],#16; ret`) needs no
-//! frame size, and only the one `sub sp` immediate is back-patched. Expression
-//! evaluation is a stack machine (intermediates spilled to the machine stack) so
-//! values survive calls.
+//! The prologue is `stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,#frame`. Locals
+//! live below the frame pointer, addressed as `x29 - offset`. Promoted callee-saved
+//! registers are spilled into the same frame with `stur`/`fstur` and restored in the
+//! epilogue. The epilogue `mov sp,x29; ldp x29,x30,[sp],#16; ret` needs no frame
+//! size, so only the one `sub sp` immediate is back-patched. Expression evaluation
+//! is a stack machine: intermediates spill to the machine stack, so values survive
+//! calls.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -56,8 +56,8 @@ pub use linux::Arm64Linux;
 
 use asm::{Asm, CodeImage};
 
-/// The `FutexWait` safety-net timeout: a missed wakeup degrades to a re-check at this
-/// period instead of deadlocking (≈1 ms — never reached when wakeups work).
+/// Safety-net timeout for `FutexWait`, about 1 ms. A missed wakeup degrades to a
+/// re-check at this period instead of deadlocking. Never reached when wakeups work.
 const FUTEX_TIMEOUT_NS: i64 = 1_000_000;
 
 const RES: u32 = 9; // integer/pointer expression result
@@ -82,9 +82,9 @@ const COND_LT: u32 = 0b1011;
 const COND_GT: u32 = 0b1100;
 const COND_LE: u32 = 0b1101;
 
-// Per-instruction register-liveness tags, used by the peephole pass (`Asm`).
-// `inst_use` is a bitmask over the general-purpose registers x0–x30 (bit r = xr);
-// x31 (SP/XZR) is never tracked. `inst_branch` classifies control flow.
+// Per-instruction register-liveness tags for the peephole pass (`Asm`).
+// `inst_use` is a bitmask over the general-purpose registers x0–x30, where bit r
+// means xr; x31 (SP/XZR) is never tracked. `inst_branch` classifies control flow.
 const GP_ALL: u32 = 0x7FFF_FFFF; // x0..x30 (conservative "reads everything")
 const B_NORMAL: u8 = 0; // straight-line instruction
 const B_CALL: u8 = 1; // bl/blr — clobbers the caller-saved temporaries
@@ -100,16 +100,16 @@ pub struct Arm64Darwin {
     out_path: PathBuf,
 }
 
-/// The per-OS object-format and link policy. The AArch64 instruction encoding
-/// and the code generation are shared between targets; this is the only
-/// Darwin-vs-Linux difference — the relocatable-object container (Mach-O vs ELF,
-/// with their relocation types and symbol-name conventions) and the linker.
+/// Per-OS object format and link policy. The AArch64 instruction encoding and the
+/// code generation are shared between targets. This trait captures the only
+/// Darwin-vs-Linux difference: the relocatable-object container (Mach-O vs ELF, each
+/// with its own relocation types and symbol-name conventions) and the linker.
 trait ArmTarget {
-    /// Package the machine code + symbolic relocations into a relocatable object.
-    /// `defined` are the `_main` + function symbols (with their `__text` byte
-    /// offsets), `commons` the BSS-allocated globals, `ndefined` the count of
-    /// defined symbols. Only hosted targets (Darwin) implement this; a
-    /// [`freestanding`](ArmTarget::freestanding) target emits an executable
+    /// Package the machine code and symbolic relocations into a relocatable object.
+    /// `defined` are the `_main` and function symbols with their `__text` byte
+    /// offsets, `commons` the BSS-allocated globals, and `ndefined` the count of
+    /// defined symbols. Only hosted targets (Darwin) implement this. A
+    /// [`freestanding`](ArmTarget::freestanding) target instead emits an executable
     /// directly via [`write_executable`](ArmTarget::write_executable).
     fn write_object(
         &self,
@@ -122,30 +122,30 @@ trait ArmTarget {
     }
 
     /// Link the relocatable object `obj` into the executable `out`. Only hosted
-    /// targets (Darwin, via `cc`) implement this; freestanding targets need no
+    /// targets implement this (Darwin, via `cc`); freestanding targets need no
     /// linker.
     fn link(&self, _obj: &Path, _out: &Path) -> Result<(), CodegenError> {
         unreachable!("link is only called for hosted (non-freestanding) targets")
     }
 
-    /// Whether variadic arguments (to `printf`/`sprintf`/…) are passed in
-    /// registers (standard AAPCS64 — `true`) or all on the stack (Apple's ARM64
-    /// ABI — `false`). The only codegen difference between the two AArch64 OSes.
+    /// Whether variadic arguments (to `printf`/`sprintf`/…) are passed in registers
+    /// or all on the stack. `true` for standard AAPCS64; `false` for Apple's ARM64
+    /// ABI. This is the only codegen difference between the two AArch64 OSes.
     fn variadic_in_registers(&self) -> bool;
 
-    /// `true` for a **freestanding** target — one that emits a self-contained
-    /// static executable with its own `_start` and raw syscalls, calling no libc
-    /// and needing no linker (`aarch64-unknown-linux` with no C toolchain). When
-    /// set, the driver emits a `_start` entry and `compile` returns the finished
-    /// executable from [`write_executable`](ArmTarget::write_executable) instead of
-    /// a relocatable object. The hosted Darwin target leaves this `false` and uses
-    /// [`write_object`](ArmTarget::write_object) + `link` (via `cc`).
+    /// `true` for a freestanding target: one that emits a self-contained static
+    /// executable with its own `_start` and raw syscalls, calling no libc and needing
+    /// no linker (`aarch64-unknown-linux` with no C toolchain). When set, the driver
+    /// emits a `_start` entry and `compile` returns the finished executable from
+    /// [`write_executable`](ArmTarget::write_executable) rather than a relocatable
+    /// object. The hosted Darwin target leaves this `false` and instead uses
+    /// [`write_object`](ArmTarget::write_object) plus `link` (via `cc`).
     fn freestanding(&self) -> bool {
         false
     }
 
-    /// Wrap the freestanding `code` (entry at its first byte, BSS of `bss` zero
-    /// bytes trailing the image) into a runnable executable. Only called when
+    /// Wrap the freestanding `code` into a runnable executable. The entry is the
+    /// first byte of `code`, and `bss` zero bytes trail the image. Only called when
     /// [`freestanding`](ArmTarget::freestanding) is `true`.
     fn write_executable(&self, _code: &[u8], _bss: u64) -> Vec<u8> {
         unreachable!("write_executable is only called for freestanding targets")
@@ -159,16 +159,16 @@ impl Arm64Darwin {
         }
     }
 
-    /// Emit the Mach-O relocatable object for `program` as raw bytes (no link).
-    /// Exposed so structural tests can byte-check the emitted object on any host.
+    /// Emit the Mach-O relocatable object for `program` as raw bytes, without
+    /// linking. Exposed so structural tests can byte-check the object on any host.
     pub fn object(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
         compile(program, &darwin::Darwin)
     }
 }
 
 /// Emit a relocatable object for `program` using `target`'s container format.
-/// This driver — function/global symbol layout, code emission, fixup resolution
-/// — is shared by every AArch64 target; only `target` differs.
+/// This driver handles function and global symbol layout, code emission, and fixup
+/// resolution. It is shared by every AArch64 target; only `target` differs.
 fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, CodegenError> {
     let (layouts, _) = crate::layout::compute(program);
     let mut cg = Cg::new(layouts);
@@ -212,13 +212,13 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
             }
         }
     }
-    // `MSize` makes `MAlloc` prepend an 8-byte size header; gate it so size-agnostic
-    // programs keep the lean, header-free heap byte-for-byte.
+    // `MSize` makes `MAlloc` prepend an 8-byte size header. Gate it so that
+    // size-agnostic programs keep the lean, header-free heap byte-for-byte.
     cg.uses_msize = crate::ast::program_calls_any(program, &["MSize"]);
-    // The command line is exposed as the implicit globals `ArgC`/`ArgV` (`_main`
-    // captures x0/x1 into the two hidden symbols below; a `...` function's `VargC`/
-    // `VargV` varargs locals are distinct names). Only when the program references
-    // them, so arg-free programs stay byte-for-byte unchanged.
+    // The command line is exposed as the implicit globals `ArgC`/`ArgV`: `_main`
+    // captures x0/x1 into the two hidden symbols below. (A `...` function's `VargC`/
+    // `VargV` varargs locals are distinct names.) Done only when the program
+    // references them, so arg-free programs stay byte-for-byte unchanged.
     if crate::ast::program_uses_ident(program, &["ArgC", "ArgV"]) {
         cg.uses_args = true;
         for name in [ARGC_GLOBAL, ARGV_GLOBAL] {
@@ -228,9 +228,9 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
             cg.global_order.push(name.to_string());
         }
     }
-    // The environment is the implicit global `U8 **EnvP` (`_main` captures the `main`
-    // 3rd arg, x2, into the hidden symbol below). Gated independently of the command
-    // line so an `EnvP`-free program is byte-for-byte unchanged.
+    // The environment is the implicit global `U8 **EnvP`: `_main` captures the
+    // `main` 3rd arg (x2) into the hidden symbol below. Gated independently of the
+    // command line, so an `EnvP`-free program is byte-for-byte unchanged.
     if crate::ast::program_uses_ident(program, &["EnvP"]) {
         cg.uses_env = true;
         let sym = ndefined + cg.global_order.len() as u32;
@@ -238,10 +238,41 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
             .insert(ENVP_GLOBAL.to_string(), GlobalInfo { sym, ty: Type::U64 });
         cg.global_order.push(ENVP_GLOBAL.to_string());
     }
+    // The current task `CTask *Fs`, backing exception state (`Fs->except_ch`). It is a
+    // single hidden, zero-initialized `CTask` region; `gen_fs_ptr` loads its address.
+    // (Process-global for now; the per-thread TLS upgrade is localized there.)
+    if crate::ast::program_uses_ident(program, &["Fs"])
+        || crate::ast::program_has_exceptions(program)
+    {
+        cg.uses_exc = true;
+        // The freestanding process-global `CTask` region (single-task fallback).
+        let sym = ndefined + cg.global_order.len() as u32;
+        cg.globals.insert(
+            CTASK_GLOBAL.to_string(),
+            GlobalInfo {
+                sym,
+                ty: Type::Named("CTask".to_string()),
+            },
+        );
+        cg.global_order.push(CTASK_GLOBAL.to_string());
+        cg.ctask_sym = Some(sym);
+        // The hosted (Darwin) per-thread TLS key (`pthread_key_t`). Harmless on
+        // freestanding, which never references it.
+        let ksym = ndefined + cg.global_order.len() as u32;
+        cg.globals.insert(
+            FSKEY_GLOBAL.to_string(),
+            GlobalInfo {
+                sym: ksym,
+                ty: Type::U64,
+            },
+        );
+        cg.global_order.push(FSKEY_GLOBAL.to_string());
+        cg.fs_key_sym = Some(ksym);
+    }
 
-    // Freestanding: lay out the globals in BSS (no linker to allocate commons), in
-    // declaration order with natural alignment, so `addr_global` can address each
-    // by a fixed offset.
+    // Freestanding: there is no linker to allocate commons, so lay the globals out
+    // in BSS in declaration order with natural alignment. `addr_global` then
+    // addresses each by a fixed offset.
     if cg.freestanding {
         for name in cg.global_order.clone() {
             let g = &cg.globals[&name];
@@ -255,17 +286,26 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
         }
     }
 
-    // Freestanding: emit `_start` (the ELF entry, first byte of `__text`) — call
-    // `_main`, then exit_group with its return value. Hosted targets let the libc
-    // start-up code call `_main` and turn its return into the exit status.
+    // Freestanding: emit `_start`, the ELF entry at the first byte of `__text`. It
+    // calls `_main`, then `exit_group` with its return value. Hosted targets instead
+    // let the libc start-up code call `_main` and turn its return into the exit
+    // status.
     if cg.freestanding {
         cg.asm.place(start_label);
+        // Per-thread exception state: point the main thread's user thread pointer
+        // (`TPIDR_EL0`) at the global `CTask`. Spawned threads set their own in the
+        // `clone` child. Gated on use, so non-exception programs are unchanged.
+        if cg.uses_exc {
+            let sym = cg.ctask_sym.expect("CTask region");
+            cg.addr_global(SCRATCH, sym);
+            cg.asm.msr_tpidr_el0(SCRATCH);
+        }
         // At the ELF entry the kernel leaves the initial stack as
         // `[sp]=argc, [sp+8..]=argv[0..argc], NULL, envp[..], NULL, …`. `_main`
         // captures argc/argv/envp from x0/x1/x2 (the Darwin libc convention), so the
-        // freestanding `_start` materialises them there from the stack before the call
-        // (otherwise `_main` reads stale registers — argc came out 0). Gated on use so
-        // an arg-free program's entry is byte-for-byte unchanged.
+        // freestanding `_start` must materialise them in those registers from the
+        // stack before the call. Without this `_main` reads stale registers and argc
+        // comes out 0. Gated on use, so an arg-free program's entry is unchanged.
         if cg.uses_args || cg.uses_env {
             cg.asm.load_mem(0, SP, 8, false); // x0 = [sp] = argc
         }
@@ -308,9 +348,9 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
         cg.emit_fs_runtime();
     }
 
-    // Freestanding: no symbol table or linker — the image is the executable. For
-    // now (no globals/strings/libc lowered yet) any leftover relocation means the
-    // program uses a feature not ported to the freestanding backend.
+    // Freestanding: there is no symbol table or linker, so the image is the
+    // executable. No globals/strings/libc are lowered yet, so any leftover
+    // relocation means the program uses a feature not ported to this backend.
     if cg.freestanding {
         let image = cg.asm.finish()?;
         if !image.relocs.is_empty() {
@@ -324,10 +364,11 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
         return Ok(target.write_executable(&image.text, cg.bss_size));
     }
 
-    // Symbol table: defined (`_main` + funcs, in __text) then common globals. The
-    // *label ids* are collected now; their byte offsets are read from the finished
-    // image (post-peephole), since `finish` removes dead words and shifts positions —
-    // a pre-`finish` offset would land past the shrunken `__text` and ld would warn.
+    // Symbol table: the defined symbols (`_main` + funcs, in __text), then the
+    // common globals. The label ids are collected now, but their byte offsets are
+    // read from the finished image (post-peephole): `finish` removes dead words and
+    // shifts positions, so a pre-`finish` offset would land past the shrunken
+    // `__text` and `ld` would warn.
     let mut defined_labels = vec![("_main".to_string(), main_label)];
     for item in &program.items {
         if let StmtKind::Func(f) = &item.kind {
@@ -360,8 +401,8 @@ fn compile(program: &Program, target: &dyn ArmTarget) -> Result<Vec<u8>, Codegen
             Ok((name, off))
         })
         .collect::<Result<_, CodegenError>>()?;
-    // Hand the machine code + symbolic relocations to the target's object
-    // writer, which lowers the relocations and packages the relocatable object.
+    // Hand the machine code and symbolic relocations to the target's object writer,
+    // which lowers the relocations and packages the relocatable object.
     Ok(target.write_object(&image, &defined, &commons, ndefined))
 }
 
@@ -411,9 +452,9 @@ struct FnInfo {
 }
 
 /// A local variable's location. Normally the value lives in the frame at
-/// `x29 - off`. For an array parameter (which decays to a pointer, C-style),
-/// `indirect` is set: the slot at `x29 - off` holds a *pointer* to the data. A
-/// `reg`-promoted local (a non-address-taken scalar — see `plan_registers`)
+/// `x29 - off`. For an array parameter, which decays to a pointer C-style,
+/// `indirect` is set: the slot at `x29 - off` then holds a pointer to the data. A
+/// register-promoted local (a non-address-taken scalar; see `plan_registers`)
 /// instead lives entirely in a callee-saved register and has no frame slot.
 #[derive(Clone)]
 struct VarLoc {
@@ -438,9 +479,9 @@ struct Cg {
     globals: HashMap<String, GlobalInfo>,
     global_order: Vec<String>,
     scopes: Vec<HashMap<String, VarLoc>>,
-    /// Bytes of frame used below x29: `depth` is the current bump pointer (reclaimed
-    /// after a call's transient variadic buffer), `max_depth` the high-water mark the
-    /// frame is sized to.
+    /// Bytes of frame used below x29. `depth` is the current bump pointer, reclaimed
+    /// after a call's transient variadic buffer; `max_depth` is the high-water mark
+    /// the frame is sized to.
     depth: u32,
     max_depth: u32,
     break_targets: Vec<usize>,
@@ -454,9 +495,9 @@ struct Cg {
     /// Locals promoted to callee-saved registers in the current function:
     /// name -> register (x19..x28). See `plan_registers`.
     promote: HashMap<String, u32>,
-    /// Callee-saved registers used by the current function and where their
-    /// incoming value is spilled, as `(reg, frame_off)` — saved in the prologue
-    /// and restored in every epilogue.
+    /// Callee-saved registers used by the current function, with where each one's
+    /// incoming value is spilled, as `(reg, frame_off)`. Saved in the prologue and
+    /// restored in every epilogue.
     cs_saves: Vec<(u32, u32)>,
     /// Whether the program calls `ArgC`/`ArgV`. When set, the `_main` entry
     /// captures the incoming argc/argv (x0/x1) into the hidden globals below.
@@ -475,21 +516,44 @@ struct Cg {
     /// `MAlloc` and `HeapExtend`, allocated once.
     heap_fs_off: Option<(u64, u64)>,
     /// Freestanding BSS layout: each global symbol's byte offset within the BSS
-    /// region that follows code+strings, and the running total size. Globals are
-    /// addressed by a self-resolved `ADR` to `text_end + offset` (no relocations);
-    /// runtime scratch (allocator state, …) is bump-allocated here too.
+    /// region that follows code+strings, plus the running total size. Globals are
+    /// addressed by a self-resolved `ADR` to `text_end + offset`, needing no
+    /// relocations. Runtime scratch (allocator state, etc.) is bump-allocated here
+    /// too.
     global_bss: HashMap<u32, u64>,
     bss_size: u64,
     /// Freestanding builtin runtime routines (name -> label), emitted once at the
     /// end of `__text` in place of the libc calls the hosted backends make.
     fs_routines: HashMap<&'static str, usize>,
+    /// Symbol of the hidden process-global `CTask` region used by the **freestanding**
+    /// targets for the implicit `Fs` (single-task; the clone-path per-thread upgrade is
+    /// future work). On hosted (Darwin) targets `Fs` is per-thread via pthread TLS, so
+    /// this is unused there.
+    ctask_sym: Option<u32>,
+    /// Whether the program uses `Fs`/exceptions at all (drives the per-thread setup).
+    uses_exc: bool,
+    /// (Darwin) Symbol of the hidden `pthread_key_t` for the per-thread `CTask`,
+    /// created once in `_main`.
+    fs_key_sym: Option<u32>,
+    /// (Darwin) Frame slot caching this function's `CTask*`, computed once in the
+    /// prologue (thread-invariant within a function) so each `Fs` access is a cheap
+    /// load instead of a TLS call. `None` if this function never touches `Fs`.
+    fs_slot: Option<u32>,
 }
 
-/// Hidden globals holding the command line, populated at the entry (only when the
-/// program uses `ArgC`/`ArgV`). Common symbols, like the RNG state word.
+/// Hidden globals holding the command line and environment, populated at the entry
+/// only when the program uses `ArgC`/`ArgV`/`EnvP`. They are ordinary common symbols.
 const ARGC_GLOBAL: &str = "__solomon_holyc_argc";
 const ARGV_GLOBAL: &str = "__solomon_holyc_argv";
 const ENVP_GLOBAL: &str = "__solomon_holyc_envp";
+/// Hidden `CTask` region backing the implicit `Fs` global (exception state).
+const CTASK_GLOBAL: &str = "__solomon_holyc_ctask";
+/// Hidden `pthread_key_t` for the per-thread `CTask` (Darwin/hosted TLS).
+const FSKEY_GLOBAL: &str = "__solomon_holyc_fs_key";
+/// `ExcFrame` size on AArch64: prev, saved_sp, saved_fp, landing_pad (4×8=32) plus the
+/// callee-saved set saved at `try` and restored by `throw` — x19..x28 (10×8) and
+/// d8..d15 (8×8). 32 + 80 + 64 = 176, a 16-byte multiple.
+const EXC_FRAME_SIZE: u32 = 176;
 
 impl Cg {
     fn new(layouts: Layouts) -> Self {
@@ -518,6 +582,10 @@ impl Cg {
             global_bss: HashMap::new(),
             bss_size: 0,
             fs_routines: HashMap::new(),
+            ctask_sym: None,
+            uses_exc: false,
+            fs_key_sym: None,
+            fs_slot: None,
         }
     }
 
@@ -532,7 +600,7 @@ impl Cg {
     }
 
     /// Reserve `size` bytes of freestanding BSS at `align`, returning the offset of
-    /// its first byte (relative to the BSS base = end of code+strings).
+    /// its first byte relative to the BSS base (the end of code+strings).
     fn alloc_bss_fs(&mut self, size: u64, align: u64) -> u64 {
         let a = align.max(1);
         let off = self.bss_size.div_ceil(a) * a;
@@ -553,6 +621,65 @@ impl Cg {
         }
     }
 
+    /// Load the current task pointer (`CTask *Fs`) into `dst`. Hosted (Darwin): the
+    /// per-thread `CTask*` cached in this function's `fs_slot` (a cheap load, no call).
+    /// Freestanding: the address of the process-global `CTask` region (single-task).
+    fn gen_fs_ptr(&mut self, dst: u32) {
+        if self.freestanding {
+            // Per-thread: the kernel-managed user thread pointer holds this thread's
+            // `CTask` (set at `_start` for the main thread, in the `clone` child for
+            // spawned threads).
+            self.asm.mrs_tpidr_el0(dst);
+        } else {
+            let slot = self
+                .fs_slot
+                .expect("Fs accessed in a function with no cached task slot");
+            self.asm.ldur(dst, FP, -(slot as i32));
+        }
+    }
+
+    /// (Darwin) Compute the current thread's `CTask*` via pthread TLS and cache it in
+    /// `slot`. On first access per thread it lazily `malloc`s and zeroes a `CTask` and
+    /// `pthread_setspecific`s it, so both the main thread and pthread-spawned threads
+    /// get independent exception state with no change to the spawn path.
+    fn emit_fs_cache(&mut self, slot: u32) {
+        let key = self.fs_key_sym.expect("fs key not registered");
+        let size = self.type_size(&Type::Named("CTask".to_string())).max(8);
+        let have = self.asm.new_label();
+        let done = self.asm.new_label();
+        let soff = -(slot as i32);
+        // x0 = pthread_getspecific(*key)
+        self.addr_global(0, key);
+        self.asm.load_mem(0, 0, 8, false);
+        self.asm.bl_extern("_pthread_getspecific");
+        self.asm.cbnz(0, have);
+        // First access on this thread: x0 = malloc(sizeof CTask), zero it, set self.
+        self.asm.load_imm(0, size as i64);
+        self.asm.bl_extern("_malloc");
+        let mut off = 0;
+        while off < size {
+            self.asm.store_mem_off(31, 0, off, 8); // xzr -> [x0 + off]
+            off += 8;
+        }
+        self.asm.store_mem_off(0, 0, 0, 8); // self-pointer = x0
+        self.asm.stur(0, FP, soff); // cache the new task
+        // pthread_setspecific(*key, ptr)
+        self.addr_global(0, key);
+        self.asm.load_mem(0, 0, 8, false); // x0 = key
+        self.asm.ldur(1, FP, soff); // x1 = ptr
+        self.asm.bl_extern("_pthread_setspecific");
+        self.asm.b(done);
+        // Existing task on this thread: cache the pointer getspecific returned.
+        self.asm.place(have);
+        self.asm.stur(0, FP, soff);
+        self.asm.place(done);
+    }
+
+    /// Byte offset of a `CTask` field (`except_ch`/`catch_except`/`exc_top`).
+    fn ctask_off(&self, field: &str) -> u32 {
+        self.layouts.offset_of("CTask", field).unwrap_or(0) as u32
+    }
+
     // ---- type helpers ----
 
     fn type_size(&self, ty: &Type) -> u32 {
@@ -570,7 +697,7 @@ impl Cg {
     fn alloc(&mut self, size: u32, align: u32) -> u32 {
         let a = align.max(1);
         self.depth = (self.depth + size).div_ceil(a) * a;
-        // `max_depth` is the high-water mark — the frame is sized to it, so reclaiming
+        // `max_depth` is the high-water mark the frame is sized to, so reclaiming
         // `depth` (a call's transient variadic buffer) never shrinks the frame.
         self.max_depth = self.max_depth.max(self.depth);
         self.depth
@@ -648,6 +775,7 @@ impl Cg {
         self.labels.clear();
         self.cur_ret = ret.clone();
         self.sret_off = None;
+        self.fs_slot = None;
         self.promote = plan_registers(params, body);
         self.cs_saves.clear();
 
@@ -660,10 +788,10 @@ impl Cg {
         self.asm.mov_fp_sp(); // x29 = sp
         let sub_idx = self.asm.emit_sub_sp_placeholder();
 
-        // Spill the incoming value of every callee-saved register we'll reuse for
-        // a promoted local, near x29 (one STUR each). Restored in every epilogue.
-        // Distinct registers only — with live-range sharing several locals may map
-        // to the same register, but it is saved/restored once.
+        // Spill the incoming value of every callee-saved register we reuse for a
+        // promoted local, near x29 (one STUR each), restored in every epilogue. Only
+        // distinct registers: with live-range sharing several locals may map to one
+        // register, but it is saved and restored once.
         let mut used: Vec<u32> = self.promote.values().copied().collect();
         used.sort_unstable();
         used.dedup();
@@ -823,6 +951,23 @@ impl Cg {
             self.addr_global(SCRATCH, esym);
             self.asm.store_mem(2, SCRATCH, 8); // __envp = x2
         }
+        // Per-thread exception state (Darwin/hosted). Done after the argc/env capture
+        // (which reads x0/x1/x2) since this clobbers the arg registers. `_main` creates
+        // the pthread TLS key once; any function that touches `Fs` then caches this
+        // thread's `CTask*` for the rest of its body.
+        if !self.freestanding && self.uses_exc {
+            if is_main {
+                let key = self.fs_key_sym.expect("fs key");
+                self.addr_global(0, key); // x0 = &key
+                self.asm.load_imm(1, 0); // x1 = NULL destructor
+                self.asm.bl_extern("_pthread_key_create");
+            }
+            if crate::ast::stmts_use_fs_or_exceptions(body) {
+                let slot = self.alloc(8, 8);
+                self.fs_slot = Some(slot);
+                self.emit_fs_cache(slot);
+            }
+        }
 
         for &s in body {
             // Top-level declarations are globals (allocated by the linker as
@@ -873,6 +1018,7 @@ impl Cg {
     fn gen_stmt(&mut self, s: &Stmt) -> Result<(), CodegenError> {
         match &s.kind {
             StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached codegen"),
+            StmtKind::TypeSwitch { .. } => unreachable!("type switch reached codegen"),
             StmtKind::Empty | StmtKind::Include(_) => {}
 
             StmtKind::Label(name) => {
@@ -973,7 +1119,7 @@ impl Cg {
                             self.gen_store(RES, T2, &d.ty);
                         }
                         // An uninitialised aggregate is zero-filled, matching the
-                        // interpreter (the conformance oracle) — without this, its
+                        // interpreter (the conformance oracle). Without this, its
                         // elements/fields would read back as stack garbage.
                         None => self.gen_zero_slot(off, size),
                     }
@@ -1059,6 +1205,9 @@ impl Cg {
             | StmtKind::SwitchStart
             | StmtKind::SwitchEnd => {}
 
+            StmtKind::Try { body, handler } => self.gen_try(body, handler)?,
+            StmtKind::Throw(val) => self.gen_throw(val)?,
+
             StmtKind::Func(_) | StmtKind::Class(_) => {
                 return Err(CodegenError::at(
                     s.span.pos,
@@ -1069,24 +1218,152 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower a `switch`. The control structure (partition, dispatch, body) is the
-    /// shared [`crate::backend::gen_switch`] driver; this backend supplies the leaf
-    /// emits via [`SwitchEmitter`], including the O(1) jump-table fast path.
+    /// Lower a `switch`. The control structure (partition, dispatch, body) comes from
+    /// the shared [`crate::backend::gen_switch`] driver. This backend supplies the
+    /// leaf emits via [`crate::backend::Emitter`], including the O(1) jump-table fast
+    /// path.
     fn gen_switch(&mut self, cond: &Expr, body: &Stmt, pos: Pos) -> Result<(), CodegenError> {
         crate::backend::gen_switch(self, cond, body, pos)
     }
 
+    /// Terminate the process with the exit code already in `x0` (never returns).
+    fn emit_exit(&mut self) {
+        if self.freestanding {
+            self.asm.load_imm(8, 94); // SYS_exit_group
+            self.asm.svc();
+        } else {
+            self.asm.bl_extern("_exit");
+        }
+    }
+
+    /// Lower `try { body } catch { handler }`. A handler frame (an `ExcFrame`) is built
+    /// on the stack and pushed onto the per-task chain (`Fs->exc_top`); the `catch`
+    /// block is the longjmp landing pad. On normal completion the frame is popped and
+    /// the handler is skipped. See [`Cg::gen_throw`] for the unwinding side. Registers
+    /// x11/x12/x13 are caller-saved scratch (x16–x18 are reserved on Darwin).
+    fn gen_try(&mut self, body: &[Stmt], handler: &[Stmt]) -> Result<(), CodegenError> {
+        let ef = self.alloc(EXC_FRAME_SIZE, 16); // &ExcFrame == FP - ef
+        let exctop = self.ctask_off("exc_top");
+        let catchex = self.ctask_off("catch_except");
+        let catch_l = self.asm.new_label();
+        let after_l = self.asm.new_label();
+
+        // x11 = &ExcFrame, x12 = CTask*
+        self.asm.sub_imm(11, FP, ef);
+        self.gen_fs_ptr(12);
+        // frame.prev = Fs->exc_top
+        self.asm.load_mem_off(13, 12, exctop, 8, false);
+        self.asm.store_mem_off(13, 11, 0, 8);
+        // frame.saved_sp = sp ; frame.saved_fp = x29 ; frame.landing_pad = &catch
+        self.asm.add_imm(13, SP, 0);
+        self.asm.store_mem_off(13, 11, 8, 8);
+        self.asm.store_mem_off(FP, 11, 16, 8);
+        self.asm.adr_label(13, catch_l);
+        self.asm.store_mem_off(13, 11, 24, 8);
+        // Save the full callee-saved set (x19..x28, d8..d15) so `throw` can restore the
+        // caller's values that abandoned callees may have clobbered.
+        for i in 0..10u32 {
+            self.asm.stur(19 + i, 11, (32 + i * 8) as i32);
+        }
+        for i in 0..8u32 {
+            self.asm.fstur(8 + i, 11, (112 + i * 8) as i32);
+        }
+        // Fs->exc_top = &ExcFrame
+        self.asm.store_mem_off(11, 12, exctop, 8);
+
+        // try body
+        for s in body {
+            self.gen_stmt(s)?;
+        }
+
+        // Normal completion: pop the handler (Fs->exc_top = frame.prev), skip the catch.
+        // The body may have made calls, so recompute the scratch values.
+        self.asm.sub_imm(11, FP, ef);
+        self.gen_fs_ptr(12);
+        self.asm.load_mem_off(13, 11, 0, 8, false);
+        self.asm.store_mem_off(13, 12, exctop, 8);
+        self.asm.b(after_l);
+
+        // Landing pad: `throw` jumps here with sp/fp/callee-saved already restored,
+        // `exc_top` popped, `except_ch` set, and `catch_except` = 1.
+        self.asm.place(catch_l);
+        for s in handler {
+            self.gen_stmt(s)?;
+        }
+        // Clear catch_except after the handler, matching the interpreter.
+        self.gen_fs_ptr(12);
+        self.asm.load_imm(13, 0);
+        self.asm.store_mem_off(13, 12, catchex, 8);
+
+        self.asm.place(after_l);
+        Ok(())
+    }
+
+    /// Lower `throw expr;` (or a bare `throw;`). Sets `Fs->except_ch`, then unwinds to
+    /// the nearest handler: restores its saved callee-saved set / sp / fp from the
+    /// `ExcFrame`, pops it, sets `catch_except` = 1, and branches to its landing pad.
+    /// An empty handler chain means an uncaught exception, which exits the process.
+    fn gen_throw(&mut self, val: &Option<Expr>) -> Result<(), CodegenError> {
+        let except = self.ctask_off("except_ch");
+        let exctop = self.ctask_off("exc_top");
+        let catchex = self.ctask_off("catch_except");
+
+        // x13 = the value to raise (computed before any further bookkeeping, since the
+        // expression may itself call functions and clobber scratch).
+        match val {
+            Some(e) => {
+                self.gen_int_expr(e, &Type::I64)?; // RES
+                self.asm.mov_reg(13, RES);
+            }
+            None => {
+                // Bare `throw;` re-raises the current `Fs->except_ch`.
+                self.gen_fs_ptr(12);
+                self.asm.load_mem_off(13, 12, except, 8, false);
+            }
+        }
+        // Fs->except_ch = x13
+        self.gen_fs_ptr(12);
+        self.asm.store_mem_off(13, 12, except, 8);
+        // x11 = f = Fs->exc_top; if NULL, the exception is uncaught.
+        self.asm.load_mem_off(11, 12, exctop, 8, false);
+        let live = self.asm.new_label();
+        self.asm.cbnz(11, live);
+        self.asm.mov_reg(0, 13); // exit code = thrown value
+        self.emit_exit();
+        self.asm.place(live);
+        // Restore the saved callee-saved set, then sp and fp, from the handler frame.
+        for i in 0..10u32 {
+            self.asm.ldur(19 + i, 11, (32 + i * 8) as i32);
+        }
+        for i in 0..8u32 {
+            self.asm.fldur(8 + i, 11, (112 + i * 8) as i32);
+        }
+        self.asm.load_mem_off(13, 11, 8, 8, false); // saved_sp
+        self.asm.add_imm(SP, 13, 0);
+        self.asm.load_mem_off(FP, 11, 16, 8, false); // saved_fp
+        // Fs->exc_top = f.prev (x12 still holds CTask*, untouched by the restores).
+        self.asm.load_mem_off(13, 11, 0, 8, false);
+        self.asm.store_mem_off(13, 12, exctop, 8);
+        // catch_except = 1
+        self.asm.load_imm(13, 1);
+        self.asm.store_mem_off(13, 12, catchex, 8);
+        // Jump to the handler's landing pad.
+        self.asm.load_mem_off(13, 11, 24, 8, false);
+        self.asm.br(13);
+        Ok(())
+    }
+
     /// Try to dispatch a switch through an O(1) jump table instead of a linear
-    /// compare-chain. Returns `Ok(true)` when it emitted the table (the caller
-    /// then skips the compare-chain), `Ok(false)` to fall back.
+    /// compare-chain. Returns `Ok(true)` when it emitted the table, so the caller
+    /// skips the compare-chain; `Ok(false)` to fall back.
     ///
-    /// Fires only when every `case` value is a compile-time integer constant and
-    /// the covered value span is small/dense enough to be worth a table. The
-    /// table is `span` 32-bit offset words (`table[k] = label_k - table`);
-    /// dispatch is `idx = v - min`, an unsigned bounds check, then
+    /// Fires only when every `case` value is a compile-time integer constant and the
+    /// covered value span is small and dense enough to be worth a table. The table is
+    /// `span` 32-bit offset words (`table[k] = label_k - table`). Dispatch is
+    /// `idx = v - min`, then an unsigned bounds check, then
     /// `LDRSW off, [table, idx, lsl #2]; BR (table + off)`. Out-of-range and gap
-    /// values go to `gap_target` (the switch's default / epilogue / exit), and
-    /// overlapping ranges resolve to the first covering case — both matching the
+    /// values go to `gap_target` (the switch's default, epilogue, or exit), and
+    /// overlapping ranges resolve to the first covering case. Both match the
     /// compare-chain's semantics.
     fn try_gen_branch_table(
         &mut self,
@@ -1150,7 +1427,7 @@ impl Cg {
         self.asm.adr_label(T2, table); // T2 = &table
         self.asm.ldrsw_reg(SCRATCH, T2, RES); // SCRATCH = table[idx] (signed)
         self.asm.add(T2, T2, SCRATCH); // T2 = &table + offset = target
-        self.asm.br(T2); // unconditional — the table data below is never run as code
+        self.asm.br(T2); // unconditional: the table data below never runs as code
         self.asm.place(table);
         for slot in slots {
             self.asm.table_word(table, slot);
@@ -1251,8 +1528,9 @@ impl Cg {
     }
 
     /// Emit a brace/designated initialiser into the aggregate at `place`. The
-    /// recursion/dispatch is the shared [`crate::backend::gen_init_into`] driver;
-    /// this backend supplies the leaf stores via [`InitEmitter`].
+    /// recursion and dispatch come from the shared
+    /// [`crate::backend::gen_init_into`] driver; this backend supplies the leaf
+    /// stores via [`crate::backend::Emitter`].
     fn gen_init_into(
         &mut self,
         place: Place,
@@ -1266,10 +1544,10 @@ impl Cg {
     // ---- expressions: value -> RES ----
 
     /// Evaluate `e` to an integer in RES for storage into a `target`-typed slot.
-    /// Identical to `gen_expr` except that converting an F64 source to an
-    /// **unsigned** integer target uses `fcvtzu` instead of the default `fcvtzs`
-    /// (they differ past `I64::MAX` and for negatives) — matching C and the
-    /// interpreter's `cast_value`.
+    /// Identical to `gen_expr` except when converting an F64 source to an unsigned
+    /// integer target: it then uses `fcvtzu` instead of the default `fcvtzs`. The two
+    /// differ past `I64::MAX` and for negatives. This matches C and the interpreter's
+    /// `cast_value`.
     fn gen_int_expr(&mut self, e: &Expr, target: &Type) -> Result<(), CodegenError> {
         if is_unsigned_int(target) && is_f64(&self.expr_ty(e)) {
             self.gen_fexpr(e)?;
@@ -1282,19 +1560,19 @@ impl Cg {
 
     fn gen_expr(&mut self, e: &Expr) -> Result<(), CodegenError> {
         // F64-typed expressions are evaluated into the FP register file. This
-        // function's contract is "integer/pointer result in RES", so when an
-        // F64 value reaches here it is in integer context (assignment to an int
-        // slot, an int parameter/return, an int array element, …) and must be
-        // truncated to an integer — matching C / the interpreter — rather than
-        // having its raw bit pattern stored.
+        // function's contract is "integer/pointer result in RES", so an F64 value
+        // reaching here is in integer context: assignment to an int slot, an int
+        // parameter/return, an int array element, and so on. It must be truncated to
+        // an integer (matching C and the interpreter), not stored as its raw bit
+        // pattern.
         if is_f64(&self.expr_ty(e)) {
             self.gen_fexpr(e)?;
             self.asm.fcvtzs(RES, FRES);
             return Ok(());
         }
         // Constant-fold a compile-time integer expression to a single `load_imm`.
-        // `const_eval_i64` mirrors the runtime arithmetic exactly (and only
-        // succeeds for pure-integer operand trees), so this can't change behavior.
+        // `const_eval_i64` mirrors the runtime arithmetic exactly and only succeeds
+        // for pure-integer operand trees, so this can't change behavior.
         if matches!(&e.kind, ExprKind::Binary { .. } | ExprKind::Unary { .. }) {
             if let Some(n) = const_eval_i64(e) {
                 self.asm.load_imm(RES, n);
@@ -1395,8 +1673,14 @@ impl Cg {
             "TRUE" => return Ok(self.asm.load_imm(RES, 1)),
             _ => {}
         }
-        // The command line `ArgC` (count) / `ArgV` (the `U8 **` base) are implicit
-        // globals captured at the entry — unless a user variable shadows them.
+        // `Fs` is the implicit `CTask *` task pointer: its value is the address of the
+        // task region (no load), unless shadowed by a local.
+        if name == "Fs" && self.lookup(name).is_none() && self.ctask_sym.is_some() {
+            self.gen_fs_ptr(RES);
+            return Ok(());
+        }
+        // `ArgC` (count), `ArgV` (the `U8 **` base), and `EnvP` are implicit globals
+        // captured at the entry, unless a user variable shadows them.
         if self.lookup(name).is_none() && matches!(name, "ArgC" | "ArgV" | "EnvP") {
             let g = match name {
                 "ArgC" => ARGC_GLOBAL,
@@ -1699,10 +1983,10 @@ impl Cg {
         Ok(())
     }
 
-    /// Immediate-form fast paths for `<expr> op <small constant>` (and the
-    /// commutative `<const> + <expr>`): emit the operation against an immediate
+    /// Immediate-form fast paths for `<expr> op <small constant>`, and the
+    /// commutative `<const> + <expr>`: emit the operation against an immediate
     /// instead of materializing the constant in a register. Returns whether it
-    /// handled the op. (Fully-constant expressions already fold in `gen_expr`.)
+    /// handled the op. Fully-constant expressions already fold in `gen_expr`.
     fn try_imm_binop(
         &mut self,
         op: BinOp,
@@ -1712,7 +1996,7 @@ impl Cg {
         rt: &Type,
     ) -> Result<bool, CodegenError> {
         use BinOp::*;
-        // Add is commutative — the constant may be on either side.
+        // Add is commutative, so the constant may be on either side.
         if op == Add {
             let (var, k) = match (const_eval_i64(lhs), const_eval_i64(rhs)) {
                 (_, Some(k)) => (lhs, k),
@@ -1726,8 +2010,8 @@ impl Cg {
             self.emit_addsub_imm(sub, imm);
             return Ok(true);
         }
-        // Multiplication by a constant power of two is a left shift (commutative,
-        // signedness-independent — both wrap mod 2^64).
+        // Multiplication by a constant power of two is a left shift. It is
+        // commutative and signedness-independent, since both wrap mod 2^64.
         if op == Mul {
             let (var, k) = match (const_eval_i64(lhs), const_eval_i64(rhs)) {
                 (_, Some(k)) => (lhs, k),
@@ -1754,9 +2038,9 @@ impl Cg {
                 self.emit_addsub_imm(sub, imm);
                 Ok(true)
             }
-            // Unsigned divide / modulo by a power of two reduce to a logical
-            // shift / a low-bits mask. (Signed needs a bias to round toward zero,
-            // so it keeps the generic SDIV/MSUB path.)
+            // Unsigned divide/modulo by a power of two reduce to a logical shift or a
+            // low-bits mask. Signed needs a bias to round toward zero, so it keeps the
+            // generic SDIV/MSUB path.
             Div if is_unsigned_int(lt) => match log2_pow2(k) {
                 Some(sh) => {
                     self.gen_expr(lhs)?;
@@ -1863,7 +2147,7 @@ impl Cg {
             BitXor => self.asm.eor(rd, rn, rm),
             Shl => self.asm.lslv(rd, rn, rm),
             // `>>` is arithmetic for a signed left operand, logical for unsigned
-            // (C semantics) — matching the interpreter.
+            // (C semantics), matching the interpreter.
             Shr if signed => self.asm.asrv(rd, rn, rm),
             Shr => self.asm.lsrv(rd, rn, rm),
             other => {
@@ -2201,19 +2485,17 @@ impl Cg {
     // ---- calls & printing ----
 
     fn gen_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        // A name that is neither a registered builtin nor a primitive intrinsic is an
-        // ordinary function call — even if it shares a name with a former builtin now
-        // living in the stdlib (`Sign`, `StrToUpper`, `StrRev`, `StrLen`, …). Skip the
-        // bespoke lowering and call the compiled body. A **compiled user function also
-        // shadows a like-named primitive** (a program's own `Join`/`Read`): `funcs`
-        // holds only real definitions (bodyless lib prototypes aren't compiled), so its
-        // presence means "call the body." (Primitive intrinsics — the printf family,
-        // heap, clock, sockets, threads — otherwise fall through to the name-keyed
-        // lowering below; an optimization intrinsic like `Sqrt` is intercepted earlier,
-        // in `gen_call_expr`.)
-        if self.funcs.contains_key(name)
-            || (!crate::builtins::is_builtin(name) && !crate::intrinsics::is_primitive(name))
-        {
+        // A name that is not a primitive intrinsic is an ordinary function call, even
+        // if it shares a name with a former builtin now living in the stdlib (`Sign`,
+        // `StrToUpper`, `StrRev`, `StrLen`, …): skip the bespoke lowering and call the
+        // compiled body. A compiled user function also shadows a like-named primitive
+        // (a program's own `Join`/`Read`). `funcs` holds only real definitions —
+        // bodyless lib prototypes aren't compiled — so a present entry means "call the
+        // body." Primitive intrinsics (the printf family, heap, clock, sockets,
+        // threads) otherwise fall through to the name-keyed lowering below; an
+        // optimization intrinsic like `Sqrt` is intercepted earlier, in
+        // `gen_call_expr`.
+        if self.funcs.contains_key(name) || !crate::intrinsics::is_primitive(name) {
             return self.emit_user_call(name, args, pos);
         }
         // Clock/time primitives. UnixNS = CLOCK_REALTIME, NanoNS = CLOCK_MONOTONIC.
@@ -2225,7 +2507,7 @@ impl Cg {
         }
         // POSIX fd primitives. Freestanding lowers to raw Linux syscalls; hosted
         // Darwin calls libc. `Open` needs per-target massaging (an `openat` AT_FDCWD
-        // prepend freestanding, a Linux→macOS flag translation on Darwin); the rest
+        // prepend freestanding, a Linux→macOS flag translation on Darwin). The rest
         // map their args straight to the syscall/libc registers.
         if name == "Exit" {
             self.gen_expr(&args[0])?; // RES = code
@@ -2234,7 +2516,7 @@ impl Cg {
                 self.asm.load_imm(8, 94); // x8 = SYS_exit_group
                 self.asm.svc();
             } else {
-                self.asm.bl_extern("_exit"); // libc exit(code) — never returns
+                self.asm.bl_extern("_exit"); // libc exit(code), never returns
             }
             return Ok(());
         }
@@ -2258,9 +2540,9 @@ impl Cg {
                 };
                 self.asm.bl_extern(sym);
                 self.asm.mov_reg(RES, 0);
-                // `pid_t` is a signed int; `uid_t`/`gid_t` are unsigned — but every real
-                // id is a small non-negative value, so a 32-bit extend (either
-                // signedness) yields the same result.
+                // `pid_t` is a signed int; `uid_t`/`gid_t` are unsigned. Every real id
+                // is a small non-negative value, so a 32-bit extend of either
+                // signedness yields the same result.
                 let ty = if matches!(name, "Getuid" | "Getgid") {
                     Type::U32
                 } else {
@@ -2295,7 +2577,7 @@ impl Cg {
         if name == "Join" {
             return self.gen_join(args, pos);
         }
-        // Atomics (`sync.hc`) — hardware `ldaxr`/`stlxr` loops, acquire/release.
+        // Atomics (`sync.hc`): hardware `ldaxr`/`stlxr` loops, acquire/release.
         if matches!(
             name,
             "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas"
@@ -2310,8 +2592,8 @@ impl Cg {
             return self.gen_futex(name, args, pos);
         }
         // `HeapExtend`: the in-place bump-grow primitive. Freestanding has a real
-        // implementation; the hosted libc heap exposes no in-place API, so it returns
-        // NULL — `ReAlloc` then takes the copy path, where libc `free` reclaims.
+        // implementation. The hosted libc heap exposes no in-place API, so it returns
+        // NULL; `ReAlloc` then takes the copy path, where libc `free` reclaims.
         if name == "HeapExtend" {
             if self.freestanding {
                 return self.gen_builtin_fs(name, args, pos);
@@ -2322,9 +2604,9 @@ impl Cg {
             self.asm.load_imm(RES, 0);
             return Ok(());
         }
-        // `MSize(ptr)` — the requested size from `ptr`'s header (`*(ptr-16)`), 0 for
+        // `MSize(ptr)`: the requested size from `ptr`'s header (`*(ptr-16)`), or 0 for
         // NULL. Freestanding uses an emitted routine; hosted reads the header inline.
-        // (Only reached when the program uses `MSize`, so every block has a header.)
+        // Only reached when the program uses `MSize`, so every block has a header.
         if name == "MSize" {
             if self.freestanding {
                 return self.gen_builtin_fs(name, args, pos);
@@ -2361,15 +2643,15 @@ impl Cg {
             self.asm.bl_extern("_free");
             return Ok(());
         }
-        // Freestanding: lower libc-backed builtins to emitted AArch64 routines (or
-        // inline sequences) instead of libc calls.
-        if self.freestanding && crate::builtins::libc_symbol(name).is_some() {
+        // Freestanding: lower the libc-backed heap primitives to emitted AArch64
+        // routines (the `mmap` bump allocator) instead of libc calls.
+        if self.freestanding && libc_symbol(name).is_some() {
             return self.gen_builtin_fs(name, args, pos);
         }
-        // A libc-backed builtin (`Sqrt`/`Fabs`/`MAlloc`/`Free` →
-        // `_sqrt`/`_fabs`/…) is an external call; its argument classes come from the
-        // inferred call-site types and its return type from the builtin registry.
-        if let Some(sym) = crate::builtins::libc_symbol(name) {
+        // The hosted (Darwin) heap primitives `MAlloc`/`Free` lower to libc
+        // `_malloc`/`_free` (an external call); the argument classes come from the
+        // inferred call-site types and the return type is the heap signature.
+        if let Some(sym) = libc_symbol(name) {
             let params: Vec<Param> = args
                 .iter()
                 .map(|a| Param {
@@ -2379,7 +2661,7 @@ impl Cg {
                     span: Span::dummy(),
                 })
                 .collect();
-            let ret = crate::builtins::ret_of(name).unwrap_or(Type::I64);
+            let ret = Type::I64;
             self.emit_call(
                 CallTarget::Extern(sym),
                 &params,
@@ -2452,7 +2734,7 @@ impl Cg {
         self.gen_expr(&args[1])?; // RES = flags (Linux values)
         if !self.freestanding {
             // macos = (f & 3) | (O_CREAT 0x40→0x200) | (O_TRUNC 0x200→0x400) |
-            //         (O_APPEND 0x400→0x8) — each `from`-bit moved to its `to`-bit.
+            //         (O_APPEND 0x400→0x8): each `from`-bit moved to its `to`-bit.
             self.asm.and_imm_lowbits(T2, RES, 2); // access mode (low 2 bits)
             for (from, to) in [(6u32, 9u32), (9, 10), (10, 3)] {
                 self.asm.lsr_imm(SCRATCH, RES, from);
@@ -2486,9 +2768,9 @@ impl Cg {
             self.asm.add_sp_imm(16);
             self.asm.mov_reg(RES, 0); // open's return is in x0
             self.gen_cast(&Type::I32); // sign-extend the libc `int` return
-            // libc `open` returns -1 and stashes the reason in `errno`; the
+            // libc `open` returns -1 and stashes the reason in `errno`. The
             // freestanding path already yields `-errno`, so convert here too:
-            // `if (ret < 0) ret = -*__error();` (`___error()` is errno's address).
+            // `if (ret < 0) ret = -*___error();` (`___error()` is errno's address).
             let ok = self.asm.new_label();
             self.asm.cmp_imm(RES, 0);
             self.asm.b_cond(COND_GE, ok);
@@ -2500,9 +2782,10 @@ impl Cg {
         Ok(())
     }
 
-    /// After a libc call whose `int` result is already in `RES`: convert the `-1`
-    /// failure to the `-errno` the freestanding syscalls return — `if (RES < 0) RES =
-    /// -*___error();` (`___error()` returns errno's address on Darwin).
+    /// After a libc call whose `int` result is already in `RES`, convert the `-1`
+    /// failure to the `-errno` the freestanding syscalls return:
+    /// `if (RES < 0) RES = -*___error();` (`___error()` returns errno's address on
+    /// Darwin).
     fn darwin_errno_neg(&mut self) {
         let ok = self.asm.new_label();
         self.asm.cmp_imm(RES, 0);
@@ -2514,10 +2797,11 @@ impl Cg {
     }
 
     /// Lower the filesystem/working-directory ops `Remove`/`Rename`/`Mkdir`/`Chdir`,
-    /// which all return 0 or `-errno`. Freestanding uses the aarch64 `*at` syscalls (no
-    /// bare `unlink`/`rename`/`mkdir`) with an `AT_FDCWD` prepend — `chdir` is a bare
-    /// syscall; Darwin calls libc and converts the `-1`/errno failure to `-errno`. Args
-    /// are evaluated onto the stack, then popped into the syscall/ABI registers.
+    /// which all return 0 or `-errno`. Freestanding uses the aarch64 `*at` syscalls
+    /// (there is no bare `unlink`/`rename`/`mkdir`) with an `AT_FDCWD` prepend; `chdir`
+    /// is a bare syscall. Darwin calls libc and converts the `-1`/errno failure to
+    /// `-errno`. Args are evaluated onto the stack, then popped into the syscall/ABI
+    /// registers.
     fn gen_fsop(&mut self, name: &str, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
         for a in args {
             self.gen_expr(a)?;
@@ -2577,10 +2861,10 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower `Getcwd(buf, size)` → 0 on success / `-errno`. Freestanding `getcwd`
-    /// returns the byte length (incl NUL) on success, so a non-negative result is
-    /// normalised to 0; Darwin libc `getcwd` returns `buf` (non-NULL) or NULL, so a
-    /// non-NULL result is 0 and NULL becomes `-errno`.
+    /// Lower `Getcwd(buf, size)` to 0 on success or `-errno`. Freestanding `getcwd`
+    /// returns the byte length (incl. NUL) on success, so a non-negative result is
+    /// normalised to 0. Darwin libc `getcwd` returns `buf` (non-NULL) or NULL, so a
+    /// non-NULL result becomes 0 and NULL becomes `-errno`.
     fn gen_getcwd(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
         self.gen_expr(&args[0])?; // buf
         self.asm.push(RES);
@@ -2656,19 +2940,13 @@ impl Cg {
         Ok(())
     }
 
-    /// Freestanding `Thread`: spawn a real `CLONE_THREAD` thread via `clone(2)` onto
-    /// an `mmap`'d stack, running `fn(arg)`. A 32-byte **thread control block** at the
-    /// stack base — `[retval | ctid futex | fn | arg]` — passes `fn`/`arg` in and
-    /// carries the result back; its address is the handle. `CLONE_CHILD_SETTID` makes
-    /// the kernel write the new TID into the `ctid` word and `CLONE_CHILD_CLEARTID`
-    /// zero it + futex-wake on exit, which is how `Join` waits. The child inherits the
-    /// register file, so `base` rides in via the callee-saved x19.
-    /// Lower an atomic op (`sync.hc`), width-directed by the pointer's pointee type:
-    /// `ldar`/`stlr` (load/store) and `ldaxr`/`stlxr` retry loops (add/swap/cas), sized
-    /// 1/2/4/8 bytes. Each loaded value is sign/zero-extended to the pointee width
-    /// (`gen_cast`) so the result matches a normal load (and the add is correct for a
-    /// signed narrow type). The pointer lives in T2, the value operand(s) in SCRATCH
-    /// (and x12 for a CAS expected), the store-exclusive status in w11; result in RES.
+    /// Lower an atomic op (`sync.hc`), width-directed by the pointer's pointee type.
+    /// Load/store use `ldar`/`stlr`; add/swap/cas use `ldaxr`/`stlxr` retry loops. All
+    /// are sized 1/2/4/8 bytes. Each loaded value is sign/zero-extended to the pointee
+    /// width (`gen_cast`) so the result matches a normal load, and so the add is
+    /// correct for a signed narrow type. The pointer lives in T2 and the value
+    /// operand(s) in SCRATCH (plus x12 for a CAS expected); the store-exclusive status
+    /// is in w11, and the result in RES.
     fn gen_atomic(&mut self, name: &str, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
         const STATUS: u32 = 11;
         const EXP: u32 = 12;
@@ -2750,12 +3028,13 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` (`sync.hc`). Freestanding →
-    /// the Linux `futex(2)` syscall (`FUTEX_WAIT`/`FUTEX_WAKE` on the low 32 bits of
-    /// `*addr`); Darwin → libc `__ulock_wait`/`__ulock_wake` (`UL_COMPARE_AND_WAIT`).
-    /// A `FutexWait` carries a short **timeout** so a (buggy/lost) missed wakeup only
-    /// turns into a periodic re-check, never a deadlock — matching the documented
-    /// spurious-wakeup contract (callers always re-test the condition in a loop).
+    /// Lower `FutexWait(addr, val)` / `FutexWake(addr, n)` (`sync.hc`). Freestanding
+    /// uses the Linux `futex(2)` syscall (`FUTEX_WAIT`/`FUTEX_WAKE` on the low 32 bits
+    /// of `*addr`); Darwin uses libc `__ulock_wait`/`__ulock_wake`
+    /// (`UL_COMPARE_AND_WAIT`). A `FutexWait` carries a short timeout, so a missed
+    /// wakeup only turns into a periodic re-check rather than a deadlock. This matches
+    /// the documented spurious-wakeup contract: callers always re-test the condition in
+    /// a loop.
     fn gen_futex(&mut self, name: &str, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
         let wake = name == "FutexWake";
         if self.freestanding {
@@ -2809,12 +3088,19 @@ impl Cg {
         Ok(())
     }
 
+    /// Freestanding `Thread`: spawn a real `CLONE_THREAD` thread via `clone(2)` onto
+    /// an `mmap`'d stack, running `fn(arg)`. A 32-byte thread control block at the
+    /// stack base, `[retval | ctid futex | fn | arg]`, passes `fn`/`arg` in and carries
+    /// the result back; its address is the handle. `CLONE_PARENT_SETTID` makes the
+    /// kernel write the new TID into the `ctid` word, and `CLONE_CHILD_CLEARTID` zeroes
+    /// it and futex-wakes on exit, which is how `Join` waits. The child inherits the
+    /// register file, so `base` rides in via the callee-saved x19.
     fn gen_thread_fs(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
         const STACK_SIZE: i64 = 0x2_0000; // 128 KiB stack + TCB
         // CLONE_VM|FS|FILES|SIGHAND|THREAD|PARENT_SETTID|CHILD_CLEARTID. PARENT_SETTID
-        // writes the new tid into the futex word **synchronously** (before clone
-        // returns), so `Join` can't race a not-yet-set word; CHILD_CLEARTID zeroes it
-        // + futex-wakes on exit.
+        // writes the new tid into the futex word synchronously, before clone returns,
+        // so `Join` can't race a not-yet-set word. CHILD_CLEARTID zeroes it and
+        // futex-wakes on exit.
         const FLAGS: i64 = 0x31_0F00;
         let base_slot = self.alloc(8, 8);
         // mmap(0, SIZE, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) -> x0 = base.
@@ -2837,8 +3123,8 @@ impl Cg {
         self.load_local(T2, base_slot, &Type::I64);
         self.asm.add_imm(T2, T2, 24);
         self.asm.store_mem(RES, T2, 8); // [base+24] = arg
-        // clone(FLAGS, child_sp, ptid=0, tls=0, ctid=&TCB.futex). arm64 arg order is
-        // (flags, stack, ptid, tls, ctid).
+        // clone(FLAGS, child_sp, ptid=&TCB.futex, tls=0, ctid=&TCB.futex). The arm64
+        // arg order is (flags, stack, ptid, tls, ctid).
         let l_child = self.asm.new_label();
         let l_done = self.asm.new_label();
         self.asm.push(19);
@@ -2852,12 +3138,19 @@ impl Cg {
         self.asm.load_imm(SCRATCH, 220); // SYS_clone
         self.asm.svc();
         self.asm.cbz(0, l_child);
-        // parent: x0 = child tid (the futex word tracks liveness — nothing to store).
+        // parent: x0 = child tid. The futex word tracks liveness, so nothing to store.
         self.asm.mov_reg(RES, 19); // handle = base
         self.asm.pop(19); // restore the caller's x19
         self.asm.b(l_done);
         // child: fn(arg), stash the return, exit (fires CLONE_CHILD_CLEARTID).
         self.asm.place(l_child);
+        // Per-thread exception state: point this child's user thread pointer at a
+        // fresh `CTask` carved from its (zero-filled) mmap'd region, just past the
+        // 32-byte TCB. Gated on use.
+        if self.uses_exc {
+            self.asm.add_imm(T2, 19, 32); // T2 = &child CTask (zeroed by MAP_ANONYMOUS)
+            self.asm.msr_tpidr_el0(T2);
+        }
         self.asm.add_imm(T2, 19, 16);
         self.asm.load_mem(RES, T2, 8, false); // RES = fn
         self.asm.add_imm(T2, 19, 24);
@@ -2871,9 +3164,9 @@ impl Cg {
         Ok(())
     }
 
-    /// Freestanding `Join`: futex-wait on the TCB's `ctid` word until the kernel
-    /// clears it (thread exit), then return the `retval` the thread left. (The handle
-    /// is the TCB address.)
+    /// Freestanding `Join`: futex-wait on the TCB's `ctid` word until the kernel clears
+    /// it (thread exit), then return the `retval` the thread left. The handle is the
+    /// TCB address.
     fn gen_join_fs(&mut self, args: &[Expr], _pos: Pos) -> Result<(), CodegenError> {
         self.gen_expr(&args[0])?; // RES = handle (TCB base)
         self.asm.push(19);
@@ -2925,17 +3218,17 @@ impl Cg {
         )
     }
 
-    /// Whether `name` resolves to a variable (local or global) rather than a
-    /// function — i.e. calling it is an indirect (function-pointer) call.
+    /// Whether `name` resolves to a variable (local or global) rather than a function.
+    /// If so, calling it is an indirect (function-pointer) call.
     fn is_variable(&self, name: &str) -> bool {
         self.lookup(name).is_some() || self.globals.contains_key(name)
     }
 
-    /// Whether evaluating `e` provably touches only RES (never the lhs temp T2),
-    /// so a binary op can keep its lhs in T2 rather than spilling to the stack.
-    /// Literals, constant-folded subtrees, and scalar variables qualify; anything
-    /// that recurses through T2 / the stack (nested binops, calls, indexing) does
-    /// not — `gen_addr_ident` and `load_imm` both work only through RES.
+    /// Whether evaluating `e` provably touches only RES, never the lhs temp T2, so a
+    /// binary op can keep its lhs in T2 rather than spilling it to the stack. Literals,
+    /// constant-folded subtrees, and scalar variables qualify; anything that recurses
+    /// through T2 or the stack (nested binops, calls, indexing) does not. Both
+    /// `gen_addr_ident` and `load_imm` work only through RES.
     fn is_simple_operand(&self, e: &Expr) -> bool {
         if const_eval_i64(e).is_some() {
             return true;
@@ -2950,23 +3243,21 @@ impl Cg {
     }
 
     /// The F64 analogue of `is_simple_operand`: whether evaluating `e` as a float
-    /// operand touches only FRES (never the lhs temp FT2). A float literal, or any
-    /// integer/scalar `is_simple_operand` (which converts to a double through
-    /// RES/FRES), qualifies — so an F64 binary op can keep its lhs in FT2 rather
-    /// than spilling it through a GPR and the machine stack.
+    /// operand touches only FRES, never the lhs temp FT2. A float literal qualifies, as
+    /// does any integer/scalar `is_simple_operand` (which converts to a double through
+    /// RES/FRES). An F64 binary op can then keep its lhs in FT2 rather than spilling it
+    /// through a GPR and the machine stack.
     fn is_simple_foperand(&self, e: &Expr) -> bool {
         matches!(&e.kind, ExprKind::Float(_)) || self.is_simple_operand(e)
     }
 
-    /// Dispatch a call expression: a bare function/builtin name is a direct call;
-    /// anything else (a function-pointer variable or computed value) is indirect.
-    /// Emit a recognized stdlib intrinsic ([`crate::intrinsics`]) inline — a hardware
-    /// instruction in place of a call to the function's lib implementation, where
-    /// this backend supports it. Returns whether it was handled; an unhandled name
-    /// (or one this backend can't inline) falls through to an ordinary call, so the
-    /// lib HolyC body is the fallback. The interpreter always runs that body, and an
-    /// optimization intrinsic computes the same value (`Sqrt` is correctly rounded
-    /// either way), so conformance holds.
+    /// Emit a recognized stdlib intrinsic ([`crate::intrinsics`]) inline: a hardware
+    /// instruction in place of a call to the function's lib implementation, where this
+    /// backend supports it. Returns whether it was handled. An unhandled name, or one
+    /// this backend can't inline, falls through to an ordinary call, so the lib HolyC
+    /// body is the fallback. The interpreter always runs that body, and an optimization
+    /// intrinsic computes the same value (`Sqrt` is correctly rounded either way), so
+    /// conformance holds.
     fn try_intrinsic(
         &mut self,
         name: &str,
@@ -2976,7 +3267,7 @@ impl Cg {
         if crate::intrinsics::kind(name).is_none() || args.len() != 1 {
             return Ok(false);
         }
-        // Only optimize a call that actually resolves to the lib intrinsic — a single
+        // Only optimize a call that actually resolves to the lib intrinsic: a single
         // F64 arg, F64 result. A user function that shadows the name with a different
         // signature (e.g. `I64 Trunc(F64)`) must be called normally, since the
         // instruction leaves its result in the FP register, not the integer one.
@@ -2999,7 +3290,7 @@ impl Cg {
         Ok(true)
     }
 
-    /// Whether `name` resolves to a one-argument `F64 -> F64` function — the shape of
+    /// Whether `name` resolves to a one-argument `F64 -> F64` function: the shape of
     /// the algebraic/rounding intrinsics, so it's safe to replace with the FP
     /// instruction. A user override with a different signature returns `false`.
     fn is_f64_unary(&self, name: &str) -> bool {
@@ -3008,14 +3299,16 @@ impl Cg {
         })
     }
 
+    /// Dispatch a call expression. A bare function or builtin name is a direct call;
+    /// anything else (a function-pointer variable or computed value) is indirect.
     fn gen_call_expr(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), CodegenError> {
         let pos = callee.span.pos;
         if let ExprKind::Ident(name) = &callee.kind {
-            // Registry builtins (`ArgC`/`ArgV`/`VarArg*`) and **primitive intrinsics**
-            // (the heap, the clock, sockets, …) get bespoke lowering in `gen_call`. The
-            // printf family is ordinary HolyC now (`fmt.hc`), so `gen_call` routes those
-            // to their compiled bodies via the shadow check (`funcs.contains_key`).
-            if crate::builtins::is_builtin(name) || crate::intrinsics::is_primitive(name) {
+            // Primitive intrinsics (the heap, the clock, sockets, …) get bespoke
+            // lowering in `gen_call`. The printf family is ordinary HolyC now
+            // (`fmt.hc`), so `gen_call` routes those to their compiled bodies via the
+            // shadow check (`funcs.contains_key`).
+            if crate::intrinsics::is_primitive(name) {
                 return self.gen_call(name, args, pos);
             }
             if !self.is_variable(name) {
@@ -3158,10 +3451,11 @@ impl Cg {
         }
     }
 
-    /// Printing is the pure-HolyC `Print` now (auto-included via `<fmt.hc>` when a
-    /// program prints): synthesize `Print(fmt, args…)` and emit it as an ordinary call
-    /// to the compiled body. Target-independent — the same path serves Darwin and the
-    /// freestanding ELF, since the HolyC `Print` ultimately calls `StdWrite`.
+    /// Lower a print as a call to the pure-HolyC `Print` (auto-included via `<fmt.hc>`
+    /// when a program prints): synthesize `Print(fmt, args…)` and emit it as an
+    /// ordinary call to the compiled body. This is target-independent — the same path
+    /// serves Darwin and the freestanding ELF, since the HolyC `Print` ultimately calls
+    /// `StdWrite`.
     fn gen_print(&mut self, fmt: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
         let fmt_expr = Expr::new(ExprKind::Str(fmt.to_string()), Span::dummy());
         fmt_expr.set_ty(Type::Ptr(Box::new(Type::U8)));
@@ -3174,8 +3468,8 @@ impl Cg {
     /// Freestanding lowering of a libc-backed builtin: inline scalar ops, or a call
     /// to an emitted runtime routine (same ABI as the libc function it replaces).
     fn gen_builtin_fs(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<(), CodegenError> {
-        // (`Sqrt`/`Fabs` are pure HolyC in lib/math.hc now — no inline FP op here.)
-        // Routine-backed builtins (standard ABI: args in x0.., result in x0).
+        // `Sqrt`/`Fabs` are pure HolyC in lib/math.hc now, so there is no inline FP op
+        // here. Routine-backed builtins use the standard ABI: args in x0.., result in x0.
         let sname: &'static str = match name {
             "MAlloc" => "MAlloc",
             "Free" => "Free",
@@ -3197,7 +3491,7 @@ impl Cg {
                 span: Span::dummy(),
             })
             .collect();
-        let ret = crate::builtins::ret_of(name).unwrap_or(Type::I64);
+        let ret = Type::I64;
         let label = self.fs_routine(sname);
         self.emit_call(
             CallTarget::Label(label),
@@ -3215,7 +3509,7 @@ impl Cg {
     /// only caller-saved registers, so it is a safe `bl` target.
     fn emit_fs_runtime(&mut self) {
         // The printf family is pure HolyC now (`fmt.hc`), so the formatted-output
-        // runtime (`OutWrite`/`FmtInt`/`FmtStr`/`StrLen`) is gone — only the heap
+        // runtime (`OutWrite`/`FmtInt`/`FmtStr`/`StrLen`) is gone. Only the heap
         // primitives remain emitted; everything else is an ordinary compiled function.
         const ORDER: &[&str] = &["MAlloc", "HeapExtend", "MSize", "Free"];
         for &name in ORDER {
@@ -3233,9 +3527,6 @@ impl Cg {
         }
     }
 
-    /// `MAlloc(x0=n) -> x0`: a bump allocator over `mmap`'d chunks (≥1 MiB,
-    /// page-aligned), 16-byte-aligned allocations, state in two BSS words. `Free`
-    /// is a no-op, so chunks are never reused.
     /// The bump allocator's `(heap_ptr, heap_end)` BSS words, allocated once and
     /// shared by `MAlloc` and `HeapExtend`.
     fn heap_globals_fs(&mut self) -> (u64, u64) {
@@ -3247,6 +3538,9 @@ impl Cg {
         g
     }
 
+    /// `MAlloc(x0=n) -> x0`: a bump allocator over `mmap`'d chunks (≥1 MiB,
+    /// page-aligned) with 16-byte-aligned allocations and state in two BSS words.
+    /// `Free` is a no-op, so chunks are never reused.
     fn emit_fs_malloc(&mut self) {
         let (hp, he) = self.heap_globals_fs(); // heap bump pointer, heap end
         let fits = self.asm.new_label();
@@ -3307,9 +3601,9 @@ impl Cg {
     }
 
     /// `HeapExtend(x0=ptr, x1=old, x2=new) -> x0`: extend `ptr` in place to `new`
-    /// bytes when it is the last bump-allocated block and still fits the chunk
-    /// (advance `*heap_ptr`, return `ptr`); else NULL. No copy/alloc — the move path
-    /// is the HolyC `ReAlloc`.
+    /// bytes when it is the last bump-allocated block and still fits the chunk, by
+    /// advancing `*heap_ptr` and returning `ptr`; otherwise NULL. It does no
+    /// copy/alloc — the move path is the HolyC `ReAlloc`.
     fn emit_fs_heapextend(&mut self) {
         let (hp, he) = self.heap_globals_fs();
         let null = self.asm.new_label();
@@ -3358,11 +3652,11 @@ impl Cg {
         self.asm.ret();
     }
 
-    /// `UnixNS()`/`NanoNS()` — read the clock into RES as nanoseconds since the
-    /// epoch (`mono=false`, CLOCK_REALTIME) or a monotonic origin (`mono=true`).
+    /// `UnixNS()`/`NanoNS()`: read the clock into RES as nanoseconds, either since the
+    /// epoch (`mono=false`, CLOCK_REALTIME) or from a monotonic origin (`mono=true`).
     /// Freestanding emits a `clock_gettime` syscall over a BSS timespec; the hosted
-    /// (Darwin) target calls libc `clock_gettime` over a stack timespec. The two
-    /// OSes disagree on the monotonic clock id (Linux 1, macOS 6).
+    /// (Darwin) target calls libc `clock_gettime` over a stack timespec. The two OSes
+    /// disagree on the monotonic clock id (Linux 1, macOS 6).
     fn gen_clock(&mut self, mono: bool, _pos: Pos) -> Result<(), CodegenError> {
         if self.freestanding {
             let ts = self.alloc_bss_fs(16, 8);
@@ -3389,9 +3683,9 @@ impl Cg {
         Ok(())
     }
 
-    /// `Sleep(ns)` — suspend the thread for `ns` nanoseconds. Builds a timespec
-    /// (`ns / 1e9`, `ns % 1e9`) and issues `nanosleep` (freestanding) or libc
-    /// `nanosleep` (hosted).
+    /// `Sleep(ns)`: suspend the thread for `ns` nanoseconds. Builds a timespec
+    /// (`ns / 1e9`, `ns % 1e9`) and issues the `nanosleep` syscall (freestanding) or
+    /// libc `nanosleep` (hosted).
     fn gen_sleep(&mut self, arg: &Expr, _pos: Pos) -> Result<(), CodegenError> {
         self.gen_expr(arg)?; // RES = ns
         self.asm.load_imm(10, 1_000_000_000);
@@ -3427,9 +3721,15 @@ enum Place {
     Global(u32),
 }
 
-/// Leaf stores for the shared [`crate::backend::gen_init_into`] initialiser driver.
-impl crate::backend::InitEmitter for Cg {
+/// This backend's implementation of the shared-driver emitter vtable
+/// ([`crate::backend::Emitter`]). It supplies the leaf emits for the shared drivers:
+/// the initializer lowering ([`gen_init_into`]); the control-flow drivers (`switch`,
+/// where the slot is a frame offset `x29 - off` and arm64 adds a jump-table fast
+/// path, plus the loops and conditionals); and the call driver
+/// ([`crate::backend::gen_call`]).
+impl crate::backend::Emitter for Cg {
     type Place = Place;
+    type Slot = u32;
 
     fn backend_label(&self) -> &'static str {
         "arm64 backend"
@@ -3477,17 +3777,7 @@ impl crate::backend::InitEmitter for Cg {
         self.gen_store(RES, T2, ty);
         Ok(())
     }
-}
 
-/// Leaf emits for the shared control-flow drivers ([`crate::backend::CodeEmitter`]):
-/// `switch` (the slot is a frame offset `x29 - off`; the jump-table fast path is this
-/// backend's) and the loops/conditionals.
-impl crate::backend::CodeEmitter for Cg {
-    type Slot = u32;
-
-    fn backend_label(&self) -> &'static str {
-        "arm64 backend"
-    }
     fn new_label(&mut self) -> usize {
         self.asm.new_label()
     }
@@ -3569,14 +3859,10 @@ impl crate::backend::CodeEmitter for Cg {
     ) -> Result<bool, CodegenError> {
         self.try_gen_branch_table(stmts, label_at, slot, gap_target)
     }
-}
 
-/// Leaf emits for the shared call driver ([`crate::backend::gen_call`]). The sret
-/// slot is a frame offset; variadics are marshalled by computing the buffer address
-/// (`x29 - off`) and count directly into the registers after the named args.
-impl crate::backend::CallEmitter for Cg {
-    type Slot = u32;
-
+    // Call-driver leaves: the sret slot is a frame offset; variadics are marshalled by
+    // computing the buffer address (`x29 - off`) and count directly into the registers
+    // after the named args.
     fn spill_callee(&mut self, callee: &Expr) -> Result<(), CodegenError> {
         self.gen_expr(callee)?; // RES = function address
         self.asm.push(RES);
@@ -3607,10 +3893,10 @@ impl crate::backend::CallEmitter for Cg {
         varargs: bool,
         pos: Pos,
     ) -> Result<(), CodegenError> {
-        // Variadic call: stage the trailing args into a frame buffer (8 bytes each,
-        // an F64 by its bit pattern); its address + count become two hidden integer
-        // args after the named ones. Always staged for a variadic callee (count 0 for
-        // none), else the callee reads uninitialised registers.
+        // Variadic call: stage the trailing args into a frame buffer (8 bytes each, an
+        // F64 by its bit pattern). Its address and count become two hidden integer args
+        // after the named ones. Always staged for a variadic callee, with count 0 for
+        // none; otherwise the callee reads uninitialised registers.
         let va = if varargs {
             let k = extra.len() as u32;
             let off = self.alloc(k * 8, 8);
@@ -3740,12 +4026,12 @@ fn is_promotable_scalar(ty: &Type) -> bool {
     )
 }
 
-/// Accumulators for the per-function register-promotion analysis. Besides the
-/// eligibility data (address-taken names, reference counts, declaration
-/// count/type), it walks the body assigning each reference a monotonic *program
-/// point* (`pt`) to build a live interval `[first, last]` per name, records each
-/// structured loop's point range (for liveness extension), and notes whether the
-/// function uses `goto`/labels (`unstructured` — then sharing is disabled).
+/// Accumulators for the per-function register-promotion analysis. Alongside the
+/// eligibility data (address-taken names, reference counts, declaration count/type),
+/// the walk assigns each reference a monotonic program point (`pt`) to build a live
+/// interval `[first, last]` per name. It also records each structured loop's point
+/// range (for liveness extension) and notes whether the function uses `goto`/labels
+/// (`unstructured`, which then disables sharing).
 #[derive(Default)]
 struct RegAnalysis {
     addr_taken: HashSet<String>,
@@ -3757,9 +4043,15 @@ struct RegAnalysis {
     last: HashMap<String, u32>,
     loops: Vec<(u32, u32)>,
     unstructured: bool,
-    /// Loop-nesting depth at the current scan point. A use inside a loop counts
-    /// for more (it runs every iteration), so loop-invariant reads — a loop bound,
-    /// say — get promoted even when their *static* count is just one.
+    /// Whether the function contains a `try`. A `throw` longjmps in and restores the
+    /// callee-saved registers from the handler's saved set, which would revert any
+    /// register-promoted local to its try-entry value — diverging from the interpreter.
+    /// So promotion is disabled entirely for such functions (locals stay in memory,
+    /// which the sp/fp restore preserves).
+    has_try: bool,
+    /// Loop-nesting depth at the current scan point. A use inside a loop counts for
+    /// more, since it runs every iteration. So loop-invariant reads (a loop bound, say)
+    /// get promoted even when their static count is just one.
     loop_depth: u32,
 }
 
@@ -3782,6 +4074,7 @@ impl RegAnalysis {
     fn scan_stmt(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached register scan"),
+            StmtKind::TypeSwitch { .. } => unreachable!("type switch reached register scan"),
             StmtKind::Empty
             | StmtKind::Break
             | StmtKind::Continue
@@ -3801,8 +4094,8 @@ impl RegAnalysis {
                     if let Some(init) = &d.init {
                         self.scan_expr(init);
                     }
-                    // The declaration *defines* the variable; record it after the
-                    // initializer's uses so a `t = expr` over disjoint values can
+                    // The declaration defines the variable; record it after the
+                    // initializer's uses, so a `t = expr` over disjoint values can
                     // still share (the old value is read before the new is written).
                     self.touch(&d.name, false);
                 }
@@ -3840,8 +4133,8 @@ impl RegAnalysis {
                 step,
                 body,
             } => {
-                // The init runs once *before* the loop, so it's outside the range
-                // and the depth bump — only cond/step/body repeat each iteration.
+                // The init runs once before the loop, so it's outside the range and the
+                // depth bump; only cond/step/body repeat each iteration.
                 if let Some(i) = init {
                     self.scan_stmt(i);
                 }
@@ -3864,6 +4157,20 @@ impl RegAnalysis {
                 }
             }
             StmtKind::Return(v) => {
+                if let Some(e) = v {
+                    self.scan_expr(e);
+                }
+            }
+            // A `try` disables register promotion for the whole function (see
+            // `has_try`): a `throw` restores callee-saved registers on the way in, which
+            // would revert a promoted local. Keeping locals in memory matches the
+            // interpreter, which never reverts them.
+            StmtKind::Try { body, handler } => {
+                self.has_try = true;
+                body.iter().for_each(|st| self.scan_stmt(st));
+                handler.iter().for_each(|st| self.scan_stmt(st));
+            }
+            StmtKind::Throw(v) => {
                 if let Some(e) = v {
                     self.scan_expr(e);
                 }
@@ -3939,20 +4246,20 @@ struct Cand {
     refs: u32,
 }
 
-/// Decide which of a function's scalar locals/params live in callee-saved
-/// registers, and *which* register each gets. Eligible candidates (a
-/// non-address-taken scalar declared exactly once and referenced ≥2 times) are
-/// allocated by **linear scan over their live intervals**, so two whose ranges
-/// don't overlap share a register — fewer distinct registers means less
-/// prologue/epilogue save/restore, and more than a pool's worth of locals can be
-/// promoted. Integer/pointer locals draw from x19..x28, F64 locals from d8..d15.
+/// Decide which of a function's scalar locals/params live in callee-saved registers,
+/// and which register each gets. Eligible candidates (a non-address-taken scalar
+/// declared exactly once and referenced ≥2 times) are allocated by linear scan over
+/// their live intervals, so two whose ranges don't overlap share a register. Fewer
+/// distinct registers means less prologue/epilogue save/restore, and more than a
+/// pool's worth of locals can be promoted. Integer/pointer locals draw from x19..x28,
+/// F64 locals from d8..d15.
 ///
-/// Soundness: a live interval is `[first reference, last reference]` (references
-/// include the defining declaration), conservatively *over*-approximated —
-/// extended to cover any structured loop it touches (so loop-carried values stay
-/// live across the back-edge), and widened to the whole function when the body
-/// uses `goto`/labels (then nothing shares). Two variables get the same register
-/// only when their intervals are strictly disjoint. Deterministic throughout.
+/// Soundness: a live interval is `[first reference, last reference]`, where references
+/// include the defining declaration. It is conservatively over-approximated: extended
+/// to cover any structured loop it touches (so loop-carried values stay live across
+/// the back-edge), and widened to the whole function when the body uses `goto`/labels
+/// (then nothing shares). Two variables get the same register only when their
+/// intervals are strictly disjoint. Deterministic throughout.
 fn plan_registers(params: &[Param], body: &[&Stmt]) -> HashMap<String, u32> {
     let mut a = RegAnalysis::default();
     for p in params {
@@ -3969,6 +4276,12 @@ fn plan_registers(params: &[Param], body: &[&Stmt]) -> HashMap<String, u32> {
         a.scan_stmt(s);
     }
     let end_pt = a.pt;
+
+    // A function containing a `try` gets no promotion: every local stays in memory so
+    // a `throw`'s callee-saved restore can't revert it (see `RegAnalysis::has_try`).
+    if a.has_try {
+        return HashMap::new();
+    }
 
     let mut cands: Vec<Cand> = Vec::new();
     for (name, &count) in &a.decl_count {
@@ -3998,9 +4311,9 @@ fn plan_registers(params: &[Param], body: &[&Stmt]) -> HashMap<String, u32> {
         });
     }
 
-    // Extend each interval to cover any loop it intersects (to a fixpoint, so
-    // nested loops widen outward) — loop-carried values are live across the
-    // back-edge, beyond their textual last reference.
+    // Extend each interval to cover any loop it intersects, to a fixpoint so nested
+    // loops widen outward. Loop-carried values are live across the back-edge, beyond
+    // their textual last reference.
     if !a.unstructured {
         loop {
             let mut changed = false;
@@ -4024,9 +4337,9 @@ fn plan_registers(params: &[Param], body: &[&Stmt]) -> HashMap<String, u32> {
         }
     }
 
-    // Linear scan: process intervals by start point; a register frees when its
-    // interval ends strictly before the next one begins. Ties favor the
-    // most-referenced (then name) so hot variables win a scarce register.
+    // Linear scan: process intervals by start point. A register frees when its
+    // interval ends strictly before the next one begins. Ties favor the most-referenced
+    // (then name), so hot variables win a scarce register.
     cands.sort_by(|x, y| {
         x.start
             .cmp(&y.start)
@@ -4057,11 +4370,11 @@ fn plan_registers(params: &[Param], body: &[&Stmt]) -> HashMap<String, u32> {
             active.push((c.end, reg, c.fp, c.refs, c.name.clone()));
             continue;
         }
-        // Pool full: spill the coldest active interval of this register file if it
-        // is strictly colder than `c`, handing its register to the hotter variable
-        // (a whole-range swap — the evicted one falls back to a frame slot). This
-        // is the standard linear-scan spill, ranked by the same loop-weighted
-        // hotness as promotion rather than by interval end.
+        // Pool full: spill the coldest active interval of this register file if it is
+        // strictly colder than `c`, handing its register to the hotter variable. This
+        // is a whole-range swap; the evicted one falls back to a frame slot. It is the
+        // standard linear-scan spill, ranked by the same loop-weighted hotness as
+        // promotion rather than by interval end.
         let victim = active
             .iter()
             .enumerate()
@@ -4074,7 +4387,7 @@ fn plan_registers(params: &[Param], body: &[&Stmt]) -> HashMap<String, u32> {
                 promote.insert(c.name.clone(), reg);
                 active[idx] = (c.end, reg, c.fp, c.refs, c.name.clone());
             }
-            // else: `c` is no hotter than any active interval — leave it in a slot.
+            // else: `c` is no hotter than any active interval, so leave it in a slot.
         }
     }
     promote
@@ -4112,8 +4425,9 @@ fn is_signed_or(signed: bool, s: u32, u: u32) -> u32 {
     if signed { s } else { u }
 }
 
-/// Encode `+v` as an `add`/`sub` 12-bit immediate. Returns `(is_sub, imm)` where
-/// `imm` is in `0..4096`, or `None` if `v` doesn't fit (caller uses a register).
+/// Encode `v` as an `add`/`sub` 12-bit immediate. Returns `(is_sub, imm)` where
+/// `imm` is in `0..4096`, or `None` if `v` doesn't fit (the caller then uses a
+/// register).
 fn add_sub_imm12(v: i64) -> Option<(bool, u32)> {
     if (0..4096).contains(&v) {
         Some((false, v as u32))
@@ -4249,4 +4563,17 @@ fn const_eval_i64(e: &Expr) -> Option<i64> {
 
 fn align16(n: u32) -> u32 {
     (n + 15) & !15
+}
+
+/// The libc symbol the hosted (Darwin) arm64 backend lowers a heap primitive to.
+/// `MAlloc`/`Free` are the one libc-backed group on this target. The freestanding
+/// path emits an `mmap` bump allocator instead, using this only as the gate that
+/// recognizes the two names. Every other primitive intrinsic is an emitted routine or
+/// syscall, so it isn't here.
+fn libc_symbol(name: &str) -> Option<&'static str> {
+    match name {
+        "MAlloc" => Some("_malloc"),
+        "Free" => Some("_free"),
+        _ => None,
+    }
 }

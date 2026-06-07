@@ -1,8 +1,8 @@
 //! Socket / networking intrinsic tests (`lib/net.hc`).
 //!
-//! Networking is impure, so these are **property** tests: a HolyC program connects
-//! to a local echo server, sends a few bytes, and reads back what the server returns.
-//! Against a deterministic echo server the interpreter and the native backends still
+//! Networking is impure, so these are **property** tests. A HolyC program connects to
+//! a local echo server, sends a few bytes, and reads back what the server returns.
+//! Against a deterministic echo server, the interpreter and the native backends still
 //! produce the same output, so they double as a conformance check.
 
 use std::io::{Read, Write};
@@ -16,8 +16,8 @@ use solomon::sema::check_program;
 use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
 
 /// Bind a one-shot TCP echo server on 127.0.0.1 (OS-assigned port) and return the
-/// port. The listener is already listening before we return (so a connecting client
-/// never races the `accept`); a thread accepts one connection, replies with
+/// port. The listener is already listening before we return, so a connecting client
+/// never races the `accept`. A thread accepts one connection, replies with
 /// `"echo:" + <received bytes>`, and closes.
 fn spawn_echo() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -81,10 +81,10 @@ fn darwin_toolchain() -> bool {
             .unwrap_or(false)
 }
 
-/// The same echo round-trip, but through the **native arm64 Darwin** backend: the
+/// The same echo round-trip, but through the **native arm64 Darwin** backend. The
 /// socket primitives lower to libc `socket`/`connect`/`read`/`write`/`close`. Asserts
 /// the compiled binary's stdout matches the interpreter's. Self-skips off an
-/// Apple-silicon host (the freestanding socket syscalls are exercised separately).
+/// Apple-silicon host; the freestanding socket syscalls are exercised separately.
 #[test]
 fn native_arm64_tcp_echo_roundtrip() {
     if !darwin_toolchain() {
@@ -111,8 +111,8 @@ fn native_arm64_tcp_echo_roundtrip() {
     );
 }
 
-/// Build `src` with `backend` to a temp ELF and run it **natively** (only on a
-/// matching Linux host) against the in-process host echo server. The freestanding
+/// Build `src` with `backend` to a temp ELF and run it **natively** against the
+/// in-process host echo server. Only called on a matching Linux host. The freestanding
 /// socket *syscalls* (socket/connect/write/read/close) hit the real kernel. Returns
 /// the program's stdout.
 fn freestanding_socket_stdout(
@@ -133,7 +133,7 @@ fn freestanding_socket_stdout(
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// The connect/send/recv round-trip through the **freestanding x86-64** backend —
+/// The connect/send/recv round-trip through the **freestanding x86-64** backend, using
 /// raw Linux socket syscalls (no libc). Runs only on a linux/x86_64 host (CI);
 /// self-skips elsewhere.
 #[test]
@@ -148,8 +148,8 @@ fn native_x86_64_freestanding_tcp_echo() {
     assert_eq!(got, "received: echo:ping\n", "x86_64 freestanding");
 }
 
-/// The same round-trip through the **freestanding aarch64** backend (raw arm64 Linux
-/// socket syscalls). Runs only on a linux/aarch64 host; self-skips elsewhere.
+/// The same round-trip through the **freestanding aarch64** backend, using raw arm64
+/// Linux socket syscalls. Runs only on a linux/aarch64 host; self-skips elsewhere.
 #[test]
 fn native_arm64_freestanding_tcp_echo() {
     if !cfg!(all(target_os = "linux", target_arch = "aarch64")) {

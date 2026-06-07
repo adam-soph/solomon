@@ -1,25 +1,30 @@
 //! A tree-walking interpreter for HolyC.
 //!
-//! It executes a parsed program directly. Run semantic analysis first; the
-//! interpreter assumes a well-formed program and only reports faults it hits at
-//! run time (division by zero, null dereference, missing function bodies, …).
+//! It executes a parsed program directly. Run semantic analysis first: the
+//! interpreter assumes a well-formed program. It only reports faults it hits at
+//! run time, such as division by zero, a null dereference, or a missing function
+//! body.
 //!
-//! Value & memory model: most storage is a *cell* (`Rc<RefCell<Value>>`).
-//! Variables, class fields, and array elements are cells, so `&x` is a handle
-//! to a cell, `*p` reads/writes through it, and `p->field` / `a[i]` resolve to
-//! cells (via [`Place::Cell`]). `MAlloc` of an integer/float element type is the
-//! exception: it returns a raw byte buffer ([`Region::Heap`]) whose typed
-//! accesses serialize `sizeof(T)` bytes ([`Place::Bytes`]), so the heap is
-//! genuinely byte-addressable and type punning behaves like the native heap.
-//! Pointer arithmetic and indexing scale by the element size on byte-heap
-//! pointers and step element-by-element on cell pointers. A `union` instance is
-//! likewise a shared byte buffer ([`Value::Union`]): its fields overlap and
-//! alias, so writing one and reading another sees the same bytes — except
-//! pointer/class union fields, which can't be serialized and are unsupported.
+//! Value and memory model: most storage is a *cell* (`Rc<RefCell<Value>>`).
+//! Variables, class fields, and array elements are all cells. So `&x` is a handle
+//! to a cell, `*p` reads and writes through it, and `p->field` / `a[i]` resolve to
+//! cells (via [`Place::Cell`]).
 //!
-//! HolyC's implicit print is honoured: an expression statement that is a string
-//! literal prints it, and `"fmt", args…` formats and prints (a `Comma` whose
-//! first element is a string).
+//! `MAlloc` of an integer or float element type is the exception: it returns a raw
+//! byte buffer ([`Region::Heap`]). Typed accesses serialize `sizeof(T)` bytes
+//! through it ([`Place::Bytes`]), so the heap is genuinely byte-addressable and
+//! type punning behaves like the native heap. On a byte-heap pointer, arithmetic
+//! and indexing scale by the element size; on a cell pointer they step element by
+//! element.
+//!
+//! A `union` instance is likewise a shared byte buffer ([`Value::Union`]). Its
+//! fields overlap and alias, so writing one field and reading another sees the
+//! same bytes. Pointer and class union fields are the exception: they can't be
+//! serialized, and are unsupported.
+//!
+//! HolyC's implicit print is honoured. A bare string-literal expression statement
+//! prints itself, and `"fmt", args…` formats and prints (a `Comma` whose first
+//! element is a string).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,14 +35,14 @@ use std::rc::Rc;
 // ---- cross-platform OS shims ----
 //
 // The interpreter emulates HolyC's POSIX-flavoured fd/file/process primitives over
-// `std`. HolyC paths arrive as raw NUL-terminated byte strings and file ops carry
-// Unix mode bits; the few places that needs Unix-only `std` APIs are funneled through
-// these shims so the tools also build (and run) on non-Unix hosts (Windows), where the
-// mode bits are ignored and there is no POSIX uid/gid.
+// `std`. HolyC paths arrive as raw NUL-terminated byte strings, and file ops carry
+// Unix mode bits. The few spots that need Unix-only `std` APIs are funneled through
+// these shims, so the tools also build and run on non-Unix hosts (Windows). There,
+// the mode bits are ignored and there is no POSIX uid/gid.
 
 /// Build a filesystem path from HolyC's raw path bytes. On Unix the bytes pass
-/// straight through (`OsStr::from_bytes`); elsewhere they are read as UTF-8 (HolyC
-/// paths are ASCII in practice).
+/// straight through (`OsStr::from_bytes`). Elsewhere they are read as UTF-8, which
+/// is fine because HolyC paths are ASCII in practice.
 #[cfg(unix)]
 fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
@@ -59,8 +64,8 @@ fn path_to_bytes(p: &Path) -> Vec<u8> {
     p.to_string_lossy().into_owned().into_bytes()
 }
 
-/// Apply a Unix permission `mode` to a file being created; a no-op where there are no
-/// Unix mode bits (Windows).
+/// Apply a Unix permission `mode` to a file being created. A no-op on platforms
+/// without Unix mode bits (Windows).
 #[cfg(unix)]
 fn set_open_mode(opts: &mut std::fs::OpenOptions, mode: u32) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -69,7 +74,7 @@ fn set_open_mode(opts: &mut std::fs::OpenOptions, mode: u32) {
 #[cfg(not(unix))]
 fn set_open_mode(_opts: &mut std::fs::OpenOptions, _mode: u32) {}
 
-/// `mkdir(path, mode)` — the `mode` is applied on Unix and ignored elsewhere.
+/// `mkdir(path, mode)`. The `mode` is applied on Unix and ignored elsewhere.
 #[cfg(unix)]
 fn mkdir_with_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -80,7 +85,7 @@ fn mkdir_with_mode(path: &Path, _mode: u32) -> std::io::Result<()> {
     std::fs::DirBuilder::new().create(path)
 }
 
-/// The parent process id, or 0 where `std` can't report it portably (Windows).
+/// The parent process id, or 0 where `std` can't report it portably, i.e. Windows.
 #[cfg(unix)]
 fn parent_pid() -> u32 {
     std::os::unix::process::parent_id()
@@ -90,7 +95,8 @@ fn parent_pid() -> u32 {
     0
 }
 
-/// The real user/group id (via libc on Unix), or 0 where there is no POSIX uid/gid.
+/// The real user/group id, read via libc on Unix. Returns 0 where there is no
+/// POSIX uid/gid.
 #[cfg(unix)]
 fn get_uid() -> u32 {
     unsafe extern "C" {
@@ -121,7 +127,7 @@ use crate::token::Pos;
 
 /// A mutable storage location.
 type Cell = Rc<RefCell<Value>>;
-/// A lexical scope: names to their cells.
+/// A lexical scope, mapping names to their cells.
 type Scope = HashMap<String, Cell>;
 
 fn cell(v: Value) -> Cell {
@@ -149,10 +155,10 @@ fn deep_copy(v: &Value) -> Value {
     }
 }
 
-/// Apply value semantics when storing into a variable, parameter, or lvalue:
-/// HolyC structs are passed and assigned *by value*, so a class is deep-copied
-/// (which also copies any arrays/structs nested inside it). Top-level arrays stay
-/// by-reference — they decay to pointers — so they are not copied here.
+/// Apply value semantics when storing into a variable, parameter, or lvalue.
+/// HolyC classes are passed and assigned *by value*, so a class is deep-copied;
+/// the copy includes any arrays or classes nested inside it. Top-level arrays
+/// stay by-reference because they decay to pointers, so they are not copied here.
 fn by_value(v: Value) -> Value {
     match v {
         Value::Class(_) | Value::Union(_) => deep_copy(&v),
@@ -161,7 +167,7 @@ fn by_value(v: Value) -> Value {
 }
 
 /// Whether `e` denotes a place (an addressable lvalue) rather than a temporary
-/// rvalue. Member access on a non-place (e.g. a class returned by a call) reads
+/// rvalue. Member access on a non-place, such as a class returned by a call, reads
 /// the base's value instead of resolving it to a storage cell.
 fn is_place(e: &Expr) -> bool {
     matches!(
@@ -176,26 +182,27 @@ fn is_place(e: &Expr) -> bool {
     )
 }
 
-/// What a pointer points into. Giving pointers a region + offset (rather than a
-/// bare cell) is what lets pointer arithmetic, indexing, comparison, and
-/// difference work.
+/// What a pointer points into. Pointers carry a region plus an offset rather than
+/// a bare cell, which is what lets pointer arithmetic, indexing, comparison, and
+/// difference all work.
 #[derive(Clone)]
 enum Region {
-    /// A single standalone cell — `&scalar`, `&field`. Only offset 0 is valid.
+    /// A single standalone cell, e.g. `&scalar` or `&field`. Only offset 0 is valid.
     Scalar(Cell),
     /// An array's element cells; the pointer's index selects one.
     Array(Rc<RefCell<Vec<Cell>>>),
-    /// A raw, byte-addressable heap buffer (from `MAlloc` of an integer/float
-    /// element type, or an untyped allocation). A pointer's `index` into it is a
-    /// **byte** offset, and a typed access reads/writes `sizeof(T)` bytes — so
-    /// the same buffer viewed through different scalar pointer types (type
-    /// punning) behaves like the native byte heap. Class/pointer-element
-    /// allocations use `Array` instead (cells, no serialization needed).
+    /// A raw, byte-addressable heap buffer, from `MAlloc` of an integer/float
+    /// element type or an untyped allocation. A pointer's `index` into it is a
+    /// **byte** offset, and a typed access reads or writes `sizeof(T)` bytes. So the
+    /// same buffer viewed through different scalar pointer types — type punning —
+    /// behaves like the native byte heap. Class- and pointer-element allocations use
+    /// `Array` instead, since cells need no serialization.
     Heap(Rc<RefCell<Vec<u8>>>),
 }
 
 impl Region {
-    /// The cell at `index`, or `None` if out of range / not cell-backed.
+    /// The cell at `index`, or `None` if the index is out of range or the region
+    /// is not cell-backed.
     fn cell_at(&self, index: i64) -> Option<Cell> {
         match self {
             Region::Scalar(c) => (index == 0).then(|| c.clone()),
@@ -214,7 +221,7 @@ impl Region {
         }
     }
 
-    /// A stable address, used to order/compare pointers into different regions.
+    /// A stable address, used to order and compare pointers into different regions.
     fn base_addr(&self) -> usize {
         match self {
             Region::Scalar(c) => Rc::as_ptr(c) as *const () as usize,
@@ -225,29 +232,30 @@ impl Region {
 }
 
 /// A writable storage location: either a value cell or a typed slot inside a raw
-/// byte heap buffer. Reads/writes on a byte slot pack/unpack `sizeof(ty)` bytes.
+/// byte heap buffer. A read or write on a byte slot packs or unpacks `sizeof(ty)`
+/// bytes.
 enum Place {
     Cell(Cell),
     Bytes {
         buf: Rc<RefCell<Vec<u8>>>,
         off: usize,
         ty: Type,
-        /// The interpreter's pointer table. A pointer stored into a byte buffer is
-        /// serialised as an 8-byte handle into this table (since a `PtrVal` is a
-        /// region + offset, not a real address) and read back through it — so the
-        /// heap can hold pointers (and classes containing them), and a byte-wise
+        /// The interpreter's pointer table. A `PtrVal` is a region plus an offset,
+        /// not a real address, so a pointer stored into a byte buffer is serialised
+        /// as an 8-byte handle into this table and read back through it. This lets
+        /// the heap hold pointers (and classes containing them), and a byte-wise
         /// `MemCpy` of the handle bytes still names the same pointer.
         ptrs: PtrTable,
     },
 }
 
-/// A pointer is serialised in a byte buffer as `0` for NULL or a 1-based index into
-/// this table for any other pointer.
+/// In a byte buffer, a pointer is serialised as `0` for NULL, or a 1-based index
+/// into this table for any other pointer.
 type PtrTable = Rc<RefCell<Vec<PtrVal>>>;
 
 /// Serialise a value being stored into a `Type::Ptr`/`FuncPtr` byte slot to its
-/// 8-byte handle. A real pointer is interned in `ptrs`; NULL/0 is handle 0; any other
-/// value (an integer punned as a pointer) keeps its low bits.
+/// 8-byte handle. A real pointer is interned in `ptrs`, NULL/0 becomes handle 0,
+/// and any other value (an integer punned as a pointer) keeps its low bits.
 fn serialize_ptr(v: &Value, ptrs: &PtrTable) -> u64 {
     match v {
         Value::Ptr(None) => 0,
@@ -288,7 +296,7 @@ impl Place {
                 } else if is_pointer_ty(ty) {
                     Ok(deserialize_ptr(u64::from_le_bytes(le), ptrs))
                 } else {
-                    // Sign-extend signed types from their width to 64 bits.
+                    // Sign-extend a signed type from its width to 64 bits.
                     let mut v = i64::from_le_bytes(le);
                     if is_signed_scalar(ty) && n < 8 {
                         let shift = (8 - n) * 8;
@@ -331,14 +339,14 @@ impl Place {
     }
 }
 
-/// Whether `ty` is a pointer (or function pointer) — the kinds serialised through
-/// the [`PtrTable`] when stored in a byte buffer.
+/// Whether `ty` is a pointer or function pointer. These are the kinds serialised
+/// through the [`PtrTable`] when stored in a byte buffer.
 fn is_pointer_ty(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_) | Type::FuncPtr { .. })
 }
 
-/// The pointee type of an atomic op's pointer argument (its width directs the access),
-/// defaulting to `I64` for an untyped / non-pointer expression.
+/// The pointee type of an atomic op's pointer argument, whose width directs the
+/// access. Defaults to `I64` for an untyped or non-pointer expression.
 fn pointee_or_i64(e: &Expr) -> Type {
     match e.ty() {
         Some(Type::Ptr(inner)) | Some(Type::Array(inner, _)) => *inner,
@@ -372,22 +380,22 @@ impl PtrVal {
 /// A runtime value.
 #[derive(Clone)]
 pub enum Value {
-    /// The unit value of `U0` expressions / functions.
+    /// The unit value of a `U0` expression or function.
     Void,
     Int(i64),
     Float(f64),
     Str(Rc<String>),
-    /// A pointer: `None` is null.
+    /// A pointer; `None` is null.
     Ptr(Option<PtrVal>),
-    /// A class instance: field name -> cell.
+    /// A class instance, mapping each field name to its cell.
     Class(Rc<RefCell<HashMap<String, Cell>>>),
-    /// A `union` instance: a raw byte buffer all the fields share. Field access
-    /// reads/writes `sizeof(field)` bytes at the field's offset, so overlapping
+    /// A `union` instance: one raw byte buffer all the fields share. Field access
+    /// reads or writes `sizeof(field)` bytes at the field's offset, so overlapping
     /// fields alias (type punning) like the native backend.
     Union(Rc<RefCell<Vec<u8>>>),
-    /// An array: a list of element cells.
+    /// An array, as a list of element cells.
     Array(Rc<RefCell<Vec<Cell>>>),
-    /// A function pointer: the name of the function it refers to (`&Func`).
+    /// A function pointer (`&Func`): the name of the function it refers to.
     Func(String),
 }
 
@@ -406,8 +414,8 @@ impl Value {
         }
     }
 
-    /// Coerce to an integer where it makes sense (for indices, switch values,
-    /// bitwise ops, …). Floats truncate; a null pointer is 0.
+    /// Coerce to an integer where it makes sense: indices, switch values, bitwise
+    /// ops, and so on. A float truncates; a null pointer is 0.
     fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int(i) => Some(*i),
@@ -456,7 +464,8 @@ enum Flow {
     Goto(String),
 }
 
-/// Function-local scope stack (block nesting). Globals live on the interpreter.
+/// A function-local scope stack, one scope per nested block. Globals live on the
+/// interpreter, not here.
 struct Env {
     scopes: Vec<Scope>,
 }
@@ -481,37 +490,50 @@ pub struct Interpreter<W: Write> {
     classes: HashMap<String, ClassDef>,
     layouts: Layouts,
     /// Command-line arguments exposed via `ArgC`/`ArgV`. `args[0]` is the program
-    /// (or script) name, mirroring a native binary's argv, so the count is ≥ 1.
+    /// (or script) name, mirroring a native binary's argv, so the count is always
+    /// at least 1.
     args: Vec<String>,
-    /// Requested byte size of each `MAlloc`'d heap region, keyed by region identity,
-    /// for `MSize` (the native backends use a size header instead).
+    /// Requested byte size of each `MAlloc`'d heap region, keyed by region identity.
+    /// Backs `MSize`; the native backends use a size header instead.
     heap_sizes: HashMap<usize, i64>,
-    /// Pointers serialised into byte buffers (see [`PtrTable`]). Shared (cloned `Rc`)
-    /// into every `Place::Bytes` so a handle round-trips and survives `MemCpy`.
+    /// Pointers serialised into byte buffers (see [`PtrTable`]). A cloned `Rc` is
+    /// shared into every `Place::Bytes`, so a handle round-trips and survives a
+    /// `MemCpy`.
     ptr_table: PtrTable,
-    /// Open file descriptors for the POSIX-style fd intrinsics — `Socket`/`Connect`
-    /// (sockets) and `Open`/`LSeek` (files), with the shared `Read`/`Write`/`Close`.
-    /// The interpreter emulates them over `std::net`/`std::fs`. (Impure — these do
-    /// real I/O, so they're property-tested, not compared to the backends by value.)
+    /// Open file descriptors for the POSIX-style fd intrinsics: `Socket`/`Connect`
+    /// for sockets and `Open`/`LSeek` for files, with the shared `Read`/`Write`/
+    /// `Close`. The interpreter emulates them over `std::net`/`std::fs`. These do
+    /// real I/O, so they're impure: property-tested, not compared to the backends
+    /// by value.
     fds: HashMap<i64, FdObj>,
-    /// The next synthetic fd handed out by `Socket`/`Open` (past stdin/out/err).
+    /// The next synthetic fd handed out by `Socket`/`Open`, past stdin/out/err.
     next_fd: i64,
-    /// `Thread`/`Join` emulation: the interpreter runs each spawned thread body
-    /// **synchronously at spawn time** (it isn't re-entrant across OS threads) and
-    /// stashes the function's return here, keyed by handle, for `Join` to return.
-    /// Sound for interleaving-independent work — the documented `thread.hc` contract.
+    /// `Thread`/`Join` emulation. The interpreter is not re-entrant across OS
+    /// threads, so it runs each spawned thread body **synchronously at spawn time**
+    /// and stashes the function's return here, keyed by handle, for `Join` to
+    /// return. This is sound for interleaving-independent work, the documented
+    /// `thread.hc` contract.
     thread_results: HashMap<i64, i64>,
-    /// The next `Thread` handle (a namespace distinct from fds).
+    /// The next `Thread` handle, in a namespace distinct from fds.
     next_thread: i64,
-    /// Set by `Exit(code)` to halt the run: the call returns an error that unwinds
-    /// all execution, and `run` recognises this field and returns cleanly (the code
-    /// itself isn't observable through `run_to_string`, which yields the output).
+    /// Set by `Exit(code)` to halt the run. The call returns an error that unwinds
+    /// all execution; `run` recognises this field and returns cleanly. The code
+    /// itself isn't observable through `run_to_string`, which yields the output.
     exit_code: Option<i64>,
+    /// Set by `throw` to the value being raised. Like `exit_code`, the throw unwinds
+    /// via an `Err`; an enclosing `try` recognises this field, clears it, and runs the
+    /// `catch` handler. An uncaught throw reaches `run`, which finishes cleanly (the
+    /// pre-throw output is what a native abort would also have emitted).
+    pending_throw: Option<i64>,
+    /// The current thread's `CTask` (the `Fs` global points here). The interpreter
+    /// runs thread bodies synchronously, so a single task suffices; `throw`/`catch`
+    /// read and write its `except_ch`/`catch_except` fields directly by byte offset.
+    fs_task: Option<Rc<RefCell<Vec<u8>>>>,
 }
 
 /// An interpreter file descriptor: a reserved-but-unconnected socket, a live TCP
-/// stream, or an open file. `Read`/`Write` go to the stream/file; `LSeek` only to a
-/// file.
+/// stream, or an open file. `Read`/`Write` go to the stream or file; `LSeek` works
+/// only on a file.
 enum FdObj {
     PendingSocket,
     Tcp(std::net::TcpStream),
@@ -521,7 +543,7 @@ enum FdObj {
 impl<W: Write> Interpreter<W> {
     pub fn new(out: W) -> Self {
         let mut globals = Scope::new();
-        // HolyC predefined constants.
+        // HolyC's predefined constants.
         globals.insert("NULL".into(), cell(Value::Ptr(None)));
         globals.insert("TRUE".into(), cell(Value::Int(1)));
         globals.insert("FALSE".into(), cell(Value::Int(0)));
@@ -539,6 +561,8 @@ impl<W: Write> Interpreter<W> {
             thread_results: HashMap::new(),
             next_thread: 1,
             exit_code: None,
+            pending_throw: None,
+            fs_task: None,
         }
     }
 
@@ -582,18 +606,18 @@ impl<W: Write> Interpreter<W> {
 
     // ---- top-level driver ----
 
-    /// Run an (already semantically-checked) program, writing to the output sink.
-    /// Use [`run_to_string`] or call [`crate::sema::check_program`] first.
+    /// Run an already-semantically-checked program, writing to the output sink.
+    /// Run [`run_to_string`] or [`crate::sema::check_program`] first.
     pub fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
         // Reset the per-run string-literal intern cache so buffers never bleed
-        // between programs run on the same thread (e.g. across tests).
+        // between programs run on the same thread, e.g. across tests.
         STR_INTERN.with(|m| m.borrow_mut().clear());
         // Compute type layouts up front so `sizeof` reports real sizes.
         self.layouts = crate::layout::compute(program).0;
 
-        // Expose the command line as the implicit globals `I64 ArgC` / `U8 **ArgV`
-        // (a `...` function's `VargC`/`VargV` varargs locals are distinct names, so
-        // both stay in scope). `ArgV` is an array of `U8 *`, each pointing at an
+        // Expose the command line as the implicit globals `I64 ArgC` / `U8 **ArgV`.
+        // A `...` function's `VargC`/`VargV` varargs locals have distinct names, so
+        // both stay in scope. `ArgV` is an array of `U8 *`, each pointing at an
         // argument's NUL-terminated bytes.
         let argv_cells: Vec<Cell> = self
             .args
@@ -616,8 +640,9 @@ impl<W: Write> Interpreter<W> {
         );
 
         // Expose the environment as `U8 **EnvP`: a **NULL-terminated** array of the
-        // process's "KEY=VALUE" strings (mirroring the native `envp`, so a HolyC walk
-        // to the NULL sentinel works the same). Impure, like the command line / clock.
+        // process's "KEY=VALUE" strings. This mirrors the native `envp`, so a HolyC
+        // walk to the NULL sentinel works the same. Impure, like the command line and
+        // the clock.
         let mut env_cells: Vec<Cell> = std::env::vars_os()
             .map(|(k, v)| {
                 let mut s = k.into_encoded_bytes();
@@ -638,8 +663,8 @@ impl<W: Write> Interpreter<W> {
             }))),
         );
 
-        // Register all functions and classes first, so calls can resolve
-        // regardless of definition order (and top-level `Main;` works).
+        // Register all functions and classes first, so calls resolve regardless of
+        // definition order, and a top-level `Main;` works.
         for item in &program.items {
             match &item.kind {
                 StmtKind::Func(f) => {
@@ -652,14 +677,35 @@ impl<W: Write> Interpreter<W> {
             }
         }
 
-        // Execute the top-level statements as one body (function/class items are
-        // no-ops here, already registered). Using exec_stmts gives top-level
+        // Expose the current task as `CTask *Fs`, backing the exception state read in
+        // `catch` (`Fs->except_ch`). It is a zeroed heap region of `CTask` size; user
+        // member access goes through the normal heap-struct path, and `throw`/`catch`
+        // write its fields by byte offset. Materialized once `CTask` is registered
+        // (it always is, via the prelude), so this is unconditional but cheap.
+        if self.classes.contains_key("CTask") {
+            let size = self.layouts.size_of(&Type::Named("CTask".into())).max(8) as usize;
+            let buf = Rc::new(RefCell::new(vec![0u8; size]));
+            self.fs_task = Some(buf.clone());
+            self.globals.insert(
+                "Fs".to_string(),
+                cell(Value::Ptr(Some(PtrVal {
+                    region: Region::Heap(buf),
+                    index: 0,
+                }))),
+            );
+        }
+
+        // Execute the top-level statements as one body. Function and class items are
+        // no-ops here, already registered above. Using exec_stmts gives top-level
         // `goto`/labels the same resume behaviour as any block.
         let mut env = Env::top_level();
-        // `Exit(code)` unwinds execution as an error; recognise it and finish cleanly
-        // (flushing whatever was printed before the exit).
+        // `Exit(code)` unwinds execution as an error. Recognise it and finish
+        // cleanly, flushing whatever was printed before the exit.
         if let Err(e) = self.exec_stmts(&program.items, &mut env) {
-            if self.exit_code.is_none() {
+            // `Exit(code)` and an uncaught `throw` both unwind via an `Err`; finish
+            // cleanly, flushing whatever was printed first (an uncaught throw aborts a
+            // native run the same way, after the same output).
+            if self.exit_code.is_none() && self.pending_throw.is_none() {
                 return Err(e);
             }
         }
@@ -672,6 +718,7 @@ impl<W: Write> Interpreter<W> {
     fn exec_stmt(&mut self, s: &Stmt, env: &mut Env) -> Result<Flow, CodegenError> {
         match &s.kind {
             StmtKind::ShortDecl { .. } => unreachable!("deferred `:=` reached the interpreter"),
+            StmtKind::TypeSwitch { .. } => unreachable!("type switch reached the interpreter"),
             StmtKind::Empty
             | StmtKind::Label(_)
             | StmtKind::Include(_)
@@ -779,8 +826,8 @@ impl<W: Write> Interpreter<W> {
             StmtKind::Continue => Ok(Flow::Continue),
             StmtKind::Return(opt) => {
                 let v = match opt {
-                    // A brace/tuple-literal return builds the aggregate against the
-                    // return type sema recorded on the node.
+                    // A brace- or tuple-literal return builds the aggregate against
+                    // the return type that sema recorded on the node.
                     Some(e)
                         if matches!(
                             e.kind,
@@ -796,14 +843,82 @@ impl<W: Write> Interpreter<W> {
                 Ok(Flow::Return(v))
             }
             StmtKind::Goto(label) => Ok(Flow::Goto(label.clone())),
+            StmtKind::Throw(val) => {
+                // Compute the raised value (a bare `throw;` re-raises `Fs->except_ch`),
+                // store it where `catch` will read it, and unwind via an `Err` that the
+                // nearest enclosing `try` recognises through `pending_throw`.
+                let v = match val {
+                    Some(e) => self.to_i64_eval(e, e.span.pos, env)?,
+                    None => self.fs_get_field("except_ch"),
+                };
+                self.fs_set_field("except_ch", v);
+                self.fs_set_field("catch_except", 1);
+                self.pending_throw = Some(v);
+                Err(CodegenError::new("HolyC exception thrown", None))
+            }
+            StmtKind::Try { body, handler } => {
+                let depth = env.scopes.len();
+                env.scopes.push(Scope::new());
+                match self.exec_stmts(body, env) {
+                    Ok(flow) => {
+                        env.scopes.truncate(depth);
+                        Ok(flow)
+                    }
+                    Err(e) => {
+                        env.scopes.truncate(depth);
+                        if self.pending_throw.take().is_some() {
+                            // Caught: `Fs->except_ch` already holds the value.
+                            env.scopes.push(Scope::new());
+                            let flow = self.exec_stmts(handler, env);
+                            env.scopes.truncate(depth);
+                            // Clear `catch_except` only when the handler finished
+                            // normally. If it re-raised, the new throw set the flag to 1
+                            // and we propagate — matching the native longjmp, which skips
+                            // this clear on a rethrow.
+                            if flow.is_ok() {
+                                self.fs_set_field("catch_except", 0);
+                            }
+                            flow
+                        } else {
+                            Err(e) // a real runtime error or `Exit`: propagate
+                        }
+                    }
+                }
+            }
         }
     }
 
-    /// Execute a statement list. A `goto` whose target label is a direct member
-    /// of this list resumes execution there; otherwise the goto propagates to
-    /// the enclosing list (so labels in the current or any enclosing block are
-    /// reachable). Semantic analysis enforces the same scope rule, so an
-    /// unresolved goto reaching the function body is a genuine error.
+    /// Write an `I64`-sized field of the `Fs` `CTask` region by name (little-endian).
+    /// A no-op if `Fs` was not materialized or the field is unknown.
+    fn fs_set_field(&mut self, field: &str, v: i64) {
+        if let Some(buf) = self.fs_task.clone() {
+            let off = self.layouts.offset_of("CTask", field).unwrap_or(0) as usize;
+            let mut b = buf.borrow_mut();
+            if off + 8 <= b.len() {
+                b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+
+    /// Read an `I64`-sized field of the `Fs` `CTask` region by name.
+    fn fs_get_field(&self, field: &str) -> i64 {
+        if let Some(buf) = &self.fs_task {
+            let off = self.layouts.offset_of("CTask", field).unwrap_or(0) as usize;
+            let b = buf.borrow();
+            if off + 8 <= b.len() {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&b[off..off + 8]);
+                return i64::from_le_bytes(a);
+            }
+        }
+        0
+    }
+
+    /// Execute a statement list. A `goto` whose target label is a direct member of
+    /// this list resumes execution there. Otherwise the goto propagates to the
+    /// enclosing list, so labels in the current or any enclosing block are reachable.
+    /// Semantic analysis enforces the same scope rule, so an unresolved goto that
+    /// reaches the function body is a genuine error.
     fn exec_stmts(&mut self, stmts: &[Stmt], env: &mut Env) -> Result<Flow, CodegenError> {
         let mut i = 0;
         while i < stmts.len() {
@@ -819,10 +934,10 @@ impl<W: Write> Interpreter<W> {
         Ok(Flow::Normal)
     }
 
-    /// Run `stmts[from..to]` in sequence, returning the first non-`Normal` flow
-    /// (a `break` surfaces as `Flow::Break`). Unlike `exec_stmts`, a `goto` is
-    /// not resolved here — it bubbles to the enclosing block, matching how a
-    /// switch body propagates control.
+    /// Run `stmts[from..to]` in sequence, returning the first non-`Normal` flow; a
+    /// `break` surfaces as `Flow::Break`. Unlike `exec_stmts`, a `goto` is not
+    /// resolved here: it bubbles to the enclosing block, matching how a switch body
+    /// propagates control.
     fn exec_stmts_range(
         &mut self,
         stmts: &[Stmt],
@@ -868,10 +983,11 @@ impl<W: Write> Interpreter<W> {
             return self.exec_stmt(body, env);
         };
 
-        // HolyC `start:` / `end:` sub-labels split the body into an optional
-        // prologue (runs on entry, before dispatch) and epilogue (reached by
-        // fall-through; a `break` skips it). Sema has already checked that
-        // `start:` precedes every case and `end:` follows every case.
+        // HolyC's `start:` / `end:` sub-labels split the body into an optional
+        // prologue and epilogue. The prologue runs on entry, before dispatch. The
+        // epilogue is reached by fall-through, and a `break` skips it. Sema has
+        // already checked that `start:` precedes every case and `end:` follows
+        // every case.
         let start_label = stmts
             .iter()
             .position(|s| matches!(s.kind, StmtKind::SwitchStart));
@@ -936,8 +1052,8 @@ impl<W: Write> Interpreter<W> {
             },
         };
 
-        // Execute from the chosen label, falling through (into the epilogue)
-        // until `break`/end.
+        // Execute from the chosen label, falling through into the epilogue until a
+        // `break` or the end of the body.
         let flow = match self.exec_stmts_range(stmts, i, stmts.len(), env)? {
             Flow::Break => Flow::Normal,
             other => other,
@@ -977,9 +1093,9 @@ impl<W: Write> Interpreter<W> {
             ExprKind::Str(s) => Ok(Value::Str(Rc::new(s.clone()))),
             ExprKind::Ident(name) => self.eval_ident(name, pos, env),
 
-            // A dereference read may target a raw byte heap slot, so it goes
-            // through `eval_place` (which serializes scalars) rather than always
-            // resolving to a cell.
+            // A dereference read may target a raw byte heap slot, so it goes through
+            // `eval_place`, which serializes scalars, rather than always resolving to
+            // a cell.
             ExprKind::Unary {
                 op: UnOp::Deref, ..
             } => {
@@ -1020,8 +1136,8 @@ impl<W: Write> Interpreter<W> {
             ExprKind::Sizeof(arg) => {
                 let ty = match arg {
                     SizeofArg::Type(t) => t.clone(),
-                    // `sizeof(expr)` uses the expression's statically inferred
-                    // type (filled in by semantic analysis).
+                    // `sizeof(expr)` uses the expression's statically inferred type,
+                    // filled in by semantic analysis.
                     SizeofArg::Expr(e) => e.ty().ok_or_else(|| {
                         CodegenError::at(
                             pos,
@@ -1062,7 +1178,7 @@ impl<W: Write> Interpreter<W> {
         if let Some(c) = self.resolve(env, name) {
             return Ok(c.borrow().clone());
         }
-        // A bare function name invokes it (HolyC: `Main;` calls Main).
+        // A bare function name invokes it; in HolyC, `Main;` calls Main.
         if self.funcs.contains_key(name) {
             return self.call(name, Vec::new(), pos);
         }
@@ -1089,8 +1205,7 @@ impl<W: Write> Interpreter<W> {
                 Ok(deref_to_cell(&v, pos)?.borrow().clone())
             }
             UnOp::AddrOf => {
-                // `&Func` is a function pointer (unless a variable shadows the
-                // name).
+                // `&Func` is a function pointer, unless a variable shadows the name.
                 if let ExprKind::Ident(name) = &expr.kind {
                     if self.resolve(env, name).is_none() && self.funcs.contains_key(name) {
                         return Ok(Value::Func(name.clone()));
@@ -1102,8 +1217,8 @@ impl<W: Write> Interpreter<W> {
                 let delta = if matches!(op, UnOp::PreInc) { 1 } else { -1 };
                 let place = self.eval_place(expr, env)?;
                 let nv = self.step_value(&place.load(pos)?, delta, expr, env, pos)?;
-                // Truncate to the lvalue's width, like `+=`/assignment (and the
-                // native backends, which narrow `++`/`--` to the declared width).
+                // Truncate to the lvalue's width, like `+=` and assignment. The
+                // native backends likewise narrow `++`/`--` to the declared width.
                 let nv = match expr.ty() {
                     Some(t) => coerce_to(&t, nv),
                     None => nv,
@@ -1159,13 +1274,14 @@ impl<W: Write> Interpreter<W> {
         }
         let l = self.eval(lhs, env)?;
         let r = self.eval(rhs, env)?;
-        // Heap (byte-addressed) pointer arithmetic scales by the element size;
-        // cell pointers and numbers fall through to `apply_binop`.
+        // Heap (byte-addressed) pointer arithmetic scales by the element size. Cell
+        // pointers and numbers fall through to `apply_binop`.
         if let Some(v) = self.heap_ptr_arith(op, &l, lhs, &r, rhs, env)? {
             return Ok(v);
         }
-        // Signedness drives `>> / %` (left operand) and the relational compares
-        // (unsigned if either operand is unsigned — C's usual conversions).
+        // Signedness drives `>>` and `%` (off the left operand) and the relational
+        // compares. The relational compares are unsigned if either operand is
+        // unsigned, per C's usual arithmetic conversions.
         let signed = match op {
             BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                 expr_is_signed(lhs) && expr_is_signed(rhs)
@@ -1185,8 +1301,8 @@ impl<W: Write> Interpreter<W> {
     ) -> Result<Value, CodegenError> {
         use BinOp::*;
 
-        // Pointer-aware paths (arrays decay to pointers). A null pointer reads as
-        // the integer 0, so it falls through to the numeric paths below.
+        // Pointer-aware paths; arrays decay to pointers. A null pointer reads as the
+        // integer 0, so it falls through to the numeric paths below.
         let lp = as_pointer(&l);
         let rp = as_pointer(&r);
         match op {
@@ -1243,8 +1359,9 @@ impl<W: Write> Interpreter<W> {
                         Add => a + b,
                         Sub => a - b,
                         Mul => a * b,
-                        // Float `/0` is IEEE-defined (`±inf`/`nan`), matching the
-                        // native backends' hardware divide — not a runtime error.
+                        // Float division by zero is IEEE-defined (`±inf`/`nan`), not
+                        // a runtime error. This matches the native backends'
+                        // hardware divide.
                         Div => a / b,
                         Mod => a % b,
                         _ => unreachable!(),
@@ -1286,9 +1403,9 @@ impl<W: Write> Interpreter<W> {
             Eq => Ok(Value::Int(i64::from(values_equal(&l, &r)))),
             Ne => Ok(Value::Int(i64::from(!values_equal(&l, &r)))),
             Lt | Gt | Le | Ge => {
-                // Float operands compare as f64; integers compare at full 64-bit
-                // width (an f64 compare would lose precision past 2^53), signed or
-                // unsigned per the operands' types.
+                // Float operands compare as f64. Integers compare at full 64-bit
+                // width, signed or unsigned per the operands' types; an f64 compare
+                // would lose precision past 2^53.
                 let v = if l.is_float() || r.is_float() {
                     let a = l.as_f64().ok_or_else(|| self.num_err(pos))?;
                     let b = r.as_f64().ok_or_else(|| self.num_err(pos))?;
@@ -1331,8 +1448,8 @@ impl<W: Write> Interpreter<W> {
                     BitOr => a | b,
                     BitXor => a ^ b,
                     Shl => a.wrapping_shl(b as u32),
-                    // `>>` is arithmetic for a signed left operand, logical for
-                    // unsigned (C semantics) — matching the native backend.
+                    // `>>` is arithmetic for a signed left operand and logical for an
+                    // unsigned one (C semantics), matching the native backend.
                     Shr if signed => a.wrapping_shr(b as u32),
                     Shr => (a as u64).wrapping_shr(b as u32) as i64,
                     _ => unreachable!(),
@@ -1343,12 +1460,12 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// If `e` is a `MAlloc(size)` call destined for a `T*` pointer, allocate a
-    /// buffer matching how the native heap is laid out: a raw byte buffer for an
-    /// integer/float element type (so type punning works) or `size / sizeof(T)`
-    /// element-typed cells for a class/pointer element (so `Pt *p =
-    /// MAlloc(sizeof(Pt)*n)` holds class elements). Returns `None` for anything
-    /// else, leaving normal evaluation to handle it.
+    /// Allocate a buffer for a `MAlloc(size)` call destined for a `T *` pointer,
+    /// matching how the native heap is laid out. An integer/float element type gets
+    /// a raw byte buffer, so type punning works. A class/pointer element gets
+    /// `size / sizeof(T)` element-typed cells, so `Pt *p = MAlloc(sizeof(Pt)*n)`
+    /// holds class elements. Returns `None` for anything else, leaving normal
+    /// evaluation to handle it.
     fn try_typed_malloc(
         &mut self,
         e: &Expr,
@@ -1368,9 +1485,9 @@ impl<W: Write> Interpreter<W> {
         Ok(Some(self.alloc(bytes, elem, env)?))
     }
 
-    /// Allocate a heap buffer of `bytes` bytes for element type `elem`: a raw
-    /// byte region for integer/float scalars, else a region of `bytes /
-    /// sizeof(elem)` element cells.
+    /// Allocate a heap buffer of `bytes` bytes for element type `elem`. An integer
+    /// or float scalar gets a raw byte region; anything else gets a region of
+    /// `bytes / sizeof(elem)` element cells.
     fn alloc(&mut self, bytes: i64, elem: &Type, env: &mut Env) -> Result<Value, CodegenError> {
         let bytes = bytes.max(0);
         let region = if is_byte_heap_elem(elem) {
@@ -1388,17 +1505,18 @@ impl<W: Write> Interpreter<W> {
         Ok(Value::Ptr(Some(PtrVal { region, index: 0 })))
     }
 
-    /// Whether `ty` is a class/union type — an *aggregate* that, when stored into or
-    /// read from a raw byte heap buffer, must be (de)serialised field-by-field per the
-    /// layout (a generic `Vec<T>`/`Hmap` whose `T` is a class lives in a `ReAlloc`'d
-    /// byte buffer, so a whole-class element store/load lands here). Scalars/pointers
-    /// keep the direct `Place::Bytes` path.
+    /// Whether `ty` is a class or union type, i.e. an *aggregate*. When such a value
+    /// is stored into or read from a raw byte heap buffer, it must be (de)serialised
+    /// field-by-field per the layout. This happens because a generic `Vec<T>`/`Hmap`
+    /// whose `T` is a class lives in a `ReAlloc`'d byte buffer, so a whole-class
+    /// element store or load lands here. Scalars and pointers keep the direct
+    /// `Place::Bytes` path.
     fn ty_is_aggregate(&self, ty: &Type) -> bool {
         matches!(ty, Type::Named(n) if self.classes.contains_key(n))
     }
 
     /// Serialise an aggregate (or scalar) `Value` into the byte buffer at `off`,
-    /// recursing over the type's layout — mirroring the native byte layout so a
+    /// recursing over the type's layout. This mirrors the native byte layout, so a
     /// class element round-trips through a heap buffer.
     fn store_bytes_value(
         &self,
@@ -1444,8 +1562,8 @@ impl<W: Write> Interpreter<W> {
                 }
                 Ok(())
             }
-            // A scalar/pointer: the existing width-aware (and pointer-serialising)
-            // byte store.
+            // A scalar or pointer: the existing width-aware byte store, which also
+            // serialises pointers.
             scalar => {
                 let p = Place::Bytes {
                     buf: buf.clone(),
@@ -1459,8 +1577,8 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Deserialise an aggregate (or scalar) `Value` out of a byte buffer at `off` — the
-    /// inverse of [`store_bytes_value`].
+    /// Deserialise an aggregate (or scalar) `Value` out of a byte buffer at `off`.
+    /// The inverse of [`store_bytes_value`].
     fn load_bytes_value(
         &self,
         buf: &Rc<RefCell<Vec<u8>>>,
@@ -1541,14 +1659,15 @@ impl<W: Write> Interpreter<W> {
                 self.apply_binop(compound_binop(op), cur, rhs, expr_is_signed(target), pos)?
             }
         };
-        // Coerce to the lvalue's scalar type on store (e.g. `I64 w; w = 3.14;`
-        // truncates), so the interpreter matches the native backend.
+        // Coerce to the lvalue's scalar type on store, so the interpreter matches
+        // the native backend. For example, `I64 w; w = 3.14;` truncates.
         let newv = match target.ty() {
             Some(t) => coerce_to(&t, newv),
             None => newv,
         };
-        // A whole class/union value stored into a byte heap buffer (a `Vec<T>`/`Hmap`
-        // element where `T` is an aggregate) serialises field-by-field per the layout.
+        // A whole class/union value stored into a byte heap buffer serialises
+        // field-by-field per the layout. This is the case for a `Vec<T>`/`Hmap`
+        // element whose `T` is an aggregate.
         if let Place::Bytes { buf, off, ty, .. } = &place {
             if self.ty_is_aggregate(ty) {
                 self.store_bytes_value(buf, *off, ty, &newv, pos)?;
@@ -1569,11 +1688,11 @@ impl<W: Write> Interpreter<W> {
             .map(|a| self.eval(a, env))
             .collect::<Result<Vec<_>, _>>()?;
         let pos = callee.span.pos;
-        // A direct call to a named function/builtin, unless a variable shadows it.
+        // A direct call to a named function or builtin, unless a variable shadows it.
         if let ExprKind::Ident(name) = &callee.kind {
             if self.resolve(env, name).is_none() {
                 // Atomics are width-directed by the pointer's pointee type, which is
-                // only available here (at the expression level) — handle them before
+                // only available here at the expression level, so handle them before
                 // the value-only `call`. A user function with a body still shadows.
                 let shadowed = self.funcs.get(name).is_some_and(|f| f.body.is_some());
                 if !shadowed
@@ -1596,16 +1715,18 @@ impl<W: Write> Interpreter<W> {
     }
 
     fn call(&mut self, name: &str, args: Vec<Value>, pos: Pos) -> Result<Value, CodegenError> {
-        // Registry builtins (`ArgC`/`ArgV`/`VarArg*`) and **primitive intrinsics**
-        // (the printf family, heap, clock — lib prototypes with no HolyC body) are
-        // implemented by the interpreter directly. An *optimization* intrinsic like
-        // `Sqrt` is an ordinary lib function with a real body, so it falls through to
-        // the user-function path below and runs that body.
+        // **Primitive intrinsics** are lib prototypes with no HolyC body (the printf
+        // family, heap, clock). The interpreter implements them directly. An
+        // *optimization* intrinsic like `Sqrt` is an ordinary lib function with a
+        // real body, so it falls through to the user-function path below and runs
+        // that body.
+        //
         // A user-defined function with a real body shadows a like-named primitive
-        // intrinsic (e.g. a program's own `Join`/`Read`): only do the bespoke builtin
-        // lowering when no body is in scope (the lib prototype, which has none).
+        // intrinsic, e.g. a program's own `Join`/`Read`. So do the bespoke builtin
+        // lowering only when no body is in scope, i.e. the bodyless lib prototype.
+        //
         // The printf family is **always** rendered by the interpreter's own
-        // `crate::fmt` — its independent conformance oracle — even though `<fmt.hc>`
+        // `crate::fmt`, its independent conformance oracle, even though `<fmt.hc>`
         // now gives `Print`/`StrPrint`/… real HolyC bodies that the native backends
         // compile and call. Diffing native (the HolyC formatter) against interp (the
         // Rust formatter) thus cross-checks two independent implementations, rather
@@ -1614,9 +1735,7 @@ impl<W: Write> Interpreter<W> {
             return self.call_builtin(name, &args, pos);
         }
         let user_defined = self.funcs.get(name).is_some_and(|f| f.body.is_some());
-        if !user_defined
-            && (crate::builtins::is_builtin(name) || crate::intrinsics::is_primitive(name))
-        {
+        if !user_defined && crate::intrinsics::is_primitive(name) {
             return self.call_builtin(name, &args, pos);
         }
         if let Some(f) = self.funcs.get(name).cloned() {
@@ -1633,9 +1752,9 @@ impl<W: Write> Interpreter<W> {
                     ));
                 };
                 if let Some(pname) = &p.name {
-                    // Coerce the argument to the parameter's scalar type, so a
-                    // narrow param truncates its argument like the native backend
-                    // (which spills the arg at the param's width).
+                    // Coerce the argument to the parameter's scalar type, so a narrow
+                    // param truncates its argument like the native backend, which
+                    // spills the arg at the param's width.
                     let val = coerce_to(&p.ty, by_value(val));
                     env.scopes[0].insert(pname.clone(), cell(val));
                 }
@@ -1644,10 +1763,11 @@ impl<W: Write> Interpreter<W> {
                 CodegenError::at(pos, format!("call to `{name}`, which has no body"))
             })?;
             // A `...` function exposes the trailing arguments (those past the named
-            // params) as the implicit HolyC locals `I64 VargC` (the count) and
-            // `I64 *VargV` — a buffer of their raw 8-byte slots (F64 by bit pattern,
-            // pointers/strings as a serialised handle), so `VargV[i]` reads slot `i`
-            // and `*(F64 *)&VargV[i]` / `*(U8 **)&VargV[i]` read other types.
+            // params) as the implicit HolyC locals `I64 VargC`, the count, and
+            // `I64 *VargV`, a buffer of their raw 8-byte slots. A slot holds an F64
+            // by bit pattern, and a pointer or string as a serialised handle. So
+            // `VargV[i]` reads slot `i`, and `*(F64 *)&VargV[i]` / `*(U8 **)&VargV[i]`
+            // read other types.
             if f.varargs {
                 let varargs = args.get(f.params.len()..).unwrap_or(&[]);
                 let mut bytes = vec![0u8; varargs.len() * 8];
@@ -1674,8 +1794,8 @@ impl<W: Write> Interpreter<W> {
                     }))),
                 );
             }
-            // Narrow the result to the declared return width (C truncates the
-            // return value to the return type), matching the native backend.
+            // Narrow the result to the declared return width, matching the native
+            // backend; C truncates the return value to the return type.
             let result = self.exec_func_body(body, &mut env);
             return Ok(coerce_to(&f.ret, result?));
         }
@@ -1698,8 +1818,8 @@ impl<W: Write> Interpreter<W> {
                 Ok(Value::Void)
             }
             "StrPrint" | "CatPrint" => {
-                // Format `fmt, rest...`; `StrPrint` writes at the start of dst,
-                // `CatPrint` appends (writes at dst + StrLen(dst)). Both
+                // Format `fmt, rest...`. `StrPrint` writes at the start of dst;
+                // `CatPrint` appends, writing at dst + StrLen(dst). Both
                 // NUL-terminate and return dst.
                 let fmt = match &args[1] {
                     Value::Str(s) => s.to_string(),
@@ -1709,9 +1829,9 @@ impl<W: Write> Interpreter<W> {
                 let mut bytes = s.into_bytes();
                 bytes.push(0);
                 let at = if name == "CatPrint" {
-                    // Append: write at dst + StrLen(dst). `dst` may be a pointer,
-                    // an array (decays to a pointer), or a string literal — turn
-                    // any of them into a pointer before applying the offset.
+                    // Append: write at dst + StrLen(dst). `dst` may be a pointer, an
+                    // array (which decays to a pointer), or a string literal; turn any
+                    // of them into a pointer before applying the offset.
                     let cur = self.cstr_bytes(&args[0], pos)?.len() as i64;
                     match as_pointer(&args[0]) {
                         Some(Some(pv)) => Value::Ptr(Some(pv.offset(cur))),
@@ -1724,19 +1844,19 @@ impl<W: Write> Interpreter<W> {
                 Ok(args[0].clone())
             }
             "MAlloc" => {
-                // A bare allocation with no element-type context: a raw byte
-                // buffer (a typed `T *p = MAlloc(...)` is retyped by
-                // `try_typed_malloc`).
+                // A bare allocation with no element-type context gets a raw byte
+                // buffer. A typed `T *p = MAlloc(...)` is retyped by
+                // `try_typed_malloc`.
                 let n = self.to_i64(args[0].clone(), pos)?.max(0);
                 let mut env = Env::top_level();
                 self.alloc(n, &Type::U8, &mut env)
             }
-            // `HeapExtend` never extends in place here (the interpreter's heap has no
-            // bump-pointer model); returning NULL routes `ReAlloc` through the
-            // MAlloc+copy path, matching the libc/Darwin heaps.
+            // `HeapExtend` never extends in place here, since the interpreter's heap
+            // has no bump-pointer model. Returning NULL routes `ReAlloc` through the
+            // MAlloc-and-copy path, matching the libc/Darwin heaps.
             "HeapExtend" => Ok(Value::Ptr(None)),
-            // `MSize(ptr)` — the requested byte size of `ptr`'s heap region (0 for a
-            // non-`MAlloc`'d pointer), tracked in `heap_sizes` at allocation time.
+            // `MSize(ptr)`: the requested byte size of `ptr`'s heap region, tracked
+            // in `heap_sizes` at allocation time. 0 for a non-`MAlloc`'d pointer.
             "MSize" => {
                 let n = match &args[0] {
                     Value::Ptr(Some(p)) => self
@@ -1749,7 +1869,7 @@ impl<W: Write> Interpreter<W> {
                 Ok(Value::Int(n))
             }
             "MStrPrint" => {
-                // Format into a freshly allocated, right-sized buffer; return it.
+                // Format into a freshly allocated, right-sized buffer and return it.
                 let fmt = match &args[0] {
                     Value::Str(s) => s.to_string(),
                     other => String::from_utf8_lossy(&self.cstr_bytes(other, pos)?).into_owned(),
@@ -1762,12 +1882,12 @@ impl<W: Write> Interpreter<W> {
                 self.write_bytes(&buf, &bytes, pos)?;
                 Ok(buf)
             }
-            // Float conversion is not a builtin: `StrToF64` is a correctly-rounded
-            // bignum `atof` in lib/strconv.hc, `F64ToStr` a `StrPrint("%g")` wrapper
-            // in lib/cstr.hc.
-            // Storage is reclaimed by `Rc`; freeing is a no-op.
+            // Float conversion is not a builtin: `StrToF64` (a correctly-rounded bignum
+            // `atof`) and its round-trip inverse `F64ToStr` are pure HolyC in lib/cstr.hc.
+            //
+            // Storage is reclaimed by `Rc`, so freeing is a no-op.
             "Free" => Ok(Value::Void),
-            // Clock/time primitives — impure (read the host clock or sleep).
+            // Clock/time primitives. Impure: they read the host clock or sleep.
             "UnixNS" => Ok(Value::Int(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1785,9 +1905,9 @@ impl<W: Write> Interpreter<W> {
                 std::thread::sleep(std::time::Duration::from_nanos(ns));
                 Ok(Value::Void)
             }
-            // POSIX fd primitives — a thin emulator over `std::net`/`std::fs`. The
-            // socket `domain`/`type`/`proto` are ignored (only AF_INET/SOCK_STREAM is
-            // modelled, like the native `socket(2)`); `Socket` just reserves an fd and
+            // POSIX fd primitives: a thin emulator over `std::net`/`std::fs`. The
+            // socket `domain`/`type`/`proto` are ignored; like the native `socket(2)`
+            // only AF_INET/SOCK_STREAM is modelled. `Socket` just reserves an fd, and
             // `Connect` does the real `TcpStream::connect` from the `sockaddr` bytes.
             "Socket" => {
                 let fd = self.next_fd;
@@ -1811,9 +1931,9 @@ impl<W: Write> Interpreter<W> {
                     Err(_) => Ok(Value::Int(-1)),
                 }
             }
-            // `Open(path, flags, mode)` — the canonical flags are Linux's (see
-            // `lib/io.hc`); map them to `OpenOptions` (`O_RDONLY`/`O_WRONLY`/`O_RDWR`
-            // plus `O_CREAT`/`O_TRUNC`/`O_APPEND`).
+            // `Open(path, flags, mode)`. The canonical flags are Linux's (see
+            // `lib/io.hc`); map them to `OpenOptions`: `O_RDONLY`/`O_WRONLY`/`O_RDWR`
+            // plus `O_CREAT`/`O_TRUNC`/`O_APPEND`.
             "Open" => {
                 let path_bytes = self.cstr_bytes(&args[0], pos)?;
                 let path = path_from_bytes(&path_bytes);
@@ -1834,8 +1954,8 @@ impl<W: Write> Interpreter<W> {
                     opts.append(true); // O_APPEND
                 }
                 if flags & 0x40 != 0 {
-                    // O_CREAT: honour the requested permission bits (like the native
-                    // `open(2)`), so a created file is readable/writable as asked. A
+                    // O_CREAT: honour the requested permission bits, like the native
+                    // `open(2)`, so a created file is readable/writable as asked. A
                     // no-op on platforms without Unix mode bits (Windows).
                     let mode = self.to_i64(args[2].clone(), pos)?;
                     set_open_mode(&mut opts, mode as u32);
@@ -1847,9 +1967,9 @@ impl<W: Write> Interpreter<W> {
                         self.fds.insert(fd, FdObj::File(file));
                         Ok(Value::Int(fd))
                     }
-                    // Mirror the syscall contract: a negative `-errno` (the common
-                    // POSIX codes — ENOENT=2, EACCES=13, … — agree across Linux and
-                    // macOS, so the number is the same on every target).
+                    // Mirror the syscall contract: a negative `-errno`. The common
+                    // POSIX codes (ENOENT=2, EACCES=13, …) agree across Linux and
+                    // macOS, so the number is the same on every target.
                     Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
                 }
             }
@@ -1882,9 +2002,9 @@ impl<W: Write> Interpreter<W> {
                 };
                 Ok(Value::Int(res.map(|w| w as i64).unwrap_or(-1)))
             }
-            // Write to a standard stream. fd 1 → the captured output sink (so it is
-            // part of `run_to_string`, like `Print`); fd 2 → real stderr (a side
-            // channel, not compared in conformance). Other fds are an error.
+            // Write to a standard stream. fd 1 goes to the captured output sink, so
+            // it is part of `run_to_string`, like `Print`. fd 2 goes to real stderr,
+            // a side channel not compared in conformance. Other fds are an error.
             "StdWrite" => {
                 let fd = self.to_i64(args[0].clone(), pos)?;
                 let n = self.to_i64(args[2].clone(), pos)?.max(0) as usize;
@@ -1915,11 +2035,11 @@ impl<W: Write> Interpreter<W> {
             }
             "Close" => {
                 let fd = self.to_i64(args[0].clone(), pos)?;
-                self.fds.remove(&fd); // dropping the stream/file closes it
+                self.fds.remove(&fd); // dropping the stream or file closes it
                 Ok(Value::Int(0))
             }
-            // Filesystem mutation over `std::fs`. Like the fd ops, a failure is the
-            // negative `-errno` (the common POSIX codes agree across Linux/macOS).
+            // Filesystem mutation over `std::fs`. Like the fd ops, a failure returns
+            // the negative `-errno`; the common POSIX codes agree across Linux/macOS.
             "Remove" => {
                 let pb = self.cstr_bytes(&args[0], pos)?;
                 let path = path_from_bytes(&pb);
@@ -1947,20 +2067,22 @@ impl<W: Write> Interpreter<W> {
                     Err(e) => Ok(Value::Int(-(e.raw_os_error().unwrap_or(2) as i64))),
                 }
             }
-            // Halt the program with an exit status. Sets `exit_code` and unwinds via
-            // an error that `run` recognises and turns into a clean finish.
+            // Halt the program with an exit status. Set `exit_code` and unwind via an
+            // error that `run` recognises and turns into a clean finish.
             "Exit" => {
                 self.exit_code = Some(self.to_i64(args[0].clone(), pos)?);
                 Err(CodegenError::new("program called Exit", None))
             }
-            // Process / user ids (impure — differ from a native run, so property-tested).
+            // Process and user ids. Impure: they differ from a native run, so
+            // property-tested.
             "Getpid" => Ok(Value::Int(std::process::id() as i64)),
             "Getppid" => Ok(Value::Int(parent_pid() as i64)),
-            // No std accessor for the uid/gid; on Unix call libc, on Windows report 0
-            // (Windows has no POSIX uid/gid). Impure → property-tested, not value-pinned.
+            // There is no `std` accessor for the uid/gid. On Unix, call libc; on
+            // Windows, report 0, since Windows has no POSIX uid/gid. Impure, so
+            // property-tested, not value-pinned.
             "Getuid" => Ok(Value::Int(get_uid() as i64)),
             "Getgid" => Ok(Value::Int(get_gid() as i64)),
-            // Working directory, over `std::env` (impure).
+            // Working directory, over `std::env`. Impure.
             "Chdir" => {
                 let pb = self.cstr_bytes(&args[0], pos)?;
                 let path = path_from_bytes(&pb);
@@ -1986,8 +2108,8 @@ impl<W: Write> Interpreter<W> {
                 }
             }
             // Threads, emulated synchronously (see the `thread_results` note): run the
-            // function body now, save its return for `Join`. `fn` is a function pointer
-            // (`&Fn`), i.e. a `Value::Func(name)`.
+            // function body now and save its return for `Join`. `fn` is a function
+            // pointer (`&Fn`), i.e. a `Value::Func(name)`.
             "Thread" => {
                 let Value::Func(fname) = &args[0] else {
                     return Err(CodegenError::at(
@@ -2011,14 +2133,14 @@ impl<W: Write> Interpreter<W> {
                 let handle = self.to_i64(args[0].clone(), pos)?;
                 Ok(Value::Int(self.thread_results.remove(&handle).unwrap_or(0)))
             }
-            // (Atomics are handled in `eval_atomic`, dispatched from `eval_call` where
-            // the pointer's pointee width is known.) Threads run synchronously, so the
-            // fence and the futex wait/wake are no-ops (a thread never actually blocks).
+            // Atomics are handled in `eval_atomic`, dispatched from `eval_call` where
+            // the pointer's pointee width is known. Threads run synchronously, so the
+            // fence and the futex wait/wake are no-ops; a thread never actually blocks.
             "AtomicFence" => Ok(Value::Void),
             "FutexWait" | "FutexWake" => Ok(Value::Int(0)),
-            // The two irreducible algebraic F64 primitives — exactly reproducible in
-            // every backend (hardware `sqrt`, a sign-bit clear). Rounding and the
-            // transcendentals are reducible and live in `lib/math.hc`.
+            // The two irreducible algebraic F64 primitives are exactly reproducible
+            // in every backend: a hardware `sqrt` and a sign-bit clear. Rounding and
+            // the transcendentals are reducible and live in `lib/math.hc`.
             _ => Err(CodegenError::at(
                 pos,
                 format!("builtin `{name}` is not implemented"),
@@ -2027,10 +2149,11 @@ impl<W: Write> Interpreter<W> {
     }
 
     /// An atomic op (`sync.hc`), width-directed by the pointer's pointee type `pty`.
-    /// The interpreter runs threads synchronously (no real contention), so each is a
-    /// plain read-modify-write of the `pty`-sized scalar the pointer names — values
-    /// masked/extended to the pointee width so it matches the native hardware-atomic
-    /// lowering for any integer width (`U32` counter, pointer, `U8`, …).
+    /// The interpreter runs threads synchronously, with no real contention, so each
+    /// op is a plain read-modify-write of the `pty`-sized scalar the pointer names.
+    /// Values are masked or extended to the pointee width, so it matches the native
+    /// hardware-atomic lowering for any integer width: a `U32` counter, a pointer, a
+    /// `U8`, and so on.
     fn eval_atomic(
         &mut self,
         name: &str,
@@ -2073,9 +2196,9 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Resolve a pointer value (passed to an atomic op) to the `Place` of the `pty`-
-    /// sized scalar it names — a heap byte slot or a backing cell — so the atomic can
-    /// load/store it like an ordinary scalar of that width.
+    /// Resolve a pointer value, passed to an atomic op, to the `Place` of the
+    /// `pty`-sized scalar it names: a heap byte slot or a backing cell. The atomic
+    /// can then load and store it like an ordinary scalar of that width.
     fn atomic_place(&self, ptr: &Value, pty: &Type, pos: Pos) -> Result<Place, CodegenError> {
         match ptr {
             Value::Ptr(Some(pv)) => {
@@ -2095,9 +2218,10 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Read exactly `n` bytes from the buffer `ptr` points at (a heap byte buffer, a
-    /// cell-backed array/pointer, or a string literal), zero-padding if it's shorter.
-    /// Marshals a fixed-size buffer (a `sockaddr`, a read target) out of HolyC memory.
+    /// Read exactly `n` bytes from the buffer `ptr` points at, zero-padding if it is
+    /// shorter. `ptr` may be a heap byte buffer, a cell-backed array or pointer, or a
+    /// string literal. Used to marshal a fixed-size buffer — a `sockaddr`, a read
+    /// target — out of HolyC memory.
     fn read_n_bytes(&self, ptr: &Value, n: usize, pos: Pos) -> Result<Vec<u8>, CodegenError> {
         match ptr {
             Value::Str(s) => {
@@ -2133,9 +2257,9 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// The bytes of a NUL-terminated string, up to (not including) the
-    /// terminator. Accepts a string literal, a pointer into a byte buffer, or an
-    /// array that has decayed to one.
+    /// The bytes of a NUL-terminated string, up to but not including the terminator.
+    /// Accepts a string literal, a pointer into a byte buffer, or an array that has
+    /// decayed to one.
     fn cstr_bytes(&self, s: &Value, pos: Pos) -> Result<Vec<u8>, CodegenError> {
         let cell_byte = |c: &Cell| c.borrow().as_i64().map(|v| v as u8);
         match s {
@@ -2246,8 +2370,7 @@ impl<W: Write> Interpreter<W> {
             ExprKind::Member { base, field, arrow } => {
                 self.member_cell(base, field, *arrow, pos, env)
             }
-            // `a[i]` and `*p` designate the cell the corresponding address points
-            // at.
+            // `a[i]` and `*p` designate the cell their address points at.
             ExprKind::Index { .. }
             | ExprKind::Unary {
                 op: UnOp::Deref, ..
@@ -2259,9 +2382,9 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Resolve an lvalue to a writable [`Place`]: a value cell, or — when it
-    /// indexes/derefs a raw byte heap pointer — a typed slot inside that buffer.
-    /// Reads and writes go through this so heap access serializes scalars.
+    /// Resolve an lvalue to a writable [`Place`]: a value cell, or, when it indexes
+    /// or derefs a raw byte heap pointer, a typed slot inside that buffer. Reads and
+    /// writes go through this so heap access serializes scalars.
     fn eval_place(&mut self, e: &Expr, env: &mut Env) -> Result<Place, CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
@@ -2303,8 +2426,8 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// The address (region + offset) of an lvalue expression — the value of `&e`
-    /// and the basis for indexing and dereference.
+    /// The address (region plus offset) of an lvalue expression. This is the value
+    /// of `&e` and the basis for indexing and dereference.
     fn eval_addr(&mut self, e: &Expr, env: &mut Env) -> Result<PtrVal, CodegenError> {
         let pos = e.span.pos;
         match &e.kind {
@@ -2333,9 +2456,9 @@ impl<W: Write> Interpreter<W> {
                 let bv = self.eval(base, env)?;
                 let i = self.to_i64_eval(index, pos, env)?;
                 match as_pointer(&bv) {
-                    // A raw byte heap region is byte-addressed, so the index
-                    // advances by the element's size; cell regions are
-                    // element-addressed (index == element).
+                    // A raw byte heap region is byte-addressed, so the index advances
+                    // by the element's size. Cell regions are element-addressed, where
+                    // the index is the element number.
                     Some(Some(pv)) => {
                         let step = if matches!(pv.region, Region::Heap(_)) {
                             self.size_of_type(&e.ty().unwrap_or(Type::I64), env)?.max(1)
@@ -2384,7 +2507,7 @@ impl<W: Write> Interpreter<W> {
         } else if is_place(base) {
             self.eval_lvalue(base, env)?
         } else {
-            // An aggregate rvalue (e.g. a class-returning call): materialise the
+            // An aggregate rvalue, such as a class-returning call: materialise the
             // temporary in a fresh cell so its fields can be read.
             cell(self.eval(base, env)?)
         };
@@ -2402,11 +2525,11 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Resolve `base.field` (or `base->field`) to a union byte buffer + the
-    /// field's `(offset, type)`, when the field lives in a union — either because
-    /// `base` *is* a union, or because `field` is promoted from an anonymous
-    /// union embedded in `base`'s class. Returns `None` for an ordinary class
-    /// field (which `member_cell` handles).
+    /// Resolve `base.field` (or `base->field`) to a union byte buffer plus the
+    /// field's `(offset, type)`, when the field lives in a union. That happens
+    /// either because `base` *is* a union, or because `field` is promoted from an
+    /// anonymous union embedded in `base`'s class. Returns `None` for an ordinary
+    /// class field, which `member_cell` handles.
     fn union_field(
         &mut self,
         base: &Expr,
@@ -2416,7 +2539,7 @@ impl<W: Write> Interpreter<W> {
         env: &mut Env,
     ) -> Result<Option<(Rc<RefCell<Vec<u8>>>, u64, Type)>, CodegenError> {
         let bv = self.eval(base, env)?;
-        // The base's class name from its static type (deref for `->`).
+        // The base's class name, from its static type (deref for `->`).
         let class = match base.ty() {
             Some(Type::Named(n)) if !arrow => n,
             Some(Type::Ptr(inner)) if arrow => match *inner {
@@ -2425,9 +2548,9 @@ impl<W: Write> Interpreter<W> {
             },
             _ => return Ok(None),
         };
-        // `class->field` through a pointer into a byte **heap** buffer: the class is
-        // laid out as raw bytes there (e.g. a `Pt *` element of a `Vec`'s data), so
-        // the field is a typed view at its offset — exactly like a union member.
+        // `class->field` through a pointer into a byte **heap** buffer. The class is
+        // laid out as raw bytes there, e.g. a `Pt *` element of a `Vec`'s data, so
+        // the field is a typed view at its offset, exactly like a union member.
         if arrow {
             if let Some(Some(pv)) = as_pointer(&bv) {
                 if let Region::Heap(buf) = &pv.region {
@@ -2513,8 +2636,8 @@ impl<W: Write> Interpreter<W> {
         None
     }
 
-    /// Read a union field from its shared buffer: a scalar deserializes from
-    /// bytes; an array field decays to a pointer into the buffer.
+    /// Read a union field from its shared buffer. A scalar deserializes from bytes;
+    /// an array field decays to a pointer into the buffer.
     fn read_union_field(
         &self,
         buf: Rc<RefCell<Vec<u8>>>,
@@ -2545,10 +2668,10 @@ impl<W: Write> Interpreter<W> {
 
     // ---- defaults & helpers ----
 
-    /// The size in bytes of a type. Array dimensions are evaluated at runtime,
-    /// so `sizeof(arr)` agrees with the array the interpreter actually allocated
-    /// (which also evaluates the dimension at runtime). Scalar/class sizes come
-    /// from the static layout pass.
+    /// The size in bytes of a type. Array dimensions are evaluated at runtime, so
+    /// `sizeof(arr)` agrees with the array the interpreter actually allocated, which
+    /// also evaluates the dimension at runtime. Scalar and class sizes come from the
+    /// static layout pass.
     fn size_of_type(&mut self, ty: &Type, env: &mut Env) -> Result<i64, CodegenError> {
         match ty {
             Type::Array(elem, Some(dim)) => {
@@ -2561,10 +2684,10 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// The amount to advance a pointer's `index` by per element it is stepped:
-    /// a raw byte-heap pointer steps by the element's byte size; a cell-backed
-    /// pointer steps by 1 (cells are element-granular). The element type comes
-    /// from `ptr_expr`'s static pointer type.
+    /// How much to advance a pointer's `index` for each element it is stepped. A raw
+    /// byte-heap pointer steps by the element's byte size. A cell-backed pointer
+    /// steps by 1, since cells are element-granular. The element type comes from
+    /// `ptr_expr`'s static pointer type.
     fn ptr_step(
         &mut self,
         pv: &PtrVal,
@@ -2580,8 +2703,8 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Step a number or pointer by `delta` (for `++`/`--`), scaling a heap
-    /// pointer by its element size.
+    /// Step a number or pointer by `delta` (for `++`/`--`), scaling a heap pointer
+    /// by its element size.
     fn step_value(
         &mut self,
         v: &Value,
@@ -2590,10 +2713,10 @@ impl<W: Write> Interpreter<W> {
         env: &mut Env,
         pos: Pos,
     ) -> Result<Value, CodegenError> {
-        // A pointer (or an array/string that decays to one — e.g. `I64 *p = a;
-        // p++`) steps by `delta` elements, scaling a heap pointer by its element
-        // size (`ptr_step`); cell pointers step one index. This mirrors pointer
-        // `+`/`-`, which already decay through `as_pointer`. Numbers fall through.
+        // A pointer (or an array/string that decays to one, e.g. `I64 *p = a; p++`)
+        // steps by `delta` elements, scaling a heap pointer by its element size via
+        // `ptr_step`; cell pointers step one index. This mirrors pointer `+`/`-`,
+        // which already decay through `as_pointer`. Numbers fall through.
         if let Some(Some(pv)) = as_pointer(v) {
             let step = self.ptr_step(&pv, expr, env)?;
             return Ok(Value::Ptr(Some(pv.offset(delta * step))));
@@ -2601,9 +2724,9 @@ impl<W: Write> Interpreter<W> {
         step_number(v, delta, pos)
     }
 
-    /// Pointer `+`/`-` where a heap (byte-addressed) pointer is involved, scaled
-    /// by the element size. Returns `None` so cell-pointer/number arithmetic
-    /// falls through to `apply_binop`.
+    /// Pointer `+`/`-` where a heap (byte-addressed) pointer is involved, scaled by
+    /// the element size. Returns `None` so cell-pointer and number arithmetic fall
+    /// through to `apply_binop`.
     fn heap_ptr_arith(
         &mut self,
         op: BinOp,
@@ -2646,18 +2769,17 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Build the zero value for a type (for an uninitialised declaration).
-    /// Evaluate an initialiser against its declared type. A brace `InitList`
-    /// builds an array or class element-by-element (unspecified trailing
-    /// elements/fields take their default); any other expression is evaluated
-    /// and copied by value, exactly as a plain `=` initialiser.
+    /// Evaluate an initialiser against its declared type. A brace `InitList` builds
+    /// an array or class element by element, and unspecified trailing elements or
+    /// fields take their default. Any other expression is evaluated and copied by
+    /// value, exactly as a plain `=` initialiser.
     fn eval_init(&mut self, init: &Expr, ty: &Type, env: &mut Env) -> Result<Value, CodegenError> {
         if let ExprKind::DesignatedInit(items) = &init.kind {
             return self.eval_designated_init(init, items, ty, env);
         }
         let ExprKind::InitList(items) = &init.kind else {
             // `T *p = MAlloc(...)` allocates element-typed cells, matching how the
-            // native heap is laid out (so a `Pt *` buffer holds class elements).
+            // native heap is laid out, so a `Pt *` buffer holds class elements.
             if let Type::Ptr(elem) = ty {
                 if let Some(v) = self.try_typed_malloc(init, elem, env)? {
                     return Ok(v);
@@ -2715,9 +2837,9 @@ impl<W: Write> Interpreter<W> {
         }
     }
 
-    /// Evaluate a designated initialiser `{.field = value, ...}` against a
-    /// class type. The class starts at its default (zero) value; each named
-    /// field is then overwritten with its evaluated initialiser.
+    /// Evaluate a designated initialiser `{.field = value, ...}` against a class
+    /// type. The class starts at its default (zero) value, then each named field is
+    /// overwritten with its evaluated initialiser.
     fn eval_designated_init(
         &mut self,
         init: &Expr,
@@ -2779,9 +2901,9 @@ impl<W: Write> Interpreter<W> {
             .unwrap_or_default()
     }
 
-    /// Initialize a scalar union field by serializing `value` into the shared
-    /// buffer at `off`. Non-scalar fields (a rare union brace target) are left
-    /// at their zero default.
+    /// Initialize a scalar union field by serializing `value` into the shared buffer
+    /// at `off`. A non-scalar field, a rare union brace target, is left at its zero
+    /// default.
     fn init_union_field(
         &mut self,
         buf: &Rc<RefCell<Vec<u8>>>,
@@ -2804,6 +2926,7 @@ impl<W: Write> Interpreter<W> {
         Ok(())
     }
 
+    /// Build the zero value for a type, used for an uninitialised declaration.
     fn default_value(&mut self, ty: &Type, env: &mut Env) -> Result<Value, CodegenError> {
         Ok(match ty {
             Type::U0 => Value::Void,
@@ -2821,7 +2944,7 @@ impl<W: Write> Interpreter<W> {
                 }
                 Value::Array(Rc::new(RefCell::new(v)))
             }
-            // All integer / Bool types start at 0.
+            // All integer and Bool types start at 0.
             _ => Value::Int(0),
         })
     }
@@ -2897,7 +3020,7 @@ impl<W: Write> Interpreter<W> {
                 out.push('%');
                 continue;
             }
-            // `*` width / precision come from arguments, consumed left to right
+            // A `*` width or precision comes from an argument, consumed left to right
             // before the value. A negative `*` width means left-justify.
             let width = if spec.width_star {
                 let w = value_as_i64(&take(&mut ai)?);
@@ -2969,7 +3092,7 @@ impl<W: Write> Interpreter<W> {
                     out.push_str(&render_int(&spec, width, precision, "", "", &digits));
                 }
                 'c' => {
-                    // libc `%c` takes the low byte of the argument.
+                    // libc's `%c` takes the low byte of the argument.
                     let ch = value_as_i64(&take(&mut ai)?) as u8 as char;
                     out.push_str(&render_str(&spec, width, None, &ch.to_string()));
                 }
@@ -2977,8 +3100,8 @@ impl<W: Write> Interpreter<W> {
                     let v = take(&mut ai)?;
                     let body = match &v {
                         Value::Str(s) => s.to_string(),
-                        // A pointer/array into a byte buffer: read its bytes up to
-                        // the NUL terminator (as `%s` does in C).
+                        // A pointer or array into a byte buffer: read its bytes up to
+                        // the NUL terminator, as `%s` does in C.
                         Value::Ptr(Some(_)) | Value::Array(_) => {
                             String::from_utf8_lossy(&self.cstr_bytes(&v, pos)?).into_owned()
                         }
@@ -2990,12 +3113,12 @@ impl<W: Write> Interpreter<W> {
                 'f' | 'e' | 'E' | 'g' | 'G' => {
                     let v = value_as_f64(&take(&mut ai)?);
                     // The sign comes from the IEEE sign bit, so negative zero prints
-                    // with a `-` (matching libc and the freestanding bignum
-                    // formatters); a plain `v < 0.0` would drop `-0.0`'s sign.
+                    // with a `-`, matching libc and the freestanding bignum
+                    // formatters. A plain `v < 0.0` would drop `-0.0`'s sign.
                     let neg = v.is_sign_negative();
                     let mag = v.abs();
                     let body = match spec.conv {
-                        // C's default `%f` precision is 6 — match libc exactly.
+                        // C's default `%f` precision is 6; match libc exactly.
                         'f' => format!("{mag:.*}", precision.unwrap_or(6)),
                         'e' | 'E' => {
                             crate::fmt::render_exp(mag, precision.unwrap_or(6), spec.conv == 'E')
@@ -3011,7 +3134,7 @@ impl<W: Write> Interpreter<W> {
                     out.push_str(&render_int(&spec, width, None, sign, "", &body));
                 }
                 'p' => {
-                    // Addresses can't match the native backend; keep a stable form.
+                    // Addresses can't match the native backend, so keep a stable form.
                     let body = match take(&mut ai)? {
                         Value::Ptr(None) => "0x0".to_string(),
                         Value::Ptr(Some(_)) => "0x(ptr)".to_string(),
@@ -3030,10 +3153,9 @@ impl<W: Write> Interpreter<W> {
     }
 }
 
-/// Type-check and run a program, returning everything it printed. This is the
-/// safe "compile and run" entry point: it runs semantic analysis first (so the
-/// typed AST the interpreter needs is in place) and reports the first semantic
-/// error if any.
+/// Type-check and run a program, returning everything it printed. This is the safe
+/// "compile and run" entry point. It runs semantic analysis first, so the typed AST
+/// the interpreter needs is in place, and reports the first semantic error if any.
 pub fn run_to_string(program: &Program) -> Result<String, CodegenError> {
     if let Some(e) = crate::sema::check_program(program).into_iter().next() {
         return Err(CodegenError::at(
@@ -3085,16 +3207,13 @@ fn step_number(v: &Value, delta: i64, pos: Pos) -> Result<Value, CodegenError> {
 
 // Per-run cache mapping a string literal's content to the single byte buffer its
 // decayed pointer addresses. The native backend dedups identical literals into one
-// `__text` copy (`Asm::string_dedup`), so interning here makes pointer identity
-// over literals — `p == s`, `p - s`, `"x" == "x"` — agree with native instead of
+// `__text` copy (`Asm::string_dedup`). Interning here matches that: pointer identity
+// over literals — `p == s`, `p - s`, `"x" == "x"` — agrees with native instead of
 // minting a fresh buffer per decay. Cleared each `run`.
 thread_local! {
     static STR_INTERN: RefCell<HashMap<Vec<u8>, Rc<RefCell<Vec<u8>>>>> =
         RefCell::new(HashMap::new());
 }
-
-/// View a value as a pointer, decaying an array to a pointer at index 0.
-/// `None` => not pointer-like; `Some(None)` => null; `Some(Some(pv))` => pointer.
 
 /// The shared (interned) NUL-terminated byte buffer for a string literal.
 fn intern_str_buf(s: &str) -> Rc<RefCell<Vec<u8>>> {
@@ -3111,6 +3230,9 @@ fn intern_str_buf(s: &str) -> Rc<RefCell<Vec<u8>>> {
     })
 }
 
+/// View a value as a pointer, decaying an array to a pointer at index 0. `None`
+/// means not pointer-like, `Some(None)` means null, and `Some(Some(pv))` is a
+/// pointer.
 fn as_pointer(v: &Value) -> Option<Option<PtrVal>> {
     match v {
         Value::Ptr(p) => Some(p.clone()),
@@ -3118,10 +3240,10 @@ fn as_pointer(v: &Value) -> Option<Option<PtrVal>> {
             region: Region::Array(rc.clone()),
             index: 0,
         })),
-        // A string literal decays to a pointer to its bytes (NUL-terminated), so
-        // `s[i]`, `*s`, and `s + n` work as they would on a `U8*` natively. The
-        // buffer is interned by content, so two decays of the same literal share
-        // one object (matching the native `__text` dedup).
+        // A string literal decays to a pointer to its NUL-terminated bytes, so
+        // `s[i]`, `*s`, and `s + n` work as they would on a `U8 *` natively. The
+        // buffer is interned by content, so two decays of the same literal share one
+        // object, matching the native `__text` dedup.
         Value::Str(s) => Some(Some(PtrVal {
             region: Region::Heap(intern_str_buf(s)),
             index: 0,
@@ -3130,7 +3252,7 @@ fn as_pointer(v: &Value) -> Option<Option<PtrVal>> {
     }
 }
 
-/// The byte size of a scalar type (for heap byte-buffer access). Pointers and
+/// The byte size of a scalar type, for heap byte-buffer access. Pointers and
 /// anything non-scalar are 8 bytes.
 fn scalar_byte_size(ty: &Type) -> usize {
     match ty {
@@ -3154,8 +3276,8 @@ fn elem_of(ty: &Type) -> Option<Type> {
     }
 }
 
-/// Whether a type is an integer/float scalar that a raw byte heap buffer can
-/// hold (so `MAlloc` of it supports type-punning). Pointers/structs/arrays use
+/// Whether a type is an integer or float scalar that a raw byte heap buffer can
+/// hold, so `MAlloc` of it supports type punning. Pointers, classes, and arrays use
 /// cell-backed regions instead.
 fn is_byte_heap_elem(ty: &Type) -> bool {
     matches!(
@@ -3208,8 +3330,8 @@ fn values_equal(l: &Value, r: &Value) -> bool {
         // NULL compared against 0.
         (Value::Ptr(None), v) | (v, Value::Ptr(None)) => v.as_i64() == Some(0),
         (Value::Str(a), Value::Str(b)) => a == b,
-        // Float operands compare as f64; two integers compare at full width (an
-        // f64 compare loses precision past 2^53, disagreeing with the native cmp).
+        // Float operands compare as f64. Two integers compare at full width; an f64
+        // compare loses precision past 2^53, disagreeing with the native cmp.
         _ if l.is_float() || r.is_float() => match (l.as_f64(), r.as_f64()) {
             (Some(a), Some(b)) => a == b,
             _ => false,
@@ -3221,20 +3343,20 @@ fn values_equal(l: &Value, r: &Value) -> bool {
     }
 }
 
-/// Whether `ty` is a signed integer type — drives arithmetic vs logical `>>`,
-/// signed vs unsigned `/ %`, and signed vs unsigned relational compares.
+/// Whether `ty` is a signed integer type. Drives arithmetic vs logical `>>`,
+/// signed vs unsigned `/` and `%`, and signed vs unsigned relational compares.
 fn is_signed_int(ty: &Type) -> bool {
     matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
 }
 
-/// Whether an expression has a signed type (an unannotated expression defaults
-/// to signed, matching HolyC's default `I64`).
+/// Whether an expression has a signed type. An unannotated expression defaults to
+/// signed, matching HolyC's default `I64`.
 fn expr_is_signed(e: &Expr) -> bool {
     e.ty().as_ref().is_none_or(is_signed_int)
 }
 
-/// The sign prefix for a float conversion: `-` for negatives, else `+`/space per
-/// the flags, else empty.
+/// The sign prefix for a float conversion: `-` for a negative, else `+` or a space
+/// per the flags, else empty.
 fn float_sign(neg: bool, spec: &crate::fmt::Spec) -> &'static str {
     if neg {
         "-"
@@ -3248,8 +3370,8 @@ fn float_sign(neg: bool, spec: &crate::fmt::Spec) -> &'static str {
 }
 
 /// Coerce a scalar value to the type of the lvalue it is being stored into,
-/// matching the native backend (which truncates F64→I64, widens I64→F64, and
-/// narrows integer widths in registers on store). Non-scalar targets — pointers,
+/// matching the native backend, which truncates F64→I64, widens I64→F64, and
+/// narrows integer widths in registers on store. Non-scalar targets — pointers,
 /// classes, arrays — pass the value through untouched.
 fn coerce_to(ty: &Type, v: Value) -> Value {
     match ty {
@@ -3265,17 +3387,17 @@ fn coerce_to(ty: &Type, v: Value) -> Value {
         | Type::U64 => cast_value(ty, v),
         // A string literal stored into a pointer decays once to a stable byte
         // buffer, so pointer identity over it — `p - s`, `p == s`, `p++` — stays
-        // consistent (matching the native backend's single `__text` copy). Without
-        // this, each `as_pointer` of a `Value::Str` would mint a fresh buffer and
+        // consistent, matching the native backend's single `__text` copy. Without
+        // this, each `as_pointer` of a `Value::Str` would mint a fresh buffer, and
         // two pointers into "the same" literal would compare as different objects.
         Type::Ptr(_) => match v {
             Value::Str(s) => Value::Ptr(Some(PtrVal {
                 region: Region::Heap(intern_str_buf(&s)),
                 index: 0,
             })),
-            // Integer 0 stored into a pointer is the null pointer (C semantics) — the
-            // path `NULL` takes now that it's the macro `0` from <builtin.hc> rather
-            // than a predefined null-pointer constant.
+            // Integer 0 stored into a pointer is the null pointer (C semantics). This
+            // is the path `NULL` takes now that it is the macro `0` from <builtin.hc>
+            // rather than a predefined null-pointer constant.
             Value::Int(0) => Value::Ptr(None),
             other => other,
         },
@@ -3283,12 +3405,12 @@ fn coerce_to(ty: &Type, v: Value) -> Value {
     }
 }
 
-/// Cast a value to `ty`. Narrowing integer casts truncate / sign-extend to the
-/// target width (HolyC byte/word arithmetic relies on this).
+/// Cast a value to `ty`. A narrowing integer cast truncates or sign-extends to the
+/// target width; HolyC byte and word arithmetic relies on this.
 fn cast_value(ty: &Type, v: Value) -> Value {
-    // A float converts to a signed integer via `i64` (`fcvtzs`) but to an
-    // unsigned one via `u64` (`fcvtzu`) — they differ past `I64::MAX` and for
-    // negatives. The bit pattern is then narrowed by the per-width arms below.
+    // A float converts to a signed integer via `i64` (`fcvtzs`) but to an unsigned
+    // one via `u64` (`fcvtzu`); they differ past `I64::MAX` and for negatives. The
+    // bit pattern is then narrowed by the per-width arms below.
     let i = match &v {
         Value::Float(f) if matches!(ty, Type::U8 | Type::U16 | Type::U32 | Type::U64) => {
             *f as u64 as i64
@@ -3305,7 +3427,7 @@ fn cast_value(ty: &Type, v: Value) -> Value {
         Type::I32 => Value::Int(i as i32 as i64),
         Type::U32 => Value::Int(i & 0xFFFF_FFFF),
         Type::I64 | Type::U64 => Value::Int(i),
-        // Pointers / aggregates / U0 pass through unchanged.
+        // Pointers, aggregates, and U0 pass through unchanged.
         _ => v,
     }
 }

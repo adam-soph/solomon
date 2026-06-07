@@ -177,10 +177,10 @@ fn nested_parens_in_arguments() {
 
 #[test]
 fn nested_call_to_same_function_macro_expands() {
-    // Regression: each argument is fully expanded *before* substitution, so a
-    // nested call to the *same* macro inside the argument is not blocked by the
-    // outer macro's hide-set. `ID(ID(5))` -> the arg `ID(5)` expands to `5`,
-    // then `ID(5)` -> `5`. (Previously the inner `ID` was emitted as a literal.)
+    // Regression: each argument is fully expanded *before* substitution, so a nested
+    // call to the *same* macro inside the argument is not blocked by the outer macro's
+    // hide-set. In `ID(ID(5))` the arg `ID(5)` expands to `5`, then the outer
+    // `ID(5)` -> `5`. Previously the inner `ID` was emitted as a literal.
     assert_eq!(pp("#define ID(x) x\nID(ID(5))"), vec![int(5)]);
 }
 
@@ -382,8 +382,8 @@ fn macros_feed_through_to_parsing() {
 
 #[test]
 fn forward_reference_to_a_type_parses() {
-    // `Thing` is used before it is defined; the hoisting pre-pass makes this
-    // parse as a declaration rather than a syntax error.
+    // `Thing` is used before it is defined. The hoisting pre-pass makes this parse as
+    // a declaration rather than a syntax error.
     let src = "U0 Use() { Thing t; t.id = 1; } class Thing { I64 id; }";
     let program = parse(src).expect("forward type reference should parse");
     assert!(
@@ -395,10 +395,10 @@ fn forward_reference_to_a_type_parses() {
 #[test]
 fn forward_reference_without_hoisting_would_be_a_multiply() {
     // Sanity: a name that is NOT a type stays an expression. `Foo * x` with Foo
-    // undeclared parses as a multiplication statement (then sema flags Foo).
+    // undeclared parses as a multiplication statement, and sema then flags Foo.
     let src = "U0 F() { Foo * x; }";
     let program = parse(src).expect("should parse as an expression");
-    // Two undeclared identifiers (Foo and x) — proving it was not a declaration.
+    // Two undeclared identifiers (Foo and x), proving it was not a declaration.
     let errs = check_program(&program);
     assert!(errs.iter().any(|e| e.message.contains("`Foo`")));
 }
@@ -406,8 +406,12 @@ fn forward_reference_without_hoisting_would_be_a_multiply() {
 #[test]
 fn type_defined_in_an_include_is_usable() {
     // Hoisting descends into `#include`d files, so a class declared there parses
-    // as a type and the whole program type-checks.
-    let dir = make_files("inctype", &[("types.hc", "class Pt { I64 x; I64 y; }")]);
+    // as a type and the whole program type-checks. The type is `public` so it is
+    // visible across the file boundary (file-scoped visibility).
+    let dir = make_files(
+        "inctype",
+        &[("types.hc", "public class Pt { I64 x; I64 y; }")],
+    );
     let src = "#include \"types.hc\"\nU0 Main() { Pt p; p.x = 1; p.y = 2; }";
     let program = parse_in_dir(src, &dir).expect("type from include should parse");
     assert!(
@@ -420,7 +424,7 @@ fn type_defined_in_an_include_is_usable() {
 fn angle_include_resolves_from_the_embedded_stdlib() {
     // `parse` carries no filesystem search path, so `#include <...>` of a standard
     // library module must resolve from the copy embedded in the compiler at build
-    // time — and its types (generic `Vec<T>`) and functions (`StrLen`) become usable.
+    // time. Its types (generic `Vec<T>`) and functions (`StrLen`) then become usable.
     let src = "#include <vec.hc>\n#include <cstr.hc>\n\
                U0 Main() { Vec<I64> v; VecInit(&v); I64 n = StrLen(\"hi\"); }";
     let program = parse(src).expect("angle include should resolve from the embedded stdlib");

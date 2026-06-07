@@ -1,9 +1,9 @@
 #ifndef _SPECIAL_HC
 #define _SPECIAL_HC
-// special.hc — the special functions: the error-function and gamma families, and the
-// Bessel functions. These are bulky (rational/series/asymptotic approximations) and
-// rarely used, so they live apart from the elementary `<math.hc>` they build on.
-// Include with `#include <special.hc>`.
+// special.hc — the special functions: the error-function and gamma families, plus
+// the Bessel functions. They use rational, series, and asymptotic approximations.
+// These are bulky and rarely used, so they live apart from the elementary
+// `<math.hc>` they build on. Include with `#include <special.hc>`.
 
 #include <math.hc>
 
@@ -17,7 +17,7 @@
 
 // erfc(ax) for ax > 0 via the Laplace continued fraction (converges for ax >~ 1):
 //   erfc(x) = e^{-x^2}/sqrt(pi) · 1/(x + (1/2)/(x + (2/2)/(x + (3/2)/(x + …))))
-F64 ErfcCF(F64 ax)
+public F64 ErfcCF(F64 ax)
 {
   F64 f = 0.0;
   I64 k;
@@ -27,7 +27,7 @@ F64 ErfcCF(F64 ax)
 
 // The error function. Small |x| uses the (cancellation-free) Taylor series; larger
 // |x| goes through the continued fraction. Accurate to ~1e-15.
-F64 Erf(F64 x)
+public F64 Erf(F64 x)
 {
   if (x != x) return x;
   F64 ax = Fabs(x);
@@ -51,7 +51,7 @@ F64 Erf(F64 x)
 }
 
 // The complementary error function, 1 - erf(x).
-F64 Erfc(F64 x)
+public F64 Erfc(F64 x)
 {
   if (x != x) return x;
   F64 ax = Fabs(x);
@@ -61,9 +61,10 @@ F64 Erfc(F64 x)
   return ec;
 }
 
-// Inverse error function: the x with erf(x) = y, for y in (-1, 1). A Winitzki
-// initial guess (~1e-3) refined by Newton on `Erf` (each step doubles the digits).
-F64 Erfinv(F64 y)
+// Inverse error function: the x with erf(x) = y, for y in (-1, 1). It starts from a
+// Winitzki initial guess (~1e-3), then refines with Newton on `Erf`; each step
+// doubles the digits.
+public F64 Erfinv(F64 y)
 {
   if (y >= 1.0) { if (y == 1.0) return Inf(1); return NaN(); }
   if (y <= -1.0) { if (y == -1.0) return Inf(-1); return NaN(); }
@@ -79,7 +80,7 @@ F64 Erfinv(F64 y)
 }
 
 // Inverse complementary error function: the x with erfc(x) = y, for y in (0, 2).
-F64 Erfcinv(F64 y)
+public F64 Erfcinv(F64 y)
 {
   if (y <= 0.0) { if (y == 0.0) return Inf(1); return NaN(); }
   if (y >= 2.0) { if (y == 2.0) return Inf(-1); return NaN(); }
@@ -87,9 +88,9 @@ F64 Erfcinv(F64 y)
 }
 
 // The gamma function (Lanczos g=7, 9 coefficients), with Euler reflection for the
-// left half-plane. Overflows to +Inf past ~171, poles at 0/-1/-2/… via the
-// reflection's sin term. Accurate to ~1e-14.
-F64 Gamma(F64 x)
+// left half-plane. It overflows to +Inf past ~171. The poles at 0/-1/-2/… come from
+// the reflection's sin term. Accurate to ~1e-14.
+public F64 Gamma(F64 x)
 {
   F64 c[9];
   c[0] = 0.99999999999980993;
@@ -110,9 +111,9 @@ F64 Gamma(F64 x)
   return SQRT_PI * 1.4142135623730951 * Pow(t, x + 0.5) * Exp(-t) * a;
 }
 
-// log|Gamma(x)| plus its sign (written through `sign`). The Lanczos log form, with
-// reflection for x < 0.5; `sign` is -1 on the intervals where Gamma is negative.
-F64 Lgamma(F64 x, I64 *sign)
+// log|Gamma(x)| plus its sign (written through `sign`). Uses the Lanczos log form,
+// with reflection for x < 0.5. `sign` is -1 on the intervals where Gamma is negative.
+public F64 Lgamma(F64 x, I64 *sign)
 {
   *sign = 1;
   F64 c[9];
@@ -145,7 +146,7 @@ F64 Lgamma(F64 x, I64 *sign)
 // Asymptotic expansion of J_nu and Y_nu for large x (nu = 0 or 1), written through
 // the pointers. amp·(P·cos ω − Q·sin ω) and amp·(P·sin ω + Q·cos ω), with the
 // amplitude series a_k = a_{k-1}·(4ν²−(2k−1)²)/(8k).
-U0 BesselAsymp(F64 x, I64 nu, F64 *pj, F64 *py)
+public U0 BesselAsymp(F64 x, I64 nu, F64 *pj, F64 *py)
 {
   F64 mu = 4.0 * nu * nu;
   F64 a = 1.0, xp = 1.0, invx = 1.0 / x;
@@ -167,7 +168,7 @@ U0 BesselAsymp(F64 x, I64 nu, F64 *pj, F64 *py)
 }
 
 // J0 (even): power series Σ (−x²/4)^m/(m!)² for small x.
-F64 J0(F64 x)
+public F64 J0(F64 x)
 {
   x = Fabs(x);
   if (x < BESSEL_X0) {
@@ -187,7 +188,7 @@ F64 J0(F64 x)
 }
 
 // J1 (odd): power series (x/2)·Σ (−x²/4)^m/(m!(m+1)!).
-F64 J1(F64 x)
+public F64 J1(F64 x)
 {
   F64 s = 1.0;
   if (x < 0.0) { s = -1.0; x = -x; }
@@ -208,7 +209,7 @@ F64 J1(F64 x)
 }
 
 // Y0: (2/π)(ln(x/2)+γ)·J0 + (2/π) Σ (−1)^{k+1} h_k (x²/4)^k/(k!)². Undefined for x≤0.
-F64 Y0(F64 x)
+public F64 Y0(F64 x)
 {
   if (x < 0.0) return NaN();
   if (x == 0.0) return Inf(-1);
@@ -231,7 +232,7 @@ F64 Y0(F64 x)
 }
 
 // Y1: (2/π)ln(x/2)·J1 − 2/(πx) − (1/π) Σ (−1)^k (−2γ+h_k+h_{k+1}) (x/2)^{2k+1}/(k!(k+1)!).
-F64 Y1(F64 x)
+public F64 Y1(F64 x)
 {
   if (x < 0.0) return NaN();
   if (x == 0.0) return Inf(-1);
@@ -256,7 +257,7 @@ F64 Y1(F64 x)
 
 // J_n: upward recurrence when |x| > n (stable), else Miller's downward recurrence
 // with the J0 + 2(J2+J4+…) = 1 normalization.
-F64 Jn(I64 n, F64 x)
+public F64 Jn(I64 n, F64 x)
 {
   if (n == 0) return J0(x);
   if (n == 1) return J1(x);
@@ -292,7 +293,7 @@ F64 Jn(I64 n, F64 x)
 }
 
 // Y_n: upward recurrence Y_{n+1} = (2n/x)Y_n − Y_{n-1} (stable for Y). x ≤ 0 undefined.
-F64 Yn(I64 n, F64 x)
+public F64 Yn(I64 n, F64 x)
 {
   if (n == 0) return Y0(x);
   if (n == 1) return Y1(x);

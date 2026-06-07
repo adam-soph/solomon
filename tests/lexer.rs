@@ -79,7 +79,7 @@ fn decimal_hex_binary_integers() {
 
 #[test]
 fn octal_integers() {
-    // A leading `0` on a multi-digit integer is octal (C semantics); a bare `0` and a
+    // A leading `0` on a multi-digit integer is octal (C semantics). A bare `0` and a
     // float starting with `0` are unaffected.
     assert_eq!(
         kinds("0 010 0644 0755 0.5"),

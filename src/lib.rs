@@ -1,16 +1,15 @@
 //! Solomon: a reimplementation of HolyC.
 //!
-//! A full compiler front end — lexer, preprocessor, parser, semantic analysis,
-//! and type layout — feeding a tree-walking [`Interpreter`] (the conformance
-//! oracle) and two native code generators behind the [`Codegen`] trait, each
-//! named for its target: [`Arm64Darwin`] (`aarch64-apple-darwin`) and
-//! [`X64Linux`] (`x86_64-unknown-linux`). The native backends match the
+//! The crate is a full compiler front end — lexer, preprocessor, parser, semantic
+//! analysis, and type layout. It feeds a tree-walking [`Interpreter`], the
+//! conformance oracle, and two native code generators behind the [`Codegen`]
+//! trait. Each is named for its target: [`Arm64Darwin`] (`aarch64-apple-darwin`)
+//! and [`X64Linux`] (`x86_64-unknown-linux`). The native backends match the
 //! interpreter byte-for-byte.
 
 pub mod arm64;
 pub mod ast;
 pub mod backend;
-pub mod builtins;
 pub mod codegen;
 pub mod fmt;
 pub mod interp;
@@ -37,18 +36,21 @@ pub use sema::{SemaError, analyze, check_program};
 pub use token::{Keyword, Pos, Span, Token, TokenKind};
 pub use x86_64::{X64Linux, X64Windows};
 
-/// The default standard-library search directories for **angle** includes
-/// (`#include <math.hc>`), tried in order: the `SOLOMON_STDLIB` environment
-/// variable (`:`-separated) if set, then `lib/` resolved relative to the running
-/// executable (covering both an installed `<prefix>/bin/hcc` → `<prefix>/lib`
-/// layout and the dev `target/<profile>/hcc` → repo `lib/` layout), then `./lib`.
-/// Non-existent entries are simply skipped at resolution time.
+/// The default search directories for angle includes (`#include <math.hc>`),
+/// tried in order.
+///
+/// First the `SOLOMON_STDLIB` environment variable, `:`-separated, if set. Then
+/// `lib/` resolved relative to the running executable; this covers both an
+/// installed `<prefix>/bin/hcc` → `<prefix>/lib` layout and the dev
+/// `target/<profile>/hcc` → repo `lib/` layout. Finally `./lib`. Non-existent
+/// entries are skipped at resolution time.
 pub fn stdlib_dirs() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
-    // The standard library is embedded in the compiler (see `EMBEDDED_STDLIB`), so a
-    // `lib/` directory on disk is no longer required. This returns only the override
-    // dirs from `SOLOMON_STDLIB` (searched before the embedded copy), for developing
-    // against a working tree's `lib/` without recompiling the compiler.
+    // The standard library is embedded in the compiler (see `EMBEDDED_STDLIB`), so
+    // a `lib/` directory on disk is no longer required. This returns only the
+    // `SOLOMON_STDLIB` override dirs, which are searched before the embedded copy.
+    // They let you develop against a working tree's `lib/` without recompiling the
+    // compiler.
     std::env::var("SOLOMON_STDLIB")
         .ok()
         .into_iter()
@@ -61,12 +63,14 @@ pub fn stdlib_dirs() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// The HolyC standard library (`lib/*.hc`), embedded into the compiler **at build
-/// time** via `include_str!`, as `(angle-include name, source)` pairs. An angle
-/// include `#include <name>` resolves here when the filesystem search path
-/// (`SOLOMON_STDLIB`, `-I`) doesn't provide it — so the compiler is self-contained
-/// and needs no `lib/` on disk. Editing a `lib/*.hc` file triggers a recompile
-/// (Cargo tracks `include_str!` inputs), keeping the embedded copy in sync.
+/// The HolyC standard library (`lib/*.hc`), embedded into the compiler at build
+/// time via `include_str!`, as `(angle-include name, source)` pairs.
+///
+/// An angle include `#include <name>` resolves here when the filesystem search
+/// path (`SOLOMON_STDLIB`, `-I`) does not provide it, so the compiler is
+/// self-contained and needs no `lib/` on disk. Editing a `lib/*.hc` file triggers
+/// a recompile, since Cargo tracks `include_str!` inputs, keeping the embedded
+/// copy in sync.
 pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("builtin.hc", include_str!("../lib/builtin.hc")),
     ("cstr.hc", include_str!("../lib/cstr.hc")),
@@ -75,13 +79,11 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("vec.hc", include_str!("../lib/vec.hc")),
     ("sort.hc", include_str!("../lib/sort.hc")),
     ("hmap.hc", include_str!("../lib/hmap.hc")),
-    ("_strhash.hc", include_str!("../lib/_strhash.hc")),
+    ("strhash.hc", include_str!("../lib/strhash.hc")),
     ("fmt.hc", include_str!("../lib/fmt.hc")),
-    ("_fltfmt.hc", include_str!("../lib/_fltfmt.hc")),
-    ("stdio.hc", include_str!("../lib/stdio.hc")),
-    ("_printf.hc", include_str!("../lib/_printf.hc")),
+    ("fltfmt.hc", include_str!("../lib/fltfmt.hc")),
+    ("printf.hc", include_str!("../lib/printf.hc")),
     ("bignum.hc", include_str!("../lib/bignum.hc")),
-    ("strconv.hc", include_str!("../lib/strconv.hc")),
     ("bits.hc", include_str!("../lib/bits.hc")),
     ("math.hc", include_str!("../lib/math.hc")),
     ("special.hc", include_str!("../lib/special.hc")),
@@ -94,7 +96,7 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("sync.hc", include_str!("../lib/sync.hc")),
 ];
 
-/// The embedded source for stdlib angle-include `name`, or `None` if it isn't a
+/// The embedded source for stdlib angle-include `name`, or `None` if it is not a
 /// bundled standard-library module.
 pub fn embedded_stdlib(name: &str) -> Option<&'static str> {
     EMBEDDED_STDLIB

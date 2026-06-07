@@ -1,11 +1,11 @@
 //! Tests for the x86-64 / PE (Windows) backend.
 //!
-//! The backend can't be *executed* on the dev host (an Apple-silicon Mac runs the
-//! amd64 image under QEMU, where Wine can't run x86 Windows code), so — like the
-//! x86-64 Linux structural tests — these instead **byte-scan the emitted PE**:
-//! the PE32+ headers, and the exact instruction bytes of each `kernel32` shim,
-//! checking that every `call [rip]` resolves through the import address table to
-//! the function it should. This pins the generated code without running it.
+//! The backend can't be executed on the dev host. An Apple-silicon Mac runs the
+//! amd64 image under QEMU, where Wine can't run x86 Windows code. So these tests
+//! byte-scan the emitted PE instead, like the x86-64 Linux structural tests do.
+//! They check the PE32+ headers and the exact instruction bytes of each `kernel32`
+//! shim, confirming that every `call [rip]` resolves through the import address
+//! table to the function it should. This pins the generated code without running it.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -86,9 +86,9 @@ fn find_code(pe: &[u8], needle: &[u8]) -> usize {
         .unwrap_or_else(|| panic!("byte pattern {needle:02X?} not found in code"))
 }
 
-/// The `kernel32` function name a `call qword [rip+disp32]` at file offset `pos`
-/// resolves to: follow the RIP-relative displacement to an IAT slot, then the
-/// slot's RVA to its hint/name entry.
+/// The `kernel32` function name that a `call qword [rip+disp32]` at file offset
+/// `pos` resolves to. Follow the RIP-relative displacement to an IAT slot, then
+/// follow the slot's RVA to its hint/name entry.
 fn call_target(pe: &[u8], pos: usize) -> String {
     assert_eq!(
         &pe[pos..pos + 2],
@@ -163,8 +163,9 @@ fn entry_is_framed_and_exits_via_exitprocess() {
 fn printing_lowers_to_getstdhandle_then_writefile() {
     let pe = build_pe("\"hi\\n\";");
 
-    // A bare string lowers to `StdWrite(STDOUT, …)`, whose Windows shim selects the std
-    // handle from the fd before `GetStdHandle`, byte for byte (the disp32s aside):
+    // A bare string lowers to `StdWrite(STDOUT, …)`. Its Windows shim picks the std
+    // handle from the fd before calling `GetStdHandle`. Match the shim byte for byte
+    // (the disp32s aside):
     //   sub rsp,72; mov [rsp+48],rsi; mov [rsp+56],rdx;
     //   mov ecx,-11; cmp rdi,2; jne +5; mov ecx,-12; call [GetStdHandle]
     let head = [
@@ -213,7 +214,7 @@ fn printing_lowers_to_getstdhandle_then_writefile() {
 
 #[test]
 fn args_capture_calls_getcommandline() {
-    // A program using ArgC/ArgV captures the command line at the entry: the first
+    // A program using ArgC/ArgV captures the command line at the entry. So the first
     // `call [rip]` after the frame prologue is `GetCommandLineA`.
     let pe = build_pe("\"%d\\n\", ArgC;");
     // The capture opens with `sub rsp, 32; call [rip]` (shadow space + the call).
@@ -249,7 +250,7 @@ fn malloc_lowers_to_virtualalloc() {
 fn time_builtins_lower_to_kernel32() {
     // Each time builtin marshals its args, then calls a kernel32 import behind the
     // `call_aligned` shim (save rsp in r15, 16-align, 32-byte shadow, call [rip]).
-    // We can't execute the PE here, so byte-scan for the shim and resolve the import.
+    // The PE can't run here, so byte-scan for the shim and resolve the import.
     let shim: &[u8] = &[
         0x49, 0x89, 0xE7, // mov r15, rsp
         0x48, 0x81, 0xE4, 0xF0, 0xFF, 0xFF, 0xFF, // and rsp, -16
@@ -271,9 +272,10 @@ fn time_builtins_lower_to_kernel32() {
 #[test]
 fn file_io_lowers_to_kernel32() {
     // `Open`/`Write`/`Close` lower to `CreateFileA`/`WriteFile`/`CloseHandle`. A
-    // print-free program keeps the `WriteFile`/`CloseHandle` calls unambiguous (no
-    // `StdWrite` from a `Print`). The shims force-16-align rsp before the call; we scan
-    // the (alignment-independent) arg-marshalling tails just before each `call [rip]`.
+    // print-free program keeps the `WriteFile`/`CloseHandle` calls unambiguous, with
+    // no `StdWrite` from a `Print`. The shims force-16-align rsp before the call, so
+    // scan the alignment-independent arg-marshalling tails just before each
+    // `call [rip]`.
     let pe = build_pe(
         "#include <io.hc>\n\
          U0 Main() { I64 fd = Open(\"t\", O_WRONLY|O_CREAT|O_TRUNC, MODE_0644);\n\
@@ -305,9 +307,9 @@ fn file_io_lowers_to_kernel32() {
 #[test]
 fn posix_only_builtins_rejected_on_windows() {
     // The syscall-group primitives with no Windows lowering yet (sockets, filesystem
-    // mutation, process ids, working dir, threads, futex) must be a clear compile error
-    // on the PE target — not a silently-emitted, invalid Linux `syscall`. (File I/O is
-    // wired via kernel32, so it is *not* in this set.)
+    // mutation, process ids, working dir, threads, futex) must be a clear compile
+    // error on the PE target, not a silently-emitted, invalid Linux `syscall`. File
+    // I/O is wired via kernel32, so it is not in this set.
     for (src, name) in [
         (
             "#include <os.hc>\nU0 Main(){ Mkdir(\"d\", 0700); } Main;",
@@ -337,15 +339,15 @@ fn posix_only_builtins_rejected_on_windows() {
 
 // ---- execution conformance: the emitted PE matches the interpreter ----
 //
-// The structural checks above pin the generated bytes; these compile each program to a
-// PE, run it, and assert its stdout equals the interpreter's (the conformance oracle) —
-// the same byte-for-byte check the other three backends get. Building the PE happens on
-// every host (it just emits bytes, so the *compilation* is exercised everywhere); the
-// program is only **executed** on a native Windows host, and the comparison self-skips
-// elsewhere (a non-Windows runner can't run a PE).
+// The structural checks above pin the generated bytes. These tests instead compile
+// each program to a PE, run it, and assert its stdout equals the interpreter's (the
+// conformance oracle). It's the same byte-for-byte check the other three backends get.
+// Building the PE happens on every host, so the compilation is exercised everywhere.
+// The program is only executed on a native Windows host; the comparison self-skips
+// elsewhere, since a non-Windows runner can't run a PE.
 
-/// Run each PE at `paths` and capture its stdout — natively, only on a Windows host.
-/// `None` (skip) off Windows.
+/// Run each PE at `paths` and capture its stdout, natively and only on a Windows
+/// host. Returns `None` to skip off Windows.
 fn run_stdouts(paths: &[std::path::PathBuf]) -> Option<Vec<String>> {
     use std::process::Command;
     if !cfg!(target_os = "windows") {
@@ -362,8 +364,8 @@ fn run_stdouts(paths: &[std::path::PathBuf]) -> Option<Vec<String>> {
         .collect()
 }
 
-/// For each `(name, program)`: capture the interpreter's stdout, build the PE, then (on
-/// a Windows host) run it and assert the stdout matches byte-for-byte.
+/// For each `(name, program)`, capture the interpreter's stdout and build the PE. On a
+/// Windows host, also run the PE and assert its stdout matches byte-for-byte.
 fn run_pe_conformance(cases: Vec<(String, solomon::Program)>) {
     let mut paths = Vec::new();
     let mut wants = Vec::new();
@@ -392,8 +394,8 @@ fn run_pe_conformance(cases: Vec<(String, solomon::Program)>) {
 #[test]
 fn pe_examples_match_the_interpreter() {
     // The whole shared example set (`common::EXAMPLES`) compiles to a PE and prints
-    // exactly what the interpreter does — the *same* catch-all the arm64 and freestanding
-    // backends enforce, now executed natively on Windows.
+    // exactly what the interpreter does. It's the same catch-all the arm64 and
+    // freestanding backends enforce, now executed natively on Windows.
     let cases = common::EXAMPLES
         .iter()
         .map(|(name, src)| {
@@ -438,15 +440,33 @@ fn pe_printing_matches_the_interpreter() {
             .collect(),
     );
 }
+
+#[test]
+fn pe_env_matches_interpreter() {
+    // `EnvP`/`Getenv` work on Windows: the entry builds the `U8 **EnvP` array over
+    // `GetEnvironmentStringsA` (skipping the leading-`=` per-drive entries to match the
+    // interpreter's `std::env` view). Output is presence-based so it's deterministic and
+    // matches the interpreter on the same host. Runs only on Windows; self-skips else.
+    run_pe_conformance(vec![(
+        "env".to_string(),
+        compile(
+            "#include <os.hc>\n\
+             U0 Main(){ I64 n = 0; while (EnvP[n]) n++; \
+               \"%d %d %d\\n\", n > 0, Getenv(\"PATH\") != NULL, Getenv(\"NOPE_X9Z7\") != NULL; } \
+             Main;",
+        ),
+    )]);
+}
+
 #[test]
 fn pe_file_io_matches_interpreter() {
     // File I/O end-to-end: write a string to a temp file via the kernel32
     // `CreateFileA`/`WriteFile`, read it back via `ReadFile`, and print it. The
-    // interpreter (over `std::fs`) and the executed PE must agree byte-for-byte. Runs
-    // only on a Windows host (self-skips elsewhere). A process-unique temp path keeps
-    // the interpreter's write (which happens on every host while computing the expected
-    // output) out of the repo; backslashes are normalized so the path embeds cleanly in
-    // a HolyC string literal (Windows file APIs accept forward slashes).
+    // interpreter (over `std::fs`) and the executed PE must agree byte-for-byte. This
+    // runs only on a Windows host and self-skips elsewhere. A process-unique temp path
+    // keeps the repo clean: the interpreter's write runs on every host while computing
+    // the expected output. Backslashes are normalized to forward slashes so the path
+    // embeds cleanly in a HolyC string literal; Windows file APIs accept them.
     let path = std::env::temp_dir()
         .join(format!("solomon-pe-io-{}.txt", std::process::id()))
         .to_string_lossy()
