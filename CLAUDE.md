@@ -131,12 +131,14 @@ the backend can't re-derive it differently.
 **x86 consumes the IR too** (`src/x86_64/isel.rs`). It walks the phi-free IR and emits
 x86-64, reusing the `Asm` encoder and the **`OsTarget` seam** in `src/x86_64/mod.rs`
 (per-OS deltas: exit, page alloc, std write, file ops, clock, command-line capture;
-freestanding ELF vs Windows PE). Spill-everything **+ promotion** (Linux only): on the
-freestanding ELF target a vreg lives in an `[rbp-off]` slot unless `regalloc::plan_registers`
-lifts it into a callee-saved GPR (**rbx/r12–r14**, saved/restored in prologue/`teardown`;
-r15 excluded — the Windows seam uses it; no float promotion, since System V has no
-callee-saved xmm). The Windows PE keeps pure spill-everything (its inlined kernel32 seam
-doesn't reliably preserve a promoted value across a call). Scratch rax/rcx/rdx +
+freestanding ELF vs Windows PE). Spill-everything **+ promotion** (both OSes): a vreg lives
+in an `[rbp-off]` slot unless `regalloc::plan_registers` lifts it into a callee-saved GPR
+(**rbx/r12–r14**, saved/restored in prologue/`teardown`; r15 excluded — the Windows seam
+uses it; no float promotion, since System V has no callee-saved xmm). On Windows a
+**frame larger than one page is stack-probed** in the prologue (`Asm::prologue_probe`:
+commit each 4 KiB page descending to `rsp-frame`) — the PE commits only one stack page and
+we emit no `__chkstk`, so a deep access (e.g. a promoted vreg's prologue spill at the
+bottom of the frame) would otherwise skip the guard page and fault. Scratch rax/rcx/rdx +
 rsi/rdi (all low regs, so the parametric `load_local_reg`/`store_local_reg`/`lea_local_reg`
 need no REX.R) and xmm0/xmm1; the internal ABI matches arm64 (int args rdi/rsi/rdx/rcx/r8/r9,
 F64 xmm0–7, sret pointer in **r11**); single-task `Fs` as a BSS `CTask` seeded in `@entry`,
@@ -174,9 +176,10 @@ the `Backend` trait/`emit_blocks`).
   x86-64 (default), to a freestanding static ELF (`x86_64-unknown-linux`) or, via the
   `OsTarget` seam, a self-contained PE with hand-built kernel32 imports
   (`x86_64-pc-windows`). Spill-everything in `[rbp-off]` slots + `plan_registers` promotion
-  into rbx/r12–r14 (Linux only); rax/rcx/rdx + rsi/rdi scratch, xmm0/xmm1 F64; System V-style internal
-  ABI; compare-chain `switch`. **`mod.rs`** now holds only the shared `OsTarget` seam +
-  register numbering (no AST `Cg`).
+  into rbx/r12–r14 (both OSes; Windows stack-probes frames >1 page, since the PE commits one
+  page and emits no `__chkstk`); rax/rcx/rdx + rsi/rdi scratch, xmm0/xmm1 F64; System V-style
+  internal ABI; compare-chain `switch`. **`mod.rs`** now holds only the shared `OsTarget` seam
+  + register numbering (no AST `Cg`).
 
 Both backends cover the whole implemented subset; only the deliberately-excluded
 transcendentals are absent (they're lib functions, below).
