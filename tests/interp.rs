@@ -1550,8 +1550,8 @@ fn goto_to_label_in_enclosing_block() {
 
 #[test]
 fn argc_and_argv_expose_the_command_line() {
-    // `ArgC`/`ArgV` are the implicit command-line globals. Each `ArgV[i]` is a `U8 *`.
-    let src = r#"I64 i; for (i = 0; i < ArgC; i++) "%d=%s\n", i, ArgV[i];"#;
+    // `argc`/`argv` are the implicit command-line globals. Each `argv[i]` is a `U8 *`.
+    let src = r#"I64 i; for (i = 0; i < argc; i++) "%d=%s\n", i, argv[i];"#;
     let program = parse(src).unwrap();
     // Type-check first: the interpreter runs analyzed programs (sema annotates every
     // expression's type in place), and the `"fmt", …` form now executes the HolyC
@@ -1585,22 +1585,22 @@ fn extreme_field_width_and_precision_are_clamped() {
 
 #[test]
 fn variadic_functions_read_their_varargs() {
-    // The implicit `VargC`/`VargV` locals read the trailing `...` args. `VargV[i]` is
+    // The implicit `argc`/`argv` locals read the trailing `...` args. `argv[i]` is
     // the i-th raw slot, punned for F64 and pointer values.
     let out = run(r#"
         I64 SumI(...) {
           I64 s = 0, i = 0;
-          while (i < VargC) { s += VargV[i]; i++; }
+          while (i < argc) { s += argv[i]; i++; }
           return s;
         }
         F64 AvgF(...) {
           F64 s = 0.0; I64 i = 0;
-          while (i < VargC) { s += *(F64 *)&VargV[i]; i++; }
-          return s / VargC;
+          while (i < argc) { s += *(F64 *)&argv[i]; i++; }
+          return s / argc;
         }
         U0 Join(U8 *sep, ...) {
           I64 i = 0;
-          while (i < VargC) { if (i) "%s", sep; "%s", *(U8 **)&VargV[i]; i++; }
+          while (i < argc) { if (i) "%s", sep; "%s", *(U8 **)&argv[i]; i++; }
           "\n";
         }
         U0 Main() {
@@ -1608,7 +1608,7 @@ fn variadic_functions_read_their_varargs() {
           "%.2f\n", AvgF(1.0, 2.0, 3.0, 4.0);
           Join(", ", "a", "b", "c");
         }
-        I64 ArgcZero(...) { return VargC; }
+        I64 ArgcZero(...) { return argc; }
         Main;
     "#);
     assert_eq!(out, "60 5 0\n2.50\na, b, c\n");

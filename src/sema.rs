@@ -140,16 +140,18 @@ impl Analyzer {
         self.files = program.files.clone();
         self.scopes.push(HashMap::new()); // global scope
         // The command line is exposed as two implicit globals captured at entry:
-        // `I64 ArgC` and `U8 **ArgV`. A `...` function's `VargC`/`VargV` varargs
-        // locals are distinct names, so both groups stay in scope there.
-        self.scopes[0].insert("ArgC".to_string(), Type::I64);
+        // `I64 argc` and `U8 **argv`. Inside a `...` function these same names are the
+        // varargs (`I64 argc`, `I64 *argv`) — sema declares them as locals there, so they
+        // shadow these globals: `argc`/`argv` mean the command line at global / non-variadic
+        // scope and the variadic arguments inside a `...` function.
+        self.scopes[0].insert("argc".to_string(), Type::I64);
         self.scopes[0].insert(
-            "ArgV".to_string(),
+            "argv".to_string(),
             Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
         );
-        // The environment: `U8 **EnvP`, a NULL-terminated array of "KEY=VALUE" strings.
+        // The environment: `U8 **envp`, a NULL-terminated array of "KEY=VALUE" strings.
         self.scopes[0].insert(
-            "EnvP".to_string(),
+            "envp".to_string(),
             Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
         );
         // The current task/thread context: `CTask *Fs`, holding the exception state
@@ -443,13 +445,13 @@ impl Analyzer {
                 self.declare(name, Self::decay(p.ty.clone()), p.span.pos, false);
             }
         }
-        // A `...` function gets the implicit HolyC varargs locals: `I64 VargC` (the
-        // count) and `I64 *VargV` (the raw 8-byte slots; pun the address for other
+        // A `...` function gets the implicit HolyC varargs locals: `I64 argc` (the
+        // count) and `I64 *argv` (the raw 8-byte slots; pun the address for other
         // types).
         if f.varargs {
             let pos = f.params.first().map_or(Pos::new(0, 0), |p| p.span.pos);
-            self.declare("VargC", Type::I64, pos, false);
-            self.declare("VargV", Type::Ptr(Box::new(Type::I64)), pos, false);
+            self.declare("argc", Type::I64, pos, false);
+            self.declare("argv", Type::Ptr(Box::new(Type::I64)), pos, false);
         }
         for stmt in body {
             self.check_stmt(stmt);

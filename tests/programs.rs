@@ -1,7 +1,7 @@
 //! Output-level tests for the larger sample programs: they don't just run
 //! cleanly, they compute the right answers.
 
-use solomon::interp::{run_to_string, run_to_string_with_input};
+use solomon::interp::run_to_string_with_input;
 use solomon::parser::parse_with;
 
 mod common;
@@ -70,7 +70,7 @@ fn tuples_multireturn_index_and_destructure() {
 
 #[test]
 fn varargs_vargc_and_vargv() {
-    // A `...` function reads `VargC` (count) and `VargV` (raw 8-byte arg slots),
+    // A `...` function reads `argc` (count) and `argv` (raw 8-byte arg slots),
     // including the zero-argument call `Sum()`.
     let out = run("varargs.hc", include_str!("../examples/varargs.hc"));
     assert_eq!(
@@ -104,8 +104,8 @@ fn wordcount_generic_containers() {
 
 #[test]
 fn args_reads_argc_argv() {
-    // `ArgC`/`ArgV` are ambient globals. `run_to_string` supplies one arg (the
-    // program name), so `ArgC == 1` and there are no extra args to echo.
+    // `argc`/`argv` are ambient globals. `run_to_string` supplies one arg (the
+    // program name), so `argc == 1` and there are no extra args to echo.
     let out = run("args.hc", include_str!("../examples/args.hc"));
     assert_eq!(out, "argc=1\n(no extra args)\n");
 }

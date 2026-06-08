@@ -197,8 +197,13 @@ function shadows a like-named primitive** (a program's own `Read`/`Join`) — a 
 it needs `<stdio.hc>` — which the print auto-include always supplies.
 
 The only compiler-provided names with **no `lib/*.hc` declaration** are the implicit
-command line `ArgC`/`ArgV`, environment `EnvP`, and a `...` function's `VargC`/`VargV` —
-sema-injected globals/locals (doc-commented in `lib/builtin.hc`), captured at entry.
+`argc`/`argv`, the environment `envp`, and the exception task `Fs` — sema-injected
+globals/locals (doc-commented in `lib/builtin.hc`), captured at entry. `argc`/`argv` are
+**scope-dual**: the command line at global / non-variadic scope, and a `...` function's
+variadic args (count + an `I64 *` of raw 8-byte slots) inside one, where the varargs
+*shadow* the command-line globals. The command-line capture is gated on `argc`/`argv` use
+**outside** a variadic function (`ast::program_uses_command_line`), so a `printf` caller —
+which only uses them as varargs — never drags in the command line.
 (On hosted Darwin, `emit_prim` maps the heap primitives to libc — `MAlloc`→`_malloc`,
 `Free`→`_free`; freestanding emits an `mmap` bump-allocator runtime.) Everything reducible
 is pure HolyC in `lib/*.hc`, so
@@ -215,7 +220,8 @@ human-readable header in each file is the API reference. Map:
 
 Public C-named headers:
 - `builtin.hc` — implicit prelude (no `#include`): `NULL`/`TRUE`/`FALSE`, `MAlloc`/`Free`
-  prototypes, `CTask`, doc for the sema-injected `ArgC`/`ArgV`/`EnvP`/`VargC`/`VargV`/`Fs`.
+  prototypes, `CTask`, doc for the sema-injected `argc`/`argv` (command line / varargs),
+  `envp`, and `Fs`.
 - `string.hc` (`<string.h>`) — C `U8 *` string ops (`Str*` family) **and** the raw-memory
   `mem*` family (`MemCpy`/`MemMove`/`MemSet`/`MemCmp`/`MemFind`/`MemSearch`), plus `CmpStr`.
 - `ctype.hc` (`<ctype.h>`) — ASCII classification (`Is*`/`ToUpper`/`ToLower`, 0/1).

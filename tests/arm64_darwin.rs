@@ -529,14 +529,14 @@ fn native_command_line_args() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
         return;
     }
-    // Checks that `ArgC`/`ArgV` are the implicit command-line globals, captured
-    // from x0/x1 at the entry, with each `ArgV[i]` a `U8 *`. The program echoes
-    // ArgV[1..]; ArgV[0] is the binary path, which varies, so it is skipped. The
-    // binary runs with two args, and ArgV[0] is the path, so `ArgC == 3`.
+    // Checks that `argc`/`argv` are the implicit command-line globals, captured
+    // from x0/x1 at the entry, with each `argv[i]` a `U8 *`. The program echoes
+    // argv[1..]; argv[0] is the binary path, which varies, so it is skipped. The
+    // binary runs with two args, and argv[0] is the path, so `argc == 3`.
     let src = r#"
         I64 i;
-        for (i = 1; i < ArgC; i++) "%s\n", ArgV[i];
-        if (ArgC == 3) "ok\n";
+        for (i = 1; i < argc; i++) "%s\n", argv[i];
+        if (argc == 3) "ok\n";
     "#;
     // `parse_with` so the implicit `builtin.hc` prelude (NULL/TRUE/FALSE) is in scope.
     let program = parse_with(src, std::path::Path::new("."), &[]).unwrap();

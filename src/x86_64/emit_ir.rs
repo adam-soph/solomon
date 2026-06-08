@@ -227,18 +227,18 @@ pub(super) fn compile_ir(
     // The command-line capture writes *both* argc and argv, but lowering registers each
     // global only when that exact name is used. So when either is used, give the missing
     // one a write-only scratch slot (the program never reads it).
-    let need_args = gid_of("ArgC").is_some() || gid_of("ArgV").is_some();
+    let need_args = gid_of("argc").is_some() || gid_of("argv").is_some();
     let argc_off = need_args.then(|| {
-        gid_of("ArgC")
+        gid_of("argc")
             .map(|g| global_bss[g as usize])
             .unwrap_or_else(|| alloc_bss(8, 8))
     });
     let argv_off = need_args.then(|| {
-        gid_of("ArgV")
+        gid_of("argv")
             .map(|g| global_bss[g as usize])
             .unwrap_or_else(|| alloc_bss(8, 8))
     });
-    let envp_off = gid_of("EnvP").map(|g| global_bss[g as usize]);
+    let envp_off = gid_of("envp").map(|g| global_bss[g as usize]);
     let ctx = Ctx {
         global_bss,
         fs_gid,
@@ -294,7 +294,7 @@ struct Ctx {
     heap_labels: HashMap<&'static str, usize>,
     /// A ≥32-byte BSS scratch for the clock primitives' OS time structures.
     clock_scratch: Option<i32>,
-    /// Command-line / environment BSS slots (the captured `ArgC`/`ArgV`/`EnvP` globals).
+    /// Command-line / environment BSS slots (the captured `argc`/`argv`/`envp` globals).
     argc_off: Option<i32>,
     argv_off: Option<i32>,
     envp_off: Option<i32>,

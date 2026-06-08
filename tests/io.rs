@@ -380,9 +380,9 @@ fn native_arm64_freestanding_fsops() {
     assert_eq!(got, FSOPS_EXPECTED, "arm64 freestanding");
 }
 
-// ---- the environment: EnvP ----
+// ---- the environment: envp ----
 
-/// `EnvP` is a NULL-terminated `U8 **` of "KEY=VALUE" strings. These are structural
+/// `envp` is a NULL-terminated `U8 **` of "KEY=VALUE" strings. These are structural
 /// invariants that hold for any real process environment: it is non-empty and every
 /// entry has a '='. So the check is deterministic without depending on a specific
 /// variable.
@@ -390,8 +390,8 @@ const ENV_INVARIANTS: &str = r#"
     #include <string.hc>
     U0 Main() {
       I64 i = 0, all_kv = 1;
-      while (EnvP[i] != NULL) {
-        if (StrChr(EnvP[i], '=') == NULL) all_kv = 0;
+      while (envp[i] != NULL) {
+        if (StrChr(envp[i], '=') == NULL) all_kv = 0;
         i++;
       }
       "nonempty=%d all_kv=%d\n", i > 0, all_kv;
@@ -408,7 +408,7 @@ fn interp_envp_invariants() {
 #[test]
 fn native_arm64_envp_invariants_and_lookup() {
     if !darwin_toolchain() {
-        eprintln!("skipping: native EnvP test needs aarch64-apple-darwin + cc");
+        eprintln!("skipping: native envp test needs aarch64-apple-darwin + cc");
         return;
     }
     // Same invariants, captured natively from `main`'s envp (x2).
@@ -431,8 +431,8 @@ fn native_arm64_envp_invariants_and_lookup() {
         #include <string.hc>
         U0 Main() {
           I64 i = 0;
-          while (EnvP[i] != NULL) {
-            if (StrNCmp(EnvP[i], "SOLOMON_ENV=", 12) == 0) { "got=%s\n", EnvP[i] + 12; return; }
+          while (envp[i] != NULL) {
+            if (StrNCmp(envp[i], "SOLOMON_ENV=", 12) == 0) { "got=%s\n", envp[i] + 12; return; }
             i++;
           }
           "missing\n";
@@ -452,12 +452,12 @@ fn native_arm64_envp_invariants_and_lookup() {
     assert_eq!(String::from_utf8_lossy(&out2.stdout), "got=hi\n");
 }
 
-/// EnvP invariants through the **freestanding x86-64** backend. Here envp is read off
+/// envp invariants through the **freestanding x86-64** backend. Here envp is read off
 /// the initial stack, just past argv's NULL. Runs only on a linux/x86_64 host.
 #[test]
 fn native_x86_64_freestanding_envp() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        eprintln!("skipping: freestanding x86-64 EnvP test needs a linux/x86_64 host");
+        eprintln!("skipping: freestanding x86-64 envp test needs a linux/x86_64 host");
         return;
     }
     let out = std::env::temp_dir().join(format!("solomon-x64-env-{}", std::process::id()));

@@ -929,9 +929,9 @@ fn variadic_functions_match_the_interpreter() {
     // Varargs are deterministic, so the native vararg ABI (a caller-frame buffer
     // plus two hidden args) is held byte-for-byte to the interpreter.
     let src = r#"
-        I64 SumI(...) { I64 s=0,i=0; while(i<VargC){s+=VargV[i];i++;} return s; }
-        F64 AvgF(...) { F64 s=0.0; I64 i=0; while(i<VargC){s+=*(F64*)&VargV[i];i++;} return s/VargC; }
-        U0 Join(U8 *sep, ...) { I64 i=0; while(i<VargC){ if(i)"%s",sep; "%s",*(U8**)&VargV[i]; i++; } "\n"; }
+        I64 SumI(...) { I64 s=0,i=0; while(i<argc){s+=argv[i];i++;} return s; }
+        F64 AvgF(...) { F64 s=0.0; I64 i=0; while(i<argc){s+=*(F64*)&argv[i];i++;} return s/argc; }
+        U0 Join(U8 *sep, ...) { I64 i=0; while(i<argc){ if(i)"%s",sep; "%s",*(U8**)&argv[i]; i++; } "\n"; }
         U0 Main() {
           "%d %d\n", SumI(10,20,30,40), SumI(7);
           "%.3f\n", AvgF(1.0,2.0,6.0);

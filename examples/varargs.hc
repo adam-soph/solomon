@@ -1,25 +1,25 @@
-// varargs.hc — variadic functions via the implicit locals `VargC` and `VargV`. In a
-// function declared with a trailing `...`, `VargC` is the number of variadic arguments
-// and `VargV` is an `I64 *` of their raw 8-byte slots (so `VargV[i]` reads slot `i` as
-// an integer; a stored F64 would be read back with `*(F64 *)&VargV[i]`). No #include
-// needed — `VargC`/`VargV` are ambient inside a `...` function.
+// varargs.hc — variadic functions via the implicit locals `argc` and `argv`. In a
+// function declared with a trailing `...`, `argc` is the number of variadic arguments
+// and `argv` is an `I64 *` of their raw 8-byte slots (so `argv[i]` reads slot `i` as
+// an integer; a stored F64 would be read back with `*(F64 *)&argv[i]`). No #include
+// needed — `argc`/`argv` are ambient inside a `...` function.
 
 // Sum every integer argument, however many are passed.
 I64 Sum(...)
 {
   I64 total = 0, i;
-  for (i = 0; i < VargC; i++)
-    total += VargV[i];
+  for (i = 0; i < argc; i++)
+    total += argv[i];
   return total;
 }
 
 // The max of the arguments (or 0 when called with none).
 I64 Max(...)
 {
-  if (VargC == 0) return 0;
-  I64 best = VargV[0], i;
-  for (i = 1; i < VargC; i++)
-    if (VargV[i] > best) best = VargV[i];
+  if (argc == 0) return 0;
+  I64 best = argv[0], i;
+  for (i = 1; i < argc; i++)
+    if (argv[i] > best) best = argv[i];
   return best;
 }
 

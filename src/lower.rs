@@ -70,7 +70,7 @@ pub fn lower(program: &Program, layouts: &Layouts) -> Result<IrProgram, CodegenE
     // can resolve it. Globals live zero-initialised in the data region; a non-trivial
     // initializer runs as code in `@entry` at the point it appears, matching the
     // interpreter's top-level execution order. (The impure sema-injected globals
-    // `ArgC`/`ArgV`/`EnvP` are intentionally not registered yet.)
+    // `argc`/`argv`/`envp` are intentionally not registered yet.)
     let mut out_globals: Vec<IrGlobal> = Vec::new();
     let mut globals: HashMap<String, (GlobalId, Type)> = HashMap::new();
     for item in &program.items {
@@ -108,13 +108,22 @@ pub fn lower(program: &Program, layouts: &Layouts) -> Result<IrProgram, CodegenE
     }
 
     // The command line / environment, exposed as implicit globals captured at program
-    // entry (`I64 ArgC`, `U8 **ArgV`, `U8 **EnvP`) — the same names sema injects. Each
-    // is registered only when the program references it, so an arg-free program is
-    // unchanged. The native `@entry` stores the incoming argc/argv/envp registers into
-    // these slots; the interpreter seeds them in `fresh_mem`.
+    // entry (`I64 argc`, `U8 **argv`, `U8 **envp`) — the same names sema injects. Each is
+    // registered only when the program references it, so an arg-free program is unchanged.
+    // `argc`/`argv` are command-line *only outside* a variadic function, where they are the
+    // varargs that shadow these globals — so a `printf` caller does not drag in the command
+    // line. `envp` is never shadowed, so an ordinary use check suffices. The native
+    // `@entry` stores the incoming argc/argv/envp registers into these slots; the
+    // interpreter seeds them in `fresh_mem`.
     let u8pp = || Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8))));
-    for (name, ty) in [("ArgC", Type::I64), ("ArgV", u8pp()), ("EnvP", u8pp())] {
-        if crate::ast::program_uses_ident(program, &[name]) && !globals.contains_key(name) {
+    let cmdline = crate::ast::program_uses_command_line(program, &["argc", "argv"]);
+    let env = crate::ast::program_uses_ident(program, &["envp"]);
+    for (name, ty, used) in [
+        ("argc", Type::I64, cmdline),
+        ("argv", u8pp(), cmdline),
+        ("envp", u8pp(), env),
+    ] {
+        if used && !globals.contains_key(name) {
             let gid = out_globals.len() as GlobalId;
             out_globals.push(IrGlobal {
                 name: name.to_string(),
@@ -462,26 +471,26 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // A variadic function receives two hidden trailing parameters: `VargC` (the
-        // count) and `VargV` (a pointer to the packed argument buffer). They are
+        // A variadic function receives two hidden trailing parameters: `argc` (the
+        // count) and `argv` (a pointer to the packed argument buffer). They are
         // sema-injected locals in the body; bind them here as SSA values.
         if f.varargs {
             let vc = self.fresh_vreg();
             params.push(IrParam {
                 ty: ArgTy::Int(IrTy::I64),
                 vreg: vc,
-                name: Some("VargC".to_string()),
+                name: Some("argc".to_string()),
             });
-            let vc_id = self.bind_ssa("VargC", Type::I64);
+            let vc_id = self.bind_ssa("argc", Type::I64);
             self.write_variable(vc_id, entry, Val::Reg(vc));
 
             let vv = self.fresh_vreg();
             params.push(IrParam {
                 ty: ArgTy::Int(IrTy::Ptr),
                 vreg: vv,
-                name: Some("VargV".to_string()),
+                name: Some("argv".to_string()),
             });
-            let vv_id = self.bind_ssa("VargV", Type::Ptr(Box::new(Type::I64)));
+            let vv_id = self.bind_ssa("argv", Type::Ptr(Box::new(Type::I64)));
             self.write_variable(vv_id, entry, Val::Reg(vv));
         }
 
@@ -2129,7 +2138,7 @@ impl<'a> Lowerer<'a> {
 
     /// Lower a direct call by name (also the entry point for the `"fmt", args` print
     /// form, which desugars to `Print(...)`). Variadic callees receive their fixed
-    /// args plus two hidden trailing args: `VargC` (the variadic count) and `VargV`
+    /// args plus two hidden trailing args: `argc` (the variadic count) and `argv`
     /// (a pointer to a packed 8-byte-per-arg buffer).
     fn lower_named_call(
         &mut self,
@@ -2246,7 +2255,7 @@ impl<'a> Lowerer<'a> {
                     val: sval,
                 });
             }
-            // The hidden `VargC` (count) and `VargV` (buffer) trailing arguments.
+            // The hidden `argc` (count) and `argv` (buffer) trailing arguments.
             ir_args.push(ArgVal {
                 ty: ArgTy::Int(IrTy::I64),
                 val: Val::ImmInt(nvar as i64),

@@ -110,23 +110,31 @@ fn print_family_is_auto_available() {
 
 #[test]
 fn implicit_argc_argv_are_in_scope() {
-    // The command line is the implicit globals `I64 ArgC` / `U8 **ArgV`, in scope
-    // everywhere with no `#include`. A `...` function's `VargC`/`VargV` varargs
+    // The command line is the implicit globals `I64 argc` / `U8 **argv`, in scope
+    // everywhere with no `#include`. A `...` function's `argc`/`argv` varargs
     // locals are distinct names, so the command line stays reachable inside one
     // too. (The printf family, heap, clock, and algebraic/string/etc. ops are lib
     // functions or intrinsics now.)
-    ok("U0 F() { I64 c = ArgC; U8 *a = ArgV[0]; }");
-    ok("U0 V(I64 n, ...) { I64 k = VargC; I64 x = VargV[0]; F64 f = *(F64 *)&VargV[1]; }");
+    ok("U0 F() { I64 c = argc; U8 *a = argv[0]; }");
+    ok("U0 V(I64 n, ...) { I64 k = argc; I64 x = argv[0]; F64 f = *(F64 *)&argv[1]; }");
     // Both namespaces coexist in a `...` function with no shadowing collision.
-    ok("U0 V(...) { I64 c = ArgC; U8 *a = ArgV[0]; I64 k = VargC; I64 x = VargV[0]; }");
+    ok("U0 V(...) { I64 c = argc; U8 *a = argv[0]; I64 k = argc; I64 x = argv[0]; }");
 }
 
 #[test]
-fn lowercase_argc_argv_are_not_in_scope() {
-    // The command line is `ArgC`/`ArgV`, and the varargs are `VargC`/`VargV`. The
-    // lowercase spellings are nothing special.
-    has("U0 F() { I64 c = argc; }", "undeclared");
-    has("I64 F(...) { return argv[0]; }", "undeclared");
+fn argc_argv_resolve_by_scope() {
+    // `argc`/`argv` are the command line at global / non-variadic scope, and the variadic
+    // arguments (shadowing) inside a `...` function. Both are valid in either place.
+    ok("\"argc=%d\\n\", argc;"); // command line at top level
+    ok("U0 F() { I64 c = argc; U8 *p = argv[0]; }"); // command line in a plain function
+    ok("I64 F(...) { return argv[0] + argc; }"); // varargs in a `...` function
+}
+
+#[test]
+fn old_capitalized_arg_names_are_gone() {
+    // The pre-unification names (`ArgC`/`ArgV`/`VargC`/`VargV`) are no longer injected.
+    has("U0 F() { I64 c = ArgC; }", "undeclared");
+    has("I64 F(...) { return VargV[0]; }", "undeclared");
 }
 
 // ---- name resolution ----
@@ -668,7 +676,7 @@ fn errors_carry_positions() {
 
 #[test]
 fn varargs_use_vargc_vargv() {
-    // Inside a `...` function, `VargC`/`VargV` are the varargs, distinct from the
-    // global command-line `ArgC`/`ArgV`.
-    ok("I64 F(...) { return VargC + VargV[0]; }");
+    // Inside a `...` function, `argc`/`argv` are the varargs, distinct from the
+    // global command-line `argc`/`argv`.
+    ok("I64 F(...) { return argc + argv[0]; }");
 }

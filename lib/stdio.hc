@@ -757,7 +757,7 @@ public U0 Print(U8 *fmt, ...)
   p.cap = 0;
   p.grow = 0;
   p.bound = 0;
-  VFmt(&p, fmt, VargV, VargC);
+  VFmt(&p, fmt, argv, argc);
 }
 
 public U8 *StrPrint(U8 *dst, U8 *fmt, ...)
@@ -769,7 +769,7 @@ public U8 *StrPrint(U8 *dst, U8 *fmt, ...)
   p.cap = 0;
   p.grow = 0;
   p.bound = 0;
-  VFmt(&p, fmt, VargV, VargC);
+  VFmt(&p, fmt, argv, argc);
   dst[p.len] = 0;
   return dst;
 }
@@ -788,7 +788,7 @@ public I64 StrNPrint(U8 *dst, I64 cap, U8 *fmt, ...)
   p.cap = cap;
   p.grow = 0;
   p.bound = 1;
-  VFmt(&p, fmt, VargV, VargC);
+  VFmt(&p, fmt, argv, argc);
   if (cap > 0) {
     I64 nul = p.len;
     if (nul > cap - 1) nul = cap - 1;
@@ -806,7 +806,7 @@ public U8 *CatPrint(U8 *dst, U8 *fmt, ...)
   p.cap = 0;
   p.grow = 0;
   p.bound = 0;
-  VFmt(&p, fmt, VargV, VargC);
+  VFmt(&p, fmt, argv, argc);
   dst[p.len] = 0;
   return dst;
 }
@@ -820,7 +820,7 @@ public U8 *MStrPrint(U8 *fmt, ...)
   p.len = 0;
   p.grow = 1;
   p.bound = 0;
-  VFmt(&p, fmt, VargV, VargC);
+  VFmt(&p, fmt, argv, argc);
   p.dst[p.len] = 0;
   return p.dst;
 }
@@ -1101,7 +1101,7 @@ public I64 SScan(U8 *buf, U8 *fmt, ...)
       I64 w = (width > 0) ? width : 1;
       if (!*s) return assigned > 0 ? assigned : -1;
       U8 *dst = NULL;
-      if (!suppress) { dst = *(U8 **)(&VargV[ai]); ai++; }
+      if (!suppress) { dst = *(U8 **)(&argv[ai]); ai++; }
       I64 k = 0;
       while (k < w && *s) {
         if (dst) dst[k] = *s; // %c does not NUL-terminate
@@ -1116,7 +1116,7 @@ public I64 SScan(U8 *buf, U8 *fmt, ...)
     if (!*s) return assigned > 0 ? assigned : -1; // input exhausted
     if (conv == 's') {
       U8 *dst = NULL;
-      if (!suppress) { dst = *(U8 **)(&VargV[ai]); ai++; }
+      if (!suppress) { dst = *(U8 **)(&argv[ai]); ai++; }
       I64 k = 0;
       while (*s && !ScWs(*s)) {
         if (width > 0 && k >= width) break;
@@ -1135,11 +1135,11 @@ public I64 SScan(U8 *buf, U8 *fmt, ...)
       else if (conv == 'o') base = 8;
       I64 v = 0;
       if (!ScanInt(&s, base, width, &v)) return assigned;
-      if (!suppress) { I64 *dst = *(I64 **)(&VargV[ai]); ai++; *dst = v; assigned++; }
+      if (!suppress) { I64 *dst = *(I64 **)(&argv[ai]); ai++; *dst = v; assigned++; }
     } else if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G') {
       F64 v = 0.0;
       if (!ScanFloat(&s, width, &v)) return assigned;
-      if (!suppress) { F64 *dst = *(F64 **)(&VargV[ai]); ai++; *dst = v; assigned++; }
+      if (!suppress) { F64 *dst = *(F64 **)(&argv[ai]); ai++; *dst = v; assigned++; }
     } else {
       return assigned; // unknown conversion: can't tell how to consume it
     }

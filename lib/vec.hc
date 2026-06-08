@@ -98,17 +98,17 @@ I64 VecBSearch<type T>(Vec<T> *v, T *key, I64 (*cmp)(T *, T *))
 
 // Collect every environment entry ("KEY=VALUE", a `U8 *`) into `out`, a `Vec<U8 *>`
 // initialised here, in the OS's order. Read an entry with `VecAt(&out, i)`. This builds
-// a `Vec` from the implicit `EnvP` (C's `environ`), so it lives here next to `Vec`
+// a `Vec` from the implicit `envp` (C's `environ`), so it lives here next to `Vec`
 // rather than in `<stdlib.hc>` (where the scalar `Getenv` is). The entries point into
 // the process environment and are read-only. `VecFree(&out)` frees the Vec's own buffer,
 // not the entries.
 public U0 Environ(Vec<U8 *> *out)
 {
   VecInit(out);
-  if (EnvP == NULL) return;   // no environment (e.g. Windows, for now)
+  if (envp == NULL) return;   // no environment (e.g. Windows, for now)
   I64 i = 0;
-  while (EnvP[i] != NULL) {
-    VecPush(out, EnvP[i]);
+  while (envp[i] != NULL) {
+    VecPush(out, envp[i]);
     i++;
   }
 }

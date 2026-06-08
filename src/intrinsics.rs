@@ -8,7 +8,7 @@
 //! This is the only seam for compiler-provided behaviour. Every algebraic or
 //! OS-level operation is declared in a `lib/*.hc` file and recognized here. The
 //! few things the compiler injects without any declaration are not intrinsics:
-//! the command line `ArgC`/`ArgV` and a `...` function's `VargC`/`VargV` are
+//! the command line `argc`/`argv` and a `...` function's `argc`/`argv` are
 //! implicit globals and locals seeded by sema, not callable functions.
 //!
 //! The flavour is [`IntrinsicKind`]. An optimization intrinsic has a real HolyC

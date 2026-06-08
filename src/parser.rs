@@ -2163,7 +2163,7 @@ pub fn parse_with(
 }
 
 /// The implicit prelude: `builtin.hc`, always in scope under [`parse_with`]. It
-/// provides the predefined constants plus the `ArgC`/`ArgV`/`VarArg*` primitives.
+/// provides the predefined constants plus the `argc`/`argv`/`VarArg*` primitives.
 fn prelude() -> &'static str {
     crate::embedded_stdlib("builtin.hc").expect("builtin.hc is embedded")
 }

@@ -563,7 +563,7 @@ impl PartialEq for Param {
 
 /// Whether the program contains a call to any function named in `names`. The
 /// native backends use this to decide whether to emit command-line-argument
-/// capture in the program entry. A program that never references `ArgC` or `ArgV`
+/// capture in the program entry. A program that never references `argc` or `argv`
 /// is then byte-for-byte unaffected by the feature.
 pub fn program_calls_any(program: &Program, names: &[&str]) -> bool {
     program.items.iter().any(|s| stmt_calls(s, names))
@@ -670,6 +670,18 @@ fn expr_calls(e: &Expr, names: &[&str]) -> bool {
 /// decide whether to capture the command line for the implicit `argc`/`argv`.
 pub fn program_uses_ident(program: &Program, names: &[&str]) -> bool {
     program.items.iter().any(|s| stmt_uses_ident(s, names))
+}
+
+/// Whether `names` are referenced where the command-line globals are visible — top-level
+/// code and **non-variadic** function bodies. A variadic `...` function's `argc`/`argv`
+/// are its varargs (they shadow the command-line globals), so its body is skipped. Used
+/// to gate the `argc`/`argv` command-line capture, so a program that only uses them as
+/// varargs (e.g. any `printf` caller) does not drag in the command line.
+pub fn program_uses_command_line(program: &Program, names: &[&str]) -> bool {
+    program.items.iter().any(|s| match &s.kind {
+        StmtKind::Func(f) if f.varargs => false,
+        _ => stmt_uses_ident(s, names),
+    })
 }
 
 /// Whether the program contains any `try`/`throw`. The backends use this (with a

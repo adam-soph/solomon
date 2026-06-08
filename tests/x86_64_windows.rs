@@ -214,9 +214,9 @@ fn printing_lowers_to_getstdhandle_then_writefile() {
 
 #[test]
 fn args_capture_calls_getcommandline() {
-    // A program using ArgC/ArgV captures the command line at the entry. So the first
+    // A program using argc/argv captures the command line at the entry. So the first
     // `call [rip]` after the frame prologue is `GetCommandLineA`.
-    let pe = build_pe("\"%d\\n\", ArgC;");
+    let pe = build_pe("\"%d\\n\", argc;");
     // The capture opens with `sub rsp, 32; call [rip]` (shadow space + the call).
     let at = find_code(&pe, &[0x48, 0x83, 0xEC, 0x20, 0xFF, 0x15]);
     assert_eq!(call_target(&pe, at + 4), "GetCommandLineA");
@@ -443,7 +443,7 @@ fn pe_printing_matches_the_interpreter() {
 
 #[test]
 fn pe_env_matches_interpreter() {
-    // `EnvP`/`Getenv` work on Windows: the entry builds the `U8 **EnvP` array over
+    // `envp`/`Getenv` work on Windows: the entry builds the `U8 **envp` array over
     // `GetEnvironmentStringsA` (skipping the leading-`=` per-drive entries to match the
     // interpreter's `std::env` view). Output is presence-based so it's deterministic and
     // matches the interpreter on the same host. Runs only on Windows; self-skips else.
@@ -451,7 +451,7 @@ fn pe_env_matches_interpreter() {
         "env".to_string(),
         compile(
             "#include <stdlib.hc>\n\
-             U0 Main(){ I64 n = 0; while (EnvP[n]) n++; \
+             U0 Main(){ I64 n = 0; while (envp[n]) n++; \
                \"%d %d %d\\n\", n > 0, Getenv(\"PATH\") != NULL, Getenv(\"NOPE_X9Z7\") != NULL; } \
              Main;",
         ),

@@ -419,7 +419,7 @@ With no subcommand, hcc compiles for the host's architecture and OS. FILE is
 read from stdin when omitted.
 
 `hcc -i` executes the program with the tree-walking interpreter. Arguments after
-FILE become the program's argv (read with ArgC/ArgV); `--` ends option parsing so
+FILE become the program's argv (read with argc/argv); `--` ends option parsing so
 option-looking program arguments pass through.
 
 Options:

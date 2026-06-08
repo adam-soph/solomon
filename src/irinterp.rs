@@ -16,7 +16,7 @@
 //! `apply_binop`/`cast_value` bit-for-bit.
 //!
 //! Not yet handled: the impure primitives (clock, fd/file I/O, sockets, threads,
-//! atomics) and the command line (`ArgC`/`ArgV`/`EnvP`) — these are property-tested,
+//! atomics) and the command line (`argc`/`argv`/`envp`) — these are property-tested,
 //! not value-pinned, against the oracle.
 
 use std::collections::HashMap;
@@ -234,7 +234,7 @@ pub struct IrInterp<'p> {
     data: Vec<u8>,
     str_addr: Vec<u64>,
     global_addr: Vec<u64>,
-    /// Command-line arguments exposed via `ArgC`/`ArgV` (`args[0]` is the program name,
+    /// Command-line arguments exposed via `argc`/`argv` (`args[0]` is the program name,
     /// so the count is always ≥ 1).
     args: Vec<String>,
     /// The program's standard input (fd 0), consumed on the next `run`/`run_program`.
@@ -281,7 +281,7 @@ impl<'p> IrInterp<'p> {
         }
     }
 
-    /// Set the command line visible through `ArgC`/`ArgV` (`args[0]` = program name).
+    /// Set the command line visible through `argc`/`argv` (`args[0]` = program name).
     pub fn set_args(&mut self, args: Vec<String>) {
         if !args.is_empty() {
             self.args = args;
@@ -323,7 +323,7 @@ impl<'p> IrInterp<'p> {
         mem
     }
 
-    /// Seed `ArgC`/`ArgV`/`EnvP` (when the program registered them) to the configured
+    /// Seed `argc`/`argv`/`envp` (when the program registered them) to the configured
     /// command line (`args[0]` is the program name) and the real process environment —
     /// matching the tree-walking interpreter and the native backends.
     fn seed_command_line(&self, mem: &mut Mem) {
@@ -347,12 +347,12 @@ impl<'p> IrInterp<'p> {
             mem.store(base + (items.len() * 8) as u64, IrTy::Ptr, RVal::Int(0));
             base
         };
-        if store_global(mem, "ArgC", self.args.len() as i64) {
+        if store_global(mem, "argc", self.args.len() as i64) {
             let argv: Vec<Vec<u8>> = self.args.iter().map(|a| a.as_bytes().to_vec()).collect();
             let base = make_argv(mem, &argv);
-            store_global(mem, "ArgV", base as i64);
+            store_global(mem, "argv", base as i64);
         }
-        if self.prog.globals.iter().any(|g| g.name == "EnvP") {
+        if self.prog.globals.iter().any(|g| g.name == "envp") {
             let env: Vec<Vec<u8>> = std::env::vars_os()
                 .map(|(k, v)| {
                     let mut s = k.into_encoded_bytes();
@@ -362,7 +362,7 @@ impl<'p> IrInterp<'p> {
                 })
                 .collect();
             let base = make_argv(mem, &env);
-            store_global(mem, "EnvP", base as i64);
+            store_global(mem, "envp", base as i64);
         }
     }
 

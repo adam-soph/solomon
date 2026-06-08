@@ -362,10 +362,10 @@ impl OsTarget for WindowsTarget {
     fn emit_capture_env(&mut self, asm: &mut Asm, envp_off: i32) {
         // Windows has no `envp` array: its environment is a double-NUL-terminated block
         // of "KEY=VALUE\0" strings from GetEnvironmentStringsA. Build a NULL-terminated
-        // pointer array (`U8 **EnvP`) over that block — each entry points straight into
+        // pointer array (`U8 **envp`) over that block — each entry points straight into
         // the block (already NUL-separated, no copy). This runs at the entry before any
         // program code, so it may clobber any register. (`stdlib.hc`'s `Getenv` and
-        // `vec.hc`'s `Environ` are pure HolyC over `EnvP`, so they now work on Windows too.)
+        // `vec.hc`'s `Environ` are pure HolyC over `envp`, so they now work on Windows too.)
         let ges = self.extern_idx("GetEnvironmentStringsA");
         let va = self.extern_idx("VirtualAlloc");
 
@@ -385,14 +385,14 @@ impl OsTarget for WindowsTarget {
         asm.emit(&[0x48, 0x83, 0xC4, 0x20]); // add rsp, 32
         asm.mov_rr(RDI, RAX); // rdi = envp array base
 
-        // EnvP slot = &array
+        // envp slot = &array
         asm.lea_global(RCX, envp_off);
         asm.store_qword_at(RCX, RDI);
 
         // Collect a pointer to each "KEY=VALUE" string, up to the empty string (the
         // second NUL of the double terminator). Strings stay in place — no in-place
         // edits, since the block is already NUL-separated. The leading-`=` entries
-        // Windows prepends (the per-drive cwd, e.g. `=C:=C:\…`) are skipped, so `EnvP`
+        // Windows prepends (the per-drive cwd, e.g. `=C:=C:\…`) are skipped, so `envp`
         // matches the interpreter's `std::env` view (POSIX-style "KEY=VALUE").
         asm.xor_rr(R8, R8); // count = 0
         let loop_l = asm.new_label();

@@ -24,32 +24,31 @@
 public U8 *MAlloc(I64 n);
 public U0 Free(U8 *ptr);
 
-// The command line is exposed as two implicit globals, captured at the entry and in
-// scope everywhere with no `#include`. `ArgV[i]` is a NUL-terminated string; `ArgV[0]`
-// is the program name, so `ArgC >= 1`. Sema seeds these and the backends/interpreter
-// lower them: they are not real declarations here.
+// `argc`/`argv` are dual-purpose implicit names, resolved by scope (no `#include`):
 //
-//   extern I64    ArgC;   // argument count
-//   extern U8   **ArgV;   // the arguments
+//   * At global / non-variadic scope they are the **command line**, captured at the
+//     entry. `argv[i]` is a NUL-terminated string and `argv[0]` is the program name, so
+//     `argc >= 1`:  extern I64 argc;  extern U8 **argv;
 //
-// The environment is the implicit global `U8 **EnvP`, a NULL-terminated array of
-// "KEY=VALUE" strings. It is captured at the entry, like the command line, and is
-// sema-injected (only documented here). It is the low-level primitive: for a lookup
-// by name, use `Getenv("NAME")` from `<stdlib.hc>` (pure HolyC over `EnvP`). Walk `EnvP`
-// directly only to iterate the whole environment:
+//   * Inside a `...` function they are the **variadic arguments**, and shadow the command
+//     line. `argc` is the count; `argv[i]` is the i-th raw 8-byte slot — index it directly
+//     for an I64, or pun the slot's address for another type, e.g. `*(F64 *)&argv[i]` or
+//     `*(U8 **)&argv[i]`:  I64 argc;  I64 *argv;
 //
-//   extern U8   **EnvP;   // I64 i = 0; while (EnvP[i]) { /* "%s\n", EnvP[i]; */ i++; }
+// Sema seeds both and the backends/interpreter lower them: they are not real declarations
+// here. The command-line capture cost is paid only when `argc`/`argv` are used outside a
+// variadic function.
 //
-// The capture cost is paid only when `EnvP` is referenced. On Windows it is NULL for
+// The environment is the implicit global `U8 **envp`, a NULL-terminated array of
+// "KEY=VALUE" strings, captured at the entry and in scope everywhere (it is never
+// shadowed). It is the low-level primitive: for a lookup by name use `Getenv("NAME")`
+// from `<stdlib.hc>` (pure HolyC over `envp`); walk `envp` directly only to iterate the
+// whole environment:
+//
+//   extern U8   **envp;   // I64 i = 0; while (envp[i]) { /* "%s\n", envp[i]; */ i++; }
+//
+// The capture cost is paid only when `envp` is referenced. On Windows it is NULL for
 // now, because the OS environment is a different shape there.
-//
-// Inside any `...` function the compiler injects two implicit locals naming the
-// variadic arguments. These are distinct from the command line above, so both coexist
-// there. `VargV[i]` is the i-th raw 8-byte slot: index it directly for an I64, or pun
-// the slot's address for another type, e.g. `*(F64 *)&VargV[i]` or `*(U8 **)&VargV[i]`.
-//
-//   I64    VargC;         // number of variadic args passed
-//   I64   *VargV;         // their raw 8-byte slots
 
 // The current task/thread context, exposed as the implicit global `CTask *Fs`
 // (sema-injected, like the command line above). It holds the exception state used by

@@ -535,15 +535,15 @@ public U64 RandU64()
 public U0 Exit(I64 code);
 
 // Look up environment variable `name`. Returns a pointer to its value (the bytes after
-// `name=` in the matching `EnvP` entry), or NULL if it is unset. The result points into
-// the process environment, which is read-only: do not free or modify it. (`EnvP`, the
+// `name=` in the matching `envp` entry), or NULL if it is unset. The result points into
+// the process environment, which is read-only: do not free or modify it. (`envp`, the
 // implicit `environ` array, is the sema-injected global.)
 public U8 *Getenv(U8 *name)
 {
-  if (EnvP == NULL) return NULL;   // no environment (e.g. Windows, for now)
+  if (envp == NULL) return NULL;   // no environment (e.g. Windows, for now)
   I64 i = 0;
-  while (EnvP[i] != NULL) {
-    U8 *e = EnvP[i];
+  while (envp[i] != NULL) {
+    U8 *e = envp[i];
     I64 j = 0;
     while (name[j] != 0 && e[j] == name[j]) j++;
     // The whole name matched and the entry's key ends exactly here ('='): a hit.

@@ -90,13 +90,13 @@ trait OsTarget {
     /// Emit the entry preamble that captures the command line into the BSS slots
     /// `argc_off` and `argv_off`. The `argv_off` slot holds a pointer to the argv
     /// array. Runs just after the entry frame is set up, so the frame pointer `rbp`
-    /// is valid, and only when the program uses `ArgC`/`ArgV`. Linux reads them off
+    /// is valid, and only when the program uses `argc`/`argv`. Linux reads them off
     /// the initial stack; Windows builds them from `GetCommandLineA`.
     fn emit_capture_args(&mut self, asm: &mut Asm, argc_off: i32, argv_off: i32);
 
     /// Capture the environment pointer (`U8 **envp`) into the BSS slot `envp_off`.
     /// Runs just after the entry frame is set up, so `rbp` is valid, and only when
-    /// the program references `EnvP`. Linux computes `&envp[0]` from the initial
+    /// the program references `envp`. Linux computes `&envp[0]` from the initial
     /// stack, just past the argv NULL terminator. Windows has no `envp` array, so it
     /// stores a NULL; env access there is unsupported for now.
     fn emit_capture_env(&mut self, asm: &mut Asm, envp_off: i32);

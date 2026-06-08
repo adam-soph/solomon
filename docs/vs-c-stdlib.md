@@ -120,8 +120,10 @@ and `*` (e.g. `%-10s`, `%08.3f`, `%.*g`). `SScan` mirrors the same conversions +
 | **Different** | `I64`-only (C is type-generic); ordering fixed (acquire/release on RMW, seq-cst fence) |
 
 ### `<stdarg.h>` → language built-in
-A `...` function reads its variadic slots through the sema-injected `VargC` (count) and
-`VargV` (an `I64 *` of raw 8-byte slots) — no `va_list`/`va_start`/`va_arg`/`va_end`.
+A `...` function reads its variadic slots through the sema-injected `argc` (count) and
+`argv` (an `I64 *` of raw 8-byte slots) — no `va_list`/`va_start`/`va_arg`/`va_end`. These
+are the same `argc`/`argv` names that mean the command line outside a variadic function;
+inside one they shadow it with the varargs.
 
 ### `<stddef.h>` / `<stdint.h>` / `<stdbool.h>` → language built-in
 `I8`…`U64`/`F64`/`Bool`/`U0` are **primitive types** (not typedefs). `NULL`/`TRUE`/`FALSE`

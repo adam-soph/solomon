@@ -22,7 +22,7 @@
 //! integers/pointers/floats, memory, control flow (incl. an O(1) jump-table `switch`),
 //! direct and indirect calls, by-value aggregates (sret), globals, string literals,
 //! exceptions (`try`/`catch`/`throw` via a jmp_buf/longjmp unwind over `Fs->exc_top`),
-//! the command line (`ArgC`/`ArgV`/`EnvP`), and the pure-HolyC printf path. The impure
+//! the command line (`argc`/`argv`/`envp`), and the pure-HolyC printf path. The impure
 //! primitives are all lowered: the heap, the clock, fd/file I/O, sockets, fs mutation,
 //! process ids, atomics/futex, and threads — `pthread` on Darwin, raw `clone(2)` + futex
 //! join freestanding. The algebraic intrinsics `Sqrt`/`Fabs`/the rounding family lower
@@ -114,9 +114,9 @@ pub(super) fn compile_ir(
             .map(|i| i as u32)
     };
     let fs_gid = gid_of("Fs");
-    let argc_gid = gid_of("ArgC");
-    let argv_gid = gid_of("ArgV");
-    let envp_gid = gid_of("EnvP");
+    let argc_gid = gid_of("argc");
+    let argv_gid = gid_of("argv");
+    let envp_gid = gid_of("envp");
     let (exc_top_off, except_ch_off) = if fs_gid.is_some() {
         let field = |name: &str| {
             ir.layouts.offset_of("CTask", name).ok_or_else(|| {
@@ -363,7 +363,7 @@ struct Ctx {
     global_sym: Vec<u32>,
     /// Freestanding: each global's BSS byte offset (`gid → off`). Empty when hosted.
     global_bss: Vec<u64>,
-    /// `gid` of the implicit `Fs`/`ArgC`/`ArgV`/`EnvP` globals, when present.
+    /// `gid` of the implicit `Fs`/`argc`/`argv`/`envp` globals, when present.
     fs_gid: Option<u32>,
     argc_gid: Option<u32>,
     argv_gid: Option<u32>,
@@ -2319,7 +2319,7 @@ mod tests {
              \"flag now %d\\n\", Fs->catch_except;",
             // the command line (run with no args ⇒ argc == 1, matching the oracle's
             // default argv) and an fd primitive with errno conversion.
-            "\"argc=%d\\n\", ArgC; if (ArgC >= 1) \"have prog name\\n\";",
+            "\"argc=%d\\n\", argc; if (argc >= 1) \"have prog name\\n\";",
             "#include <fcntl.hc>\n\
              I64 fd = Open(\"/no_such_solomon_4c1f_file\", O_RDONLY, 0); \
              \"missing=%d\\n\", fd < 0;",
