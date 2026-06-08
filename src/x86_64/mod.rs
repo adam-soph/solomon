@@ -1,6 +1,6 @@
 //! x86-64 code-generation backend (Linux + Windows).
 //!
-//! The code generator itself is [`emit_ir`], which walks the SSA [IR](crate::ir) and
+//! The code generator itself is [`isel`], which walks the SSA [IR](crate::ir) and
 //! hand-emits x86-64 (see that module). This file holds the shared, OS-agnostic pieces it
 //! builds on: the [`Asm`] encoder (in [`asm`]), the register numbering, and the
 //! [`OsTarget`] seam — the handful of points where the emitted program touches the
@@ -14,7 +14,7 @@
 use crate::codegen::CodegenError;
 
 mod asm;
-mod emit_ir;
+mod isel;
 mod linux;
 mod windows;
 

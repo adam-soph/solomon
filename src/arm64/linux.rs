@@ -32,7 +32,7 @@ impl Arm64Linux {
     /// so structural tests can byte-check the image on any host. For a freestanding
     /// target, `compile` produces the runnable image directly.
     pub fn object(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
-        super::emit_ir::compile_ir(program, &Linux)
+        super::isel::compile_ir(program, &Linux)
     }
 }
 

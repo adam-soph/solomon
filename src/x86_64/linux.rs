@@ -33,7 +33,7 @@ impl Codegen for X64Linux {
     }
 
     fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
-        let elf = super::emit_ir::compile_ir(program, Box::new(LinuxTarget))?;
+        let elf = super::isel::compile_ir(program, Box::new(LinuxTarget))?;
         std::fs::write(&self.out_path, &elf)
             .map_err(|e| CodegenError::new(format!("cannot write ELF executable: {e}"), None))?;
         #[cfg(unix)]

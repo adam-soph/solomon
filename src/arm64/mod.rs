@@ -47,7 +47,7 @@ use crate::codegen::{Codegen, CodegenError};
 
 mod asm;
 mod darwin;
-mod emit_ir;
+mod isel;
 mod linux;
 
 pub use linux::Arm64Linux;
@@ -141,13 +141,13 @@ impl Arm64Darwin {
     /// Emit the Mach-O relocatable object for `program` as raw bytes, without
     /// linking. Exposed so structural tests can byte-check the object on any host.
     pub fn object(&self, program: &Program) -> Result<Vec<u8>, CodegenError> {
-        emit_ir::compile_ir(program, &darwin::Darwin)
+        isel::compile_ir(program, &darwin::Darwin)
     }
 }
 
 fn build(program: &Program, out_path: &Path, target: &dyn ArmTarget) -> Result<(), CodegenError> {
     // The IR-driven backend (lower → SSA IR → AArch64) is the arm64 code generator.
-    let obj = emit_ir::compile_ir(program, target)?;
+    let obj = isel::compile_ir(program, target)?;
     if target.freestanding() {
         fs::write(out_path, &obj)
             .map_err(|e| CodegenError::new(format!("cannot write executable: {e}"), None))?;

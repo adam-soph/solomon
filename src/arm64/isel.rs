@@ -1,6 +1,11 @@
-//! IR-driven AArch64 code generation — the arm64 backend.
+//! AArch64 instruction selection — the arm64 backend's machine-code generator.
 //!
-//! This lowers a program to the SSA [IR](crate::ir), destructs it out of SSA
+//! This is **not** an IR; it *consumes* the one SSA [IR](crate::ir) (shared with the
+//! interpreter and the x86 backend) and emits AArch64. The block-walk driver and the
+//! pure-IR analyses are shared via [`crate::backend`]; this module supplies the per-arch
+//! instruction selection, ABI, exception unwind, primitives, and `Asm` encoding.
+//!
+//! It lowers a program to the SSA [IR](crate::ir), destructs it out of SSA
 //! ([`crate::regalloc::destruct_ssa`]), and emits AArch64 by walking the resulting
 //! `phi`-free blocks — reusing the [`Asm`](super::asm::Asm) encoder, the Mach-O object
 //! writer, and the freestanding-ELF writer. It is the sole arm64 backend for both
@@ -71,40 +76,9 @@ pub(super) fn compile_ir(
     let ir = crate::lower::lower(program, &layouts)?;
     let ir = crate::regalloc::destruct_program(&ir);
 
-    let by_name: HashMap<&str, &IrFunc> = ir.funcs.iter().map(|f| (f.name.as_str(), f)).collect();
-
-    // Reachable functions from `@entry` (the top-level driver), over direct calls and
-    // address-taken functions. We emit only these, so the symbol table is complete.
-    let mut reachable: Vec<&IrFunc> = Vec::new();
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut queue: Vec<&str> = Vec::new();
-    if by_name.contains_key(crate::lower::ENTRY) {
-        queue.push(crate::lower::ENTRY);
-    }
-    while let Some(name) = queue.pop() {
-        if !seen.insert(name) {
-            continue;
-        }
-        let Some(f) = by_name.get(name) else {
-            return Err(CodegenError::new(
-                format!("IR arm64 backend: needed function `{name}` was not lowered"),
-                None,
-            ));
-        };
-        reachable.push(f);
-        for b in &f.blocks {
-            for inst in &b.insts {
-                match inst {
-                    IrInst::Call {
-                        callee: Callee::Direct(n),
-                        ..
-                    } => queue.push(n),
-                    IrInst::FuncAddr { func, .. } => queue.push(func),
-                    _ => {}
-                }
-            }
-        }
-    }
+    // Reachable functions from `@entry`, over direct calls and `&Func` (we emit only
+    // these, so the symbol table is complete).
+    let reachable = crate::backend::reachable_functions(&ir, "arm64 backend")?;
 
     // Implicit-global ids, shared by both targets.
     let gid_of = |name: &str| {
@@ -133,26 +107,12 @@ pub(super) fn compile_ir(
         .max(8) as u64;
     // Whether the reachable program actually touches `Fs`/exceptions — drives the Darwin
     // per-thread pthread-TLS setup (a non-exception program needs none of it).
-    let prog_uses_fs = fs_gid.is_some_and(|g| reachable.iter().any(|f| func_uses_fs(f, g)));
+    let prog_uses_fs =
+        fs_gid.is_some_and(|g| reachable.iter().any(|f| crate::backend::func_uses_fs(f, g)));
 
     // Which heap primitives the reachable code uses (the freestanding `mmap` runtime
     // emits exactly these; `MSize` makes `MAlloc`/`HeapExtend` carry a size header).
-    let mut heap_used: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
-    for f in &reachable {
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let IrInst::Prim { prim, .. } = inst {
-                    match prim {
-                        Prim::MAlloc => heap_used.insert("MAlloc"),
-                        Prim::Free => heap_used.insert("Free"),
-                        Prim::HeapExtend => heap_used.insert("HeapExtend"),
-                        Prim::MSize => heap_used.insert("MSize"),
-                        _ => false,
-                    };
-                }
-            }
-        }
-    }
+    let heap_used = crate::backend::heap_prims_used(&reachable);
     let uses_msize = heap_used.contains("MSize");
 
     let mut asm = Asm::new();
@@ -450,7 +410,10 @@ impl FnEmit<'_> {
         // thread's `CTask*`, filled in the prologue; `&Fs` resolves to it.
         let uses_fs = !self.ctx.freestanding
             && self.ctx.fs_key_sym.is_some()
-            && self.ctx.fs_gid.is_some_and(|g| func_uses_fs(f, g));
+            && self
+                .ctx
+                .fs_gid
+                .is_some_and(|g| crate::backend::func_uses_fs(f, g));
         if uses_fs {
             self.fs_cache_off = Some(alloc(8, 8));
         }
@@ -550,15 +513,8 @@ impl FnEmit<'_> {
             self.emit_fs_cache(off);
         }
 
-        // ---- body ----
-        for (i, b) in f.blocks.iter().enumerate() {
-            self.asm.place(self.block_labels[i]);
-            for inst in &b.insts {
-                self.emit_inst(inst, f)?;
-            }
-            self.emit_term(&b.term, f)?;
-        }
-        Ok(())
+        // ---- body: walk the blocks via the shared driver ----
+        crate::backend::emit_blocks(self, f)
     }
 
     fn unsupported(&self, what: &str) -> CodegenError {
@@ -757,7 +713,7 @@ impl FnEmit<'_> {
 
     // ---- instruction selection ----
 
-    fn emit_inst(&mut self, inst: &IrInst, _f: &IrFunc) -> Result<(), CodegenError> {
+    fn sel_inst(&mut self, inst: &IrInst) -> Result<(), CodegenError> {
         match inst {
             IrInst::Bin {
                 dst,
@@ -1863,7 +1819,7 @@ impl FnEmit<'_> {
         self.asm.place(ok);
     }
 
-    fn emit_term(&mut self, term: &IrTerm, _f: &IrFunc) -> Result<(), CodegenError> {
+    fn sel_term(&mut self, term: &IrTerm) -> Result<(), CodegenError> {
         match term {
             IrTerm::Br(t) => self.asm.b(self.block_labels[*t as usize]),
             IrTerm::CondBr { cond, t, f } => {
@@ -2104,17 +2060,18 @@ impl FnEmit<'_> {
     }
 }
 
-/// Whether `f` touches the per-task `Fs` — it accesses the `Fs` global (`Fs->field`) or
-/// has any exception op (`try`/`throw`). Such a function needs a cached `CTask*` slot.
-fn func_uses_fs(f: &IrFunc, fs_gid: GlobalId) -> bool {
-    f.blocks.iter().any(|b| {
-        matches!(b.term, IrTerm::Throw(_) | IrTerm::Rethrow)
-            || b.insts.iter().any(|i| match i {
-                IrInst::TryBegin { .. } | IrInst::TryEnd => true,
-                IrInst::GlobalAddr { global, .. } => *global == fs_gid,
-                _ => false,
-            })
-    })
+/// The block-walk driver ([`crate::backend::emit_blocks`]) drives a `FnEmit` through these
+/// per-arch leaf emits.
+impl crate::backend::Backend for FnEmit<'_> {
+    fn place_block(&mut self, i: usize) {
+        self.asm.place(self.block_labels[i]);
+    }
+    fn emit_inst(&mut self, inst: &IrInst) -> Result<(), CodegenError> {
+        self.sel_inst(inst)
+    }
+    fn emit_term(&mut self, term: &IrTerm) -> Result<(), CodegenError> {
+        self.sel_term(term)
+    }
 }
 
 // ---- freestanding heap runtime (mmap bump allocator) ----

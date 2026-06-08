@@ -13,13 +13,17 @@ syscalls), and `x86_64-pc-windows` (a self-contained PE with hand-built `kernel3
 imports). Darwin is the one hosted target. Every backend matches the IR interpreter
 byte-for-byte on all examples.
 
-**Both backends consume the IR**: `src/arm64/emit_ir.rs` and `src/x86_64/emit_ir.rs`.
-There is no AST-walking codegen left — the old x86 `Cg` and the shared `src/backend.rs`
-drivers are deleted (`src/x86_64/mod.rs` now holds only the `OsTarget` seam + the `Asm`
-register numbering the IR backend builds on). The original tree-walking AST interpreter
-is also gone; `src/interp.rs` is a thin shim (the OS-syscall free-helpers, `FdObj`, and
-the `run_to_string` entry points that lower → run the IR interpreter). The whole compiler
-is now one shared SSA middle-end feeding the interpreter and both code generators.
+**Both backends consume the IR**: `src/arm64/isel.rs` and `src/x86_64/isel.rs` are
+machine-code generators (instruction selectors) that walk the *one* SSA IR — they are
+**not** separate IRs. The old AST-walking x86 `Cg` is gone (`src/x86_64/mod.rs` now holds
+only the `OsTarget` seam + `Asm` register numbering). `src/backend.rs` no longer holds the
+old AST `Emitter` drivers; it is now the **IR-level shared driver** — the pure-IR analyses
+(`reachable_functions`/`heap_prims_used`/`func_uses_fs`) and the `Backend` trait +
+`emit_blocks` block-walk loop both `isel`s share, so they can't drift on it. The original
+tree-walking AST interpreter is also gone; `src/interp.rs` is a thin shim (OS-syscall
+free-helpers, `FdObj`, and the `run_to_string` entry points that lower → run the IR
+interpreter). The whole compiler is one shared SSA middle-end feeding the interpreter and
+both code generators.
 
 ## Commands
 
@@ -124,7 +128,7 @@ the backend can't re-derive it differently.
   as before); a `try`-containing function is left fully spilled (a `throw`'s longjmp would
   not restore callee-saved registers).
 
-**x86 consumes the IR too** (`src/x86_64/emit_ir.rs`). It walks the phi-free IR and emits
+**x86 consumes the IR too** (`src/x86_64/isel.rs`). It walks the phi-free IR and emits
 x86-64, reusing the `Asm` encoder and the **`OsTarget` seam** in `src/x86_64/mod.rs`
 (per-OS deltas: exit, page alloc, std write, file ops, clock, command-line capture;
 freestanding ELF vs Windows PE). Spill-everything **+ promotion** (Linux only): on the
@@ -138,8 +142,10 @@ need no REX.R) and xmm0/xmm1; the internal ABI matches arm64 (int args rdi/rsi/r
 F64 xmm0–7, sret pointer in **r11**); single-task `Fs` as a BSS `CTask` seeded in `@entry`,
 gated on real Fs/exception use (`func_uses_fs`), so non-exception programs stay BSS-lean; a
 32-byte `ExcFrame`; `Sqrt`→`sqrtsd`/`Fabs`→`andpd`; `clone(2)` threads with base in rbx. The
-old AST `Cg` and the shared `backend.rs` drivers are deleted — `mod.rs` keeps only the
-`OsTarget` trait, register consts, and `align16`/`load_opcode`/`store_opcode` (used by `asm.rs`).
+old AST `Cg` is gone — `mod.rs` keeps only the `OsTarget` trait, register consts, and
+`align16`/`load_opcode`/`store_opcode` (used by `asm.rs`); the block-walk + pure-IR scans
+are shared via `src/backend.rs` (`reachable_functions`/`heap_prims_used`/`func_uses_fs` +
+the `Backend` trait/`emit_blocks`).
 
 ### Interpreter & backends
 - **`irinterp.rs`** — the **conformance oracle**: a flat-byte-addressable IR interpreter.
@@ -152,7 +158,7 @@ old AST `Cg` and the shared `backend.rs` drivers are deleted — `mod.rs` keeps 
   **synchronously** at spawn, atomics, futex) over `std`, plus real argv/env/stdin and
   `Exit`. `interp::run_to_string` (in the `interp.rs` shim) lowers → runs it; the CLI
   `-i` path does the same. **Match its observable output when adding backend features.**
-- **`arm64/emit_ir.rs`** (+ `asm.rs`/`darwin.rs`/`linux.rs`) — walks the `phi`-free IR
+- **`arm64/isel.rs`** (+ `asm.rs`/`darwin.rs`/`linux.rs`) — walks the `phi`-free IR
   (after `regalloc::destruct_program`) and emits AArch64: a Mach-O object linked with `cc`
   (Darwin), or a freestanding static ELF (`aarch64-unknown-linux`, via the `ArmTarget`
   seam: own `_start`, raw syscalls, `mmap` bump allocator). **Spill-everything + promotion**:
@@ -164,7 +170,7 @@ old AST `Cg` and the shared `backend.rs` drivers are deleted — `mod.rs` keeps 
   compare-chain; the algebraic intrinsics `Sqrt`/`Fabs`/the rounding family lower to single
   FP instructions (`try_intrinsic`) in place of their lib bodies. (Still not reimplemented
   from the deleted AST backend: `try_imm_binop` immediate-form strength reduction.)
-- **`x86_64/emit_ir.rs`** (+ `linux.rs`/`windows.rs`) — walks the phi-free IR and emits
+- **`x86_64/isel.rs`** (+ `linux.rs`/`windows.rs`) — walks the phi-free IR and emits
   x86-64 (default), to a freestanding static ELF (`x86_64-unknown-linux`) or, via the
   `OsTarget` seam, a self-contained PE with hand-built kernel32 imports
   (`x86_64-pc-windows`). Spill-everything in `[rbp-off]` slots + `plan_registers` promotion
@@ -302,7 +308,7 @@ into `<stdio.hc>`; the IEEE bit ops into `<math.hc>`; the djb2 hash into `<hmap.
   output. **Native** is a jmp_buf/longjmp unwinder: each `try` builds an on-stack
   `ExcFrame` pushed on the `Fs->exc_top` chain; `throw` restores sp/fp from the top frame
   and indirect-branches to its landing pad — the normal call path is untouched, zero
-  per-call cost; uncaught → exit. **arm64 (`emit_ir.rs`):** `TryBegin`/`TryEnd`/`Throw`/`Rethrow`; the
+  per-call cost; uncaught → exit. **arm64 (`isel.rs`):** `TryBegin`/`TryEnd`/`Throw`/`Rethrow`; the
   `ExcFrame` is just `{prev, saved_sp, saved_fp, landing_pad}` (32 bytes, **no
   callee-saved set** — spill-everything keeps nothing in callee-saved registers). `Fs` is
   **per-thread** on Darwin via pthread TLS: an `Fs`-using function caches this thread's
@@ -310,7 +316,7 @@ into `<stdio.hc>`; the IEEE bit ops into `<math.hc>`; the djb2 hash into `<hmap.
   / lazy-`malloc` + `pthread_setspecific`, key created in `@entry`), and `&Fs` resolves to
   that slot. Freestanding arm64 spawns real `clone(2)` threads but keeps a single BSS
   `CTask`, so concurrent cross-thread `throw`s race (non-exception parallelism is fine).
-  **x86-64 (`emit_ir.rs`):** `emit_try_begin`/`emit_try_end`/`emit_unwind` with the same
+  **x86-64 (`isel.rs`):** `emit_try_begin`/`emit_try_end`/`emit_unwind` with the same
   32-byte `ExcFrame` (no callee-saved set — spill-everything); `Fs` is a single BSS `CTask`
   seeded into the `Fs` global at `@entry`, so concurrent cross-thread `throw`s race like
   freestanding arm64. All setup is gated on real `Fs`/exception use (`func_uses_fs`).
