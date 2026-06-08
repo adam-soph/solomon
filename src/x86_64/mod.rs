@@ -123,6 +123,11 @@ const R8: u8 = 8;
 const R9: u8 = 9;
 const R10: u8 = 10;
 const R11: u8 = 11;
+// r12–r14 are the callee-saved GPRs the IR backend promotes hot vregs into (with rbx).
+// r15 is excluded: the Windows `OsTarget` seam uses it to save rsp around aligned calls.
+const R12: u8 = 12;
+const R13: u8 = 13;
+const R14: u8 = 14;
 const R15: u8 = 15;
 
 /// Opcode bytes (before ModRM) for a width-aware load into rax (the reg field is rax;

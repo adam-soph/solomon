@@ -419,7 +419,9 @@ impl FnEmit<'_> {
         // Plan register promotion: hot vregs → callee-saved x19–x28 / d8–d15. A spilled
         // vreg (`None`) still gets a frame slot below; a promoted one lives in its
         // register, so its slot is dead but harmless.
-        self.vreg_reg = crate::regalloc::plan_registers(f);
+        const PROMOTE_INT: [u32; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+        const PROMOTE_FLT: [u32; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
+        self.vreg_reg = crate::regalloc::plan_registers(f, &PROMOTE_INT, &PROMOTE_FLT);
 
         // ---- frame layout ----
         let mut frame = 0u32;

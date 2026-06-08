@@ -269,6 +269,20 @@ impl Asm {
         self.emit(&[0x48, 0x8D, 0x85 | ((reg & 7) << 3)]);
         self.emit(&(-off).to_le_bytes());
     }
+    /// `mov [rbp - off], reg` (full 64 bits, **any** register via REX.R) — save a
+    /// callee-saved register the backend promotes a hot vreg into, in the prologue.
+    pub(super) fn save_reg(&mut self, reg: u8, off: i32) {
+        let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 };
+        self.emit(&[rex, 0x89, 0x85 | ((reg & 7) << 3)]);
+        self.emit(&(-off).to_le_bytes());
+    }
+    /// `mov reg, [rbp - off]` (full 64 bits, any register) — restore a saved
+    /// callee-saved register in the epilogue.
+    pub(super) fn restore_reg(&mut self, reg: u8, off: i32) {
+        let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 };
+        self.emit(&[rex, 0x8B, 0x85 | ((reg & 7) << 3)]);
+        self.emit(&(-off).to_le_bytes());
+    }
     /// Narrows rax in place to `size` bytes, then sign- or zero-extends it back
     /// to 64 bits (`movsx`/`movzx`/`movsxd rax, <al/ax/eax>`). A no-op at 8 bytes.
     /// Truncates a value to a narrow integer width in a register — for example a

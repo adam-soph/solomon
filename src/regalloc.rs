@@ -16,12 +16,13 @@
 //! from its temporary — always correct, cycles included.
 //!
 //! [`plan_registers`] is the register *promotion* pass that runs after destruction: a
-//! liveness-based linear scan over the `phi`-free form that lifts hot vregs into
-//! callee-saved registers (x19–x28 / d8–d15), returning `vreg → Option<PReg>` (`None`
-//! stays in a frame slot). Everything not promoted falls back to the emitter's
-//! spill-everything model, so the pass is purely additive — a vreg left unpromoted is
-//! emitted exactly as before. A function containing a `try` is left fully spilled (a
-//! `throw`'s longjmp would not restore callee-saved registers).
+//! liveness-based linear scan over the `phi`-free form that lifts hot vregs into the
+//! target's callee-saved registers (passed in as pools — arm64: x19–x28 / d8–d15; x86-64:
+//! rbx/r12–r14 / none, since System V has no callee-saved xmm), returning
+//! `vreg → Option<PReg>` (`None` stays in a frame slot). Everything not promoted falls back
+//! to the emitter's spill-everything model, so the pass is purely additive — a vreg left
+//! unpromoted is emitted exactly as before. A function containing a `try` is left fully
+//! spilled (a `throw`'s longjmp would not restore callee-saved registers).
 
 use crate::ir::*;
 
@@ -259,11 +260,14 @@ fn term_uses(t: &IrTerm, mut f: impl FnMut(Vreg)) {
 }
 
 /// Plan register promotion for `f` (already out of SSA): a liveness-based linear scan that
-/// assigns hot vregs to callee-saved registers (x19–x28 / d8–d15), returning
-/// `vreg → Option<PReg>` (`None` = stays spilled). A function containing a `try` gets **no**
-/// promotion: a `throw`'s longjmp restores sp/fp but not callee-saved registers, so a
-/// promoted local could be clobbered by an abandoned callee — spill-all is always correct.
-pub fn plan_registers(f: &IrFunc) -> Vec<Option<PReg>> {
+/// assigns hot vregs to the target's callee-saved registers, returning `vreg → Option<PReg>`
+/// (`None` = stays spilled). `int_regs`/`float_regs` are the allocatable callee-saved GPR /
+/// FP register numbers (arm64: x19–x28 / d8–d15; x86-64: rbx/r12–r15 / none, since System V
+/// has no callee-saved xmm). An empty pool means that class is never promoted. A function
+/// containing a `try` gets **no** promotion: a `throw`'s longjmp restores sp/fp but not
+/// callee-saved registers, so a promoted local could be clobbered by an abandoned callee —
+/// spill-all is always correct.
+pub fn plan_registers(f: &IrFunc, int_regs: &[u32], float_regs: &[u32]) -> Vec<Option<PReg>> {
     let n = f.n_vregs as usize;
     let mut plan: Vec<Option<PReg>> = vec![None; n];
     let has_try = f.blocks.iter().any(|b| {
@@ -406,9 +410,9 @@ pub fn plan_registers(f: &IrFunc) -> Vec<Option<PReg>> {
         .collect();
     cands.sort_by_key(|&v| (start[v], std::cmp::Reverse(refs[v])));
 
-    // Free pools (held descending so `pop` hands out the lowest-numbered register).
-    let mut int_free: Vec<u32> = (19..=28).rev().collect();
-    let mut flt_free: Vec<u32> = (8..=15).rev().collect();
+    // Free pools (held so `pop` hands out the first-listed register first).
+    let mut int_free: Vec<u32> = int_regs.iter().rev().copied().collect();
+    let mut flt_free: Vec<u32> = float_regs.iter().rev().copied().collect();
     // active: (end, reg, is_float, refs, vreg)
     let mut active: Vec<(u32, u32, bool, u32, usize)> = Vec::new();
 
@@ -520,7 +524,11 @@ mod tests {
             .iter()
             .find(|f| f.name == crate::lower::ENTRY)
             .expect("entry");
-        let plan = super::plan_registers(main);
+        let plan = super::plan_registers(
+            main,
+            &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+        );
         let promoted = plan.iter().filter(|p| p.is_some()).count();
         assert!(promoted > 0, "expected some vreg promoted to a register");
         // Every promotion lands in the callee-saved pools (x19–x28 / d8–d15).
@@ -553,7 +561,11 @@ mod tests {
             .iter()
             .find(|f| f.name == crate::lower::ENTRY)
             .expect("entry");
-        let plan = super::plan_registers(main);
+        let plan = super::plan_registers(
+            main,
+            &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+        );
         assert!(
             plan.iter().all(|p| p.is_none()),
             "a try-containing function must not promote any vreg"

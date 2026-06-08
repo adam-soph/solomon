@@ -25,9 +25,13 @@
 use std::collections::HashMap;
 
 use super::asm::Asm;
-use super::{FileOp, OsTarget, R8, R9, R10, R11, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, align16};
+use super::{
+    FileOp, OsTarget, R8, R9, R10, R11, R12, R13, R14, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
+    align16,
+};
 use crate::codegen::CodegenError;
 use crate::ir::*;
+use crate::regalloc::PReg;
 
 // Scratch GPRs (all caller-saved, all low registers 0–7 so the parametric frame
 // load/store encoders need no REX.R). Values are reloaded from slots per instruction.
@@ -38,6 +42,11 @@ const ADDR2: u8 = RDI; // 7 — second address scratch (rep movsb dest)
 
 // System V integer argument registers, in order.
 const ARG_GPR: [u8; 6] = [RDI, RSI, RDX, RCX, R8, R9];
+
+// The callee-saved GPRs hot vregs may be promoted into. r15 is excluded — the Windows
+// `OsTarget` seam uses it to save rsp around aligned calls. System V has no callee-saved
+// xmm, so the float pool is empty: only integer/pointer vregs are promoted.
+const PROMOTE_INT: [u32; 4] = [RBX as u32, R12 as u32, R13 as u32, R14 as u32];
 
 // `setcc` opcode second bytes.
 const SETE: u8 = 0x94;
@@ -255,6 +264,8 @@ pub(super) fn compile_ir(
             block_labels: Vec::new(),
             slot_off: Vec::new(),
             vreg_off: Vec::new(),
+            vreg_reg: Vec::new(),
+            saved_regs: Vec::new(),
             is_entry,
         };
         e.emit(f)?;
@@ -301,6 +312,13 @@ struct FnEmit<'a> {
     slot_off: Vec<i32>,
     /// Frame offset of each vreg's spill slot.
     vreg_off: Vec<i32>,
+    /// Register-promotion plan: `vreg → Some(callee-saved GPR)` when promoted to
+    /// rbx/r12–r14, else `None` (lives in its `vreg_off` slot). Empty for a
+    /// `try`-containing function (promotion disabled — see `plan_registers`).
+    vreg_reg: Vec<Option<PReg>>,
+    /// Callee-saved registers this function promotes into, with the frame offset where
+    /// the caller's value is saved across the body: `(reg, off)`.
+    saved_regs: Vec<(u8, i32)>,
     /// Whether this is `@entry` (its `Ret` exits the process; it captures the command
     /// line and seeds `Fs`).
     is_entry: bool,
@@ -308,6 +326,11 @@ struct FnEmit<'a> {
 
 impl FnEmit<'_> {
     fn emit(&mut self, f: &IrFunc) -> Result<(), CodegenError> {
+        // Plan register promotion: hot vregs → callee-saved rbx/r12–r14 (no float pool,
+        // since System V has no callee-saved xmm). A spilled vreg (`None`) still gets a
+        // frame slot below; a promoted one lives in its register, slot dead but harmless.
+        self.vreg_reg = crate::regalloc::plan_registers(f, &PROMOTE_INT, &[]);
+
         // ---- frame layout (spill everything) ----
         let mut frame = 0i32;
         let mut alloc = |size: i32, align: i32| {
@@ -321,6 +344,18 @@ impl FnEmit<'_> {
             .map(|s| alloc(s.size as i32, s.align as i32))
             .collect();
         self.vreg_off = (0..f.n_vregs).map(|_| alloc(8, 8)).collect();
+
+        // One save slot per distinct callee-saved register we promote into: this function
+        // must preserve rbx/r12–r14 for its own caller, so it stashes the incoming value
+        // in the prologue and restores it before returning.
+        let mut used: Vec<u8> = Vec::new();
+        for p in self.vreg_reg.iter().flatten() {
+            let r = p.num as u8;
+            if !used.contains(&r) {
+                used.push(r);
+            }
+        }
+        self.saved_regs = used.into_iter().map(|r| (r, alloc(8, 8))).collect();
         let frame_size = align16(frame);
 
         self.block_labels = f.blocks.iter().map(|_| self.asm.new_label()).collect();
@@ -328,6 +363,14 @@ impl FnEmit<'_> {
         // ---- prologue ----
         self.asm.place(self.labels[f.name.as_str()]);
         let frame_pos = self.asm.prologue();
+
+        // Save the caller's value of every callee-saved register we promote into. This
+        // precedes the parameter stores below (which may overwrite a promoted register
+        // with an incoming argument) and the `@entry` capture (which may clobber them,
+        // before the body assigns each promoted vreg's def).
+        for (reg, off) in self.saved_regs.clone() {
+            self.asm.save_reg(reg, off);
+        }
 
         if self.is_entry {
             // Capture the command line / environment into the global BSS slots.
@@ -393,21 +436,32 @@ impl FnEmit<'_> {
         }
     }
 
-    /// Load integer/pointer operand `v`'s 64 bits into low GPR `reg` (0–7).
+    /// Load integer/pointer operand `v`'s 64 bits into low GPR `reg` (0–7). A promoted
+    /// vreg lives in a callee-saved register, reached with a reg-reg `mov`. (Float vregs
+    /// are never promoted, so only the int path needs this.)
     fn load_val(&mut self, v: Val, reg: u8) {
         match v {
-            Val::Reg(r) => self
-                .asm
-                .load_local_reg(reg, self.vreg_off[r as usize], 8, false),
+            Val::Reg(r) => {
+                if let Some(p) = self.vreg_reg[r as usize] {
+                    self.asm.mov_rr(reg, p.num as u8);
+                } else {
+                    self.asm
+                        .load_local_reg(reg, self.vreg_off[r as usize], 8, false);
+                }
+            }
             Val::ImmInt(i) => self.load_imm(reg, i),
             Val::ImmF64(b) => self.load_imm(reg, b as i64),
         }
     }
 
-    /// Store low GPR `reg` (0–7) into vreg `dst`'s slot.
+    /// Store low GPR `reg` (0–7) into vreg `dst` (its promoted register, or its slot).
     fn store_vreg(&mut self, dst: Vreg, reg: u8) {
-        self.asm
-            .store_local_reg(reg, self.vreg_off[dst as usize], 8);
+        if let Some(p) = self.vreg_reg[dst as usize] {
+            self.asm.mov_rr(p.num as u8, reg);
+        } else {
+            self.asm
+                .store_local_reg(reg, self.vreg_off[dst as usize], 8);
+        }
     }
 
     /// Load a float operand `v` into xmm `vr` (0–1).
@@ -1238,26 +1292,32 @@ impl FnEmit<'_> {
                     Some(val) => self.load_val(*val, RAX),
                     None => self.asm.mov_ri(RAX, 0),
                 }
-                if self.is_entry {
-                    self.os.emit_exit(self.asm); // exit(rax)
-                } else {
-                    self.asm.epilogue();
-                }
+                self.teardown();
             }
             // The throw value and `Fs` flags were written by the lowering's `Store`s, so
             // both `throw expr;` and bare `throw;` reduce to the same unwind.
             IrTerm::Throw(_) | IrTerm::Rethrow => self.emit_unwind(),
             IrTerm::Unreachable => {
-                if self.is_entry {
-                    self.asm.mov_ri(RAX, 0);
-                    self.os.emit_exit(self.asm);
-                } else {
-                    self.asm.mov_ri(RAX, 0);
-                    self.asm.epilogue();
-                }
+                self.asm.mov_ri(RAX, 0);
+                self.teardown();
             }
         }
         Ok(())
+    }
+
+    /// Return from the function with the result already in rax/xmm0: `@entry` exits the
+    /// process (no restore — `exit` does not return); any other function restores the
+    /// callee-saved registers it promoted into, then tears down the frame. The restores
+    /// touch only rbx/r12–r14, leaving the rax/xmm0 result intact.
+    fn teardown(&mut self) {
+        if self.is_entry {
+            self.os.emit_exit(self.asm);
+        } else {
+            for (reg, off) in self.saved_regs.clone() {
+                self.asm.restore_reg(reg, off);
+            }
+            self.asm.epilogue();
+        }
     }
 
     /// `cmp rax, imm`: an i32 immediate compares directly; a wide one goes through rcx.

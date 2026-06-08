@@ -118,23 +118,26 @@ the backend can't re-derive it differently.
 - **`src/regalloc.rs`** — out-of-SSA (`destruct_ssa`): resolves `phi`s into copies on CFG
   edges (critical-edge splitting, parallel-copy sequencing). Also **`plan_registers`**, a
   liveness-based linear-scan **register promotion** pass: it lifts hot vregs (≥2 refs)
-  into the callee-saved registers (x19–x28 / d8–d15), returning `vreg → Option<PReg>`. It
-  is additive over the arm64 backend's spill-everything model (an unpromoted vreg emits
-  exactly as before); a `try`-containing function is left fully spilled (a `throw`'s
-  longjmp would not restore callee-saved registers).
+  into the target's callee-saved registers — pools passed in by each backend (arm64
+  x19–x28/d8–d15; x86-64 rbx/r12–r14, no float pool) — returning `vreg → Option<PReg>`. It
+  is additive over the backends' spill-everything model (an unpromoted vreg emits exactly
+  as before); a `try`-containing function is left fully spilled (a `throw`'s longjmp would
+  not restore callee-saved registers).
 
 **x86 consumes the IR too** (`src/x86_64/emit_ir.rs`). It walks the phi-free IR and emits
 x86-64, reusing the `Asm` encoder and the **`OsTarget` seam** in `src/x86_64/mod.rs`
 (per-OS deltas: exit, page alloc, std write, file ops, clock, command-line capture;
-freestanding ELF vs Windows PE). Spill-everything (no promotion yet): every vreg in an
-`[rbp-off]` slot; scratch rax/rcx/rdx + rsi/rdi (all low regs, so the parametric
-`load_local_reg`/`store_local_reg`/`lea_local_reg` need no REX.R) and xmm0/xmm1; the
-internal ABI matches arm64 (int args rdi/rsi/rdx/rcx/r8/r9, F64 xmm0–7, sret pointer in
-**r11**); single-task `Fs` as a BSS `CTask` seeded in `@entry`, gated on real Fs/exception
-use (`func_uses_fs`), so non-exception programs stay BSS-lean; a 32-byte `ExcFrame`;
-`Sqrt`→`sqrtsd`/`Fabs`→`andpd`; `clone(2)` threads with base in rbx. The old AST `Cg` and
-the shared `backend.rs` drivers are deleted — `mod.rs` keeps only the `OsTarget` trait,
-register consts, and `align16`/`load_opcode`/`store_opcode` (used by `asm.rs`).
+freestanding ELF vs Windows PE). Spill-everything **+ promotion**: a vreg lives in an
+`[rbp-off]` slot unless `regalloc::plan_registers` lifts it into a callee-saved GPR
+(**rbx/r12–r14**, saved/restored in prologue/`teardown`; r15 excluded — the Windows seam
+uses it; no float promotion, since System V has no callee-saved xmm). Scratch rax/rcx/rdx +
+rsi/rdi (all low regs, so the parametric `load_local_reg`/`store_local_reg`/`lea_local_reg`
+need no REX.R) and xmm0/xmm1; the internal ABI matches arm64 (int args rdi/rsi/rdx/rcx/r8/r9,
+F64 xmm0–7, sret pointer in **r11**); single-task `Fs` as a BSS `CTask` seeded in `@entry`,
+gated on real Fs/exception use (`func_uses_fs`), so non-exception programs stay BSS-lean; a
+32-byte `ExcFrame`; `Sqrt`→`sqrtsd`/`Fabs`→`andpd`; `clone(2)` threads with base in rbx. The
+old AST `Cg` and the shared `backend.rs` drivers are deleted — `mod.rs` keeps only the
+`OsTarget` trait, register consts, and `align16`/`load_opcode`/`store_opcode` (used by `asm.rs`).
 
 ### Interpreter & backends
 - **`irinterp.rs`** — the **conformance oracle**: a flat-byte-addressable IR interpreter.
@@ -162,9 +165,10 @@ register consts, and `align16`/`load_opcode`/`store_opcode` (used by `asm.rs`).
 - **`x86_64/emit_ir.rs`** (+ `linux.rs`/`windows.rs`) — walks the phi-free IR and emits
   x86-64 (default), to a freestanding static ELF (`x86_64-unknown-linux`) or, via the
   `OsTarget` seam, a self-contained PE with hand-built kernel32 imports
-  (`x86_64-pc-windows`). Spill-everything in `[rbp-off]` slots; rax/rcx/rdx + rsi/rdi
-  scratch, xmm0/xmm1 F64; System V-style internal ABI; compare-chain `switch`. **`mod.rs`**
-  now holds only the shared `OsTarget` seam + register numbering (no AST `Cg`).
+  (`x86_64-pc-windows`). Spill-everything in `[rbp-off]` slots + `plan_registers` promotion
+  into rbx/r12–r14; rax/rcx/rdx + rsi/rdi scratch, xmm0/xmm1 F64; System V-style internal
+  ABI; compare-chain `switch`. **`mod.rs`** now holds only the shared `OsTarget` seam +
+  register numbering (no AST `Cg`).
 
 Both backends cover the whole implemented subset; only the deliberately-excluded
 transcendentals are absent (they're lib functions, below).
