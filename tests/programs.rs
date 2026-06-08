@@ -104,8 +104,8 @@ fn wordcount_generic_containers() {
 
 #[test]
 fn args_reads_argc_argv() {
-    // `argc`/`argv` are ambient globals. `run_to_string` supplies one arg (the
-    // program name), so `argc == 1` and there are no extra args to echo.
+    // `argc`/`argv` are the command line at top-level scope. `run_to_string` supplies
+    // one arg (the program name), so `argc == 1` and there are no extra args to echo.
     let out = run("args.hc", include_str!("../examples/args.hc"));
     assert_eq!(out, "argc=1\n(no extra args)\n");
 }

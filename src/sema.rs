@@ -139,17 +139,14 @@ impl Analyzer {
     fn run(&mut self, program: &Program) {
         self.files = program.files.clone();
         self.scopes.push(HashMap::new()); // global scope
-        // The command line is exposed as two implicit globals captured at entry:
-        // `I64 argc` and `U8 **argv`. Inside a `...` function these same names are the
-        // varargs (`I64 argc`, `I64 *argv`) — sema declares them as locals there, so they
-        // shadow these globals: `argc`/`argv` mean the command line at global / non-variadic
-        // scope and the variadic arguments inside a `...` function.
-        self.scopes[0].insert("argc".to_string(), Type::I64);
-        self.scopes[0].insert(
-            "argv".to_string(),
-            Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
-        );
-        // The environment: `U8 **envp`, a NULL-terminated array of "KEY=VALUE" strings.
+        // `argc`/`argv` are scope-dependent and so are NOT global-scope names: at the top
+        // level (`check_ident` with no enclosing function) they are the command line
+        // (`I64 argc`, `U8 **argv`); inside a `...` function they are the varargs
+        // (`I64 argc`, `I64 *argv`), declared as locals below. A non-variadic function can
+        // reach neither — referencing them there is an "undeclared identifier" error.
+        // The environment: `U8 **envp`, a NULL-terminated array of "KEY=VALUE" strings. It
+        // has a single meaning, so unlike `argc`/`argv` it is a plain global, in scope
+        // everywhere (e.g. `Getenv` walks it).
         self.scopes[0].insert(
             "envp".to_string(),
             Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
@@ -951,6 +948,16 @@ impl Analyzer {
         // type.
         if let Some(sig) = self.funcs.get(name) {
             return sig.ret.clone();
+        }
+        // `argc`/`argv` at the top level (no enclosing function) are the command line.
+        // Inside a variadic function they were found as varargs locals above; inside a
+        // non-variadic function they fall through here to the undeclared error.
+        if self.cur_ret.is_none() {
+            match name {
+                "argc" => return Type::I64,
+                "argv" => return Type::Ptr(Box::new(Type::Ptr(Box::new(Type::U8)))),
+                _ => {}
+            }
         }
         self.error(span.pos, format!("use of undeclared identifier `{name}`"));
         Type::I64

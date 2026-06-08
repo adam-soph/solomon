@@ -122,8 +122,8 @@ and `*` (e.g. `%-10s`, `%08.3f`, `%.*g`). `SScan` mirrors the same conversions +
 ### `<stdarg.h>` → language built-in
 A `...` function reads its variadic slots through the sema-injected `argc` (count) and
 `argv` (an `I64 *` of raw 8-byte slots) — no `va_list`/`va_start`/`va_arg`/`va_end`. These
-are the same `argc`/`argv` names that mean the command line outside a variadic function;
-inside one they shadow it with the varargs.
+are the same `argc`/`argv` names that mean the command line at top-level scope; inside a
+`...` function they are the varargs instead, and inside a non-variadic function neither.
 
 ### `<stddef.h>` / `<stdint.h>` / `<stdbool.h>` → language built-in
 `I8`…`U64`/`F64`/`Bool`/`U0` are **primitive types** (not typedefs). `NULL`/`TRUE`/`FALSE`

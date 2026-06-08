@@ -198,12 +198,15 @@ it needs `<stdio.hc>` — which the print auto-include always supplies.
 
 The only compiler-provided names with **no `lib/*.hc` declaration** are the implicit
 `argc`/`argv`, the environment `envp`, and the exception task `Fs` — sema-injected
-globals/locals (doc-commented in `lib/builtin.hc`), captured at entry. `argc`/`argv` are
-**scope-dual**: the command line at global / non-variadic scope, and a `...` function's
-variadic args (count + an `I64 *` of raw 8-byte slots) inside one, where the varargs
-*shadow* the command-line globals. The command-line capture is gated on `argc`/`argv` use
-**outside** a variadic function (`ast::program_uses_command_line`), so a `printf` caller —
-which only uses them as varargs — never drags in the command line.
+(doc-commented in `lib/builtin.hc`), captured at entry. `argc`/`argv` are **scope-dual but
+not global**: at **top-level scope** they are the command line; inside a `...` function
+they are the variadic args (count + an `I64 *` of raw 8-byte slots); inside a non-variadic
+function they are *undeclared* (sema resolves the top-level case in `check_ident` only when
+`cur_ret.is_none()`, and the varargs case via locals it declares in `...` functions). The
+command-line capture is gated on top-level `argc`/`argv` use (`ast::program_uses_command_line`
+skips all function bodies), so a `printf` caller — which uses them only as varargs — never
+drags in the command line. `envp` (single meaning) is by contrast a plain global, in scope
+everywhere (e.g. `Getenv` walks it).
 (On hosted Darwin, `emit_prim` maps the heap primitives to libc — `MAlloc`→`_malloc`,
 `Free`→`_free`; freestanding emits an `mmap` bump-allocator runtime.) Everything reducible
 is pure HolyC in `lib/*.hc`, so

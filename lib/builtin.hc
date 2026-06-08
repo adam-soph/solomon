@@ -26,18 +26,22 @@ public U0 Free(U8 *ptr);
 
 // `argc`/`argv` are dual-purpose implicit names, resolved by scope (no `#include`):
 //
-//   * At global / non-variadic scope they are the **command line**, captured at the
-//     entry. `argv[i]` is a NUL-terminated string and `argv[0]` is the program name, so
-//     `argc >= 1`:  extern I64 argc;  extern U8 **argv;
+//   * At **top-level scope** (outside any function) they are the **command line**,
+//     captured at the entry. `argv[i]` is a NUL-terminated string and `argv[0]` is the
+//     program name, so `argc >= 1`:  I64 argc;  U8 **argv;  Command-line handling lives at
+//     the top level, not in a function.
 //
-//   * Inside a `...` function they are the **variadic arguments**, and shadow the command
-//     line. `argc` is the count; `argv[i]` is the i-th raw 8-byte slot — index it directly
-//     for an I64, or pun the slot's address for another type, e.g. `*(F64 *)&argv[i]` or
-//     `*(U8 **)&argv[i]`:  I64 argc;  I64 *argv;
+//   * Inside a `...` function they are the **variadic arguments**. `argc` is the count;
+//     `argv[i]` is the i-th raw 8-byte slot — index it directly for an I64, or pun the
+//     slot's address for another type, e.g. `*(F64 *)&argv[i]` or `*(U8 **)&argv[i]`:
+//     I64 argc;  I64 *argv;
+//
+//   * Inside a non-variadic function they are neither — referencing them there is an
+//     "undeclared identifier" error.
 //
 // Sema seeds both and the backends/interpreter lower them: they are not real declarations
-// here. The command-line capture cost is paid only when `argc`/`argv` are used outside a
-// variadic function.
+// here. The command-line capture cost is paid only when `argc`/`argv` are used at top
+// level.
 //
 // The environment is the implicit global `U8 **envp`, a NULL-terminated array of
 // "KEY=VALUE" strings, captured at the entry and in scope everywhere (it is never

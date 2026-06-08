@@ -672,14 +672,14 @@ pub fn program_uses_ident(program: &Program, names: &[&str]) -> bool {
     program.items.iter().any(|s| stmt_uses_ident(s, names))
 }
 
-/// Whether `names` are referenced where the command-line globals are visible — top-level
-/// code and **non-variadic** function bodies. A variadic `...` function's `argc`/`argv`
-/// are its varargs (they shadow the command-line globals), so its body is skipped. Used
-/// to gate the `argc`/`argv` command-line capture, so a program that only uses them as
-/// varargs (e.g. any `printf` caller) does not drag in the command line.
+/// Whether `names` (`argc`/`argv`) are referenced at **top-level** scope, where they are
+/// the command line. Inside any function they are the varargs (variadic) or undeclared
+/// (non-variadic), never the command line — so function bodies are skipped. Used to gate
+/// the command-line capture, so a program that only uses them as varargs (e.g. any
+/// `printf` caller) does not drag in the command line.
 pub fn program_uses_command_line(program: &Program, names: &[&str]) -> bool {
     program.items.iter().any(|s| match &s.kind {
-        StmtKind::Func(f) if f.varargs => false,
+        StmtKind::Func(_) => false,
         _ => stmt_uses_ident(s, names),
     })
 }
