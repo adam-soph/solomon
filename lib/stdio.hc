@@ -7,20 +7,21 @@
 //
 // The printf family is ordinary HolyC: `VFmt` (below) walks the format string and renders
 // each conversion into a sink (a fd via `StdWrite`, or a buffer); floats go through the
-// base-2³² bignum formatter `FmtFloat`. The interpreter renders the printf family via its
-// own `crate::fmt` module, an independent conformance oracle, and never runs these bodies
-// — so the native (compiled HolyC) output is diffed against an independent implementation.
-// Include with `#include <stdio.hc>`.
+// base-2³² bignum formatter `FmtFloat`. There is no separate Rust formatter — the
+// interpreter runs these same bodies and the backends compile them, so every target's
+// output is byte-identical by construction. Include with `#include <stdio.hc>`.
 //
 // Note: a bare string statement (`"hi\n";`) lowers to a raw `StdWrite`, and the
 // `"fmt", a, b` comma form desugars to a `Print(...)` call. The compiler auto-includes
 // this file when a program prints, so those need no explicit include. You only need this
-// file to call `Print`/`StrPrint`/`CatPrint`/`MStrPrint` (or the file helpers) by name.
+// file to call `Print`/`StrPrint`/`StrNPrint`/`CatPrint`/`MStrPrint` (or the file
+// helpers) by name.
 //
-//   Print(fmt, ...)              — printf to stdout.
-//   StrPrint(dst, fmt, ...)      — sprintf into `dst`; returns `dst`.
-//   CatPrint(dst, fmt, ...)      — sprintf appended at `dst + StrLen(dst)`; returns `dst`.
-//   MStrPrint(fmt, ...)          — asprintf into a fresh, growing heap buffer.
+//   Print(fmt, ...)               — printf to stdout.
+//   StrPrint(dst, fmt, ...)       — sprintf into `dst`; returns `dst`.
+//   StrNPrint(dst, cap, fmt, ...) — snprintf: bounded sprintf; returns the would-be length.
+//   CatPrint(dst, fmt, ...)       — sprintf appended at `dst + StrLen(dst)`; returns `dst`.
+//   MStrPrint(fmt, ...)           — asprintf into a fresh, growing heap buffer.
 //
 // File errors are returned Unix-style: a non-negative result on success, a negative
 // `-errno` on failure.
@@ -476,9 +477,14 @@ public I64 FmtFloat(U8 *out, F64 v, I64 conv, I64 flags, I64 width, I64 prec)
 #define _PF_MAX_PREC  512
 
 // A formatted-output sink: a fd (when `dst` is NULL) or a buffer at `dst`. `len` is
-// the bytes emitted so far, and also the write cursor. When `grow` is set, a write
-// that would overflow `cap` grows `dst` (the `MStrPrint` growing buffer).
-class Pf { U8 *dst; I64 fd; I64 len; I64 cap; I64 grow; }
+// the bytes emitted so far, and the write cursor — for a bounded sink it is the
+// would-be length, which may exceed what was actually stored. When `grow` is set, a
+// write that would overflow `cap` grows `dst` (the `MStrPrint` growing buffer). When
+// `bound` is set, `cap` is a hard limit: at most `cap - 1` bytes are stored (the last
+// byte left for the caller's NUL) and the overflow is counted but dropped (`StrNPrint`,
+// i.e. snprintf). `grow` and `bound` are mutually exclusive; with neither, a `dst` sink
+// is unbounded (`StrPrint`/`CatPrint` — the caller guarantees a big-enough buffer).
+class Pf { U8 *dst; I64 fd; I64 len; I64 cap; I64 grow; I64 bound; }
 
 // Append `n` bytes to the sink.
 U0 PfPut(Pf *p, U8 *buf, I64 n)
@@ -494,8 +500,18 @@ U0 PfPut(Pf *p, U8 *buf, I64 n)
     p->dst = nd;
     p->cap = ncap;
   }
+  // How many of the n bytes actually land in the buffer. An unbounded or freshly-grown
+  // sink takes all of them; a bounded sink stores only up to `cap - 1`, reserving the
+  // last byte for the terminating NUL. Either way `len` advances by the full `n`, so it
+  // reports the would-be length, like C's snprintf return value.
+  I64 fits = n;
+  if (p->bound) {
+    I64 room = p->cap - 1 - p->len;
+    if (room < 0) room = 0;
+    if (fits > room) fits = room;
+  }
   I64 i;
-  for (i = 0; i < n; i++) p->dst[p->len + i] = buf[i];
+  for (i = 0; i < fits; i++) p->dst[p->len + i] = buf[i];
   p->len += n;
 }
 
@@ -740,6 +756,7 @@ public U0 Print(U8 *fmt, ...)
   p.len = 0;
   p.cap = 0;
   p.grow = 0;
+  p.bound = 0;
   VFmt(&p, fmt, VargV, VargC);
 }
 
@@ -751,9 +768,33 @@ public U8 *StrPrint(U8 *dst, U8 *fmt, ...)
   p.len = 0;
   p.cap = 0;
   p.grow = 0;
+  p.bound = 0;
   VFmt(&p, fmt, VargV, VargC);
   dst[p.len] = 0;
   return dst;
+}
+
+// Bounded sprintf (snprintf): format into `dst`, writing at most `cap` bytes including
+// the terminating NUL, so `dst` is never overflowed. Returns the number of bytes that
+// *would* have been written had `cap` been large enough (excluding the NUL), so a return
+// value `>= cap` means the output was truncated. `cap <= 0` writes nothing at all (not
+// even the NUL) but still returns the would-be length, for sizing a buffer first.
+public I64 StrNPrint(U8 *dst, I64 cap, U8 *fmt, ...)
+{
+  Pf p;
+  p.dst = dst;
+  p.fd = 0;
+  p.len = 0;
+  p.cap = cap;
+  p.grow = 0;
+  p.bound = 1;
+  VFmt(&p, fmt, VargV, VargC);
+  if (cap > 0) {
+    I64 nul = p.len;
+    if (nul > cap - 1) nul = cap - 1;
+    dst[nul] = 0;
+  }
+  return p.len;
 }
 
 public U8 *CatPrint(U8 *dst, U8 *fmt, ...)
@@ -764,6 +805,7 @@ public U8 *CatPrint(U8 *dst, U8 *fmt, ...)
   p.len = StrLen(dst); // append at the existing NUL
   p.cap = 0;
   p.grow = 0;
+  p.bound = 0;
   VFmt(&p, fmt, VargV, VargC);
   dst[p.len] = 0;
   return dst;
@@ -777,9 +819,332 @@ public U8 *MStrPrint(U8 *fmt, ...)
   p.fd = 0;
   p.len = 0;
   p.grow = 1;
+  p.bound = 0;
   VFmt(&p, fmt, VargV, VargC);
   p.dst[p.len] = 0;
   return p.dst;
+}
+
+// =============================================================================
+// character & line output (public)
+// =============================================================================
+
+// Write one byte (`putchar`) / a line (`puts`, with a trailing newline) to stdout, via the
+// portable `StdWrite` (so they work on every target). `putchar` returns the byte, `puts` a
+// non-negative count, or -1 on error — like C.
+public I64 PutChar(I64 c)
+{
+  U8 b = c;
+  if (StdWrite(STDOUT, &b, 1) < 1) return -1;
+  return c;
+}
+
+public I64 Puts(U8 *s)
+{
+  StdWrite(STDOUT, s, StrLen(s));
+  StdWrite(STDOUT, "\n", 1);
+  return 0;
+}
+
+// =============================================================================
+// character & line input (public)
+// =============================================================================
+//
+// Built on the `Read` primitive, a byte at a time — there is no buffered `FILE*`
+// stream yet, so these read directly. `STDIN` (fd 0) is the program's standard input.
+
+// Next byte from `fd` (0..255), or -1 at end of file. Like C's fgetc / getc.
+public I64 FGetC(I64 fd)
+{
+  U8 c;
+  if (Read(fd, &c, 1) <= 0) return -1;
+  return c;
+}
+
+// Next byte from stdin, or -1 at EOF. Like C's getchar.
+public I64 GetChar() { return FGetC(STDIN); }
+
+// Read a line from `fd` into `buf` (capacity `cap`): up to `cap - 1` bytes, stopping
+// after a newline (which is kept) or at EOF, then NUL-terminate. Returns `buf`, or
+// NULL if EOF is reached before any byte is read. Like C's fgets.
+public U8 *FGetS(U8 *buf, I64 cap, I64 fd)
+{
+  if (cap <= 0) return NULL;
+  I64 i = 0;
+  while (i < cap - 1) {
+    I64 c = FGetC(fd);
+    if (c < 0) break;
+    buf[i] = c;
+    i++;
+    if (c == '\n') break;
+  }
+  if (i == 0) return NULL; // EOF before any byte
+  buf[i] = 0;
+  return buf;
+}
+
+// POSIX getline: read a whole line from `fd` (including the trailing newline) into
+// *`line`, growing the buffer as needed; *`cap` tracks its allocated size. Pass
+// `*line = NULL, *cap = 0` to have it allocated for you. Returns the number of bytes
+// read (excluding the NUL), or -1 at EOF with nothing read. The caller owns *`line`
+// (`Free` it). Grows with `MAlloc`/`MemCpy`/`Free`, so stdio needs no `<stdlib.hc>`.
+public I64 GetLine(U8 **line, I64 *cap, I64 fd)
+{
+  if (*line == NULL || *cap < 2) {
+    *cap = 128;
+    *line = MAlloc(*cap);
+  }
+  I64 n = 0;
+  while (TRUE) {
+    I64 c = FGetC(fd);
+    if (c < 0) break;
+    if (n + 1 >= *cap) { // keep room for the NUL
+      I64 ncap = *cap * 2;
+      U8 *nb = MAlloc(ncap);
+      MemCpy(nb, *line, n);
+      Free(*line);
+      *line = nb;
+      *cap = ncap;
+    }
+    (*line)[n] = c;
+    n++;
+    if (c == '\n') break;
+  }
+  if (n == 0) return -1; // EOF, nothing read
+  (*line)[n] = 0;
+  return n;
+}
+
+// Read one line from `fd` into a fresh heap buffer with the trailing newline stripped,
+// or NULL at EOF. The caller owns the buffer (`Free` it). An ergonomic HolyC sibling
+// of `GetLine`.
+public U8 *ReadLine(I64 fd)
+{
+  U8 *line = NULL;
+  I64 cap = 0;
+  I64 n = GetLine(&line, &cap, fd);
+  if (n < 0) {
+    if (line) Free(line);
+    return NULL;
+  }
+  if (n > 0 && line[n - 1] == '\n') line[n - 1] = 0;
+  return line;
+}
+
+// =============================================================================
+// formatted input — sscanf (public)
+// =============================================================================
+//
+// `SScan` parses `buf` against `fmt` (the printf conversions in reverse) and stores
+// each field through the matching pointer argument, returning the number of fields
+// assigned (or -1 at end of input before any match), like C's sscanf. It is
+// self-contained — its own integer/float scanners — so stdio stays lean (no
+// `<stdlib.hc>`); the `%f` parser is a direct accumulate-and-scale, not the
+// correctly-rounded `StrToF64`, which is plenty for scanf. For stdin, read a line with
+// `FGetS`/`ReadLine` and `SScan` it.
+//
+// Supported: whitespace in `fmt` skips any run of input whitespace; an ordinary `fmt`
+// char must match the input; the conversions `d i u o x X c s f e E g G` (+ `%%`), an
+// optional `*` (scan but don't assign), a max field width, and length modifiers
+// (`l`/`h`/`L`/`z`/`j`/`t`), which are ignored — HolyC is uniform-width.
+
+// ASCII whitespace (\t\n\v\f\r and space), without pulling <ctype.hc>.
+I64 ScWs(I64 c) { return (c >= 9 && c <= 13) || c == ' '; }
+
+// Digit value of `c` in `base` (2..36), or -1 if it is not a digit of that base.
+I64 ScDigit(I64 c, I64 base)
+{
+  I64 v = -1;
+  if (c >= '0' && c <= '9') v = c - '0';
+  else if (c >= 'a' && c <= 'z') v = c - 'a' + 10;
+  else if (c >= 'A' && c <= 'Z') v = c - 'A' + 10;
+  if (v < 0 || v >= base) return -1;
+  return v;
+}
+
+// Scan an integer from *`sp` in `base` (0 = auto: 0x→16, 0→8, else 10), consuming at
+// most `width` chars (0 = unlimited; no leading-whitespace skip — the caller does it).
+// Writes *`out` and advances *`sp` on success (returns 1), else returns 0.
+I64 ScanInt(U8 **sp, I64 base, I64 width, I64 *out)
+{
+  U8 *s = *sp;
+  I64 used = 0, neg = 0;
+  if (*s == '-' || *s == '+') {
+    if (*s == '-') neg = 1;
+    s++;
+    used++;
+  }
+  if (base == 0) {
+    if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; used += 2; }
+    else if (*s == '0') base = 8;
+    else base = 10;
+  } else if (base == 16 && *s == '0' && (s[1] == 'x' || s[1] == 'X')) {
+    s += 2;
+    used += 2;
+  }
+  I64 val = 0, ndig = 0;
+  while (*s) {
+    if (width > 0 && used >= width) break;
+    I64 d = ScDigit(*s, base);
+    if (d < 0) break;
+    val = val * base + d;
+    s++;
+    used++;
+    ndig++;
+  }
+  if (ndig == 0) return 0;
+  if (neg) val = -val;
+  *out = val;
+  *sp = s;
+  return 1;
+}
+
+// Scan a float from *`sp` (sign, int part, '.', fraction, [eE][+-]?exp), consuming at
+// most `width` chars (0 = unlimited; no leading-whitespace skip). Writes *`out` and
+// advances *`sp` on success (returns 1), else 0. Accumulate-and-scale (see the note).
+I64 ScanFloat(U8 **sp, I64 width, F64 *out)
+{
+  U8 *s = *sp;
+  I64 used = 0, neg = 0;
+  if (*s == '-' || *s == '+') {
+    if (*s == '-') neg = 1;
+    s++;
+    used++;
+  }
+  F64 val = 0.0;
+  I64 ndig = 0;
+  while (*s >= '0' && *s <= '9') {
+    if (width > 0 && used >= width) break;
+    val = val * 10.0 + (*s - '0');
+    s++;
+    used++;
+    ndig++;
+  }
+  if (*s == '.' && (width == 0 || used < width)) {
+    s++;
+    used++;
+    F64 scale = 0.1;
+    while (*s >= '0' && *s <= '9') {
+      if (width > 0 && used >= width) break;
+      val = val + (*s - '0') * scale;
+      scale = scale / 10.0;
+      s++;
+      used++;
+      ndig++;
+    }
+  }
+  if (ndig == 0) return 0;
+  if ((*s == 'e' || *s == 'E') && (width == 0 || used < width)) {
+    U8 *save = s;
+    I64 esave = used, eneg = 0;
+    s++;
+    used++;
+    if (*s == '-' || *s == '+') {
+      if (*s == '-') eneg = 1;
+      s++;
+      used++;
+    }
+    I64 ev = 0, edig = 0;
+    while (*s >= '0' && *s <= '9') {
+      if (width > 0 && used >= width) break;
+      ev = ev * 10 + (*s - '0');
+      s++;
+      used++;
+      edig++;
+    }
+    if (edig == 0) { s = save; used = esave; } // no exponent digits: roll back the 'e'
+    else {
+      I64 k = 0;
+      while (k < ev) { if (eneg) val = val / 10.0; else val = val * 10.0; k++; }
+    }
+  }
+  if (neg) val = -val;
+  *out = val;
+  *sp = s;
+  return 1;
+}
+
+public I64 SScan(U8 *buf, U8 *fmt, ...)
+{
+  U8 *s = buf;
+  I64 ai = 0, fi = 0, assigned = 0;
+  while (fmt[fi]) {
+    U8 fc = fmt[fi];
+    if (ScWs(fc)) { // a space in fmt matches any run of input whitespace
+      fi++;
+      while (ScWs(*s)) s++;
+      continue;
+    }
+    if (fc != '%') { // an ordinary char must match the input
+      if (*s != fc) return assigned;
+      s++;
+      fi++;
+      continue;
+    }
+    fi++; // past '%'
+    I64 suppress = 0;
+    if (fmt[fi] == '*') { suppress = 1; fi++; }
+    I64 width = 0;
+    while (fmt[fi] >= '0' && fmt[fi] <= '9') { width = width * 10 + (fmt[fi] - '0'); fi++; }
+    while (fmt[fi] == 'l' || fmt[fi] == 'h' || fmt[fi] == 'L' || fmt[fi] == 'z'
+           || fmt[fi] == 'j' || fmt[fi] == 't') fi++; // length modifiers: ignored
+    I64 conv = fmt[fi];
+    if (conv) fi++;
+
+    if (conv == '%') { // a literal percent, after optional whitespace
+      while (ScWs(*s)) s++;
+      if (*s != '%') return assigned;
+      s++;
+      continue;
+    }
+    if (conv == 'c') { // exactly `width` bytes (default 1), no whitespace skip
+      I64 w = (width > 0) ? width : 1;
+      if (!*s) return assigned > 0 ? assigned : -1;
+      U8 *dst = NULL;
+      if (!suppress) { dst = *(U8 **)(&VargV[ai]); ai++; }
+      I64 k = 0;
+      while (k < w && *s) {
+        if (dst) dst[k] = *s; // %c does not NUL-terminate
+        s++;
+        k++;
+      }
+      if (!suppress) assigned++;
+      continue;
+    }
+    // The remaining conversions skip leading whitespace first.
+    while (ScWs(*s)) s++;
+    if (!*s) return assigned > 0 ? assigned : -1; // input exhausted
+    if (conv == 's') {
+      U8 *dst = NULL;
+      if (!suppress) { dst = *(U8 **)(&VargV[ai]); ai++; }
+      I64 k = 0;
+      while (*s && !ScWs(*s)) {
+        if (width > 0 && k >= width) break;
+        if (dst) dst[k] = *s;
+        s++;
+        k++;
+      }
+      if (dst) dst[k] = 0;
+      if (k == 0) return assigned;
+      if (!suppress) assigned++;
+    } else if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X'
+               || conv == 'o') {
+      I64 base = 10;
+      if (conv == 'i') base = 0;
+      else if (conv == 'x' || conv == 'X') base = 16;
+      else if (conv == 'o') base = 8;
+      I64 v = 0;
+      if (!ScanInt(&s, base, width, &v)) return assigned;
+      if (!suppress) { I64 *dst = *(I64 **)(&VargV[ai]); ai++; *dst = v; assigned++; }
+    } else if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G') {
+      F64 v = 0.0;
+      if (!ScanFloat(&s, width, &v)) return assigned;
+      if (!suppress) { F64 *dst = *(F64 **)(&VargV[ai]); ai++; *dst = v; assigned++; }
+    } else {
+      return assigned; // unknown conversion: can't tell how to consume it
+    }
+  }
+  return assigned;
 }
 
 // =============================================================================

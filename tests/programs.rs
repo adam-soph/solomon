@@ -1,7 +1,7 @@
 //! Output-level tests for the larger sample programs: they don't just run
 //! cleanly, they compute the right answers.
 
-use solomon::interp::run_to_string;
+use solomon::interp::{run_to_string, run_to_string_with_input};
 use solomon::parser::parse_with;
 
 mod common;
@@ -9,16 +9,45 @@ mod common;
 /// Parse and run a sample, returning everything it printed. Examples carry their
 /// own `#include <string.hc>`, resolved against the repo `lib/`.
 fn run(name: &str, src: &str) -> String {
+    run_with_input(name, src, &[])
+}
+
+/// Like [`run`], but feeds `input` as the program's standard input (fd 0).
+fn run_with_input(name: &str, src: &str, input: &[u8]) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let program = parse_with(src, std::path::Path::new("."), &[lib])
         .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
-    run_to_string(&program).unwrap_or_else(|e| panic!("{name}: {e}"))
+    run_to_string_with_input(&program, input).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
 #[test]
 fn hello_greets() {
     let out = run("hello.hc", include_str!("../examples/hello.hc"));
     assert_eq!(out, "Hello, World!\nx=42 y=255 ratio=3.140000\n");
+}
+
+#[test]
+fn upcase_filters_stdin() {
+    let src = include_str!("../examples/upcase.hc");
+    assert_eq!(
+        run_with_input("upcase.hc", src, b"Hello\nworld\nMiXeD 123"),
+        "HELLO\nWORLD\nMIXED 123\n"
+    );
+    // EOF-safe: no input -> no output (so it stays deterministic in the catch-all).
+    assert_eq!(run_with_input("upcase.hc", src, b""), "");
+}
+
+#[test]
+fn errno_renders_messages() {
+    let out = run("errno.hc", include_str!("../examples/errno.hc"));
+    assert_eq!(
+        out,
+        "open: No such file or directory (errno 2)\n\
+         recognized ENOENT\n\
+         22=Invalid argument\n\
+         28=No space left on device\n\
+         13=Permission denied\n"
+    );
 }
 
 #[test]

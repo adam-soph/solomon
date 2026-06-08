@@ -8,7 +8,7 @@
 // to libc `pthread_create`/`pthread_join` on Darwin, or to the raw `clone(2)` syscall
 // with a hand-built child stack on the freestanding targets. Threads share the address
 // space (globals and the heap), so they communicate through shared memory. The locks are
-// pure-HolyC futex primitives over `<atomic.hc>` (Drepper "Futexes Are Tricky").
+// pure-HolyC futex primitives over `<stdatomic.hc>` (Drepper "Futexes Are Tricky").
 //
 // Threading is impure and concurrent, so a program using it is not reproducible by
 // value; conformance is by property. The interpreter (the oracle) runs each thread body
@@ -17,7 +17,7 @@
 // interleaving-independent, race-free work: have each thread write to its own slot or
 // return its own value, then combine after joining. Include with `#include <threads.hc>`.
 
-#include <atomic.hc>
+#include <stdatomic.hc>
 
 // --- thread spawn / join (intrinsics) ----------------------------------------
 

@@ -47,7 +47,7 @@ impl Codegen for X64Windows {
     }
 
     fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
-        let pe = super::compile(program, Box::new(WindowsTarget::new()))?;
+        let pe = super::compile_program(program, Box::new(WindowsTarget::new()))?;
         std::fs::write(&self.out_path, &pe)
             .map_err(|e| CodegenError::new(format!("cannot write PE executable: {e}"), None))
     }
@@ -314,6 +314,33 @@ impl OsTarget for WindowsTarget {
         // GetTickCount64() -> ms since boot (monotonic); *1e6 = ns.
         self.call_aligned(asm, "GetTickCount64");
         asm.imul_rax_imm32(1_000_000);
+    }
+
+    fn emit_cpu_ns(&mut self, asm: &mut Asm, sc: i32) {
+        // CpuNS = (kernelTime + userTime) * 100, from
+        // GetProcessTimes(hProc, &creation, &exit, &kernel, &user) — each FILETIME is in
+        // 100-ns ticks. `sc` is a 32-byte BSS slot: +0 creation, +8 exit, +16 kernel,
+        // +24 user. hProc is the current-process pseudo-handle (HANDLE)-1. This is a
+        // 5-argument call, so the 5th arg (&user) is passed on the stack at [rsp+0x20],
+        // just above the 32-byte shadow — done by hand since `call_aligned` is 4-arg only.
+        let i = self.extern_idx("GetProcessTimes");
+        asm.mov_rr(R15, super::RSP); // save caller rsp (R15 survives the call)
+        asm.and_ri(super::RSP, -16); // 16-align
+        asm.emit(&[0x48, 0x83, 0xEC, 0x30]); // sub rsp, 48 (32 shadow + 8 stack arg + 8 pad)
+        asm.mov_ri(RCX, -1); // hProcess = GetCurrentProcess() pseudo-handle
+        asm.lea_global(RDX, sc); // &creationTime
+        asm.lea_global(R8, sc + 8); // &exitTime
+        asm.lea_global(R9, sc + 16); // &kernelTime
+        asm.lea_global(RAX, sc + 24); // &userTime ...
+        asm.emit(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+0x20], rax (the 5th arg)
+        asm.call_extern(i);
+        asm.mov_rr(super::RSP, R15); // restore rsp
+        asm.lea_global(RCX, sc + 16);
+        asm.load_qword_at(RAX, RCX); // rax = kernel ticks
+        asm.lea_global(RCX, sc + 24);
+        asm.load_qword_at(RDX, RCX); // rdx = user ticks
+        asm.add_rr(RAX, RDX); // rax = kernel + user
+        asm.imul_rax_imm32(100); // 100-ns ticks -> ns
     }
 
     fn emit_sleep(&mut self, asm: &mut Asm, _scratch: i32) {

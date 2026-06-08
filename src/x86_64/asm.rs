@@ -284,6 +284,28 @@ impl Asm {
         self.emit(&[0x85]);
         self.emit(&(-off).to_le_bytes());
     }
+    /// Width-aware load from `[rbp - off]` into GPR `reg` (sign/zero-extended per
+    /// `signed`). `reg` must be a low register (0–7); the opcode's REX.W carries no
+    /// REX.R, so the IR backend keeps its scratch GPRs in that range.
+    pub(super) fn load_local_reg(&mut self, reg: u8, off: i32, size: i32, signed: bool) {
+        debug_assert!(reg < 8, "load_local_reg needs a low register");
+        self.emit(load_opcode(size, signed));
+        self.emit(&[0x85 | ((reg & 7) << 3)]); // [rbp + disp32], reg in the reg field
+        self.emit(&(-off).to_le_bytes());
+    }
+    /// Store the low `size` bytes of GPR `reg` (0–7) to `[rbp - off]`.
+    pub(super) fn store_local_reg(&mut self, reg: u8, off: i32, size: i32) {
+        debug_assert!(reg < 8, "store_local_reg needs a low register");
+        self.emit(store_opcode(size));
+        self.emit(&[0x85 | ((reg & 7) << 3)]);
+        self.emit(&(-off).to_le_bytes());
+    }
+    /// `lea <reg>, [rbp - off]` — the address of a local slot, into GPR `reg` (0–7).
+    pub(super) fn lea_local_reg(&mut self, reg: u8, off: i32) {
+        debug_assert!(reg < 8, "lea_local_reg needs a low register");
+        self.emit(&[0x48, 0x8D, 0x85 | ((reg & 7) << 3)]);
+        self.emit(&(-off).to_le_bytes());
+    }
     /// Narrows rax in place to `size` bytes, then sign- or zero-extends it back
     /// to 64 bits (`movsx`/`movzx`/`movsxd rax, <al/ax/eax>`). A no-op at 8 bytes.
     /// Truncates a value to a narrow integer width in a register — for example a
@@ -421,6 +443,19 @@ impl Asm {
     /// Emits `rep movsb`: copy rcx bytes from [rsi] to [rdi].
     pub(super) fn rep_movsb(&mut self) {
         self.emit(&[0xF3, 0xA4]);
+    }
+    /// `rep stosb`: store `al` to `[rdi]`, `rcx` times — a memset (used to zero an
+    /// aggregate slot before a partial initializer).
+    pub(super) fn rep_stosb(&mut self) {
+        self.emit(&[0xF3, 0xAA]);
+    }
+    /// `push <reg>` / `pop <reg>` for a low register (0–7); used to save a
+    /// callee-saved register the backend borrows transiently (e.g. rbx in `Thread`).
+    pub(super) fn push_reg(&mut self, reg: u8) {
+        self.emit(&[0x50 | (reg & 7)]);
+    }
+    pub(super) fn pop_reg(&mut self, reg: u8) {
+        self.emit(&[0x58 | (reg & 7)]);
     }
     pub(super) fn add_rax_rcx(&mut self) {
         self.emit(&[0x48, 0x01, 0xC8]);

@@ -33,7 +33,7 @@ impl Codegen for X64Linux {
     }
 
     fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
-        let elf = super::compile(program, Box::new(LinuxTarget))?;
+        let elf = super::compile_program(program, Box::new(LinuxTarget))?;
         std::fs::write(&self.out_path, &elf)
             .map_err(|e| CodegenError::new(format!("cannot write ELF executable: {e}"), None))?;
         #[cfg(unix)]
@@ -73,6 +73,10 @@ impl OsTarget for LinuxTarget {
 
     fn emit_mono_ns(&mut self, asm: &mut Asm, scratch: i32) {
         Self::emit_clock(asm, scratch, 1); // CLOCK_MONOTONIC
+    }
+
+    fn emit_cpu_ns(&mut self, asm: &mut Asm, scratch: i32) {
+        Self::emit_clock(asm, scratch, 2); // CLOCK_PROCESS_CPUTIME_ID
     }
 
     fn emit_sleep(&mut self, asm: &mut Asm, ts: i32) {

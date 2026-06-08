@@ -45,16 +45,15 @@ T FAAt<type T, int N>(FixedArr<T, N> *a, I64 i) { return a->data[i]; }
 // type (a class) would be a compile-time error.
 T Max<comparable T>(T a, T b) { return a > b ? a : b; }
 
-// ---- compile-time type switch (the analogue of Go's `switch v.(type)`) ----
-// Resolved per instantiation: only the arm matching the concrete `T` survives; the
-// rest are discarded before type-checking.
+// ---- compile-time type test (`if type`), the analogue of Go's `switch v.(type)` ----
+// Resolved per instantiation: only the branch matching the concrete `T` survives; the
+// rest are discarded before type-checking. `if type (T is U)` is the single-case form
+// (chain with `else`); `switch type` is the multi-way form.
 U0 Show<type T>(T x) {
-  switch type (T) {
-    case I64:  "I64 %d\n", x;
-    case F64:  "F64 %.2f\n", x;
-    case U8 *: "str %s\n", x;
-    default:   "other\n";
-  }
+  if type (T is I64)        "I64 %d\n", x;
+  else if type (T is F64)   "F64 %.2f\n", x;
+  else if type (T is U8 *)  "str %s\n", x;
+  else                      "other\n";
 }
 
 U0 Main()

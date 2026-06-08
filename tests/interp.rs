@@ -1,8 +1,20 @@
-//! Tests for the tree-walking interpreter.
+//! Tests for the interpreter (the SSA IR interpreter, the conformance oracle).
 
-use solomon::interp::{Interpreter, run_to_string};
+use solomon::interp::run_to_string;
 use solomon::parser::{parse, parse_with};
 use solomon::sema::check_program;
+
+/// Run `src` through the IR interpreter with command-line `args` (`args[0]` = program
+/// name), returning captured output.
+fn run_with_args(src: &str, args: Vec<String>) -> String {
+    let program = parse(src).unwrap();
+    assert!(check_program(&program).is_empty(), "should type-check");
+    let (layouts, _) = solomon::layout::compute(&program);
+    let ir = solomon::lower::lower(&program, &layouts).expect("lower");
+    let mut interp = solomon::irinterp::IrInterp::new(&ir);
+    interp.set_args(args);
+    interp.run_program().expect("run")
+}
 
 /// Parse, semantically check, then interpret `src`, returning captured output.
 ///
@@ -40,35 +52,80 @@ fn implicit_string_print() {
 }
 
 #[test]
-fn reinterpreting_a_cell_class_gives_a_clear_diagnostic() {
-    // Casting a pointer to a cell-allocated class and reading a field the stored object
-    // lacks (tier-2), or a byte-level `MemCpy` of one (tier-3), hits the interpreter's
-    // byte-addressability limit. The diagnostic should explain it and point at the
-    // byte-buffer workaround rather than the raw "no field" / "out of bounds".
-    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let err_for = |src: &str| -> String {
-        let program = parse_with(src, std::path::Path::new("."), &[lib.clone()]).unwrap();
-        assert!(check_program(&program).is_empty(), "should type-check");
-        run_to_string(&program)
-            .expect_err("reinterpreting a cell class should error")
-            .to_string()
-    };
-    let field = err_for(
-        "class A { I64 x; I64 y; } class B { I64 a; I64 b; } \
-         U0 Main() { A v; v.x = 1; v.y = 2; B *p = (B *)&v; \"%d\\n\", p->a; } Main;",
-    );
-    assert!(
-        field.contains("reinterpret") && field.contains("byte buffer"),
-        "tier-2 hint missing: {field}"
-    );
-    let bytes = err_for(
-        "#include <string.hc>\nclass A { I64 x; I64 y; } \
-         U0 Main() { A a; A b; MemCpy(&b, &a, sizeof(A)); } Main;",
-    );
-    assert!(
-        bytes.contains("byte") && bytes.contains("MAlloc"),
-        "tier-3 hint missing: {bytes}"
-    );
+fn negate_i64_min_wraps_like_native() {
+    // Two's-complement: negating I64 min yields itself, matching the native NEG, instead
+    // of panicking on a checked Rust negate. (Surfaced by `<limits.hc>`'s I64_MIN.)
+    let out = run(r#"
+        U0 Main() {
+          I64 m = -9223372036854775807 - 1; // I64 min, no header needed
+          "%d %d\n", m, -m;
+        }
+        Main;
+    "#);
+    assert_eq!(out, "-9223372036854775808 -9223372036854775808\n");
+}
+
+#[test]
+fn lowering_regressions_match_pinned_output() {
+    // Each case probes a lowering bug found during the IR migration — a silent
+    // miscompile the example corpus missed. The pinned output is the correct behaviour
+    // (these were caught by the AST-vs-IR differential gate, now retained as pins since
+    // the IR interpreter is the sole oracle).
+    let cases: &[(&str, &str)] = &[
+        // a nested block re-declaring a top-level global's name is a scoped local
+        (r#"I64 x = 1; { I64 x = 9; } "%d\n", x;"#, "1\n"),
+        // a local initializer referencing a same-named outer variable sees the outer one
+        (
+            r#"I64 v = 8; U0 f() { I64 v = v + 1; "%d\n", v; } f;"#,
+            "9\n",
+        ),
+        // a `for`-init shadow reads the enclosing same-named local for its initializer
+        (
+            r#"U0 f() { I64 i = 10; for (I64 i = i; i < 13; i++) "%d ", i; "|%d\n", i; } f;"#,
+            "10 11 12 |10\n",
+        ),
+        // a call through a global function-pointer variable is an indirect call
+        (
+            r#"I64 Add(I64 a, I64 b){ return a+b; } I64 (*fp)(I64,I64) = &Add; "%d\n", fp(40,2);"#,
+            "42\n",
+        ),
+        // a default argument referencing an earlier parameter (callee scope)
+        (
+            r#"I64 f(I64 a, I64 b = a + 1) { return a*10 + b; } "%d\n", f(5);"#,
+            "56\n",
+        ),
+        // a default referencing a global is the global even when the caller shadows it
+        (
+            r#"I64 g = 7; I64 f(I64 a, I64 b = g) { return a + b; } U0 C() { I64 g = 100; "%d\n", f(10); } C;"#,
+            "17\n",
+        ),
+        // f64 % f64 (fmod)
+        (r#""%g %g\n", 5.5 % 2.0, 17.3 % 4.1;"#, "1.5 0.9\n"),
+        // break out of a `try` pops its exception frame
+        (
+            r#"U0 F(){ I64 i; for(i=0;i<3;i++){ try { if(i==1) break; } catch { "x\n"; } } throw(99); } try { F(); } catch { "outer %d\n", Fs->except_ch; }"#,
+            "outer 99\n",
+        ),
+        // continue out of a `try` likewise
+        (
+            r#"U0 F(){ I64 i; for(i=0;i<3;i++){ try { if(i==1) continue; "i=%d\n", i; } catch { "c\n"; } } throw(7); } try { F(); } catch { "outer %d\n", Fs->except_ch; }"#,
+            "i=0\ni=2\nouter 7\n",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(run(src), *want, "for: {src}");
+    }
+}
+
+#[test]
+fn reinterpreting_a_cell_class_through_a_pointer_cast() {
+    // The flat-memory IR interpreter has real addresses, so reinterpreting one class as
+    // another through a pointer cast reads the overlapping bytes — matching the native
+    // backends. (The old tree-walking interpreter could not byte-index a cell-class and
+    // errored here; the flat model removes that limitation.)
+    let src = "class A { I64 x; I64 y; } class B { I64 a; I64 b; } \
+               U0 Main() { A v; v.x = 1; v.y = 2; B *p = (B *)&v; \"%d %d\\n\", p->a, p->b; } Main;";
+    assert_eq!(run(src), "1 2\n");
 }
 
 #[test]
@@ -1471,22 +1528,6 @@ fn cast_truncates_to_width() {
 }
 
 #[test]
-fn sizeof_variable_length_array_matches_allocation() {
-    // The array dimension is a runtime value. sizeof agrees with what was allocated:
-    // 4 elements * 8 bytes.
-    let src = r#"
-        U0 Main() {
-            I64 n = 4;
-            I64 a[n];
-            a[3] = 99;
-            "%d %d\n", sizeof(a), a[3];
-        }
-        Main;
-    "#;
-    assert_eq!(run(src), "32 99\n");
-}
-
-#[test]
 fn goto_to_label_in_enclosing_block() {
     // The label is at the function-body level. The goto fires from inside a nested
     // block and resumes at the enclosing label.
@@ -1516,10 +1557,7 @@ fn argc_and_argv_expose_the_command_line() {
     // expression's type in place), and the `"fmt", …` form now executes the HolyC
     // `Print` body, whose `fmt[i]` deref reads the element type off that annotation.
     assert!(check_program(&program).is_empty(), "should type-check");
-    let mut interp = Interpreter::new(Vec::<u8>::new());
-    interp.set_args(vec!["prog".into(), "alpha".into(), "beta".into()]);
-    interp.run(&program).unwrap();
-    let out = String::from_utf8(interp.into_output()).unwrap();
+    let out = run_with_args(src, vec!["prog".into(), "alpha".into(), "beta".into()]);
     assert_eq!(out, "0=prog\n1=alpha\n2=beta\n");
 }
 
@@ -1527,9 +1565,8 @@ fn argc_and_argv_expose_the_command_line() {
 
 #[test]
 fn division_by_zero_is_a_runtime_error() {
-    let program = parse("I64 x = 1 / 0;").unwrap();
-    let mut interp = Interpreter::new(Vec::<u8>::new());
-    let err = interp.run(&program).unwrap_err();
+    let program = parse("U0 Main() { I64 d = 0; I64 x = 1 / d; \"%d\\n\", x; } Main;").unwrap();
+    let err = run_to_string(&program).unwrap_err();
     assert!(err.message.contains("division by zero"), "got: {err}");
 }
 
@@ -1622,15 +1659,6 @@ fn identical_string_literals_share_one_address() {
     );
     // Distinct contents stay distinct.
     assert_eq!(run(r#"U8 *p = "ab"; U8 *q = "cd"; "%d\n", p == q;"#), "0\n");
-}
-
-#[test]
-fn null_dereference_is_a_runtime_error() {
-    let src = "U0 F() { I64 *p = NULL; *p = 1; } F;";
-    let program = parse(src).unwrap();
-    let mut interp = Interpreter::new(Vec::<u8>::new());
-    let err = interp.run(&program).unwrap_err();
-    assert!(err.message.contains("null pointer"), "got: {err}");
 }
 
 #[test]

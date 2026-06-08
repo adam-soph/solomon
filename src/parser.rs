@@ -290,6 +290,18 @@ impl<S: TokenStream> Parser<S> {
         }
     }
 
+    /// Consume a contextual word — an identifier with the given spelling — if present.
+    /// Used for the `is`/`not` in `if type (T is U)`; they are not reserved keywords, so
+    /// they only mean anything in that position and stay usable as ordinary identifiers.
+    fn eat_word(&mut self, word: &str) -> PResult<bool> {
+        if matches!(self.peek_kind()?, TokenKind::Ident(ref s) if s == word) {
+            self.advance()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn expect(&mut self, k: &TokenKind, what: &str) -> PResult<Token> {
         if self.at(k)? {
             self.advance()
@@ -798,6 +810,12 @@ impl<S: TokenStream> Parser<S> {
 
     fn parse_if(&mut self, m: Mark) -> PResult<Stmt> {
         self.advance()?; // if
+        // `if type (T is U) … [else …]` is a compile-time type test — the single-case
+        // analogue of `switch type`, resolved by `mono` (which keeps the taken branch
+        // and discards the other before sema).
+        if self.at(&TokenKind::Keyword(Keyword::Type))? {
+            return self.parse_type_if(m);
+        }
         self.expect(&TokenKind::LParen, "`(`")?;
         let cond = self.parse_expr()?;
         self.expect(&TokenKind::RParen, "`)`")?;
@@ -809,6 +827,44 @@ impl<S: TokenStream> Parser<S> {
             None
         };
         Ok(self.st(StmtKind::If { cond, then, else_ }, m))
+    }
+
+    /// Parse a compile-time type test `if type (T is U) … [else …]` (`if` already
+    /// consumed, `type` next). Both sides are types — typically a type parameter on the
+    /// left — related by `is` (or `is not` to negate). It desugars to a one-arm
+    /// [`StmtKind::TypeSwitch`] so `mono` selects the branch for the concrete `T` and
+    /// discards the other (an ill-typed dead branch never reaches sema), like `switch type`.
+    fn parse_type_if(&mut self, m: Mark) -> PResult<Stmt> {
+        self.advance()?; // `type`
+        self.expect(&TokenKind::LParen, "`(` after `if type`")?;
+        let lhs = self.parse_type_no_name()?;
+        if !self.eat_word("is")? {
+            return self.err("`if type` expects `is`, e.g. `if type (T is F64)`");
+        }
+        let negate = self.eat_word("not")?; // `is not` negates the test
+        let rhs = self.parse_type_no_name()?;
+        self.expect(&TokenKind::RParen, "`)`")?;
+        let then = self.parse_stmt()?;
+        let else_ = if self.eat(&TokenKind::Keyword(Keyword::Else))? {
+            Some(self.parse_stmt()?)
+        } else {
+            None
+        };
+        // `T == rhs ? then : else`; `!=` is the same with the branches swapped. The arm
+        // runs when the scrutinee resolves to `rhs`, the default otherwise.
+        let (arm, default) = if negate {
+            (else_, Some(then))
+        } else {
+            (Some(then), else_)
+        };
+        Ok(self.st(
+            StmtKind::TypeSwitch {
+                on: TypeSwitchOn::Ty(lhs),
+                arms: vec![(rhs, arm.map(|s| vec![s]).unwrap_or_default())],
+                default: default.map(|s| vec![s]),
+            },
+            m,
+        ))
     }
 
     fn parse_while(&mut self, m: Mark) -> PResult<Stmt> {
@@ -2190,7 +2246,10 @@ fn hoist_type_names(
                 }
             }
             TokenKind::Ident(name) => match name.as_str() {
-                "Print" | "StrPrint" | "CatPrint" | "MStrPrint" => uses_print = true,
+                "Print" | "StrPrint" | "StrNPrint" | "CatPrint" | "MStrPrint" | "SScan"
+                | "FGetC" | "GetChar" | "FGetS" | "GetLine" | "ReadLine" | "PutChar" | "Puts" => {
+                    uses_print = true
+                }
                 "F64ToStr" => uses_f64tostr = true,
                 _ => {}
             },

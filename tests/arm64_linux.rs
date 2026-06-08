@@ -73,6 +73,58 @@ fn freestanding_matches_the_interpreter_for_every_example() {
     }
 }
 
+/// Phase-3 IR backend: the freestanding ELF emitted through `lower` → IR → AArch64 must
+/// be a well-formed AArch64 static executable for every example (checked on any host),
+/// and — on a linux/aarch64 CI host — run to the same stdout as the interpreter. This is
+/// the freestanding analogue of the IR conformance the `arm64_darwin` crate proves by
+/// execution on macOS.
+#[test]
+fn ir_freestanding_matches_the_interpreter_for_every_example() {
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut names = Vec::new();
+    let mut expected = Vec::new();
+    for (file, src) in common::EXAMPLES {
+        let name = file.trim_end_matches(".hc").to_string();
+        let program =
+            common::parse_example(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        assert!(check_program(&program).is_empty(), "{name}: sema errors");
+        let want = run_to_string(&program).unwrap_or_else(|e| panic!("{name}: interp error: {e}"));
+        let elf = Arm64Linux::new(dir.join(&name))
+            .object(&program)
+            .unwrap_or_else(|e| panic!("{name}: IR freestanding build failed: {e}"));
+        // A static ELF64 for AArch64: magic, ELFCLASS64, ET_EXEC, e_machine = EM_AARCH64.
+        assert_eq!(&elf[0..4], b"\x7FELF", "{name}: not an ELF");
+        assert_eq!(elf[4], 2, "{name}: not ELFCLASS64");
+        assert_eq!(
+            u16::from_le_bytes([elf[18], elf[19]]),
+            183,
+            "{name}: e_machine != EM_AARCH64"
+        );
+        let path = dir.join(&name);
+        std::fs::write(&path, &elf).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        }
+        names.push(name);
+        expected.push(want);
+    }
+    let got = run_stdouts(&dir, &names);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(got) = got else {
+        eprintln!("skipping IR aarch64 freestanding execution: needs a linux/aarch64 host");
+        return;
+    };
+    for (name, (out, want)) in names.iter().zip(got.iter().zip(&expected)) {
+        assert_eq!(
+            out, want,
+            "IR freestanding native != interp stdout for example {name}"
+        );
+    }
+}
+
 #[test]
 fn extreme_field_width_and_precision_do_not_overflow() {
     // Pathological width/precision is clamped at the shared `fmt` layer (width ≤1024,

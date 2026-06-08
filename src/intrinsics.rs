@@ -59,8 +59,9 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         //
         // The impure clock primitives, prototyped in `lib/time.hc`. They read the
         // OS clock or sleep, so they are non-reproducible: conformance is checked
-        // by property, not by value.
-        "UnixNS" | "NanoNS" | "Sleep" => Primitive,
+        // by property, not by value. `UnixNS` = CLOCK_REALTIME, `NanoNS` =
+        // CLOCK_MONOTONIC, `CpuNS` = CLOCK_PROCESS_CPUTIME_ID (process CPU time).
+        "UnixNS" | "NanoNS" | "CpuNS" | "Sleep" => Primitive,
         // The heap. `MAlloc`/`Free` are prototyped in the `lib/builtin.hc` prelude;
         // `HeapExtend`/`MSize` in `lib/stdlib.hc`. A
         // syscall or libc primitive: an `mmap` bump allocator freestanding, or libc
@@ -105,13 +106,13 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // `pthread_create`/`pthread_join` on Darwin, raw `clone(2)` freestanding.
         // The interpreter runs the body synchronously.
         "Thread" | "Join" => Primitive,
-        // Atomics, prototyped in `lib/atomic.hc`. Lowered to the hardware atomic
+        // Atomics, prototyped in `lib/stdatomic.hc`. Lowered to the hardware atomic
         // instructions: `ldaxr`/`stlxr` loops, or `lock xadd`/`xchg`/`cmpxchg`.
         // The interpreter has synchronous threads and no contention, so it does a
         // plain read-modify-write. `Mutex` is pure HolyC on top of these.
         "AtomicLoad" | "AtomicStore" | "AtomicAdd" | "AtomicSwap" | "AtomicCas" => Primitive,
         // Memory fence plus the kernel wait/wake behind the blocking `Mutex`,
-        // prototyped in `lib/atomic.hc`: `dmb` or `mfence`, and `futex(2)`
+        // prototyped in `lib/stdatomic.hc`: `dmb` or `mfence`, and `futex(2)`
         // freestanding or `__ulock_*` on Darwin. No-ops in the synchronous interpreter.
         "AtomicFence" | "FutexWait" | "FutexWake" => Primitive,
         _ => return None,
@@ -129,4 +130,34 @@ pub fn is_intrinsic(name: &str) -> bool {
 /// the interpreter.
 pub fn is_primitive(name: &str) -> bool {
     kind(name) == Some(IntrinsicKind::Primitive)
+}
+
+/// Darwin → Linux `errno` remaps, as `(darwin, linux)` pairs, for the codes that can
+/// reach a `-errno` return on the Darwin backend — the filesystem ops
+/// (`Open`/`Remove`/`Rename`/`Mkdir`/`Chdir`/`Getcwd`). The fd and socket ops surface
+/// a plain `-1` on Darwin today (not `-errno`), so the networking codes
+/// (`ECONNREFUSED`, `ETIMEDOUT`, …) never flow through normalization and are omitted.
+///
+/// The overwhelming majority of file-domain codes already agree across the two systems
+/// (`ENOENT` 2, `EACCES` 13, `EEXIST` 17, `EINVAL` 22, `EISDIR` 21, `ENOTDIR` 20,
+/// `ENOSPC` 28, `EROFS` 30, `EMFILE` 24, `ENFILE` 23, `EFBIG` 27, …); only these few
+/// differ. The values are the Linux-canonical ones the `lib/errno.hc` constants use.
+/// Both the interpreter ([`darwin_to_linux_errno`]) and the AArch64 Darwin backend
+/// (which emits a matching compare-chain) read this one table, so they cannot drift.
+pub const DARWIN_TO_LINUX_ERRNO: &[(i64, i64)] = &[
+    (35, 11), // EAGAIN / EWOULDBLOCK
+    (11, 35), // EDEADLK
+    (63, 36), // ENAMETOOLONG
+    (62, 40), // ELOOP
+    (66, 39), // ENOTEMPTY
+];
+
+/// Translate a positive Darwin `errno` to its Linux-canonical value, or return it
+/// unchanged when the two systems already agree. See [`DARWIN_TO_LINUX_ERRNO`].
+pub fn darwin_to_linux_errno(d: i64) -> i64 {
+    DARWIN_TO_LINUX_ERRNO
+        .iter()
+        .find(|&&(darwin, _)| darwin == d)
+        .map(|&(_, linux)| linux)
+        .unwrap_or(d)
 }

@@ -1,6 +1,6 @@
-#ifndef _ATOMIC_HC
-#define _ATOMIC_HC
-// atomic.hc — C11 `<stdatomic.h>`: atomic operations on shared `I64` words, plus the
+#ifndef _STDATOMIC_HC
+#define _STDATOMIC_HC
+// stdatomic.hc — C11 `<stdatomic.h>`: atomic operations on shared `I64` words, plus the
 // low-level futex wait/wake used to build blocking primitives.
 //
 // `AtomicLoad`/`AtomicStore`/`AtomicAdd`/`AtomicSwap`/`AtomicCas` are intrinsics: the
@@ -10,7 +10,7 @@
 // naturally-aligned `I64` in shared memory: a global, or a heap/`MAlloc` slot, anything
 // visible to the other thread. `AtomicFence` is a full barrier. `FutexWait`/`FutexWake`
 // are the kernel wait/wake; most code wants `<threads.hc>`'s `Mutex`, not these directly.
-// Include with `#include <atomic.hc>`.
+// Include with `#include <stdatomic.hc>`.
 //
 // Conformance: the interpreter runs threads synchronously (see `<threads.hc>`), so it has
 // no real contention. It performs each atomic as a plain read-modify-write, and the

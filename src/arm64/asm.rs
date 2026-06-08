@@ -24,11 +24,8 @@ enum Fixup {
     /// ADR rd, label: the PC-relative address of a label in `__text` (a function
     /// entry). Used to take a function's address (`&Func`).
     Adr,
-    /// A 32-bit jump-table data word: the byte distance from a base label to a
-    /// target label. The base (the table start) is carried in the tuple; the
-    /// target is the fixup's label id. `BR (table + word)` then lands on the
-    /// target. The offset is section-internal and computed at emit time, so it
-    /// needs no Mach-O relocation.
+    /// A jump-table data word: the byte distance from the table's start label
+    /// (`usize`, a label index) to the target case label. Written as a full word.
     TableRel(usize),
 }
 
@@ -262,10 +259,9 @@ impl Asm {
             return;
         }
 
-        // Compact the word stream and remap every word-index position. Label ids
-        // and `TableRel`'s base are label indices, resolved through label_pos, so
-        // only label_pos entries and the `.0` of fixups/adr_fixups/relocs need to
-        // move.
+        // Compact the word stream and remap every word-index position. Label ids are
+        // resolved through label_pos, so only label_pos entries and the `.0` of
+        // fixups/adr_fixups/relocs need to move.
         let mut shift = vec![0usize; n + 1];
         for i in 0..n {
             shift[i + 1] = shift[i] + remove[i] as usize;
@@ -423,10 +419,6 @@ impl Asm {
         let w = 0x9B00_8000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;
         self.emit_du(w, rd as i32, gpb(rn) | gpb(rm) | gpb(ra), B_NORMAL);
     }
-    pub(super) fn madd(&mut self, rd: u32, rn: u32, rm: u32, ra: u32) {
-        let w = 0x9B00_0000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;
-        self.emit_du(w, rd as i32, gpb(rn) | gpb(rm) | gpb(ra), B_NORMAL);
-    }
     pub(super) fn sdiv(&mut self, rd: u32, rn: u32, rm: u32) {
         self.e_rrr(0x9AC0_0C00 | (rm << 16) | (rn << 5) | rd, rd, rn, rm);
     }
@@ -489,14 +481,13 @@ impl Asm {
         );
     }
 
-    // scalar double-precision floating point (F64 lives in v-registers)
-    /// FMOV Xd, Dn: moves the raw 64 bits of a double into a GPR.
-    pub(super) fn fmov_to_gpr(&mut self, xd: u32, dn: u32) {
-        self.e_wr(0x9E66_0000 | (dn << 5) | xd, xd);
-    }
     /// FMOV Dd, Xn: moves raw 64 bits from a GPR into a double register.
     pub(super) fn fmov_from_gpr(&mut self, dd: u32, xn: u32) {
         self.e_use(0x9E67_0000 | (xn << 5) | dd, gpb(xn));
+    }
+    /// FMOV Xd, Dn: moves raw 64 bits from a double register into a GPR.
+    pub(super) fn fmov_to_gpr(&mut self, xd: u32, dn: u32) {
+        self.e_wr(0x9E66_0000 | (dn << 5) | xd, xd);
     }
     /// FMOV Dd, Dn: copies one double register to another.
     pub(super) fn fmov_reg(&mut self, dd: u32, dn: u32) {
@@ -517,31 +508,30 @@ impl Asm {
     pub(super) fn fneg(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E61_4000 | (dn << 5) | dd);
     }
-    /// FSQRT Dd, Dn: scalar double-precision square root. Emitted in place of a
-    /// call to the lib `Sqrt`, as the [`crate::intrinsics`] optimization.
-    pub(super) fn fsqrt(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E61_C000 | (dn << 5) | dd);
-    }
-    /// FABS Dd, Dn: scalar double-precision absolute value (the lib `Fabs` optimization).
-    pub(super) fn fabs(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E60_C000 | (dn << 5) | dd);
-    }
-    /// The directed-rounding `FRINT*` family (scalar double), emitted in place of
-    /// the lib rounding functions: `Floor`→`frintm` (−∞), `Ceil`→`frintp` (+∞),
-    /// `Trunc`→`frintz` (0), `Round`→`frinta` (ties away), and `RoundToEven`→
-    /// `frintn` (ties even).
-    pub(super) fn frintm(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E65_4000 | (dn << 5) | dd);
-    }
-    pub(super) fn frintp(&mut self, dd: u32, dn: u32) {
-        self.e_nogp(0x1E64_C000 | (dn << 5) | dd);
-    }
     pub(super) fn frintz(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E65_C000 | (dn << 5) | dd);
     }
+    /// FSQRT Dd, Dn: the IEEE square root (`Sqrt` lowered inline).
+    pub(super) fn fsqrt(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E61_C000 | (dn << 5) | dd);
+    }
+    /// FABS Dd, Dn: the IEEE absolute value (`Fabs` lowered inline).
+    pub(super) fn fabs(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E60_C000 | (dn << 5) | dd);
+    }
+    /// FRINTM Dd, Dn: round toward −∞ (`Floor`).
+    pub(super) fn frintm(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E65_4000 | (dn << 5) | dd);
+    }
+    /// FRINTP Dd, Dn: round toward +∞ (`Ceil`).
+    pub(super) fn frintp(&mut self, dd: u32, dn: u32) {
+        self.e_nogp(0x1E64_C000 | (dn << 5) | dd);
+    }
+    /// FRINTA Dd, Dn: round to nearest, ties away from zero (`Round`).
     pub(super) fn frinta(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E66_4000 | (dn << 5) | dd);
     }
+    /// FRINTN Dd, Dn: round to nearest, ties to even (`RoundToEven`).
     pub(super) fn frintn(&mut self, dd: u32, dn: u32) {
         self.e_nogp(0x1E64_4000 | (dn << 5) | dd);
     }
@@ -603,16 +593,7 @@ impl Asm {
     pub(super) fn mov_sp_fp(&mut self) {
         self.add_imm(SP, FP, 0);
     }
-    pub(super) fn emit_sub_sp_placeholder(&mut self) -> usize {
-        let idx = self.words.len();
-        self.e_nogp(0xD100_0000 | (SP << 5) | SP); // sub sp, sp, #0
-        idx
-    }
-    pub(super) fn patch_sub_sp(&mut self, idx: usize, imm: u32) {
-        self.words[idx] |= (imm & 0xFFF) << 10;
-    }
-
-    // Atomic / acquire-release memory ops (for `atomic.hc`). `sz` = log2(bytes),
+    // Atomic / acquire-release memory ops (for `stdatomic.hc`). `sz` = log2(bytes),
     // placed in bits 31:30: 0=byte (`*b`), 1=half (`*h`), 2=word (32-bit),
     // 3=dword (64-bit). The narrow loads zero-extend into the 64-bit register; the
     // caller then sign/zero-extends per the pointee type. These ops use `emit`'s
@@ -726,9 +707,6 @@ impl Asm {
             gpb(rn) | gpb(rm),
         );
     }
-    pub(super) fn cmp_imm0(&mut self, rn: u32) {
-        self.e_use(0xF100_0000 | (rn << 5) | XZR, gpb(rn));
-    }
     /// CMP Xn, #imm12: SUBS XZR, Xn, #imm. Sets flags and discards the result.
     pub(super) fn cmp_imm(&mut self, rn: u32, imm: u32) {
         self.e_use(
@@ -742,9 +720,6 @@ impl Asm {
     }
     pub(super) fn lsr_imm(&mut self, rd: u32, rn: u32, sh: u32) {
         self.ubfm(rd, rn, sh, 63);
-    }
-    pub(super) fn asr_imm(&mut self, rd: u32, rn: u32, sh: u32) {
-        self.sbfm(rd, rn, sh, 63);
     }
     /// AND Xd, Xn, #(2^k - 1): mask to the low `k` bits, for `k` in 1..=63. `2^k-1`
     /// is a run of `k` low ones, which encodes as the logical immediate N=1,
@@ -785,33 +760,26 @@ impl Asm {
     pub(super) fn svc(&mut self) {
         self.emit(0xD400_0001); // barrier (default tags)
     }
-    /// `mrs Xt, TPIDR_EL0`: read the user thread pointer (the freestanding per-thread
-    /// `Fs` slot). `e_wr` tags it as defining `Xt`.
-    pub(super) fn mrs_tpidr_el0(&mut self, rt: u32) {
-        self.e_wr(0xD53B_D040 | rt, rt);
-    }
-    /// `msr TPIDR_EL0, Xt`: set the user thread pointer to this thread's `CTask`.
-    pub(super) fn msr_tpidr_el0(&mut self, rt: u32) {
-        self.e_use(0xD51B_D040 | rt, gpb(rt));
-    }
-    /// LDRSW Xt, [Xn, Xm, LSL #2]: load a 32-bit word at `base + index*4`,
-    /// sign-extended to 64 bits. Used to read a jump-table offset entry.
-    pub(super) fn ldrsw_reg(&mut self, rt: u32, base: u32, index: u32) {
-        let w = 0xB8A0_7800 | (index << 16) | (base << 5) | rt;
-        self.emit_du(w, rt as i32, gpb(base) | gpb(index), B_NORMAL);
-    }
-    /// Emits a 32-bit jump-table data word holding the byte distance from `base`
-    /// (the table start) to `target`. Resolved in `finish` via `Fixup::TableRel`.
-    pub(super) fn table_word(&mut self, base: usize, target: usize) {
-        self.fixups
-            .push((self.words.len(), target, Fixup::TableRel(base)));
-        self.emit(0);
-    }
     /// ADR rd, label: load the PC-relative address of a label in `__text` (a
     /// function entry) into `rd`.
     pub(super) fn adr_label(&mut self, rd: u32, label: usize) {
         self.fixups.push((self.words.len(), label, Fixup::Adr));
         self.e_wr(0x1000_0000 | rd, rd);
+    }
+    /// LDRSW Xt, [base, index, LSL #2]: load a signed 32-bit word from a 4-byte-scaled
+    /// index — the jump-table read (`Xt = (i64)table[index]`).
+    pub(super) fn ldrsw_reg(&mut self, rt: u32, base: u32, index: u32) {
+        let w = 0xB8A0_7800 | (index << 16) | (base << 5) | rt;
+        self.emit_du(w, rt as i32, gpb(base) | gpb(index), B_NORMAL);
+    }
+    /// Emit a 32-bit jump-table data word holding the byte distance from `base` (the
+    /// table-start label) to `target` (a case label); resolved in `finish` via
+    /// `Fixup::TableRel`. The word is data, not an instruction — it sits after a `br`,
+    /// so it is never executed.
+    pub(super) fn table_word(&mut self, base: usize, target: usize) {
+        self.fixups
+            .push((self.words.len(), target, Fixup::TableRel(base)));
+        self.emit(0);
     }
     /// `bl <extern>`: a call to an undefined external (libc) symbol, resolved by
     /// the linker via a BRANCH26 relocation.

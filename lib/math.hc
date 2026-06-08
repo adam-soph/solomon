@@ -46,6 +46,34 @@ public F64 Copysign(F64 f, F64 sign)
   return vf.f;
 }
 
+// IEEE-754 classification, like C `<math.h>`. `FpClassify` returns one of the `FP_*`
+// codes; `IsFinite`/`IsNormal` are the common predicates (0/1). A "normal" number is
+// finite, non-zero, and not subnormal. (The exponent field is bits 52..62; masking with
+// 0x7FF after the shift drops the sign bit, so the shift's signedness doesn't matter.)
+#define FP_NAN       0
+#define FP_INFINITE  1
+#define FP_ZERO      2
+#define FP_SUBNORMAL 3
+#define FP_NORMAL    4
+
+public I64 FpClassify(F64 x)
+{
+  I64 bits = Float64bits(x);
+  I64 e = (bits >> 52) & 0x7FF;
+  I64 m = bits & 0xFFFFFFFFFFFFF; // the 52-bit fraction
+  if (e == 0x7FF) { if (m) return FP_NAN; return FP_INFINITE; }
+  if (e == 0) { if (m) return FP_SUBNORMAL; return FP_ZERO; }
+  return FP_NORMAL;
+}
+
+public I64 IsFinite(F64 x) { return !IsNaN(x) && !IsInf(x, 0); }
+
+public I64 IsNormal(F64 x)
+{
+  I64 e = (Float64bits(x) >> 52) & 0x7FF;
+  return e != 0 && e != 0x7FF;
+}
+
 #define PI      3.14159265358979311600
 #define HALF_PI 1.57079632679489655800
 #define TAU     6.28318530717958623200
@@ -61,11 +89,46 @@ public F64 Copysign(F64 f, F64 sign)
 
 // --- small helpers ---------------------------------------------------
 
-public I64 Abs<comparable T>(T n)  { if (n < 0) return -n; return n; }
+// `Abs` returns the element type `T`, so a float argument yields an `F64` instead of a
+// truncated `I64`. The `if type` branch — compiled only for `T is F64` — defers to `Fabs`
+// for exact IEEE semantics (clears the sign bit, so `Abs(-0.0)` is `+0.0` and a NaN stays
+// NaN); the integer instantiations use the plain negate. `Sign` is always `I64` (it
+// yields -1/0/1), so it is unchanged.
+public T Abs<comparable T>(T n)
+{
+  if type (T is F64) return Fabs(n);
+  if (n < 0) return -n;
+  return n;
+}
 public I64 Sign<comparable T>(T n) { return (n > 0) - (n < 0); }
 
-public I64 Min<comparable T>(T a, T b) { if (a < b) return a; return b; }
-public I64 Max<comparable T>(T a, T b) { if (a > b) return a; return b; }
+// `Min`/`Max` return the element type `T`, so the float instantiation yields an `F64`
+// rather than a truncated `I64`. The `if type` branch — compiled only for `T is F64`,
+// dropped for the integer instantiations — adds C `fmin`/`fmax` NaN semantics: a NaN
+// operand yields the other value (plain `a > b` would mishandle `Max(x, NaN)`).
+public T Min<comparable T>(T a, T b)
+{
+  if type (T is F64) {
+    if (a != a) return b;
+    if (b != b) return a;
+  }
+  if (a < b) return a;
+  return b;
+}
+public T Max<comparable T>(T a, T b)
+{
+  if type (T is F64) {
+    if (a != a) return b;
+    if (b != b) return a;
+  }
+  if (a > b) return a;
+  return b;
+}
+
+// C `fmin`/`fmax` (F64): NaN-aware (a NaN operand yields the other) — thin wrappers over
+// the generic `Min`/`Max`, which already do that for floats.
+public F64 Fmin(F64 a, F64 b) { return Min(a, b); }
+public F64 Fmax(F64 a, F64 b) { return Max(a, b); }
 
 public I64 Gcd(I64 a, I64 b)
 {
@@ -192,6 +255,14 @@ public F64 RoundToEven(F64 x)
   if (d == -0.5) { if (((I64)t & 1) == 0) return t; return t - 1.0; }
   return t;
 }
+
+// Integer-returning rounds (C lround/llround/lrint). `LRound`/`LLRound` round halves away
+// from zero (like `Round`); `LRint` rounds halves to even (like `RoundToEven`). The result
+// is `I64`, so a value outside its range is undefined, as in C. `LLRound == LRound` here
+// since HolyC's integer is 64-bit.
+public I64 LRound(F64 x)  { return (I64)Round(x); }
+public I64 LLRound(F64 x) { return (I64)Round(x); }
+public I64 LRint(F64 x)   { return (I64)RoundToEven(x); }
 
 // Floating remainder, the C `fmod` truncated form: x - Trunc(x/y)*y.
 public F64 Fmod(F64 x, F64 y) { return x - Trunc(x / y) * y; }

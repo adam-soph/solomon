@@ -244,23 +244,68 @@ T *BSearch<type T>(T *key, T *base, I64 n, I64 (*cmp)(T *, T *))
   return NULL;
 }
 
+// C `div`/`ldiv`: the quotient and remainder together, returned as a tuple (both are I64
+// here, so one function serves both). Truncates toward zero like C — `Div(7,2)` is `(3,1)`,
+// `Div(-7,2)` is `(-3,-1)`. Unpack with `q, r := Div(a, b);`.
+public (I64, I64) Div(I64 num, I64 den) { return (num / den, num % den); }
+
 // =============================================================================
 // Number <-> string (the `atoi`/`atof` family)
 // =============================================================================
 
-// Parse a base-10 integer, like atoll. Skips leading whitespace and an optional sign,
-// then reads digits. Wraps on overflow.
-public I64 StrToI64(U8 *s)
+// Digit value of `c` in `base` (2..36), or -1 if `c` is not a digit of that base.
+I64 DigitVal(I64 c, I64 base)
 {
-  while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\f' || *s == '\r') s++;
+  I64 v = -1;
+  if (c >= '0' && c <= '9') v = c - '0';
+  else if (c >= 'a' && c <= 'z') v = c - 'a' + 10;
+  else if (c >= 'A' && c <= 'Z') v = c - 'A' + 10;
+  if (v < 0 || v >= base) return -1;
+  return v;
+}
+
+// `strtol`: parse an integer in `base`, C-style. Skips leading whitespace and an optional
+// sign. `base` 0 auto-detects ("0x"/"0X" -> 16, a leading "0" -> 8, else 10); base 16 also
+// accepts an optional "0x"/"0X" prefix. Parsing stops at the first character that is not a
+// digit of the base. If `end` is non-NULL, `*end` is set just past the last digit
+// consumed, or to `s` (the original start) when no digits were found — so a caller can
+// detect failure and resume scanning. Wraps on overflow.
+public I64 StrToI64Base(U8 *s, I64 base, U8 **endp)
+{
+  U8 *p = s;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\f' || *p == '\r' || *p == '\v')
+    p++;
   I64 neg = 0;
-  if (*s == '-') { neg = 1; s++; }
-  else if (*s == '+') s++;
-  I64 n = 0;
-  while (*s >= '0' && *s <= '9') { n = n * 10 + (*s - '0'); s++; }
+  if (*p == '-') { neg = 1; p++; }
+  else if (*p == '+') p++;
+  // A "0x"/"0X" prefix is consumed only when a hex digit follows; otherwise the leading
+  // "0" is an ordinary digit (octal under base 0), matching C.
+  if ((base == 0 || base == 16) && *p == '0' && (p[1] == 'x' || p[1] == 'X')
+      && DigitVal(p[2], 16) >= 0) {
+    base = 16;
+    p += 2;
+  } else if (base == 0) {
+    base = (*p == '0') ? 8 : 10;
+  }
+  I64 n = 0, ndig = 0, d = 0;
+  while ((d = DigitVal(*p, base)) >= 0) { n = n * base + d; p++; ndig++; }
+  if (ndig == 0) {        // no conversion: report failure at the original start
+    if (endp) *endp = s;
+    return 0;
+  }
+  if (endp) *endp = p;
   if (neg) return -n;
   return n;
 }
+
+// Parse a base-10 integer, like atoll. Skips leading whitespace and an optional sign,
+// then reads digits. Wraps on overflow. (`StrToI64Base` adds an arbitrary base + endptr.)
+public I64 StrToI64(U8 *s) { return StrToI64Base(s, 10, NULL); }
+
+// `strtoul`: the unsigned sibling of `StrToI64Base` — identical parsing (base, prefix,
+// sign, endptr), but the result is interpreted unsigned, so a leading `-` wraps ("-1" in
+// base 10 is U64 max) and values up to 2^64-1 read back correctly. Print it with `%u`.
+public U64 StrToU64Base(U8 *s, I64 base, U8 **endp) { return StrToI64Base(s, base, endp); }
 
 // Format n as decimal into buf (matching "%d") and return buf. Digits are extracted
 // in the non-positive domain, so I64 min doesn't overflow on negation.
@@ -282,10 +327,12 @@ public U8 *I64ToStr(I64 n, U8 *buf)
   return buf;
 }
 
-// `StrToF64` is a correctly-rounded decimal -> double parser, the freestanding `atof`.
-// It returns the IEEE-754 double nearest the decimal value, ties to even, so for the
-// normal range it is bit-for-bit a good libc `strtod`. Pure HolyC, so it is the *same*
-// on the interpreter and every backend (the freestanding targets have no libc `atof`).
+// `StrToF64End` is a correctly-rounded decimal -> double parser with an endptr — the
+// freestanding `strtod`. It returns the IEEE-754 double nearest the decimal value, ties to
+// even, so for the normal range it is bit-for-bit a good libc `strtod`. Pure HolyC, so it
+// is the *same* on the interpreter and every backend (the freestanding targets have no
+// libc). If `endp` is non-NULL, `*endp` is set just past the consumed number, or to `str`
+// (the original start) when no digits were found.
 //
 // Grammar (like `atof`): optional leading ASCII whitespace, an optional sign, then
 // `digits[.digits]` and an optional `e`/`E` exponent. Parsing stops at the first
@@ -296,7 +343,7 @@ public U8 *I64ToStr(I64 n, U8 *buf)
 // (build num/den, normalise into [2^52, 2^53) by powers of two, extract the 53-bit
 // mantissa by binary long division, round half-to-even). Significands past ~40 digits
 // are truncated (sub-ULP); subnormals are best-effort; the whole normal range is exact.
-public F64 StrToF64(U8 *str)
+public F64 StrToF64End(U8 *str, U8 **endp)
 {
   U8 *s = str;
   while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\f' || *s == '\v')
@@ -335,7 +382,7 @@ public F64 StrToF64(U8 *str)
       s++;
     } else break;
   }
-  if (!sawDigit) return 0.0;
+  if (!sawDigit) { if (endp) *endp = str; return 0.0; } // no conversion: cursor at start
 
   // Optional exponent. Only consumed when at least one exponent digit follows.
   I64 expo = 0;
@@ -353,6 +400,7 @@ public F64 StrToF64(U8 *str)
       s = p;
     }
   }
+  if (endp) *endp = s; // the whole number is consumed; `s` is the endptr from here on
 
   if (ndig == 0) { if (sign < 0) return -0.0; return 0.0; }
   I64 k = exp10 + expo;               // value = m * 10^k
@@ -435,6 +483,9 @@ public F64 StrToF64(U8 *str)
   if (sign < 0) r = -r;
   return r;
 }
+
+// `atof`: parse a decimal double, ignoring where it stops. (`StrToF64End` adds an endptr.)
+public F64 StrToF64(U8 *str) { return StrToF64End(str, NULL); }
 
 // Format `v` as the **shortest** decimal string that `StrToF64` parses back to exactly
 // `v` — the round-trip inverse of `StrToF64`. It tries increasing `%g` precision; 17

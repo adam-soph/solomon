@@ -3,14 +3,24 @@
 Guidance for Claude Code (claude.ai/code) working in this repository.
 
 solomon is a from-scratch reimplementation of **HolyC** (Terry Davis's TempleOS
-language) in Rust: a real compiler front end, a tree-walking **interpreter**
-(`src/interp.rs`, the **conformance oracle**), and hand-rolled native code generators
-behind the **`Codegen`** trait (`src/codegen.rs`). A backend is an (arch, OS) pair, not
-just a CPU: `aarch64-apple-darwin` (Mach-O via `cc`), `aarch64-unknown-linux` and
+language) in Rust: a real compiler front end that lowers to an **SSA IR**
+(`src/ir.rs`), an IR **interpreter** (`src/irinterp.rs`, the **conformance oracle**),
+and hand-rolled native code generators behind the **`Codegen`** trait
+(`src/codegen.rs`). A backend is an (arch, OS) pair, not just a CPU:
+`aarch64-apple-darwin` (Mach-O via `cc`), `aarch64-unknown-linux` and
 `x86_64-unknown-linux` (**freestanding** static ELFs — no libc, no linker, raw
 syscalls), and `x86_64-pc-windows` (a self-contained PE with hand-built `kernel32`
-imports). Darwin is the one hosted target. Every backend matches the interpreter
+imports). Darwin is the one hosted target. Every backend matches the IR interpreter
 byte-for-byte on all examples.
+
+**Both backends now consume the IR**: `src/arm64/emit_ir.rs` and `src/x86_64/emit_ir.rs`.
+x86 defaults to the IR backend (`compile_program` in `src/x86_64/mod.rs`); the legacy
+AST `Cg` (`mod.rs`) + the shared `src/backend.rs` drivers survive only behind the
+`SOLOMON_X86_AST` escape hatch, pending CI execution validation before deletion (x86
+execution can't run on the Apple-silicon dev host). The original tree-walking AST
+interpreter has been deleted;
+`src/interp.rs` is now a thin shim (the OS-syscall free-helpers, `FdObj`, and the
+`run_to_string` entry points that lower → run the IR interpreter).
 
 ## Commands
 
@@ -48,8 +58,11 @@ workflow on a `v*` tag, not by `make`.
 ## Architecture
 
 ### Pipeline
-`lexer → preprocessor → parser → mono → sema → layout → backend`, each a module.
-`parser::parse(src)` is the entry point and is **two-pass**: `hoist_type_names` streams
+`lexer → preprocessor → parser → mono → sema → layout → lower (AST→SSA IR) →
+{ irinterp | arm64 backend | x86 backend }`, each a module. (The legacy x86 AST path,
+behind `SOLOMON_X86_AST`, still branches off after `layout`.) `parser::parse(src)` is the
+entry point and is **two-pass**:
+`hoist_type_names` streams
 the tokens to collect `class`/`union` names (so a type can be used before it's defined),
 then the real parse, then the **`mono`** pass (`src/mono.rs`) which monomorphizes every
 deferred generic into concrete AST — so everything downstream sees an ordinary,
@@ -88,47 +101,73 @@ self-contained; editing a `lib/*.hc` recompiles).
 - `sema::check_ident` returns a variable's **undecayed** type; array→pointer decay is
   applied at use sites — an array-typed `Ident` means "address of the array data".
 
-### No IR; the dedup seams (`src/backend.rs`)
-There is **no IR** (no SSA/LLVM/Cranelift): each backend walks the typed AST and emits
-machine code directly. Shared logic lives in `src/backend.rs`:
-- **`trait Emitter`** — one TCC-style emitter vtable (assoc types `Place`/`Slot`),
-  implemented per backend by its inner `Cg` worker. Backend-independent driver functions
-  (`gen_init_into`, `gen_switch`/`gen_if`/`gen_while`/`gen_do_while`/`gen_for`,
-  `gen_call`) call back into it for the leaf emits, so the backends can't drift on
-  init/control-flow/call *shape*. Also holds the shared printf flag-bit ABI
-  (`spec_flags`/`int_conv`/`F_*`) and `classify_args`.
-- **`OsTarget`** (x86) / **`ArmTarget`** (arm64) seams — the per-OS deltas (exit, page
-  alloc, std write, file ops, clock; freestanding vs hosted vs Windows). One `Cg` per
-  arch serves both that arch's OS targets through the seam.
+### The SSA IR (`src/ir.rs`, `src/lower.rs`, `src/regalloc.rs`)
+The front end lowers to a typed **SSA IR** (`src/ir.rs`): typed virtual registers
+(`IrTy` widths + signedness baked into ops), basic blocks with `phi`, explicit
+`alloca`/`load`/`store`, `getelementptr`-style `PtrAdd`, near-machine ops, and
+`Call`/`Prim`/`TryBegin`/`TryEnd`/`Throw`. Everything tricky (narrow-int promote/truncate,
+`>>`/`/`/`%`/relational signedness, float↔int conversion, store/arg/return coercion) is
+**decided once during lowering** from `e.ty()` and frozen into the ops, so the interp and
+the backend can't re-derive it differently.
+
+- **`src/lower.rs`** — AST→SSA, built **on the fly** during the AST walk (Braun et al.
+  "Simple and Efficient SSA Construction"; `read_variable`/`write_variable` over
+  sealed/unsealed blocks, no dominance frontiers). GCC-style **register/memory split**:
+  a non-address-taken scalar becomes a `phi`/vreg SSA value; everything address-taken or
+  aggregate gets an `alloca` slot reached via `load`/`store`. The synthesised `@entry`
+  function holds the top-level code. Const-folds here. `lower(program, layouts)` is the
+  entry; `intrinsics::is_primitive` names map to `Prim`.
+- **`src/regalloc.rs`** — out-of-SSA (`destruct_ssa`): resolves `phi`s into copies on CFG
+  edges (critical-edge splitting, parallel-copy sequencing). Also **`plan_registers`**, a
+  liveness-based linear-scan **register promotion** pass: it lifts hot vregs (≥2 refs)
+  into the callee-saved registers (x19–x28 / d8–d15), returning `vreg → Option<PReg>`. It
+  is additive over the arm64 backend's spill-everything model (an unpromoted vreg emits
+  exactly as before); a `try`-containing function is left fully spilled (a `throw`'s
+  longjmp would not restore callee-saved registers).
+
+**x86 consumes the IR too** (`src/x86_64/emit_ir.rs`, the default via `compile_program`).
+It walks the phi-free IR and emits x86-64, reusing the `Asm` encoder and the **`OsTarget`
+seam** (per-OS deltas: exit, page alloc, std write, file ops, clock, command-line capture;
+freestanding ELF vs Windows PE). Spill-everything (no promotion yet): every vreg in an
+`[rbp-off]` slot; scratch rax/rcx/rdx + rsi/rdi (all low regs) and xmm0/xmm1; the internal
+ABI matches arm64 (int args rdi/rsi/rdx/rcx/r8/r9, F64 xmm0–7, sret pointer in **r11**);
+single-task `Fs` as a BSS `CTask` seeded in `@entry`, gated on real Fs/exception use; a
+32-byte `ExcFrame`; `Sqrt`→`sqrtsd`/`Fabs`→`andpd`; threads via `clone(2)` with base in
+rbx. The **legacy AST path** survives behind `SOLOMON_X86_AST`: `src/x86_64/mod.rs`'s `Cg`
+walks the AST through the shared drivers in **`src/backend.rs`** (the TCC-style `trait
+Emitter` + `gen_init_into`/`gen_switch`/`gen_if`/`gen_while`/`gen_for`/`gen_call` +
+`classify_args`). Once CI validates the IR backend's x86 execution, `backend.rs` and the
+x86 `Cg` (and the escape hatch) go away.
 
 ### Interpreter & backends
-- **`interp.rs`** — tree-walking `Interpreter<W: Write>`, the **conformance oracle**;
-  `run_to_string` is the safe check-then-run entry. **Match its observable output when
-  adding backend features.** Values are `Rc<RefCell<Value>>` cells; pointers are
-  region+offset. The exceptions are **raw byte buffers** (`Region::Heap`/`Value::Union`,
-  via `Place::Bytes`): `MAlloc` of a scalar type, every `union`, and a generic container
-  whose element is a class — so type punning and union aliasing match the native byte
-  layout. A pointer stored into a byte buffer is serialised as an 8-byte handle into a
-  `PtrTable` (a `PtrVal` is region+offset, not an address); a whole class value is
-  (de)serialised field-by-field by layout (`store_bytes_value`/`load_bytes_value`, gated
-  by `ty_is_aggregate`) — so `VecPush(&v, pt)` / `Pt p = VecAt(&v, i)` round-trip.
-- **`arm64/mod.rs`** (+ `darwin.rs`/`linux.rs`) — hand-emits AArch64 + the Mach-O object,
-  links with `cc` (Darwin); or a freestanding static ELF (`aarch64-unknown-linux`, via
-  the `ArmTarget` seam: own `_start`, raw syscalls, `mmap` bump allocator). Type-directed.
-  Emission-time optimizations (no separate pass, which would shift label/fixup offsets):
-  constant folding, immediate-form arithmetic + power-of-two strength reduction
-  (`try_imm_binop`), simple-operand lhs-in-register. Plus a real post-emission
-  **peephole** (`Asm::peephole` — dead-`mov` removal/fusion over scratch x9/x10) and a
-  per-function **register promotion** pass (`plan_registers` — linear scan over
-  loop-depth-weighted live intervals; hot scalar locals → callee-saved x19–x28 / d8–d15).
-  All behavior-preserving (the interpreter + all-examples native conformance test are the
-  oracle).
-- **`x86_64/mod.rs`** (+ `linux.rs`/`windows.rs`) — hand-emits x86-64 + a freestanding
-  static ELF (`x86_64-unknown-linux`) or, via the `OsTarget` seam, a self-contained PE
-  with hand-built kernel32 imports (`x86_64-pc-windows`). Stack machine in `rax`; System V
-  arg regs; SSE2 F64. Same implemented subset as arm64 (control flow incl. `start:`/`end:`
-  switch sub-labels; classes by value + sret; globals in BSS; function pointers; printf).
-  Uses a compare-chain for `switch` where arm64 has an O(1) jump table.
+- **`irinterp.rs`** — the **conformance oracle**: a flat-byte-addressable IR interpreter.
+  `IrInterp` runs over a `Mem` of three real-address regions (stack/data/heap;
+  `DATA_BASE`/`HEAP_BASE`/`FUNC_BASE`); SSA vregs are an `RVal` (Int/Float) register file;
+  pointers are real `u64` addresses, so ptr↔int casts round-trip, byte-indexing through
+  `&scalar` works, and union/type-punning is just overlapping bytes — the old tree-walk's
+  `Value`/`Region`/`Place`/`PtrTable` limitations are gone. It implements the **full
+  impure-primitive set** (clock, fd I/O, sockets, fs mutation, process ids, threads run
+  **synchronously** at spawn, atomics, futex) over `std`, plus real argv/env/stdin and
+  `Exit`. `interp::run_to_string` (in the `interp.rs` shim) lowers → runs it; the CLI
+  `-i` path does the same. **Match its observable output when adding backend features.**
+- **`arm64/emit_ir.rs`** (+ `asm.rs`/`darwin.rs`/`linux.rs`) — walks the `phi`-free IR
+  (after `regalloc::destruct_program`) and emits AArch64: a Mach-O object linked with `cc`
+  (Darwin), or a freestanding static ELF (`aarch64-unknown-linux`, via the `ArmTarget`
+  seam: own `_start`, raw syscalls, `mmap` bump allocator). **Spill-everything + promotion**:
+  a vreg lives in a frame slot unless `regalloc::plan_registers` lifts it into a callee-saved
+  register; one `Ctx` selects hosted-Darwin (common-symbol globals, libc primitives) vs
+  freestanding (BSS-offset globals reached by self-resolved `ADR`, syscall primitives).
+  Reuses the `Asm` encoder + its post-emission **peephole** (`Asm::peephole`). A dense,
+  all-constant `switch` lowers to an O(1) jump table (`try_switch_table`), else a
+  compare-chain; the algebraic intrinsics `Sqrt`/`Fabs`/the rounding family lower to single
+  FP instructions (`try_intrinsic`) in place of their lib bodies. (Still not reimplemented
+  from the deleted AST backend: `try_imm_binop` immediate-form strength reduction.)
+- **`x86_64/emit_ir.rs`** (+ `linux.rs`/`windows.rs`) — walks the phi-free IR and emits
+  x86-64 (default), to a freestanding static ELF (`x86_64-unknown-linux`) or, via the
+  `OsTarget` seam, a self-contained PE with hand-built kernel32 imports
+  (`x86_64-pc-windows`). Spill-everything in `[rbp-off]` slots; rax/rcx/rdx + rsi/rdi
+  scratch, xmm0/xmm1 F64; System V-style internal ABI; compare-chain `switch`. The legacy
+  AST `Cg` in **`x86_64/mod.rs`** (stack machine in `rax`) remains behind `SOLOMON_X86_AST`.
 
 Both backends cover the whole implemented subset; only the deliberately-excluded
 transcendentals are absent (they're lib functions, below).
@@ -147,17 +186,19 @@ transcendentals are absent (they're lib functions, below).
   pure HolyC in `<stdio.hc>` (bottoming out at `StdWrite`), so they are ordinary functions
   every target compiles and runs.
 
-Dispatch in both backends + interp gates on `intrinsics::is_primitive(name)`. A **compiled
-user function shadows a like-named primitive** (a program's own `Read`/`Join`) — a body in
-`funcs` means "call the body." A bare string statement prints verbatim (lowered inline); the
-`"fmt", args` comma form lowers to a `Print` call, so it needs `<stdio.hc>` — which the
-print auto-include always supplies.
+Dispatch (lowering → `Prim`; the IR backend's `emit_prim`, the IR interp's `exec_prim`,
+and the x86 AST backend) gates on `intrinsics::is_primitive(name)`. A **compiled user
+function shadows a like-named primitive** (a program's own `Read`/`Join`) — a body in
+`funcs` means "call the body." A bare string statement prints verbatim (a direct
+`StdWrite`, no `%` processing); the `"fmt", args` comma form lowers to a `Print` call, so
+it needs `<stdio.hc>` — which the print auto-include always supplies.
 
 The only compiler-provided names with **no `lib/*.hc` declaration** are the implicit
 command line `ArgC`/`ArgV`, environment `EnvP`, and a `...` function's `VargC`/`VargV` —
 sema-injected globals/locals (doc-commented in `lib/builtin.hc`), captured at entry.
-(Darwin's heap lowering keeps a tiny private `libc_symbol` map `MAlloc`→`_malloc`/
-`Free`→`_free` in `arm64/mod.rs`.) Everything reducible is pure HolyC in `lib/*.hc`, so
+(On hosted Darwin, `emit_prim` maps the heap primitives to libc — `MAlloc`→`_malloc`,
+`Free`→`_free`; freestanding emits an `mmap` bump-allocator runtime.) Everything reducible
+is pure HolyC in `lib/*.hc`, so
 each function computes identically on every target; each lib file has an `#ifndef _NAME_HC`
 guard. The **impure groups** (clock, fd I/O, sockets, fs mutation, process ids, threads)
 are conformance-tested by *property* (e.g. monotonic clock, write→read round-trip), never
@@ -201,7 +242,7 @@ Public C-named headers:
 - `socket.hc` (`<sys/socket.h>`) — TCP (`Socket`/`Connect` + `TcpConnect`/`HttpGet`).
 - `threads.hc` (`<threads.h>`) — `Thread`/`Join` (Darwin pthread; freestanding raw
   `clone(2)` + futex join; interp runs bodies synchronously at spawn) **and**
-  `Mutex`/`Cond`/`RwLock` (Drepper futex locks in pure HolyC). `atomic.hc`
+  `Mutex`/`Cond`/`RwLock` (Drepper futex locks in pure HolyC). `stdatomic.hc`
   (`<stdatomic.h>`) — atomics (`Atomic*`, width-directed by the pointee) + `AtomicFence` +
   `FutexWait`/`FutexWake`. Freestanding sync globals are 16-byte-aligned (AArch64 exclusive
   / x86 `lock` ops fault on misalignment).
@@ -242,37 +283,34 @@ into `<stdio.hc>`; the IEEE bit ops into `<math.hc>`; the djb2 hash into `<hmap.
 - **Exceptions — `try`/`catch`/`throw` + `Fs`:** `throw expr;` raises a value (a bare
   `throw;` re-raises); `try { } catch { }` catches it (HolyC form, no catch parameter) and
   reads it as `Fs->except_ch`. `Fs` is the sema-injected implicit global `CTask *` (`CTask`
-  defined in `lib/builtin.hc`). Interp (the oracle) unwinds via an `Err` carried by
-  `pending_throw` (like `Exit`), with a `CTask` heap region whose `except_ch`/`catch_except`
-  it reads/writes by byte offset; an uncaught throw finishes cleanly after the pre-throw
-  output. **Native (arm64 + x86-64):** a jmp_buf/longjmp unwinder — each `try` builds an
-  on-stack `ExcFrame` (prev, saved sp/fp, landing-pad addr, callee-saved set) pushed on
-  the `Fs->exc_top` chain (`gen_try`); `throw` restores sp/fp/callee-saved from the top
-  frame and indirect-branches to its landing pad (`gen_throw`) — so `gen_call` is
-  untouched, zero per-call cost; uncaught → exit. arm64 additionally disables register
-  promotion in `try` functions (`RegAnalysis::has_try`) so promoted locals aren't reverted
-  by the restore; x86 never promotes, so locals are already in memory. **`Fs` storage is
-  per-thread on every target with threads:** Darwin via pthread TLS (`gen_fs_ptr` reads a
-  per-function cached slot filled by `emit_fs_cache` — `pthread_getspecific`/lazy-create +
-  a key created in `_main`); freestanding arm64-linux via `TPIDR_EL0` (`msr` at `_start`
-  for the main thread, in the `clone` child for spawned ones); freestanding x86-linux via
-  the `%fs` base (`arch_prctl(ARCH_SET_FS)` at `_start`, the `clone` `CLONE_SETTLS` for
-  children — `gen_fs_addr` reads `fs:[0]`, the `CTask` self-pointer). Windows uses the
-  process-global `CTask` (`CTASK_GLOBAL`), which is correct since it has no threads. All
-  freestanding setup is gated on `uses_exc`, so non-exception programs are byte-identical.
-  The x86 unwinder is shared across both x86 OS targets, so the freestanding ELF and the
-  Windows PE both compile `try`/`throw` (uncaught → the OS seam's exit: `exit_group` /
-  `ExitProcess`). `examples/exceptions.hc` is a tracked example in `common::EXAMPLES`, so
-  the per-example catch-all on **every** backend exercises it. Verified on
-  aarch64-apple-darwin (`tests/arm64_darwin.rs`: native conformance + a per-thread pthread
-  test); x86-64 linux/windows + freestanding-arm64 execution is verified on CI/docker (the
-  per-example tests plus `tests/x86_64_linux.rs::exceptions_match_the_interpreter`) — only
-  the emitter runs locally (no x86 runtime on macOS). Tested in `tests/interp.rs`,
-  `tests/arm64_darwin.rs`, `tests/x86_64_linux.rs`, and the per-example suites.
+  defined in `lib/builtin.hc`). **IR interp (the oracle)** unwinds via a per-frame
+  try-region stack: `TryBegin` pushes its landing-pad block, a `Throw`/`Rethrow` or a
+  `Call` that returns `Outcome::Threw` pops to the nearest pad; `except_ch`/`catch_except`
+  are byte writes into the `CTask`; an uncaught throw finishes cleanly after the pre-throw
+  output. **Native** is a jmp_buf/longjmp unwinder: each `try` builds an on-stack
+  `ExcFrame` pushed on the `Fs->exc_top` chain; `throw` restores sp/fp from the top frame
+  and indirect-branches to its landing pad — `gen_call` untouched, zero per-call cost;
+  uncaught → exit. **arm64 (`emit_ir.rs`):** `TryBegin`/`TryEnd`/`Throw`/`Rethrow`; the
+  `ExcFrame` is just `{prev, saved_sp, saved_fp, landing_pad}` (32 bytes, **no
+  callee-saved set** — spill-everything keeps nothing in callee-saved registers). `Fs` is
+  **per-thread** on Darwin via pthread TLS: an `Fs`-using function caches this thread's
+  `CTask*` in a frame slot filled in the prologue (`emit_fs_cache` — `pthread_getspecific`
+  / lazy-`malloc` + `pthread_setspecific`, key created in `@entry`), and `&Fs` resolves to
+  that slot. Freestanding arm64 spawns real `clone(2)` threads but keeps a single BSS
+  `CTask`, so concurrent cross-thread `throw`s race (non-exception parallelism is fine).
+  **x86-64 (AST):** `gen_try`/`gen_throw` with the callee-saved-bearing
+  `ExcFrame`; per-thread `Fs` via the `%fs` base (`arch_prctl` at `_start`,
+  `CLONE_SETTLS`); Windows uses the process-global `CTask`. All setup is gated on
+  `uses_exc`. `examples/exceptions.hc` is a tracked example, so the per-example catch-all
+  on every backend exercises it. Verified on aarch64-apple-darwin (`tests/arm64_darwin.rs`:
+  native conformance + a per-thread pthread stress test); x86-64 + freestanding-arm64
+  execution on CI/docker. Tested in `tests/interp.rs`, `tests/arm64_darwin.rs`,
+  `tests/x86_64_linux.rs`, and the per-example suites.
 - **`switch (x)` or `switch [x]`** (parsed identically); `start:`/`end:` sub-labels
   (keywords, so not usable as identifiers) are a prologue (runs on entry before dispatch)
-  / epilogue (reached by fall-through, skipped by `break`). A dense, all-constant-case
-  switch lowers to an O(1) jump table on arm64, else a compare-chain.
+  / epilogue (reached by fall-through, skipped by `break`). Lowered to a `Switch`
+  terminator (keeping `(lo,hi)` case ranges); arm64 lowers a dense, all-constant switch to
+  an O(1) jump table (`try_switch_table`), else a compare-chain; x86 always compare-chains.
 - **Chained range comparisons** (`a < b < c`, `0 <= i < n`) are a pure parser desugar to
   `(a<b) && (b<c)` (interior operands cloned, so `a < f() < b` calls twice); `==`/`!=`
   keep C's `(a==b)==c`.
@@ -288,13 +326,14 @@ into `<stdio.hc>`; the IEEE bit ops into `<math.hc>`; the djb2 hash into `<hmap.
   logical shift; signed vs unsigned divide). **Relational `< > <= >=`** are
   signedness-directed by the usual arithmetic conversions (unsigned if either operand is);
   integer compares are full 64-bit, not via `f64`. **Float→int conversion is
-  signedness-directed** (`FCVTZU`/`as u64` saturating vs `FCVTZS`/`as i64`). Interp keys
-  off the target type in `cast_value`; native routes int-store sites through
-  `gen_int_expr(e, target)`.
-- **Scalar stores coerce to the lvalue type** in the interp (`coerce_to`): `I64 w = 3.14`
-  → `3`, `F64 x = 5` → `5.0`, matching native register truncation/widening. `coerce_to`
-  also decays a string literal into a pointer to one stable buffer (consistent pointer
-  identity).
+  signedness-directed** (`FCVTZU`/`as u64` saturating vs `FCVTZS`/`as i64`). **All of this
+  is frozen at lowering** into the IR ops' `signed`/`ty` fields and `Cast{from,to}`, so the
+  IR interp and the backend cannot re-derive it differently; the IR interp's `bin`/`cast`
+  mirror the same rules.
+- **Scalar stores coerce to the lvalue type**, decided at lowering (`coerce`/
+  `coerce_to_ast` in `lower.rs`, emitting a `Cast`): `I64 w = 3.14` → `3`, `F64 x = 5`
+  → `5.0`, matching native register truncation/widening. A string literal in value
+  position decays to a stable interned-pointer address.
 - **No `struct` keyword** — the aggregate is `class` + `union`, `repr(C)` (natural
   alignment, declaration order). A class passes/assigns **by value** (deep copy); arrays
   **decay to pointers**. An anonymous `union { … };` promotes its members into the
@@ -322,10 +361,11 @@ address (the callee copies; class returns via an sret pointer in `x8`/`r11`); ar
 decay to a by-reference pointer; `&Func` is a self-resolved address and an indirect call
 classes its args off the callee's `Type::FuncPtr`. Print formatting is **one HolyC
 implementation** shared by every target: the printf family (`Print`/`StrPrint`/… → the
-`VFmt` spec parser → `FmtFloat`) lives in `<stdio.hc>`, so the interpreter runs those
-bodies and the backends compile-and-call them — no Rust formatter, byte-identical by
-construction. A bare string prints verbatim; the `"fmt", …` comma form lowers to a `Print`
-call (`gen_print`/`as_print` in the backends, routed through `call("Print", …)` in interp).
+`VFmt` spec parser → `FmtFloat`) lives in `<stdio.hc>`, so the IR interp runs those bodies
+and the backends compile-and-call them — no Rust formatter, byte-identical by
+construction. A bare string prints verbatim (a direct `StdWrite`); the `"fmt", …` comma
+form lowers to a `Print` call (in `lower.rs` for the IR path, `gen_print` in the x86 AST
+backend).
 
 ## Generics (monomorphized; `src/mono.rs`)
 The parser never instantiates; it **defers** every generic use to an AST node — `Vec<I64>`
@@ -357,14 +397,20 @@ mangling folds a value as `C<n>E` (`FixedArr<I64,8>` → `8FixedArrI64C8E`). **`
 (T) { case I64: … default: … }`** is a compile-time type switch: mono resolves the
 scrutinee's type, keeps only the matching arm (else `default`, else nothing), and
 **discards the rest before sema** — so a dead arm ill-typed for the chosen `T` never
-errors, and the surviving arm sees the concrete type. The `type` keyword does double duty
-(param introducer + switch marker). Stdlib `Vec<T>`/`Hmap<K,V>`/`Sort<T>` are generic; see
-`examples/generic.hc`.
+errors, and the surviving arm sees the concrete type. **`if type (T is U) … [else …]`**
+(`is not` negates) is the single-case analogue: a pure parser desugar (`parse_type_if`) to
+a one-arm `TypeSwitch`, so it shares all the mono machinery — both sides are types (usually
+a type param on the left); `is`/`not` are contextual words, not reserved. Used by
+`lib/math.hc`'s `Min`/`Max`/`Abs` to add the float-only path (return `T`, with `fmin`/
+`fmax` NaN handling / `Fabs`). The `type` keyword
+does double duty (param introducer + switch/if marker). Stdlib `Vec<T>`/`Hmap<K,V>`/
+`Sort<T>` are generic; see `examples/generic.hc`.
 
 ## Status / examples
 The backends compile the whole implemented subset: the `offset` keyword, brace +
-designated initializers (nested/partial/out-of-order, arrays of classes — a shared
-`gen_init_into` per backend), member access on a call result (`Mk().x`), function pointers
+designated initializers (nested/partial/out-of-order, arrays of classes — lowered to
+`MemZero` + leaf `Store`s in `lower.rs` for the IR path, `gen_init_into` in `backend.rs`
+for x86), member access on a call result (`Mk().x`), function pointers
 end to end (`&Func`, calls through a pointer, fn-ptr class fields/arrays/vtables), and
 `typedef` aliases for scalars, pointers, classes, and the anonymous-aggregate form
 `typedef class{…} Name` (resolved at parse time, defined before use). A **function-pointer

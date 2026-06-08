@@ -13,11 +13,15 @@ pub mod backend;
 pub mod codegen;
 pub mod interp;
 pub mod intrinsics;
+pub mod ir;
+pub mod irinterp;
 pub mod layout;
 pub mod lexer;
+pub mod lower;
 pub mod mono;
 pub mod parser;
 pub mod preproc;
+pub mod regalloc;
 pub mod sema;
 pub mod token;
 pub mod x86_64;
@@ -25,7 +29,6 @@ pub mod x86_64;
 pub use arm64::{Arm64Darwin, Arm64Linux};
 pub use ast::{Expr, ExprKind, Program, Stmt, StmtKind, Type};
 pub use codegen::{Codegen, CodegenError};
-pub use interp::Interpreter;
 pub use layout::{Layout, Layouts};
 pub use lexer::{LexError, Lexer, TokenStream, tokenize};
 pub use mono::MonoError;
@@ -81,9 +84,12 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("time.hc", include_str!("../lib/time.hc")),
     ("fcntl.hc", include_str!("../lib/fcntl.hc")),
     ("unistd.hc", include_str!("../lib/unistd.hc")),
+    ("errno.hc", include_str!("../lib/errno.hc")),
+    ("limits.hc", include_str!("../lib/limits.hc")),
+    ("float.hc", include_str!("../lib/float.hc")),
     ("socket.hc", include_str!("../lib/socket.hc")),
     ("threads.hc", include_str!("../lib/threads.hc")),
-    ("atomic.hc", include_str!("../lib/atomic.hc")),
+    ("stdatomic.hc", include_str!("../lib/stdatomic.hc")),
     // Container extensions (no C equivalent).
     ("vec.hc", include_str!("../lib/vec.hc")),
     ("hmap.hc", include_str!("../lib/hmap.hc")),

@@ -4,7 +4,7 @@
 //! to this output byte-for-byte by the `stdlib_math_matches_the_interpreter`
 //! conformance tests.
 
-use solomon::interp::run_to_string;
+use solomon::interp::{run_to_string, run_to_string_with_input};
 use solomon::parser::parse_with;
 use solomon::sema::check_program;
 
@@ -20,6 +20,493 @@ fn run_with_stdlib(src: &str) -> String {
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
     run_to_string(&program).unwrap_or_else(|e| panic!("runtime error: {e}"))
+}
+
+/// Like [`run_with_stdlib`], but with `input` as the program's standard input (fd 0),
+/// for exercising the `FGetC`/`FGetS`/`GetLine`/`ReadLine` family through the oracle.
+fn run_with_stdlib_input(src: &str, input: &[u8]) -> String {
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, &lib, std::slice::from_ref(&lib))
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = check_program(&program);
+    assert!(errs.is_empty(), "semantic errors: {errs:?}");
+    run_to_string_with_input(&program, input).unwrap_or_else(|e| panic!("runtime error: {e}"))
+}
+
+#[test]
+fn sscan_parses_fields_and_bases() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        U0 Main() {
+          I64 a, b; F64 f; U8 w[16]; U8 c;
+          I64 n = SScan("  42 -7 3.14 hello X", "%d %d %f %s %c", &a, &b, &f, w, &c);
+          "n=%d a=%d b=%d f=%.2f w=%s c=%c\n", n, a, b, f, w, c;
+          I64 h, o, i1;                       // hex, octal, %i auto-base
+          SScan("0xFF 075 0x10", "%x %o %i", &h, &o, &i1);
+          "h=%d o=%d i1=%d\n", h, o, i1;
+          F64 e; I64 z;                        // scientific float; %d then fails -> count 1
+          I64 m = SScan("1.5e3 zzz", "%f %d", &e, &z);
+          "m=%d e=%.1f\n", m, e;
+          I64 keep, skip;                      // '*' suppresses assignment
+          I64 k = SScan("1 2 3", "%d %*d %d", &keep, &skip);
+          "k=%d keep=%d skip=%d\n", k, keep, skip;
+          I64 only;                            // EOF before any match -> -1
+          "r=%d\n", SScan("", "%d", &only);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "n=5 a=42 b=-7 f=3.14 w=hello c=X\n\
+         h=255 o=61 i1=16\n\
+         m=1 e=1500.0\n\
+         k=2 keep=1 skip=3\n\
+         r=-1\n"
+    );
+}
+
+#[test]
+fn fgets_reads_stdin_lines_and_is_eof_safe() {
+    let src = r#"
+        #include <stdio.hc>
+        U0 Main() {
+          U8 line[32];
+          I64 n = 0;
+          while (FGetS(line, 32, STDIN)) {
+            I64 len = StrLen(line);
+            if (len > 0 && line[len - 1] == '\n') line[len - 1] = 0;
+            "[%s]\n", line;
+            n++;
+          }
+          "lines=%d\n", n;
+        }
+        Main;
+    "#;
+    assert_eq!(
+        run_with_stdlib_input(src, b"alpha\nbeta\ngamma"),
+        "[alpha]\n[beta]\n[gamma]\nlines=3\n"
+    );
+    assert_eq!(run_with_stdlib_input(src, b""), "lines=0\n");
+}
+
+#[test]
+fn getchar_and_readline_read_stdin() {
+    // GetChar streams bytes; ReadLine allocates a NL-stripped line per call.
+    let chars = run_with_stdlib_input(
+        r#"
+        #include <stdio.hc>
+        U0 Main() {
+          I64 c, n = 0;
+          while ((c = GetChar()) >= 0) n++;
+          "bytes=%d\n", n;
+        }
+        Main;
+    "#,
+        b"abcde",
+    );
+    assert_eq!(chars, "bytes=5\n");
+
+    let lines = run_with_stdlib_input(
+        r#"
+        #include <stdio.hc>
+        U0 Main() {
+          U8 *l;
+          while ((l = ReadLine(STDIN))) { "<%s>\n", l; Free(l); }
+        }
+        Main;
+    "#,
+        b"one\ntwo\nthree",
+    );
+    assert_eq!(lines, "<one>\n<two>\n<three>\n");
+}
+
+#[test]
+fn errno_strerror_table() {
+    let out = run_with_stdlib(
+        r#"
+        #include <errno.hc>
+        U0 Main() {
+          "%s\n", StrError(0);
+          "%s\n", StrError(ENOENT);
+          "%s\n", StrError(-ENOENT);    // a negative -errno is accepted too
+          "%s\n", StrError(EINVAL);
+          "%s\n", StrError(ENAMETOOLONG);
+          "%s\n", StrError(ECONNREFUSED);
+          "%s\n", StrError(99999);      // unknown -> generic
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "Success\n\
+         No such file or directory\n\
+         No such file or directory\n\
+         Invalid argument\n\
+         File name too long\n\
+         Connection refused\n\
+         Unknown error\n"
+    );
+}
+
+#[test]
+fn strnprint_bounds_and_returns_would_be_length() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        U0 Main() {
+          U8 buf[32];
+          I64 r;
+          r = StrNPrint(buf, 32, "%d-%s!", 42, "hello");  // fits: "42-hello!"
+          "[%s] r=%d\n", buf, r;
+          r = StrNPrint(buf, 5, "%d-%s!", 42, "hello");    // truncate to cap-1 = 4
+          "[%s] r=%d\n", buf, r;
+          r = StrNPrint(buf, 1, "abc");                    // only the NUL fits
+          "[%s] r=%d\n", buf, r;
+          StrCpy(buf, "ZZZ");
+          r = StrNPrint(buf, 0, "abc");                    // nothing written, still counts
+          "[%s] r=%d\n", buf, r;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "[42-hello!] r=9\n\
+         [42-h] r=9\n\
+         [] r=3\n\
+         [ZZZ] r=3\n"
+    );
+}
+
+#[test]
+fn if_type_selects_branch_per_instantiation() {
+    // `if type` is the single-case `switch type`: the untaken branch is discarded before
+    // sema, so a dead arm ill-typed for the chosen `T` is fine. Covers `is`/`is not` + else.
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        U8 *Kind<type T>(T x) {
+          if type (T is F64) return "float";
+          if type (T is not I64) return "other";
+          else return "int";
+        }
+        U0 Main() { "%s %s %s\n", Kind(1.5), Kind(42), Kind("hi"); }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "float int other\n");
+}
+
+#[test]
+fn min_max_preserve_element_type_and_handle_nan() {
+    let out = run_with_stdlib(
+        r#"
+        #include <math.hc>
+        U0 Main() {
+          "%d %d\n", Min(3, 9), Max(3, 9);          // integers stay I64
+          "%.2f %.2f\n", Min(2.5, 1.5), Max(2.5, 1.5); // floats are F64, not truncated
+          F64 nan = NaN();                              // fmin/fmax: NaN -> the other
+          "%.1f %.1f %.1f\n", Max(5.0, nan), Max(nan, 5.0), Min(nan, 5.0);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "3 9\n1.50 2.50\n5.0 5.0 5.0\n");
+}
+
+#[test]
+fn abs_preserves_element_type_and_ieee_semantics() {
+    let out = run_with_stdlib(
+        r#"
+        #include <math.hc>
+        U0 Main() {
+          "%d %d\n", Abs(-7), Abs(7);              // integers stay I64
+          "%.2f %.2f\n", Abs(-3.5), Abs(3.5);       // floats are F64, not truncated
+          "%.1f\n", Abs(-0.0);                       // IEEE: +0.0, not -0.0
+          "%d\n", IsNaN(Abs(NaN()));                 // NaN stays NaN
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "7 7\n3.50 3.50\n0.0\n1\n");
+}
+
+#[test]
+fn strtoi64base_handles_bases_and_endptr() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdlib.hc>
+        U0 Main() {
+          U8 *e;
+          "%d %d %d %d %d\n",
+            StrToI64Base("0xFF", 16, NULL),   // hex, explicit base
+            StrToI64Base("0xff", 0, NULL),    // hex, auto-detected
+            StrToI64Base("0755", 0, NULL),    // octal, auto-detected
+            StrToI64Base("777", 8, NULL),     // octal, explicit
+            StrToI64Base("-101", 2, NULL);    // binary, signed
+          StrToI64Base("  42rest", 10, &e);   // endptr left just past the digits
+          "endptr=[%s]\n", e;
+          U8 *s = "zzz";                       // no digits: 0, endptr == start
+          I64 v = StrToI64Base(s, 10, &e);
+          "fail v=%d ateq=%d\n", v, e == s;
+          "edge %d [%s]\n", StrToI64Base("0xZ", 0, &e), e; // "0x" w/o hex digit -> just "0"
+          "compat %d %d %d\n", StrToI64("123"), StrToI64("  7x"), StrToI64("abc");
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "255 255 493 511 -5\n\
+         endptr=[rest]\n\
+         fail v=0 ateq=1\n\
+         edge 0 [xZ]\n\
+         compat 123 7 0\n"
+    );
+}
+
+#[test]
+fn strtoul_and_strtof64_endptr() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdlib.hc>
+        U0 Main() {
+          U8 *e;
+          // strtoul: unsigned result, leading '-' wraps, full 64-bit range
+          "%u %u\n", StrToU64Base("-1", 10, NULL),
+                     StrToU64Base("0xFFFFFFFFFFFFFFFF", 16, NULL);
+          StrToU64Base("  255zzz", 0, &e);
+          "uend=[%s]\n", e;
+          // strtod: value + endptr
+          "%.3f\n", StrToF64End("3.14159xyz", &e);
+          "fend=[%s]\n", e;
+          "%.1f\n", StrToF64End("  -2.5e2 ", &e);
+          U8 *s = "nope";                         // no digits: 0.0, endptr == start
+          F64 v = StrToF64End(s, &e);
+          "fail %.1f ateq=%d\n", v, e == s;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "18446744073709551615 18446744073709551615\n\
+         uend=[zzz]\n\
+         3.142\n\
+         fend=[xyz]\n\
+         -250.0\n\
+         fail 0.0 ateq=1\n"
+    );
+}
+
+#[test]
+fn limits_and_float_constants() {
+    let out = run_with_stdlib(
+        r#"
+        #include <limits.hc>
+        #include <float.hc>
+        #include <math.hc>
+        U0 Main() {
+          "%d %d %u | %d %d %u\n", I8_MIN, I8_MAX, U8_MAX, I16_MIN, I16_MAX, U16_MAX;
+          "%d %d %u\n", I32_MIN, I32_MAX, U32_MAX;
+          "%d %d %u\n", I64_MIN, I64_MAX, U64_MAX;
+          // float characteristics must hit the canonical IEEE-754 bit patterns
+          "%x %x %x %x\n", Float64bits(F64_MAX), Float64bits(F64_MIN),
+                           Float64bits(F64_EPSILON), Float64bits(F64_TRUE_MIN);
+          "%x %x\n", Float64bits(DBL_MAX), Float64bits(DBL_EPSILON); // C aliases
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "-128 127 255 | -32768 32767 65535\n\
+         -2147483648 2147483647 4294967295\n\
+         -9223372036854775808 9223372036854775807 18446744073709551615\n\
+         7fefffffffffffff 10000000000000 3cb0000000000000 1\n\
+         7fefffffffffffff 3cb0000000000000\n"
+    );
+}
+
+#[test]
+fn strsep_preserves_empty_fields() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        #include <string.hc>
+        U0 Main() {
+          U8 s[32]; StrCpy(s, "a,,b,");      // empty fields kept (unlike StrTok)
+          U8 *p = s, *t;
+          while ((t = StrSep(&p, ","))) "[%s]", t;
+          "\n";
+          U8 s2[32]; StrCpy(s2, ",x"); p = s2; // leading delimiter -> empty first field
+          while ((t = StrSep(&p, ","))) "[%s]", t;
+          "\n";
+          U8 s3[32]; StrCpy(s3, "name=value"); p = s3;
+          U8 *k = StrSep(&p, "="), *v = StrSep(&p, "=");
+          "%s=%s null=%d\n", k, v, p == NULL;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "[a][][b][]\n[][x]\nname=value null=1\n");
+}
+
+#[test]
+fn string_h_workhorses() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        #include <string.hc>
+        U0 Main() {
+          U8 buf[32]; StrCpy(buf, "ab"); StrNCat(buf, "cdef", 2);   // strncat
+          "%s\n", buf;
+          "%s\n", StrPBrk("hello, world", " ,");                     // strpbrk
+          "%d %d %d\n", StrCaseCmp("Hello", "hello"), StrCaseCmp("abc", "abd"),
+                        StrNCaseCmp("ABCxx", "abcyy", 3);            // strcasecmp/strncasecmp
+          U8 *d = StrDup("dup"); "%s\n", d; Free(d);                 // strdup
+          U8 *nd = StrNDup("truncated", 5); "%s\n", nd; Free(nd);    // strndup
+          U8 s1[32]; StrCpy(s1, "a,bb,,ccc");                        // strtok (empty fields skipped)
+          U8 *t = StrTok(s1, ",");
+          while (t) { "%s.", t; t = StrTok(NULL, ","); }
+          "\n";
+          U8 s2[32]; StrCpy(s2, "one  two");                         // strtok_r
+          U8 *sv; U8 *r = StrTokR(s2, " ", &sv);
+          while (r) { "%s.", r; r = StrTokR(NULL, " ", &sv); }
+          "\n";
+          U8 mb[16]; U8 *q = MemCCpy(mb, "key=v", '=', 16); *q = 0;  // memccpy
+          "%s\n", mb;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "abcd\n, world\n0 -1 0\ndup\ntrunc\na.bb.ccc.\none.two.\nkey=\n"
+    );
+}
+
+#[test]
+fn math_classification_and_integer_rounds() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        #include <math.hc>
+        #include <float.hc>
+        U0 Main() {
+          // lround: ties away from zero
+          "%d %d %d %d %d\n", LRound(2.5), LRound(-2.5), LRound(2.4), LRound(2.6), LRound(-0.5);
+          // lrint: ties to even
+          "%d %d %d %d\n", LRint(2.5), LRint(3.5), LRint(-2.5), LRint(2.6);
+          F64 nan = NaN(), inf = Inf(1), sub = F64_TRUE_MIN;
+          "%d %d %d %d\n", IsFinite(1.0), IsFinite(nan), IsFinite(inf), IsFinite(sub);
+          "%d %d %d %d %d\n", IsNormal(1.0), IsNormal(0.0), IsNormal(sub), IsNormal(inf), IsNormal(nan);
+          // FpClassify -> FP_NAN/INFINITE/ZERO/SUBNORMAL/NORMAL = 0..4
+          "%d %d %d %d %d\n", FpClassify(nan), FpClassify(inf), FpClassify(0.0),
+                              FpClassify(sub), FpClassify(1.5);
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "3 -3 2 3 -1\n\
+         2 4 -2 3\n\
+         1 0 0 1\n\
+         1 0 0 0 0\n\
+         0 1 2 3 4\n"
+    );
+}
+
+#[test]
+fn time_difftime_localtime_and_cpu_clock() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        #include <time.hc>
+        U0 Main() {
+          "%.1f\n", Difftime(1000, 250);             // pure: 750.0 seconds
+          DateTime l = Localtime(1700000000, -8 * 3600); // UTC 22:13:20 -> PST 14:13:20
+          U8 b[64]; FmtISO(b, l); "%s\n", b;
+          // CpuNS/Clock are impure -> property only: non-negative and non-decreasing
+          I64 a = CpuNS(), s = 0, i;
+          for (i = 0; i < 1000000; i++) s += i;
+          I64 c = CpuNS();
+          "%d %d %d\n", a >= 0, c >= a, Clock() >= 0;
+          "%d\n", CLOCKS_PER_SEC;
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(out, "750.0\n2023-11-14 14:13:20\n1 1 1\n1000000\n");
+}
+
+#[test]
+fn strftime_formats_dates() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        #include <time.hc>
+        U0 Main() {
+          DateTime dt = FromUnix(1700000000); // Tue 2023-11-14 22:13:20 UTC
+          U8 b[128];
+          Strftime(b, 128, "%Y-%m-%d %H:%M:%S", dt); "%s\n", b;
+          Strftime(b, 128, "%a %A %b %B", dt); "%s\n", b;
+          Strftime(b, 128, "%I:%M %p j=%j w=%w u=%u", dt); "%s\n", b;
+          Strftime(b, 128, "%F %T %R %D %y %%", dt); "%s\n", b;
+          Strftime(b, 128, "%c", dt); "%s\n", b;
+          // truncation returns 0; a fitting one returns the length
+          "trunc=%d ok=%d\n", Strftime(b, 5, "%Y-%m-%d", dt), Strftime(b, 8, "%H:%M", dt);
+          DateTime e = FromUnix(0); Strftime(b, 128, "%a %F", e); "%s\n", b; // Thu epoch
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "2023-11-14 22:13:20\n\
+         Tue Tuesday Nov November\n\
+         10:13 PM j=318 w=2 u=2\n\
+         2023-11-14 22:13:20 22:13 11/14/23 23 %\n\
+         Tue Nov 14 22:13:20 2023\n\
+         trunc=0 ok=5\n\
+         Thu 1970-01-01\n"
+    );
+}
+
+#[test]
+fn cheap_cleanups_fmax_div_strnlen_puts_errno() {
+    let out = run_with_stdlib(
+        r#"
+        #include <stdio.hc>
+        #include <stdlib.hc>
+        #include <math.hc>
+        #include <string.hc>
+        #include <errno.hc>
+        U0 Main() {
+          "%.1f %.1f %.1f\n", Fmax(2.5, 1.5), Fmin(2.5, 1.5), Fmax(5.0, NaN()); // fmin/fmax
+          q, r := Div(-7, 2);                                   // div/ldiv, truncates to (-3,-1)
+          "%d %d\n", q, r;
+          "%d %d\n", StrNLen("hello", 3), StrNLen("hi", 9);     // strnlen
+          PutChar('H'); PutChar('i'); PutChar('\n');             // putchar
+          Puts("line");                                          // puts (+newline)
+          "%s|%s\n", StrError(ECONNABORTED), StrError(ECANCELED); // new errno codes
+        }
+        Main;
+    "#,
+    );
+    assert_eq!(
+        out,
+        "2.5 1.5 5.0\n\
+         -3 -1\n\
+         3 2\n\
+         Hi\n\
+         line\n\
+         Software caused connection abort|Operation canceled\n"
+    );
 }
 
 #[test]

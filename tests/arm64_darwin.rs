@@ -11,12 +11,13 @@
 //!   shell out to `cc` and execute a Mach-O binary, so they only run on an
 //!   arm64-Darwin host and self-skip elsewhere.
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use solomon::arm64::Arm64Darwin;
 use solomon::codegen::Codegen;
-use solomon::interp::run_to_string;
+use solomon::interp::{run_to_string, run_to_string_with_input};
 use solomon::parser::{parse, parse_with};
 use solomon::sema::check_program;
 
@@ -203,6 +204,323 @@ fn assert_native_matches_interp(src: &str) {
     );
     let native = build_and_capture(src);
     assert_eq!(native, interp, "native != interp for:\n{src}");
+}
+
+/// Like [`assert_native_matches_interp`] but with `input` on the program's stdin: the
+/// native binary gets it through a pipe, the interpreter through
+/// `run_to_string_with_input`. Exercises the `Read(0,…)`-based input family natively.
+fn assert_native_matches_interp_input(src: &str, input: &[u8]) {
+    let program = common::parse_example(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(check_program(&program).is_empty());
+    let interp =
+        run_to_string_with_input(&program, input).unwrap_or_else(|e| panic!("interp error: {e}"));
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let out = std::env::temp_dir().join(format!("solomon-arm64-in-{}-{id}", std::process::id()));
+    Arm64Darwin::new(&out)
+        .run(&program)
+        .unwrap_or_else(|e| panic!("arm64 build failed: {e}"));
+    let mut child = Command::new(&out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("could not spawn produced binary: {e}"));
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&out);
+    let native = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(native, interp, "native != interp (stdin) for:\n{src}");
+}
+
+#[test]
+fn native_strtoi64base_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `StrToI64Base` (strtol: base + endptr) is pure HolyC — must match the interpreter
+    // (strtoi64base_handles_bases_and_endptr in tests/stdlib.rs), incl. the endptr write.
+    let src = r#"
+        #include <stdlib.hc>
+        U0 Main() {
+          U8 *e;
+          "%d %d %d %d %d\n",
+            StrToI64Base("0xFF", 16, NULL), StrToI64Base("0xff", 0, NULL),
+            StrToI64Base("0755", 0, NULL), StrToI64Base("777", 8, NULL),
+            StrToI64Base("-101", 2, NULL);
+          StrToI64Base("  42rest", 10, &e);
+          "[%s]\n", e;
+          U8 *s = "zzz"; I64 v = StrToI64Base(s, 10, &e);
+          "%d %d\n", v, e == s;
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_cheap_cleanups_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Fmin/Fmax, Div (tuple), StrNLen, PutChar/Puts, new errno codes — all pure HolyC.
+    let src = r#"
+        #include <stdio.hc>
+        #include <stdlib.hc>
+        #include <math.hc>
+        #include <string.hc>
+        #include <errno.hc>
+        U0 Main() {
+          "%.1f %.1f %.1f\n", Fmax(2.5, 1.5), Fmin(2.5, 1.5), Fmax(5.0, NaN());
+          q, r := Div(-7, 2);
+          "%d %d %d %d\n", q, r, StrNLen("hello", 3), StrNLen("hi", 9);
+          PutChar('H'); PutChar('i'); PutChar('\n'); Puts("line");
+          "%s\n", StrError(ECANCELED);
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_difftime_localtime_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Difftime/Localtime are pure calendar math — pinned against the interpreter.
+    let src = r#"
+        #include <stdio.hc>
+        #include <time.hc>
+        U0 Main() {
+          "%.1f\n", Difftime(1000, 250);
+          DateTime l = Localtime(1700000000, -8 * 3600);
+          U8 b[64]; FmtISO(b, l); "%s\n", b;
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_cpu_clock_is_sane() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // CpuNS/Clock are impure (process CPU time via clock_gettime), so they're checked by
+    // property — non-negative and non-decreasing across some work — not interp-vs-value.
+    let src = r#"
+        #include <stdio.hc>
+        #include <time.hc>
+        U0 Main() {
+          I64 a = CpuNS(), s = 0, i;
+          for (i = 0; i < 2000000; i++) s += i;
+          I64 c = CpuNS();
+          "%d\n", a >= 0 && c >= a && Clock() >= 0;
+        }
+        Main;
+    "#;
+    assert_eq!(build_and_capture(src), "1\n");
+}
+
+#[test]
+fn native_strftime_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `Strftime` is pure HolyC (name tables + StrPrint) — pinned against the interpreter
+    // (strftime_formats_dates in stdlib.rs).
+    let src = r#"
+        #include <stdio.hc>
+        #include <time.hc>
+        U0 Main() {
+          DateTime dt = FromUnix(1700000000);
+          U8 b[128];
+          Strftime(b, 128, "%A %B %e %Y %T", dt); "%s\n", b;
+          Strftime(b, 128, "%I:%M %p j=%j w=%w u=%u %c", dt); "%s\n", b;
+          "%d %d\n", Strftime(b, 5, "%Y-%m-%d", dt), Strftime(b, 8, "%H:%M", dt);
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_math_classify_round_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // The new <math.h> rounds/classifiers are pure HolyC — pinned against the interpreter
+    // (math_classification_and_integer_rounds in stdlib.rs).
+    let src = r#"
+        #include <stdio.hc>
+        #include <math.hc>
+        #include <float.hc>
+        U0 Main() {
+          "%d %d %d %d\n", LRound(2.5), LRound(-2.5), LRint(2.5), LRint(3.5);
+          F64 nan = NaN(), inf = Inf(1), sub = F64_TRUE_MIN;
+          "%d %d %d %d\n", IsFinite(1.0), IsFinite(inf), IsNormal(sub), IsNormal(1.0);
+          "%d %d %d %d %d\n", FpClassify(nan), FpClassify(inf), FpClassify(0.0),
+                              FpClassify(sub), FpClassify(1.5);
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_limits_float_constants_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // The `<limits.hc>`/`<float.hc>` constants must read back identically natively —
+    // incl. I64_MIN (native NEG wraps, like the fixed interpreter) and the F64 bit
+    // patterns. Pinned against the interpreter (limits_and_float_constants in stdlib.rs).
+    let src = r#"
+        #include <limits.hc>
+        #include <float.hc>
+        #include <math.hc>
+        U0 Main() {
+          "%d %d %u %d %d %u\n", I8_MIN, I8_MAX, U8_MAX, I16_MIN, I16_MAX, U16_MAX;
+          "%d %d %u %d %d %u\n", I32_MIN, I32_MAX, U32_MAX, I64_MIN, I64_MAX, U64_MAX;
+          "%x %x %x %x\n", Float64bits(F64_MAX), Float64bits(F64_MIN),
+                           Float64bits(F64_EPSILON), Float64bits(F64_TRUE_MIN);
+          "%d\n", -I64_MIN; // wraps to I64_MIN
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_strsep_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // strsep keeps empty fields and uses an explicit `**stringp` — pure HolyC, pinned
+    // against the interpreter (strsep_preserves_empty_fields in stdlib.rs).
+    let src = r#"
+        #include <stdio.hc>
+        #include <string.hc>
+        U0 Main() {
+          U8 s[32]; StrCpy(s, "a,,b,"); U8 *p = s, *t;
+          while ((t = StrSep(&p, ","))) "[%s]", t;
+          "\n";
+          U8 s2[32]; StrCpy(s2, "k=v"); p = s2;
+          U8 *k = StrSep(&p, "="), *v = StrSep(&p, "=");
+          "%s=%s %d\n", k, v, p == NULL;
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_string_h_workhorses_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // The new <string.h> functions (strncat/strpbrk/strcasecmp/strdup/strtok/memccpy …)
+    // are pure HolyC — pinned against the interpreter (string_h_workhorses in stdlib.rs),
+    // incl. StrTok's private-global state and StrDup's MAlloc.
+    let src = r#"
+        #include <stdio.hc>
+        #include <string.hc>
+        U0 Main() {
+          U8 buf[32]; StrCpy(buf, "ab"); StrNCat(buf, "cdef", 2);
+          "%s %s\n", buf, StrPBrk("hello, world", " ,");
+          "%d %d %d\n", StrCaseCmp("Hello", "hello"), StrCaseCmp("abc", "abd"),
+                        StrNCaseCmp("ABCxx", "abcyy", 3);
+          U8 *d = StrDup("dup"); U8 *nd = StrNDup("truncated", 5);
+          "%s %s\n", d, nd; Free(d); Free(nd);
+          U8 s1[32]; StrCpy(s1, "a,bb,,ccc"); U8 *t = StrTok(s1, ",");
+          while (t) { "%s.", t; t = StrTok(NULL, ","); }
+          "\n";
+          U8 mb[16]; U8 *q = MemCCpy(mb, "key=v", '=', 16); *q = 0; "%s\n", mb;
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_strtoul_strtof64end_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `StrToU64Base` (strtoul) + `StrToF64End` (strtod w/ endptr) are pure HolyC — must
+    // match the interpreter (strtoul_and_strtof64_endptr in tests/stdlib.rs).
+    let src = r#"
+        #include <stdlib.hc>
+        U0 Main() {
+          U8 *e;
+          "%u %u\n", StrToU64Base("-1", 10, NULL),
+                     StrToU64Base("0xFFFFFFFFFFFFFFFF", 16, NULL);
+          StrToU64Base("  255zzz", 0, &e); "[%s]\n", e;
+          "%.3f\n", StrToF64End("3.14159xyz", &e); "[%s]\n", e;
+          U8 *s = "nope"; F64 v = StrToF64End(s, &e);
+          "%.1f %d\n", v, e == s;
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_generic_minmax_abs_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `Min`/`Max`/`Abs` return the element type `T` (so floats aren't truncated) with an
+    // `if type (T is F64)` branch — fmin/fmax NaN semantics for Min/Max, IEEE Fabs for
+    // Abs — checked natively vs the interpreter.
+    let src = r#"
+        #include <math.hc>
+        U0 Main() {
+          "%d %d\n", Min(3, 9), Max(3, 9);
+          "%.2f %.2f\n", Min(2.5, 1.5), Max(2.5, 1.5);
+          F64 nan = NaN();
+          "%.1f %.1f %.1f\n", Max(5.0, nan), Max(nan, 5.0), Min(nan, 5.0);
+          "%d %.2f %.1f %d\n", Abs(-7), Abs(-3.5), Abs(-0.0), IsNaN(Abs(nan));
+        }
+        Main;
+    "#;
+    assert_native_matches_interp(src);
+}
+
+#[test]
+fn native_stdin_input_matches_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // Reads stdin line by line (FGetS) and SScans two ints per line — exercises the
+    // text-input family and sscanf natively against the interpreter.
+    let src = r#"
+        #include <stdio.hc>
+        U0 Main() {
+          U8 line[64];
+          I64 n = 0;
+          while (FGetS(line, 64, STDIN)) {
+            I64 a, b;
+            if (SScan(line, "%d %d", &a, &b) == 2) "sum=%d\n", a + b;
+            else "skip\n";
+            n++;
+          }
+          "lines=%d\n", n;
+        }
+        Main;
+    "#;
+    assert_native_matches_interp_input(src, b"3 4\n10 20\nnope\n5 6");
+    assert_native_matches_interp_input(src, b""); // EOF-safe
 }
 
 #[test]
@@ -1245,6 +1563,37 @@ fn native_strprint_matches_interp() {
 }
 
 #[test]
+fn native_strnprint_bounds_match_interp() {
+    if !toolchain_available() {
+        eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
+        return;
+    }
+    // `StrNPrint` (snprintf) truncates to `cap - 1` bytes and returns the would-be
+    // length — its bounded `Pf` path is HolyC, so it must match the interpreter
+    // (strnprint_bounds_and_returns_would_be_length in tests/stdlib.rs).
+    let src = r#"
+        U0 Main() {
+            U8 buf[32];
+            I64 r;
+            r = StrNPrint(buf, 32, "%d-%s!", 42, "hello");
+            "[%s] r=%d\n", buf, r;
+            r = StrNPrint(buf, 5, "%d-%s!", 42, "hello");
+            "[%s] r=%d\n", buf, r;
+            r = StrNPrint(buf, 1, "abc");
+            "[%s] r=%d\n", buf, r;
+            StrCpy(buf, "ZZZ");
+            r = StrNPrint(buf, 0, "abc");
+            "[%s] r=%d\n", buf, r;
+        }
+        Main;
+    "#;
+    assert_eq!(
+        build_and_capture(src),
+        "[42-hello!] r=9\n[42-h] r=9\n[] r=3\n[ZZZ] r=3\n"
+    );
+}
+
+#[test]
 fn native_scientific_general_floats_match_interp() {
     if !toolchain_available() {
         eprintln!("skipping: arm64 backend needs aarch64-apple-darwin + cc");
@@ -1479,8 +1828,9 @@ fn compiles_printing() {
         // hex and char
         (r#""%x\n", 255;"#, "ff\n"),
         (r#""%c%c\n", 65, 66;"#, "AB\n"),
-        // literal percent
-        (r#""100%%\n";"#, "100%\n"),
+        // a bare string prints verbatim (no format processing), so `%%` stays `%%`;
+        // only the comma form `"fmt", args` formats. (Matches the interpreter oracle.)
+        (r#""100%%\n";"#, "100%%\n"),
         // a string-literal argument
         (r#""%s!\n", "hi";"#, "hi!\n"),
         // the Print() builtin
@@ -2509,12 +2859,18 @@ fn native_exceptions_are_per_thread() {
 #[test]
 fn unsupported_constructs_are_rejected() {
     // Constructs beyond the current milestones must error at build time rather than
-    // silently miscompile.
+    // silently miscompile. Each is exercised (called from the top level) so the
+    // reachability-based IR backend actually emits it and rejects it — the AST backend
+    // rejects every defined function regardless, so both agree.
     let out = std::env::temp_dir().join("solomon-arm64-should-not-exist");
     for src in [
-        "U0 F(I64 a,I64 b,I64 c,I64 d,I64 e,I64 f,I64 g,I64 h,I64 i){}", // >8 integer params
-        "U0 G(F64 a,F64 b,F64 c,F64 d,F64 e,F64 f,F64 g,F64 h,F64 i){}", // >8 float params
-        "U0 P(){ I64 Q(){ return 1; } }",                                // nested function
+        // >8 integer params
+        "U0 F(I64 a,I64 b,I64 c,I64 d,I64 e,I64 f,I64 g,I64 h,I64 i){} F(1,2,3,4,5,6,7,8,9);",
+        // >8 float params
+        "U0 G(F64 a,F64 b,F64 c,F64 d,F64 e,F64 f,F64 g,F64 h,F64 i){} \
+         G(1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0);",
+        // nested function
+        "U0 P(){ I64 Q(){ return 1; } } P;",
     ] {
         let program = parse(src).unwrap();
         let err = match Arm64Darwin::new(&out).run(&program) {

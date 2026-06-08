@@ -74,10 +74,6 @@ impl ArmTarget for Darwin {
         }
         Ok(())
     }
-
-    fn variadic_in_registers(&self) -> bool {
-        false // Apple's ARM64 ABI passes all variadic args on the stack
-    }
 }
 
 const RELOC_BRANCH26: u32 = 2;

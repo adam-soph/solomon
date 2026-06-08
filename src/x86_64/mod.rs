@@ -100,8 +100,20 @@ use crate::layout::{self, Layouts};
 use crate::token::{Pos, Span};
 
 mod asm;
+mod emit_ir;
 mod linux;
 mod windows;
+
+/// Compile a program to a runnable image, choosing the IR backend by default and the
+/// legacy AST-walking backend only when `SOLOMON_X86_AST` is set (a transition escape
+/// hatch during the IR migration).
+fn compile_program(program: &Program, os: Box<dyn OsTarget>) -> Result<Vec<u8>, CodegenError> {
+    if std::env::var_os("SOLOMON_X86_AST").is_some() {
+        compile(program, os)
+    } else {
+        emit_ir::compile_ir(program, os)
+    }
+}
 
 use asm::Asm;
 pub use linux::X64Linux;
@@ -171,6 +183,11 @@ trait OsTarget {
     /// unspecified. Linux uses `clock_gettime(CLOCK_MONOTONIC)`; Windows uses
     /// `GetTickCount64`.
     fn emit_mono_ns(&mut self, asm: &mut Asm, scratch: i32);
+
+    /// Read the process CPU time into `rax` as nanoseconds. `scratch` is at least 32
+    /// bytes of BSS. Linux uses `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`; Windows sums
+    /// the kernel and user `FILETIME`s from `GetProcessTimes`.
+    fn emit_cpu_ns(&mut self, asm: &mut Asm, scratch: i32);
 
     /// Suspend the thread for the nanosecond count in `rax`. Linux uses `nanosleep`;
     /// Windows uses `Sleep`, which has millisecond granularity.
@@ -2059,7 +2076,7 @@ impl Cg {
         Ok(())
     }
 
-    /// Lower an atomic op (`atomic.hc`), width-directed by the pointer's pointee type
+    /// Lower an atomic op (`stdatomic.hc`), width-directed by the pointer's pointee type
     /// (1/2/4/8 bytes). On x86-64 a plain aligned `mov` already gives an atomic
     /// acquire load / release store; add/swap/cas use the `lock`-prefixed
     /// `xadd`/`xchg`/`cmpxchg`. The loaded value is sign/zero-extended to the pointee
@@ -2148,12 +2165,14 @@ impl Cg {
             }
             // Clock/time primitives via the Linux syscalls (clock_gettime nr 228,
             // nanosleep nr 35) over a BSS timespec. CLOCK_REALTIME=0, MONOTONIC=1.
-            "UnixNS" | "NanoNS" => {
-                let scratch = self.alloc_bss(16, 8);
-                if name == "NanoNS" {
-                    self.os.emit_mono_ns(&mut self.asm, scratch);
-                } else {
-                    self.os.emit_unix_ns(&mut self.asm, scratch);
+            "UnixNS" | "NanoNS" | "CpuNS" => {
+                // CpuNS needs room for Windows' four FILETIMEs (32 bytes); the others
+                // use a 16-byte timespec.
+                let scratch = self.alloc_bss(if name == "CpuNS" { 32 } else { 16 }, 8);
+                match name {
+                    "NanoNS" => self.os.emit_mono_ns(&mut self.asm, scratch),
+                    "CpuNS" => self.os.emit_cpu_ns(&mut self.asm, scratch),
+                    _ => self.os.emit_unix_ns(&mut self.asm, scratch),
                 }
                 Ok(())
             }

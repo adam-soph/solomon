@@ -22,7 +22,6 @@ use std::process::ExitCode;
 
 use solomon::arm64::{Arm64Darwin, Arm64Linux};
 use solomon::codegen::Codegen;
-use solomon::interp::Interpreter;
 use solomon::x86_64::{X64Linux, X64Windows};
 use solomon::{lexer, parser, sema};
 
@@ -356,17 +355,38 @@ fn run_interp(rest: Vec<String>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let stdout = std::io::stdout();
-    let mut interp = Interpreter::new(stdout.lock());
-    // argv[0] is the script name, or "hcc" when reading from stdin. The rest are
-    // the trailing command-line arguments.
+    // Lower to the SSA IR and run it through the IR interpreter (the same engine the
+    // conformance oracle uses). The program reads the host's stdin via `Read(0, …)` (so
+    // the HolyC `FGetC`/`FGetS`/`GetLine` family works), matching a compiled binary.
+    let (layouts, layout_errs) = solomon::layout::compute(&program);
+    if let Some(e) = layout_errs.first() {
+        eprintln!("{}", e.message);
+        return ExitCode::FAILURE;
+    }
+    let ir = match solomon::lower::lower(&program, &layouts) {
+        Ok(ir) => ir,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut interp = solomon::irinterp::IrInterp::new(&ir);
+    interp.set_input(Box::new(std::io::stdin()));
+    // argv[0] is the script name, or "hcc" when reading from stdin; the rest are the
+    // trailing command-line arguments.
     interp.set_args(if positionals.is_empty() {
         vec!["hcc".to_string()]
     } else {
         positionals
     });
-    match interp.run(&program) {
-        Ok(()) => ExitCode::SUCCESS,
+    match interp.run_program() {
+        Ok(out) => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(out.as_bytes());
+            let _ = stdout.flush();
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
