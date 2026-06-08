@@ -287,15 +287,10 @@ impl FnEmit<'_> {
         // Plan register promotion: hot vregs → callee-saved rbx/r12–r14 (no float pool,
         // since System V has no callee-saved xmm). A spilled vreg (`None`) still gets a
         // frame slot below; a promoted one lives in its register, slot dead but harmless.
-        // Linux only: the Windows PE's inlined kernel32 seam (`WriteFile`/`VirtualAlloc`/…)
-        // does not reliably preserve a promoted value across a call, so the Windows target
-        // keeps the proven spill-everything baseline (an empty pool = no promotion).
-        let int_pool: &[u32] = if self.os.is_posix() {
-            &PROMOTE_INT
-        } else {
-            &[]
-        };
-        self.vreg_reg = crate::regalloc::plan_registers(f, int_pool, &[]);
+        // Safe on Windows too now that the prologue stack-probes large frames: a promoted
+        // vreg's prologue spill writes deep in the frame, which without the probe skipped
+        // the one-page Windows stack commit and faulted (see `Asm::prologue_probe`).
+        self.vreg_reg = crate::regalloc::plan_registers(f, &PROMOTE_INT, &[]);
 
         // ---- frame layout (spill everything) ----
         let mut frame = 0i32;
@@ -328,7 +323,16 @@ impl FnEmit<'_> {
 
         // ---- prologue ----
         self.asm.place(self.labels[f.name.as_str()]);
-        let frame_pos = self.asm.prologue();
+        // Windows commits only one stack page, and we emit no `__chkstk`, so a frame larger
+        // than a page must probe each page as it descends or a deep access faults (Linux
+        // grows the stack on demand). The probe bakes in the frame size; the plain prologue
+        // patches it later.
+        let frame_pos = if !self.os.is_posix() && frame_size > 4096 {
+            self.asm.prologue_probe(frame_size);
+            None
+        } else {
+            Some(self.asm.prologue())
+        };
 
         // Save the caller's value of every callee-saved register we promote into. This
         // precedes the parameter stores below (which may overwrite a promoted register
@@ -382,7 +386,10 @@ impl FnEmit<'_> {
         // Walk the blocks via the shared driver.
         crate::backend::emit_blocks(self, f)?;
 
-        self.asm.patch_frame(frame_pos, frame_size);
+        // The probed prologue baked the frame size in; the plain one needs a patch.
+        if let Some(pos) = frame_pos {
+            self.asm.patch_frame(pos, frame_size);
+        }
         Ok(())
     }
 

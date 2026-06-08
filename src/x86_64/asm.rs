@@ -234,6 +234,29 @@ impl Asm {
         self.emit(&[0, 0, 0, 0]);
         pos
     }
+
+    /// A frame prologue that **stack-probes**, for frames larger than one page on Windows.
+    /// `push rbp; mov rbp, rsp`, then commit each 4 KiB page from `rsp` down to
+    /// `rsp - frame`, touching one page at a time so a deep frame access (e.g. a prologue
+    /// callee-saved spill at the bottom of the frame) never skips the guard page — Windows
+    /// faults on that, since we emit no `__chkstk`. The frame size is baked in (no patch).
+    /// `rax` is scratch here: parameters arrive in argument registers / on the stack.
+    pub(super) fn prologue_probe(&mut self, frame: i32) {
+        self.emit(&[0x55]); // push rbp
+        self.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+        self.emit(&[0xB8]); // mov eax, frame  (zero-extended into rax)
+        self.emit(&frame.to_le_bytes());
+        let loop_start = self.code.len();
+        self.emit(&[0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00]); // sub rsp, 4096
+        self.emit(&[0x48, 0x83, 0x0C, 0x24, 0x00]); // or qword [rsp], 0  (commit the page)
+        self.emit(&[0x48, 0x2D, 0x00, 0x10, 0x00, 0x00]); // sub rax, 4096
+        self.emit(&[0x48, 0x3D, 0x00, 0x10, 0x00, 0x00]); // cmp rax, 4096
+        // ja loop_start while the remaining size still exceeds a page (rel8 backward).
+        let rel = loop_start as i64 - (self.code.len() as i64 + 2);
+        self.emit(&[0x77, rel as u8]); // ja rel8
+        self.emit(&[0x48, 0x29, 0xC4]); // sub rsp, rax  (the < 4096-byte remainder)
+        self.emit(&[0x48, 0x83, 0x0C, 0x24, 0x00]); // or qword [rsp], 0  (commit the last page)
+    }
     pub(super) fn patch_frame(&mut self, pos: usize, frame: i32) {
         self.code[pos..pos + 4].copy_from_slice(&frame.to_le_bytes());
     }
