@@ -189,6 +189,14 @@ impl WindowsTarget {
         asm.store_rsp_imm(48, 0); // [rsp+48] = hTemplateFile = NULL
         asm.call_extern(cf);
         asm.mov_rr(super::RSP, R15); // restore rsp
+        // CreateFileA returns INVALID_HANDLE_VALUE (-1) on failure. The other targets'
+        // `Open` returns `-errno`, so map a failed open to `-ENOENT` (the common
+        // missing-file case, and the canonical Linux errno). A valid HANDLE is never -1.
+        let ok = asm.new_label();
+        asm.cmp_ri(RAX, -1);
+        asm.jne(ok);
+        asm.mov_ri(RAX, -2); // -ENOENT
+        asm.place(ok);
     }
 }
 
