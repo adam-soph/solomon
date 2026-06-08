@@ -47,7 +47,7 @@ impl Codegen for X64Windows {
     }
 
     fn run(&mut self, program: &Program) -> Result<(), CodegenError> {
-        let pe = super::compile_program(program, Box::new(WindowsTarget::new()))?;
+        let pe = super::emit_ir::compile_ir(program, Box::new(WindowsTarget::new()))?;
         std::fs::write(&self.out_path, &pe)
             .map_err(|e| CodegenError::new(format!("cannot write PE executable: {e}"), None))
     }

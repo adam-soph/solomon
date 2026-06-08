@@ -31,10 +31,15 @@ use crate::ast::{
     AssignOp, BinOp, Expr, ExprKind, FuncDef, PostOp, Program, SizeofArg, Stmt, StmtKind, Type,
     UnOp,
 };
-use crate::backend::is_aggregate;
 use crate::codegen::CodegenError;
 use crate::ir::*;
 use crate::layout::Layouts;
+
+/// Whether `ty` is an aggregate (a class/union or array) — represented by its address,
+/// never a register, so it lives in an `alloca` slot reached via load/store.
+fn is_aggregate(ty: &Type) -> bool {
+    matches!(ty, Type::Named(_) | Type::Array(..))
+}
 
 /// Lower a typed, laid-out program to SSA IR.
 ///

@@ -9,7 +9,6 @@
 
 pub mod arm64;
 pub mod ast;
-pub mod backend;
 pub mod codegen;
 pub mod interp;
 pub mod intrinsics;

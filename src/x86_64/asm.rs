@@ -200,20 +200,6 @@ impl Asm {
         }
         self.emit(&[0xFF, 0xE0 | (reg & 7)]);
     }
-    /// Emits `add <reg>, imm32` (sign-extended), `0x81 /0`. A general counterpart to
-    /// `add_rax_imm32` for computing `base + field_offset` in any register.
-    pub(super) fn add_imm32(&mut self, reg: u8, imm: i32) {
-        let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 };
-        self.emit(&[rex, 0x81, 0xC0 | (reg & 7)]);
-        self.emit(&imm.to_le_bytes());
-    }
-    /// Emits `mov <reg>, fs:[0]` — read the per-thread `Fs` self-pointer from the FS
-    /// base (the freestanding-Linux per-thread `CTask`). FS prefix `0x64`, then a
-    /// `[disp32]` (SIB no-base/no-index) addressing form with disp32 = 0.
-    pub(super) fn mov_reg_fs0(&mut self, reg: u8) {
-        let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 };
-        self.emit(&[0x64, rex, 0x8B, 0x04 | ((reg & 7) << 3), 0x25, 0, 0, 0, 0]);
-    }
     /// Emits `lea rax, [rip + disp32]` to a code `label`, i.e. the address of a
     /// function (for `&Func`). Reuses the rel32 code-label fixup: the
     /// displacement is relative to the end of the displacement field, which is
@@ -228,10 +214,6 @@ impl Asm {
         self.emit(&[0x48, 0x8D, 0x05]); // lea rax, [rip+disp32]
         self.str_fixups.push((self.code.len(), idx));
         self.emit(&[0, 0, 0, 0]);
-    }
-    /// Emits `lea rax, [rip + disp32]` to a global (BSS) at byte offset `off`.
-    pub(super) fn lea_rax_global(&mut self, off: i32) {
-        self.lea_global(0, off); // 0 = rax
     }
     /// Emits `lea <reg>, [rip + disp32]` to a global (BSS) at byte offset `off`.
     pub(super) fn lea_global(&mut self, reg: u8, off: i32) {
@@ -264,25 +246,6 @@ impl Asm {
     pub(super) fn mov_rax_imm(&mut self, v: i64) {
         self.emit(&[0x48, 0xB8]);
         self.emit(&v.to_le_bytes());
-    }
-    /// Emits `lea rax, [rbp - off]`, the address of a local slot.
-    pub(super) fn lea_local(&mut self, off: i32) {
-        self.emit(&[0x48, 0x8D, 0x85]);
-        self.emit(&(-off).to_le_bytes());
-    }
-    /// Width-aware load from `[rbp - off]` into rax. Narrow values are sign- or
-    /// zero-extended per `signed`. ModRM `0x85` is `[rbp + disp32]` with rax in
-    /// the reg field.
-    pub(super) fn load_local(&mut self, off: i32, size: i32, signed: bool) {
-        self.emit(load_opcode(size, signed));
-        self.emit(&[0x85]);
-        self.emit(&(-off).to_le_bytes());
-    }
-    /// Store the low `size` bytes of rax to `[rbp - off]`.
-    pub(super) fn store_local(&mut self, off: i32, size: i32) {
-        self.emit(store_opcode(size));
-        self.emit(&[0x85]);
-        self.emit(&(-off).to_le_bytes());
     }
     /// Width-aware load from `[rbp - off]` into GPR `reg` (sign/zero-extended per
     /// `signed`). `reg` must be a low register (0–7); the opcode's REX.W carries no
@@ -380,17 +343,9 @@ impl Asm {
         self.emit(store_opcode(size));
         self.emit(&[0x01]); // ModRM 0x01 = [rcx], reg field rax
     }
-    pub(super) fn pop_rcx(&mut self) {
-        self.emit(&[0x59]);
-    }
     /// `imul rax, rax, imm32`
     pub(super) fn imul_rax_imm32(&mut self, imm: i32) {
         self.emit(&[0x48, 0x69, 0xC0]);
-        self.emit(&imm.to_le_bytes());
-    }
-    /// `add rax, imm32`
-    pub(super) fn add_rax_imm32(&mut self, imm: i32) {
-        self.emit(&[0x48, 0x05]);
         self.emit(&imm.to_le_bytes());
     }
     /// `mov rax, <arg register i>` (System V order).
@@ -405,40 +360,11 @@ impl Asm {
             _ => unreachable!("at most 6 args"),
         }
     }
-    /// `pop <arg register i>`
-    pub(super) fn pop_argreg(&mut self, i: usize) {
-        match i {
-            0 => self.emit(&[0x5F]),       // pop rdi
-            1 => self.emit(&[0x5E]),       // pop rsi
-            2 => self.emit(&[0x5A]),       // pop rdx
-            3 => self.emit(&[0x59]),       // pop rcx
-            4 => self.emit(&[0x41, 0x58]), // pop r8
-            5 => self.emit(&[0x41, 0x59]), // pop r9
-            _ => unreachable!("at most 6 args"),
-        }
-    }
-    pub(super) fn push_rax(&mut self) {
-        self.emit(&[0x50]);
-    }
-    pub(super) fn pop_rax(&mut self) {
-        self.emit(&[0x58]);
-    }
-    pub(super) fn mov_rcx_rax(&mut self) {
-        self.emit(&[0x48, 0x89, 0xC1]);
-    }
-    /// `mov rcx, imm32` (sign-extended to 64 bits)
-    pub(super) fn mov_rcx_imm32(&mut self, imm: i32) {
-        self.emit(&[0x48, 0xC7, 0xC1]);
-        self.emit(&imm.to_le_bytes());
-    }
     pub(super) fn mov_rax_rdx(&mut self) {
         self.emit(&[0x48, 0x89, 0xD0]);
     }
     pub(super) fn mov_rdi_rax(&mut self) {
         self.emit(&[0x48, 0x89, 0xC7]);
-    }
-    pub(super) fn mov_rsi_rax(&mut self) {
-        self.emit(&[0x48, 0x89, 0xC6]);
     }
     /// Emits `rep movsb`: copy rcx bytes from [rsi] to [rdi].
     pub(super) fn rep_movsb(&mut self) {
@@ -596,15 +522,6 @@ impl Asm {
     pub(super) fn store_byte_imm_at(&mut self, base: u8, imm: u8) {
         self.emit(&[0x40 | if base >= 8 { 0x01 } else { 0 }, 0xC6, base & 7, imm]);
     }
-    /// `cmp byte [base], imm8`.
-    pub(super) fn cmp_byte_imm_at(&mut self, base: u8, imm: u8) {
-        self.emit(&[
-            0x40 | if base >= 8 { 0x01 } else { 0 },
-            0x80,
-            (7 << 3) | (base & 7),
-            imm,
-        ]);
-    }
     pub(super) fn and_ri(&mut self, rm: u8, imm: i32) {
         self.alu_ri(4, rm, imm);
     }
@@ -708,14 +625,6 @@ impl Asm {
         }
         bytes.extend_from_slice(&[0x0F, op, modrm_rr(xd, xs)]);
         self.emit(&bytes);
-    }
-    /// `movsd [rbp - off], xmm0`.
-    pub(super) fn movsd_store_local(&mut self, off: i32) {
-        self.movsd_local_xmm(0x11, off, 0);
-    }
-    /// `movsd [rbp - off], xmmN`. Used to spill an argument register to its slot.
-    pub(super) fn movsd_store_local_xmm(&mut self, off: i32, xmm: u8) {
-        self.movsd_local_xmm(0x11, off, xmm);
     }
     /// A `movsd` between `xmm` and `[rbp - off]` (`op` 0x10 load / 0x11 store).
     pub(super) fn movsd_local_xmm(&mut self, op: u8, off: i32, xmm: u8) {
