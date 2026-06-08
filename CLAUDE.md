@@ -127,10 +127,12 @@ the backend can't re-derive it differently.
 **x86 consumes the IR too** (`src/x86_64/emit_ir.rs`). It walks the phi-free IR and emits
 x86-64, reusing the `Asm` encoder and the **`OsTarget` seam** in `src/x86_64/mod.rs`
 (per-OS deltas: exit, page alloc, std write, file ops, clock, command-line capture;
-freestanding ELF vs Windows PE). Spill-everything **+ promotion**: a vreg lives in an
-`[rbp-off]` slot unless `regalloc::plan_registers` lifts it into a callee-saved GPR
-(**rbx/r12–r14**, saved/restored in prologue/`teardown`; r15 excluded — the Windows seam
-uses it; no float promotion, since System V has no callee-saved xmm). Scratch rax/rcx/rdx +
+freestanding ELF vs Windows PE). Spill-everything **+ promotion** (Linux only): on the
+freestanding ELF target a vreg lives in an `[rbp-off]` slot unless `regalloc::plan_registers`
+lifts it into a callee-saved GPR (**rbx/r12–r14**, saved/restored in prologue/`teardown`;
+r15 excluded — the Windows seam uses it; no float promotion, since System V has no
+callee-saved xmm). The Windows PE keeps pure spill-everything (its inlined kernel32 seam
+doesn't reliably preserve a promoted value across a call). Scratch rax/rcx/rdx +
 rsi/rdi (all low regs, so the parametric `load_local_reg`/`store_local_reg`/`lea_local_reg`
 need no REX.R) and xmm0/xmm1; the internal ABI matches arm64 (int args rdi/rsi/rdx/rcx/r8/r9,
 F64 xmm0–7, sret pointer in **r11**); single-task `Fs` as a BSS `CTask` seeded in `@entry`,
@@ -166,7 +168,7 @@ old AST `Cg` and the shared `backend.rs` drivers are deleted — `mod.rs` keeps 
   x86-64 (default), to a freestanding static ELF (`x86_64-unknown-linux`) or, via the
   `OsTarget` seam, a self-contained PE with hand-built kernel32 imports
   (`x86_64-pc-windows`). Spill-everything in `[rbp-off]` slots + `plan_registers` promotion
-  into rbx/r12–r14; rax/rcx/rdx + rsi/rdi scratch, xmm0/xmm1 F64; System V-style internal
+  into rbx/r12–r14 (Linux only); rax/rcx/rdx + rsi/rdi scratch, xmm0/xmm1 F64; System V-style internal
   ABI; compare-chain `switch`. **`mod.rs`** now holds only the shared `OsTarget` seam +
   register numbering (no AST `Cg`).
 

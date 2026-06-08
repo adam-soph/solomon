@@ -329,7 +329,15 @@ impl FnEmit<'_> {
         // Plan register promotion: hot vregs → callee-saved rbx/r12–r14 (no float pool,
         // since System V has no callee-saved xmm). A spilled vreg (`None`) still gets a
         // frame slot below; a promoted one lives in its register, slot dead but harmless.
-        self.vreg_reg = crate::regalloc::plan_registers(f, &PROMOTE_INT, &[]);
+        // Linux only: the Windows PE's inlined kernel32 seam (`WriteFile`/`VirtualAlloc`/…)
+        // does not reliably preserve a promoted value across a call, so the Windows target
+        // keeps the proven spill-everything baseline (an empty pool = no promotion).
+        let int_pool: &[u32] = if self.os.is_posix() {
+            &PROMOTE_INT
+        } else {
+            &[]
+        };
+        self.vreg_reg = crate::regalloc::plan_registers(f, int_pool, &[]);
 
         // ---- frame layout (spill everything) ----
         let mut frame = 0i32;
