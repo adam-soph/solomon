@@ -380,13 +380,29 @@ pub fn build_and_run_native(program: &Program, args: &[String], stdin: &[u8]) ->
 /// Spawn `bin` with `args` and `stdin`, returning its stdout. Stdin is fed from a thread
 /// so a program that writes a lot of stdout can't deadlock against an unread stdin pipe.
 fn run_binary(bin: &Path, args: &[String], stdin: &[u8]) -> Vec<u8> {
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| panic!("could not spawn {}: {e}", bin.display()));
+    // Retry on ETXTBSY (os error 26): with many freshly-built native binaries exec'd in
+    // parallel, one can still be open for writing in a sibling process, so the exec races and
+    // fails transiently. A short bounded backoff clears it; this is a test-harness race, not a
+    // codegen fault.
+    let mut child = {
+        let mut attempt = 0;
+        loop {
+            match Command::new(bin)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 50 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("could not spawn {}: {e}", bin.display()),
+            }
+        }
+    };
     let mut sin = child.stdin.take().unwrap();
     let data = stdin.to_vec();
     let writer = std::thread::spawn(move || {

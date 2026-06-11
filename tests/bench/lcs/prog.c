@@ -1,6 +1,6 @@
 #include <stdio.h>
-#define N 250
-#define REPS 200
+#define N 150
+#define REPS 550
 static unsigned char a[N], b[N];
 static long long dp[N+1][N+1];
 int main(void){

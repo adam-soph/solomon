@@ -1,6 +1,6 @@
 // Longest-common-subsequence length via 2D dynamic programming (nested loops, 2D arrays).
-#define N 250
-#define REPS 200
+#define N 150
+#define REPS 550
 U8 a[N], b[N];
 I64 dp[N + 1][N + 1];
 I64 i, j, r, total = 0;
