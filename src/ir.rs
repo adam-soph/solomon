@@ -555,6 +555,23 @@ impl IrTerm {
             IrTerm::Br(_) | IrTerm::Ret(None) | IrTerm::Rethrow | IrTerm::Unreachable => {}
         }
     }
+
+    /// The mutable mirror of [`for_each_use`](IrTerm::for_each_use), for operand rewrites (use
+    /// substitution in the SSA-cleanup / strength-reduction passes).
+    pub fn for_each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
+        match self {
+            IrTerm::CondBr { cond, .. } => match cond {
+                Cond::NonZero { val, .. } => f(val),
+                Cond::Cmp { lhs, rhs, .. } => {
+                    f(lhs);
+                    f(rhs);
+                }
+            },
+            IrTerm::Switch { val, .. } => f(val),
+            IrTerm::Ret(Some(val)) | IrTerm::Throw(val) => f(val),
+            IrTerm::Br(_) | IrTerm::Ret(None) | IrTerm::Rethrow | IrTerm::Unreachable => {}
+        }
+    }
 }
 
 impl IrInst {
@@ -624,6 +641,57 @@ impl IrInst {
             IrInst::Prim { args, .. } => {
                 for a in args {
                     f(*a);
+                }
+            }
+            IrInst::SlotAddr { .. }
+            | IrInst::GlobalAddr { .. }
+            | IrInst::StrAddr { .. }
+            | IrInst::FuncAddr { .. }
+            | IrInst::TryBegin { .. }
+            | IrInst::TryEnd => {}
+        }
+    }
+
+    /// The mutable mirror of [`for_each_use`](IrInst::for_each_use), for operand rewrites (use
+    /// substitution in the SSA-cleanup / strength-reduction passes). Visits exactly the same
+    /// operands, so a substitution can't miss one a use-walk would have seen.
+    pub fn for_each_use_mut(&mut self, mut f: impl FnMut(&mut Val)) {
+        match self {
+            IrInst::Bin { lhs, rhs, .. } | IrInst::Cmp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            IrInst::Un { src, .. } | IrInst::Cast { src, .. } | IrInst::Mov { src, .. } => f(src),
+            IrInst::PtrAdd { base, index, .. } => {
+                f(base);
+                f(index);
+            }
+            IrInst::Load { addr, .. } => f(addr),
+            IrInst::Store { addr, val, .. } => {
+                f(addr);
+                f(val);
+            }
+            IrInst::MemCpy { dst, src, .. } => {
+                f(dst);
+                f(src);
+            }
+            IrInst::MemZero { dst, .. } => f(dst),
+            IrInst::Call {
+                callee, args, sret, ..
+            } => {
+                if let Callee::Indirect(v) = callee {
+                    f(v);
+                }
+                for a in args {
+                    f(&mut a.val);
+                }
+                if let Some(s) = sret {
+                    f(s);
+                }
+            }
+            IrInst::Prim { args, .. } => {
+                for a in args {
+                    f(a);
                 }
             }
             IrInst::SlotAddr { .. }

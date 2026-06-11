@@ -21,12 +21,84 @@
 use crate::ir::*;
 use crate::irinterp::{RVal, bin, cmp};
 
-/// Run scalar simplification over every function in `p`.
+/// Run scalar simplification over every function in `p`: constant folding / identities /
+/// strength reduction, then trivial-`phi` elimination (which the previous folding can expose
+/// and which unblocks later loop-invariant code motion).
 pub(crate) fn run(mut p: IrProgram) -> IrProgram {
     for f in &mut p.funcs {
         run_func(f);
+        eliminate_trivial_phis(f);
     }
     p
+}
+
+/// Remove **trivial** `phi` nodes — those whose arguments are, ignoring self-references, all a
+/// single value `V`. Such a `phi` always equals `V` (on first entry it takes `V`; a back-edge
+/// re-supplies its own unchanged value), so every use of it is replaced by `V` and the `phi`
+/// deleted. This collapses the loop-invariant header phis SSA construction inserts for a value
+/// merely *live across* a loop (e.g. an outer loop counter inside an inner loop), so LICM can
+/// then treat it as invariant, and out-of-SSA emits fewer back-edge copies.
+fn eliminate_trivial_phis(f: &mut IrFunc) {
+    loop {
+        let mut found: Option<(usize, usize, Vreg, Val)> = None;
+        'scan: for (bi, b) in f.blocks.iter().enumerate() {
+            for (pi, phi) in b.phis.iter().enumerate() {
+                let mut only: Option<Val> = None;
+                let mut trivial = true;
+                for (_, arg) in &phi.args {
+                    if *arg == Val::Reg(phi.dst) {
+                        continue; // self-reference: contributes nothing
+                    }
+                    match only {
+                        None => only = Some(*arg),
+                        Some(v) if v == *arg => {}
+                        Some(_) => {
+                            trivial = false;
+                            break;
+                        }
+                    }
+                }
+                if trivial {
+                    if let Some(v) = only {
+                        found = Some((bi, pi, phi.dst, v));
+                        break 'scan;
+                    }
+                    // All args self-referential — an undefined/dead phi; leave it.
+                }
+            }
+        }
+        let Some((bi, pi, dst, val)) = found else {
+            break;
+        };
+        f.blocks[bi].phis.remove(pi);
+        replace_all_uses(f, dst, val);
+    }
+}
+
+/// Replace every operand use of `Reg(from)` (in phis, instructions, and terminators) with `to`.
+fn replace_all_uses(f: &mut IrFunc, from: Vreg, to: Val) {
+    let target = Val::Reg(from);
+    for b in &mut f.blocks {
+        for phi in &mut b.phis {
+            for (_, arg) in &mut phi.args {
+                if *arg == target {
+                    *arg = to;
+                }
+            }
+        }
+        for inst in &mut b.insts {
+            inst.for_each_use_mut(|v| {
+                if *v == target {
+                    *v = to;
+                }
+            });
+        }
+        b.term.for_each_use_mut(|v| {
+            if *v == target {
+                *v = to;
+            }
+        });
+    }
 }
 
 fn run_func(f: &mut IrFunc) {

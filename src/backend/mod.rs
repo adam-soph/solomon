@@ -40,6 +40,7 @@ use crate::token::Pos;
 
 mod analysis;
 pub mod arm64;
+mod ivsr;
 mod licm;
 mod regalloc;
 mod simplify;
@@ -142,6 +143,15 @@ pub fn lower_to_machine_ir(program: &crate::ast::Program) -> Result<IrProgram, C
     debug_assert!(
         crate::ir::verify(&ir).is_empty(),
         "LICM produced invalid IR: {:?}",
+        crate::ir::verify(&ir)
+    );
+    // Induction-variable strength reduction: replace a loop counter's `base + k*stride` address
+    // recompute with a parallel induction variable advanced by one add per iteration. Runs after
+    // LICM (which hoists the invariant base) — semantics-preserving, validated by the goldens.
+    let ir = ivsr::run(ir);
+    debug_assert!(
+        crate::ir::verify(&ir).is_empty(),
+        "IVSR produced invalid IR: {:?}",
         crate::ir::verify(&ir)
     );
     Ok(destruct_program(&ir))

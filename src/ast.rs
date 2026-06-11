@@ -684,6 +684,55 @@ pub fn program_uses_command_line(program: &Program, names: &[&str]) -> bool {
     })
 }
 
+/// Whether any **function** references the *global* `name` — it uses `name` and does **not**
+/// declare its own parameter or local of that name (which would shadow the global). Top-level
+/// code is excluded. Lowering uses this to learn that a top-level scalar is touched only by
+/// top-level code, so it can be promoted to an `@entry` SSA local instead of a global. The
+/// shadow check is what lets a top-level counter named `i`/`k` promote despite a stdlib
+/// function having its *own* unrelated local `i`/`k`.
+pub fn global_used_in_functions(program: &Program, name: &str) -> bool {
+    program.items.iter().any(|item| match &item.kind {
+        StmtKind::Func(f) => {
+            f.body
+                .as_ref()
+                .is_some_and(|b| b.iter().any(|s| stmt_uses_ident(s, &[name])))
+                && !func_declares(f, name)
+        }
+        _ => false,
+    })
+}
+
+/// Whether `f` declares `name` as a parameter or as a local (a `VarDecl`/`:=` anywhere in its
+/// body, including nested blocks/loops) — so a use of `name` in `f` is that local, not a global.
+fn func_declares(f: &FuncDef, name: &str) -> bool {
+    f.params.iter().any(|p| p.name.as_deref() == Some(name))
+        || f.body
+            .as_ref()
+            .is_some_and(|b| b.iter().any(|s| stmt_declares(s, name)))
+}
+
+fn stmt_declares(s: &Stmt, name: &str) -> bool {
+    match &s.kind {
+        StmtKind::VarDecl { decls } => decls.iter().any(|d| d.name == name),
+        StmtKind::ShortDecl { names, .. } => names.iter().any(|n| n.as_deref() == Some(name)),
+        StmtKind::Block(ss) => ss.iter().any(|s| stmt_declares(s, name)),
+        StmtKind::If { then, else_, .. } => {
+            stmt_declares(then, name) || else_.as_deref().is_some_and(|s| stmt_declares(s, name))
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::Switch { body, .. } => stmt_declares(body, name),
+        StmtKind::For { init, body, .. } => {
+            init.as_deref().is_some_and(|s| stmt_declares(s, name)) || stmt_declares(body, name)
+        }
+        StmtKind::Try { body, handler } => {
+            body.iter().any(|s| stmt_declares(s, name))
+                || handler.iter().any(|s| stmt_declares(s, name))
+        }
+        _ => false,
+    }
+}
+
 /// Whether the program contains any `try`/`throw`. The backends use this (with a
 /// reference to `Fs`) to decide whether to set up the `CTask`/exception machinery.
 pub fn program_has_exceptions(program: &Program) -> bool {

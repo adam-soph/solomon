@@ -248,9 +248,15 @@ impl<'a> crate::lower::Lowerer<'a> {
         // to `declare_local` (otherwise `{ I64 x = 9; }` would clobber a global `x`).
         if self.is_entry && self.scopes.len() == 1 {
             if let Some(&(gid, _)) = self.globals.get(name) {
-                let base = self.global_addr(gid, 0);
-                self.init_memory(base, ty, init)?;
-                return Ok(());
+                // A promotable top-level scalar (not address-taken, used only by top-level code)
+                // falls through to `declare_local` instead — it becomes an `@entry` SSA value
+                // (the dead global stays in BSS, unreferenced), so loop counters live in
+                // registers and LICM/promotion apply. Everything else initialises the global.
+                if !self.promotable.contains(name) {
+                    let base = self.global_addr(gid, 0);
+                    self.init_memory(base, ty, init)?;
+                    return Ok(());
+                }
             }
         }
 

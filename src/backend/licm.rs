@@ -12,13 +12,22 @@
 //! **Safety.** Only **pure, non-trapping** instructions are hoisted: arithmetic/bit ops
 //! (`Bin` except an *integer* `Div`/`Mod`, which could divide by an invariant zero that a
 //! zero-trip loop would never reach), `Un`, `Cast`, `Cmp`, `PtrAdd`, and the address ops.
-//! Never `Load`/`Store` (memory may change or fault), `Call`/`Prim`/`Mem*` (effects). An
-//! instruction is hoisted only when every operand is already defined outside the loop, so a
-//! round never reorders interdependent hoists; chains resolve over successive rounds.
+//! Never `Store`, `Call`/`Prim`/`Mem*` (effects). An instruction is hoisted only when every
+//! operand is already defined outside the loop, so a round never reorders interdependent
+//! hoists; chains resolve over successive rounds.
+//!
+//! **Load hoisting (memory-invariant loads).** A `Load` of a *global or stack slot* is hoisted
+//! when the location can't change across the loop: its base is a [`MemBase`] (a `GlobalAddr`/
+//! `SlotAddr`, not a computed pointer) that is **never address-taken** (so no pointer can alias
+//! it), the loop contains **no `Call`/`Prim`** (a callee could write it), and **no `Store`/`Mem*`
+//! in the loop writes that exact base**. A global/slot is always a mapped address, so the load
+//! never faults — hoisting it (even out of a zero-trip loop) is side-effect-free. This lets a
+//! loop counter held in memory (a top-level HolyC scalar) and the address arithmetic that
+//! depends on it leave the loop, instead of reloading + recomputing every iteration.
 
 use crate::backend::analysis::{self, Cfg, DomTree, LoopForest};
 use crate::ir::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const NONE: BlockId = u32::MAX;
 
@@ -51,14 +60,23 @@ fn run_func(f: &mut IrFunc) {
     }
     drop((loops, dom, cfg));
 
+    // Memory model for load hoisting: which vreg names a global/slot base, and which of those
+    // bases ever have their address taken (so a pointer could alias them). Stable under
+    // hoisting (it moves instructions, never changes their dsts/operands), so compute it once.
+    let mem = MemInfo::new(f);
     for (target, body) in work {
-        hoist_loop(f, target, &body);
+        hoist_loop(f, target, &body, &mem);
     }
 }
 
 /// Hoist invariant instructions out of `body` to the end of `target`, to a fixpoint.
-fn hoist_loop(f: &mut IrFunc, target: BlockId, body: &HashSet<BlockId>) {
+fn hoist_loop(f: &mut IrFunc, target: BlockId, body: &HashSet<BlockId>, mem: &MemInfo) {
     let body_blocks: Vec<BlockId> = body.iter().copied().collect();
+    // The loop's memory effects, stable across the fixpoint (hoisting only removes loads/pure
+    // ops, never adds a `Store`/`Call`): does it call (clobbers everything), and which exact
+    // global/slot bases does it write?
+    let eff = LoopEffects::new(f, &body_blocks, mem);
+
     loop {
         let def_block = def_blocks(f);
         // A vreg is loop-invariant iff it is not defined inside the loop body.
@@ -72,7 +90,14 @@ fn hoist_loop(f: &mut IrFunc, target: BlockId, body: &HashSet<BlockId>) {
             let blk = &mut f.blocks[b as usize];
             let mut kept = Vec::with_capacity(blk.insts.len());
             for inst in blk.insts.drain(..) {
-                if hoistable(&inst) && all_uses_invariant(&inst, invariant) {
+                // A pure op (existing) or a memory-invariant load, with every operand (the
+                // load's address included) already defined outside the loop.
+                let ok = all_uses_invariant(&inst, invariant)
+                    && match &inst {
+                        IrInst::Load { addr, .. } => load_hoistable(*addr, mem, &eff),
+                        other => hoistable(other),
+                    };
+                if ok {
                     hoisted.push(inst);
                 } else {
                     kept.push(inst);
@@ -138,4 +163,120 @@ fn all_uses_invariant(i: &IrInst, invariant: impl Fn(Vreg) -> bool) -> bool {
         }
     });
     ok
+}
+
+/// A disjoint memory base — a named global or stack slot. Two *different* bases never alias; a
+/// computed pointer (anything else) is not a base, so a load through one is never hoisted.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum MemBase {
+    Global(GlobalId),
+    Slot(SlotId),
+}
+
+/// Whole-function memory facts for load hoisting.
+struct MemInfo {
+    /// Each vreg that is exactly a `GlobalAddr`/`SlotAddr`, mapped to its base (the `off` is
+    /// ignored — aliasing is decided per base, conservatively).
+    base: HashMap<Vreg, MemBase>,
+    /// Bases whose address is *taken* — their `GlobalAddr`/`SlotAddr` flows somewhere other
+    /// than a direct memory-access operand, so a pointer could alias them. A base that is never
+    /// address-taken can only be written by a *direct* store to it.
+    taken: HashSet<MemBase>,
+}
+
+impl MemInfo {
+    fn new(f: &IrFunc) -> MemInfo {
+        let mut base: HashMap<Vreg, MemBase> = HashMap::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    IrInst::GlobalAddr { dst, global, .. } => {
+                        base.insert(*dst, MemBase::Global(*global));
+                    }
+                    IrInst::SlotAddr { dst, slot, .. } => {
+                        base.insert(*dst, MemBase::Slot(*slot));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The `addr` of a `Load`/`Store` and a `Mem*` location operand access memory in place —
+        // not an escape. Every *other* operand use takes the address (computes with it, passes
+        // it, stores it as a value), so it escapes.
+        let mut taken: HashSet<MemBase> = HashSet::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    IrInst::Load { .. } | IrInst::MemZero { .. } | IrInst::MemCpy { .. } => {}
+                    IrInst::Store { val, .. } => {
+                        if let Val::Reg(v) = val {
+                            mark_base(&base, &mut taken, *v);
+                        }
+                    }
+                    other => analysis::uses_of(other, |v| mark_base(&base, &mut taken, v)),
+                }
+            }
+            analysis::term_uses(&b.term, |v| mark_base(&base, &mut taken, v));
+        }
+        MemInfo { base, taken }
+    }
+
+    /// The disjoint base a `Load`/`Store` address denotes, or `None` for a computed pointer.
+    fn addr_base(&self, addr: Val) -> Option<MemBase> {
+        addr.reg().and_then(|v| self.base.get(&v).copied())
+    }
+}
+
+fn mark_base(base: &HashMap<Vreg, MemBase>, taken: &mut HashSet<MemBase>, v: Vreg) {
+    if let Some(&mb) = base.get(&v) {
+        taken.insert(mb);
+    }
+}
+
+/// A loop's memory writes, used to decide which loads stay invariant across it.
+struct LoopEffects {
+    /// The loop contains a call — a callee may write any global, so no load is invariant.
+    has_call: bool,
+    /// The exact bases the loop writes via a *direct* `Store`/`Mem*` to a `GlobalAddr`/`SlotAddr`.
+    written: HashSet<MemBase>,
+}
+
+impl LoopEffects {
+    fn new(f: &IrFunc, body: &[BlockId], mem: &MemInfo) -> LoopEffects {
+        let mut has_call = false;
+        let mut written: HashSet<MemBase> = HashSet::new();
+        for &b in body {
+            for i in &f.blocks[b as usize].insts {
+                match i {
+                    IrInst::Call { .. } | IrInst::Prim { .. } => has_call = true,
+                    IrInst::Store { addr, .. } => {
+                        if let Some(mb) = mem.addr_base(*addr) {
+                            written.insert(mb);
+                        }
+                    }
+                    IrInst::MemZero { dst, .. } | IrInst::MemCpy { dst, .. } => {
+                        if let Some(mb) = mem.addr_base(*dst) {
+                            written.insert(mb);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        LoopEffects { has_call, written }
+    }
+}
+
+/// Whether a `Load` from `addr` is invariant across the loop: a disjoint, never-address-taken
+/// base (so only a direct store could write it), no call in the loop, and no store in the loop
+/// to that exact base. A global/slot is always a mapped address, so the load can't fault — it is
+/// safe to evaluate once in the preheader even if the loop runs zero times.
+fn load_hoistable(addr: Val, mem: &MemInfo, eff: &LoopEffects) -> bool {
+    if eff.has_call {
+        return false;
+    }
+    match mem.addr_base(addr) {
+        Some(mb) => !mem.taken.contains(&mb) && !eff.written.contains(&mb),
+        None => false,
+    }
 }

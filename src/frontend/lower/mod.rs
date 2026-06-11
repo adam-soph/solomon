@@ -138,6 +138,41 @@ pub fn lower(program: &Program, layouts: &Layouts) -> Result<IrProgram, CodegenE
         }
     }
 
+    // Top-level scalars that can become `@entry` SSA locals instead of globals: a scalar (so it
+    // can be an SSA value), never `public` (a public global may be referenced from another
+    // directory), never address-taken anywhere in the program (so no pointer can alias it), and
+    // referenced only by top-level code (no function body uses it). Promoting such a loop
+    // counter lets LICM / register promotion treat it as a value rather than a global reloaded
+    // and rewritten every iteration. Semantics-preserving — and the golden suite checks it,
+    // since the interpreter consumes this same lowered IR.
+    let mut addr_taken_prog: HashSet<String> = HashSet::new();
+    for item in &program.items {
+        match &item.kind {
+            StmtKind::Func(func) => {
+                if let Some(b) = &func.body {
+                    for s in b {
+                        collect_addr_taken(s, &mut addr_taken_prog);
+                    }
+                }
+            }
+            _ => collect_addr_taken(item, &mut addr_taken_prog),
+        }
+    }
+    let mut promotable: HashSet<String> = HashSet::new();
+    for item in &program.items {
+        if let StmtKind::VarDecl { decls } = &item.kind {
+            for d in decls {
+                if scalar_ir_ty(&d.ty).is_some()
+                    && !d.is_public
+                    && !addr_taken_prog.contains(&d.name)
+                    && !crate::ast::global_used_in_functions(program, &d.name)
+                {
+                    promotable.insert(d.name.clone());
+                }
+            }
+        }
+    }
+
     let mut strings = StringInterner::default();
     let mut funcs = Vec::new();
 
@@ -148,8 +183,16 @@ pub fn lower(program: &Program, layouts: &Layouts) -> Result<IrProgram, CodegenE
     for item in &program.items {
         if let StmtKind::Func(f) = &item.kind {
             if let Some(body) = &f.body {
-                let mut lw =
-                    Lowerer::new(layouts, &sigs, &defined, &globals, &mut strings, f, false);
+                let mut lw = Lowerer::new(
+                    layouts,
+                    &sigs,
+                    &defined,
+                    &globals,
+                    &mut strings,
+                    f,
+                    false,
+                    &promotable,
+                );
                 match lw.lower_func(f, body) {
                     Ok(irf) => funcs.push(irf),
                     Err(e) => debug_skip(&f.name, &e),
@@ -195,6 +238,7 @@ pub fn lower(program: &Program, layouts: &Layouts) -> Result<IrProgram, CodegenE
             &mut strings,
             &entry,
             true,
+            &promotable,
         );
         match lw.lower_func(&entry, &body) {
             Ok(irf) => funcs.push(irf),
@@ -294,6 +338,9 @@ struct Lowerer<'a> {
     /// True when lowering the synthesised top-level `@entry`, where a top-level
     /// `VarDecl` defines a global rather than a local.
     is_entry: bool,
+    /// Top-level scalar names that `@entry` lowers as SSA locals instead of globals (computed
+    /// whole-program; see `lower`). Consulted only in `@entry`'s outermost scope.
+    promotable: &'a HashSet<String>,
     /// True when the function uses `try`/`throw`/`Fs`: locals are forced to memory so
     /// they stay live across an exception unwind (the handler is reached by a non-local
     /// jump, not a CFG edge). Matches the native "no register promotion in try
@@ -340,6 +387,7 @@ impl<'a> Lowerer<'a> {
         strings: &'a mut StringInterner,
         f: &FuncDef,
         is_entry: bool,
+        promotable: &'a HashSet<String>,
     ) -> Self {
         let mut addr_taken = HashSet::new();
         let mut force_mem = false;
@@ -357,6 +405,7 @@ impl<'a> Lowerer<'a> {
             globals,
             strings,
             is_entry,
+            promotable,
             force_mem,
             ret_ty: f.ret.clone(),
             addr_taken,
