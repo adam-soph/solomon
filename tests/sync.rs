@@ -9,11 +9,11 @@
 
 use std::process::Command;
 
-use solomon::codegen::Codegen;
-use solomon::interp::run_to_string;
-use solomon::parser::parse_with;
-use solomon::sema::check_program;
-use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
+use hcc::backend::Codegen;
+use hcc::irinterp::run_to_string;
+use hcc::parser::parse_with;
+use hcc::sema::check_program;
+use hcc::{Arm64Darwin, Arm64Linux, X64Linux};
 
 // The portable program, which runs on all four targets. It exercises a *single* shared
 // atomic counter under real threads, the mutex on its *uncontended* fast path
@@ -135,7 +135,7 @@ fn lib_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib")
 }
 
-fn compile(src: &str) -> solomon::Program {
+fn compile(src: &str) -> hcc::Program {
     let program = parse_with(src, std::path::Path::new("."), &[lib_dir()])
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(check_program(&program).is_empty(), "sema errors");

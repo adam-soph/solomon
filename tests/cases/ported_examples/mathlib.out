@@ -1,0 +1,4 @@
+abs=7 max=12 min=-7 clamp=10
+sq6=36 ipow=1024 isqrt=12 popcount=8
+fancy enabled
+release build

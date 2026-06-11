@@ -29,10 +29,12 @@ pub enum IntrinsicKind {
     /// stays conformant.
     Optimization,
     /// The library declaration is a prototype with no body. The function cannot be
-    /// expressed in HolyC at all, because it bundles OS syscalls or the format
-    /// machinery, so every backend and the interpreter must provide its lowering.
-    /// These are the printf family, the heap, and the clock: real library
-    /// functions you `#include`, but the compiler is their only implementation.
+    /// expressed in HolyC at all, because it bundles an OS syscall (or a Win32 import),
+    /// so every backend and the interpreter must provide its lowering. These are the
+    /// `StdWrite` sink, the heap, the clock, fd/file I/O, sockets, fs mutation, process
+    /// control, threads, atomics, and the Win32 imports: real library functions you
+    /// `#include`, but the compiler is their only implementation. (The printf family is
+    /// **not** here — it is pure HolyC, see below.)
     Primitive,
 }
 
@@ -73,8 +75,8 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // `lib/socket.hc`. Impure OS I/O, so non-reproducible like the clock; raw
         // syscalls freestanding, libc on Darwin. `Read`/`Write`/`Close`/`Open`/`LSeek`
         // are general fd ops shared by files and sockets; `Socket`/`Connect` are the
-        // socket-specific pair. The libs build `ReadFile`, `TcpConnect`, and so on, on
-        // top of these.
+        // socket-specific pair. The libs build their path/address helpers (`FileSize`,
+        // `MakeSockaddr`, …) on top of these.
         "Socket" | "Connect" | "Open" | "LSeek" | "Read" | "Write" | "Close" => Primitive,
         // The standard-stream write primitive, prototyped in `lib/unistd.hc`.
         // `StdWrite(fd,…)` writes to stdout (fd 1) or stderr (fd 2) portably.
@@ -115,13 +117,43 @@ pub fn kind(name: &str) -> Option<IntrinsicKind> {
         // prototyped in `lib/stdatomic.hc`: `dmb` or `mfence`, and `futex(2)`
         // freestanding or `__ulock_*` on Darwin. No-ops in the synchronous interpreter.
         "AtomicFence" | "FutexWait" | "FutexWake" => Primitive,
+        // Win32 functions, prototyped in `lib/windows.hc` behind `#ifdef _WIN32`.
+        // Each lowers to a kernel32 import on the `x86_64-pc-windows` backend (see
+        // [`win_import`]); the other backends reject them, and the interpreter models
+        // them over `std`. They are only ever in scope when compiling for Windows.
+        n if win_import(n).is_some() => Primitive,
         _ => return None,
     })
 }
 
-/// Whether `name` is a compiler-recognized intrinsic.
-pub fn is_intrinsic(name: &str) -> bool {
-    kind(name).is_some()
+/// The curated Win32 functions that `lib/windows.hc` exposes as import primitives,
+/// returning the interned (`'static`) `(function name, DLL)`. This is the single source
+/// of truth for the Windows-only surface: [`kind`] marks these `Primitive`, lowering
+/// tags them `Prim::WinCall`, the Windows backend emits a direct import from the named
+/// DLL + an MS-x64 call, and the interpreter models them.
+///
+/// Returning the `'static` literal (not the input `&str`) is what lets the IR carry a
+/// `Copy` `&'static str` rather than an owned `String`.
+pub fn win_import(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        // kernel32: file I/O + process. (Win32's `ReadFile`/`WriteFile` own those names;
+        // a `CreateFileA` HANDLE also works with the portable `Read`/`Write`.)
+        "CreateFileA" => ("CreateFileA", "kernel32.dll"),
+        "ReadFile" => ("ReadFile", "kernel32.dll"),
+        "WriteFile" => ("WriteFile", "kernel32.dll"),
+        "CloseHandle" => ("CloseHandle", "kernel32.dll"),
+        "SetFilePointerEx" => ("SetFilePointerEx", "kernel32.dll"),
+        "GetFileSizeEx" => ("GetFileSizeEx", "kernel32.dll"),
+        "GetLastError" => ("GetLastError", "kernel32.dll"),
+        "GetCurrentProcessId" => ("GetCurrentProcessId", "kernel32.dll"),
+        // advapi32: the registry — a genuinely Windows-only API with no POSIX analog.
+        "RegCreateKeyExA" => ("RegCreateKeyExA", "advapi32.dll"),
+        "RegSetValueExA" => ("RegSetValueExA", "advapi32.dll"),
+        "RegQueryValueExA" => ("RegQueryValueExA", "advapi32.dll"),
+        "RegCloseKey" => ("RegCloseKey", "advapi32.dll"),
+        "RegDeleteKeyA" => ("RegDeleteKeyA", "advapi32.dll"),
+        _ => return None,
+    })
 }
 
 /// Whether `name` is a [`IntrinsicKind::Primitive`] intrinsic, one the backends

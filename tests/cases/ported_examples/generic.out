@@ -1,0 +1,10 @@
+ints: len=3 max=30
+flts: 1.5 + 2.5 = 4.0
+sizeof = 72
+len=5 first=0 last=16
+hello world
+max i = 9
+max f = 2.5
+I64 42
+F64 3.14
+str hi

@@ -1,8 +1,14 @@
 [package]
-name = "solomon"
+name = "hcc"
 version = "1.0.0-alpha.1"
 edition = "2024"
 
 [[bin]]
 name = "hcc"
 path = "src/main.rs"
+
+[dev-dependencies]
+# Generates the integration/comparison test functions by globbing tests/cases & tests/bench
+# at compile time (replaces the former build.rs + tools/gen_cases.py). A proc-macro must be
+# its own crate, so it lives beside the tests it serves under tests/macros/.
+hcc-test-macros = { path = "tests/macros" }

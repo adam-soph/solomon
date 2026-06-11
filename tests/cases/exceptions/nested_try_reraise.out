@@ -1,0 +1,3 @@
+inner caught 7
+outer caught 7 flag=1
+flag now 0

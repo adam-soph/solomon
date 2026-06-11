@@ -1,0 +1,23 @@
+tokens=25 distinct=12
+by word:
+  again 1
+  and 1
+  barks 1
+  brown 1
+  dog 3
+  fox 3
+  jumps 2
+  lazy 2
+  over 2
+  quick 2
+  runs 1
+  the 6
+top 3:
+  the x6
+  dog x3
+  fox x3
+by length:
+  len 3: 4
+  len 4: 3
+  len 5: 5
+sum=25

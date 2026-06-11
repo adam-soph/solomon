@@ -14,6 +14,23 @@
 #define TRUE  1
 #define FALSE 0
 
+// Predefined **target macros** (compiler-injected, not defined here — like the
+// command line below). The compiler seeds these into the preprocessor for the target
+// being compiled for, mirroring C, so platform-specific code can be gated with
+// `#ifdef`. `__solomon__` is always defined (the compiler marker, like C's
+// `__GNUC__`); each is `1`. By target:
+//
+//   aarch64-apple-darwin : __APPLE__ __MACH__ __unix__ __aarch64__ __solomon__
+//   x86_64-unknown-linux : __linux__ __unix__ __x86_64__ __solomon__
+//   aarch64-unknown-linux: __linux__ __unix__ __aarch64__ __solomon__
+//   x86_64-pc-windows    : _WIN32 _WIN64 __x86_64__ __solomon__
+//
+// The interpreter and `#exe` compile-time blocks run on the host, so they see the
+// host's macros; a cross-compiled binary sees the target's. The Windows-only header
+// `<windows.hc>` (C analog `<windows.h>`) is gated on `_WIN32`. Example:
+//
+//   #ifdef _WIN32  /* Windows-only */  #else  /* POSIX */  #endif
+
 // The heap allocator. `MAlloc`/`Free` are irreducible compiler primitives, not HolyC:
 // the compiler is their implementation (an `mmap` bump allocator freestanding, libc
 // `malloc`/`free` hosted). Like the command line below, they are ambient with no

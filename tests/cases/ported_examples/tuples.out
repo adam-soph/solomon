@@ -1,0 +1,10 @@
+infer: 5 1.5 items 10 (3,1)
+divmod: 3 rem 2
+stats: sum=10 prod=21 avg=5.0
+tagged: answer
+indexed: t[0]=3 t[1]=2
+swapped: 9 8
+pair: 1 2
+range #1: 4 rem 3
+vec: key=2 val=20
+hmap: 7->49 (ok=1)  8 found=0

@@ -1,42 +1,37 @@
 //! Solomon: a reimplementation of HolyC.
 //!
 //! The crate is a full compiler front end — lexer, preprocessor, parser, semantic
-//! analysis, and type layout. It feeds a tree-walking [`Interpreter`], the
-//! conformance oracle, and two native code generators behind the [`Codegen`]
-//! trait. Each is named for its target: [`Arm64Darwin`] (`aarch64-apple-darwin`)
-//! and [`X64Linux`] (`x86_64-unknown-linux`). The native backends match the
-//! interpreter byte-for-byte.
+//! analysis, and type layout — lowering to one SSA [IR](crate::ir). It feeds an IR
+//! interpreter ([`crate::irinterp`], the conformance oracle) and four native code
+//! generators behind the [`Codegen`] trait, one per (arch, OS) target: [`Arm64Darwin`]
+//! (`aarch64-apple-darwin`), [`Arm64Linux`] (`aarch64-unknown-linux`), [`X64Linux`]
+//! (`x86_64-unknown-linux`), and [`X64Windows`] (`x86_64-pc-windows`). Every native
+//! backend matches the IR interpreter byte-for-byte.
 
-pub mod arm64;
 pub mod ast;
 pub mod backend;
-pub mod codegen;
-pub mod interp;
+pub mod frontend;
 pub mod intrinsics;
 pub mod ir;
 pub mod irinterp;
-pub mod layout;
-pub mod lexer;
-pub mod lower;
-pub mod mono;
-pub mod parser;
-pub mod preproc;
-pub mod regalloc;
-pub mod sema;
 pub mod token;
-pub mod x86_64;
 
-pub use arm64::{Arm64Darwin, Arm64Linux};
+// The front-end passes live under `frontend` (see that module's pipeline doc).
+// Re-export them at the crate root so `crate::parser`, `crate::sema`, … — and the
+// external `hcc::parser`, … — keep resolving as before.
+pub use frontend::{layout, lexer, lower, mono, parser, preproc, sema};
+
 pub use ast::{Expr, ExprKind, Program, Stmt, StmtKind, Type};
-pub use codegen::{Codegen, CodegenError};
-pub use layout::{Layout, Layouts};
-pub use lexer::{LexError, Lexer, TokenStream, tokenize};
-pub use mono::MonoError;
-pub use parser::{ParseError, Parser, parse};
-pub use preproc::Preprocessor;
-pub use sema::{SemaError, analyze, check_program};
+pub use backend::arm64::{Arm64Darwin, Arm64Linux};
+pub use backend::x86_64::{X64Linux, X64Windows};
+pub use backend::{Codegen, CodegenError};
+pub use frontend::layout::{Layout, Layouts};
+pub use frontend::lexer::{LexError, Lexer, TokenStream, tokenize};
+pub use frontend::mono::MonoError;
+pub use frontend::parser::{ParseError, Parser, parse, parse_with_target};
+pub use frontend::preproc::Preprocessor;
+pub use frontend::sema::{SemaError, analyze, check_program};
 pub use token::{Keyword, Pos, Span, Token, TokenKind};
-pub use x86_64::{X64Linux, X64Windows};
 
 /// The default search directories for angle includes (`#include <math.hc>`),
 /// tried in order.
@@ -90,6 +85,9 @@ pub const EMBEDDED_STDLIB: &[(&str, &str)] = &[
     ("socket.hc", include_str!("../lib/socket.hc")),
     ("threads.hc", include_str!("../lib/threads.hc")),
     ("stdatomic.hc", include_str!("../lib/stdatomic.hc")),
+    // Platform-specific header (C analog: `<windows.h>`), gated by the predefined
+    // `_WIN32` target macro (see `target_macros`).
+    ("windows.hc", include_str!("../lib/windows.hc")),
     // Container extensions (no C equivalent).
     ("vec.hc", include_str!("../lib/vec.hc")),
     ("hmap.hc", include_str!("../lib/hmap.hc")),
@@ -102,4 +100,66 @@ pub fn embedded_stdlib(name: &str) -> Option<&'static str> {
         .iter()
         .find(|(n, _)| *n == name)
         .map(|&(_, src)| src)
+}
+
+/// The compiler-predefined preprocessor macros for a target `triple`, faithful to
+/// C's platform macros (`_WIN32`, `__linux__`, `__APPLE__`, `__x86_64__`, …). Each
+/// is an object-like macro defined to `1`, seeded into the preprocessor so a
+/// program can `#ifdef _WIN32` / `#ifdef __linux__` and select per target — the
+/// mechanism a platform header like `<windows.hc>` is gated on.
+///
+/// `__solomon__` (the compiler marker, C analog `__GNUC__`) is always defined. An
+/// unrecognized triple yields just that marker. This is the single source of truth
+/// for the policy; the CLI's `Target` and the integration tests both consult it.
+pub fn target_macros(triple: &str) -> Vec<(&'static str, &'static str)> {
+    let mut m = vec![("__solomon__", "1")];
+    let (arch, os) = match triple {
+        "aarch64-apple-darwin" => ("aarch64", "darwin"),
+        "x86_64-unknown-linux" => ("x86_64", "linux"),
+        "aarch64-unknown-linux" => ("aarch64", "linux"),
+        "x86_64-pc-windows" => ("x86_64", "windows"),
+        _ => return m,
+    };
+    match arch {
+        "x86_64" => m.push(("__x86_64__", "1")),
+        "aarch64" => m.push(("__aarch64__", "1")),
+        _ => {}
+    }
+    match os {
+        "darwin" => {
+            // `__APPLE__` + `__MACH__` is the canonical macOS pair; macOS is a Unix.
+            m.push(("__APPLE__", "1"));
+            m.push(("__MACH__", "1"));
+            m.push(("__unix__", "1"));
+        }
+        "linux" => {
+            m.push(("__linux__", "1"));
+            m.push(("__unix__", "1"));
+        }
+        "windows" => {
+            // `_WIN32` is defined on both 32- and 64-bit Windows; `_WIN64` adds 64-bit.
+            m.push(("_WIN32", "1"));
+            m.push(("_WIN64", "1"));
+        }
+        _ => {}
+    }
+    m
+}
+
+/// The host's target triple, used by the host-defaulting parse entry points and the
+/// interpreter (which executes on the host). `cfg!`-based and decoupled from
+/// backend support, so the interpreter on any host still sees that host's OS/arch
+/// macros; an unrecognized host yields `""` (the `__solomon__`-only macro set).
+pub fn host_triple() -> &'static str {
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        "x86_64-unknown-linux"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        "aarch64-unknown-linux"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "windows")) {
+        "x86_64-pc-windows"
+    } else {
+        ""
+    }
 }

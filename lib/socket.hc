@@ -8,11 +8,10 @@
 // primitives `Read`/`Write`/`Close` (and `WriteAll`) are shared with files, in
 // `<unistd.hc>`. They do real, impure network I/O, so a program using them is not
 // reproducible; conformance is by property, not by interp-vs-native value. On top of
-// these primitives the module builds `ParseIPv4`, `MakeSockaddr`, `TcpConnect`, and a
-// minimal `HttpGet`. Include with `#include <socket.hc>`.
+// these primitives the module builds the `ParseIPv4` and `MakeSockaddr` address helpers;
+// connecting is `Socket` + `MakeSockaddr` + `Connect`. Include with `#include <socket.hc>`.
 
 #include <unistd.hc>   // Read/Write/Close/WriteAll
-#include <stdio.hc>    // StrPrint (for HttpGet)
 
 #define AF_INET     2
 #define SOCK_STREAM 1
@@ -50,39 +49,6 @@ public U0 MakeSockaddr(U8 *sa, U32 ip, I64 port)
   sa[5] = (ip >> 16) & 0xFF;
   sa[6] = (ip >> 8) & 0xFF;
   sa[7] = ip & 0xFF;
-}
-
-// Open a TCP connection to `ip` (host order) : `port`. Returns the fd, or -errno.
-public I64 TcpConnect(U32 ip, I64 port)
-{
-  I64 fd = Socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return fd;
-  U8 sa[16];
-  MakeSockaddr(sa, ip, port);
-  I64 r = Connect(fd, sa, 16);
-  if (r < 0) { Close(fd); return r; }
-  return fd;
-}
-
-// HTTP/1.0 GET of `path` from the dotted-quad `ip_str` : `port`. Reads the whole
-// raw response (status line + headers + body) into `buf` (capacity `cap`). Returns
-// the byte count, or -errno. The caller NUL-terminates / parses it.
-public I64 HttpGet(U8 *ip_str, I64 port, U8 *path, U8 *buf, I64 cap)
-{
-  I64 fd = TcpConnect(ParseIPv4(ip_str), port);
-  if (fd < 0) return fd;
-  U8 req[512];
-  StrPrint(req, "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n", path, ip_str);
-  I64 w = WriteAll(fd, req, StrLen(req));
-  if (w < 0) { Close(fd); return w; }
-  I64 total = 0;
-  while (total < cap) {
-    I64 r = Read(fd, buf + total, cap - total);
-    if (r <= 0) break;
-    total += r;
-  }
-  Close(fd);
-  return total;
 }
 
 #endif

@@ -2,8 +2,7 @@
 #define _STDIO_HC
 // stdio.hc — C `<stdio.h>`: formatted output (the printf family + its private rendering
 // core and correctly-rounded float formatter), the file-removal primitives
-// (`Remove`/`Rename`), and path-based file helpers
-// (`ReadFile`/`WriteFile`/`AppendFile`/`FileSize`).
+// (`Remove`/`Rename`), and path-based file helpers (`AppendFile`/`FileSize`).
 //
 // The printf family is ordinary HolyC: `VFmt` (below) walks the format string and renders
 // each conversion into a sink (a fd via `StdWrite`, or a buffer); floats go through the
@@ -1165,33 +1164,6 @@ public I64 FileSize(U8 *path)
   I64 n = LSeek(fd, 0, SEEK_END);
   Close(fd);
   return n;  // LSeek already yields -errno on failure
-}
-
-// Read up to `cap` bytes of `path` into `buf`. Returns the byte count, or -errno. The
-// caller NUL-terminates / parses the result.
-public I64 ReadFile(U8 *path, U8 *buf, I64 cap)
-{
-  I64 fd = Open(path, O_RDONLY, 0);
-  if (fd < 0) return fd;
-  I64 total = 0;
-  while (total < cap) {
-    I64 r = Read(fd, buf + total, cap - total);
-    if (r < 0) { Close(fd); return r; }
-    if (r == 0) break;  // EOF
-    total += r;
-  }
-  Close(fd);
-  return total;
-}
-
-// Create/truncate `path` (mode 0644) and write `n` bytes. Returns 0, or -errno.
-public I64 WriteFile(U8 *path, U8 *buf, I64 n)
-{
-  I64 fd = Open(path, O_WRONLY | O_CREAT | O_TRUNC, MODE_0644);
-  if (fd < 0) return fd;
-  I64 r = WriteAll(fd, buf, n);
-  Close(fd);
-  return r;
 }
 
 // Append `n` bytes to `path` (creating it, mode 0644). Returns 0, or -errno.

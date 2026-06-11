@@ -4,15 +4,15 @@
 //! known string to a path, reads it back, and prints the content plus size. Against
 //! a fresh temp file, the interpreter and all native backends produce the same
 //! stdout. So these also serve as a conformance check of `Open`/`LSeek`/`Read`/
-//! `Write`/`Close` and the `WriteFile`/`ReadFile`/`FileSize` helpers.
+//! `Write`/`Close` and the `FileSize` helper.
 
 use std::process::Command;
 
-use solomon::codegen::Codegen;
-use solomon::interp::run_to_string;
-use solomon::parser::parse_with;
-use solomon::sema::check_program;
-use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
+use hcc::backend::Codegen;
+use hcc::irinterp::run_to_string;
+use hcc::parser::parse_with;
+use hcc::sema::check_program;
+use hcc::{Arm64Darwin, Arm64Linux, X64Linux};
 
 /// A HolyC program that writes `"solomon\n"` to `path`, reads it back, and prints the
 /// content and file size. The stdout is deterministic: `got: solomon\nsize=8\n`.
@@ -22,11 +22,15 @@ fn file_program(path: &str) -> String {
         #include <stdio.hc>
         U0 Main() {{
           U8 *msg = "solomon\n";
-          I64 wr = WriteFile("{path}", msg, StrLen(msg));
-          if (wr < 0) {{ "write failed: %d\n", -wr; return; }}
+          I64 wfd = Open("{path}", O_WRONLY | O_CREAT | O_TRUNC, MODE_0644);
+          if (wfd < 0) {{ "write failed: %d\n", -wfd; return; }}
+          WriteAll(wfd, msg, StrLen(msg));
+          Close(wfd);
           U8 buf[64];
-          I64 n = ReadFile("{path}", buf, 64);
-          if (n < 0) {{ "read failed: %d\n", -n; return; }}
+          I64 rfd = Open("{path}", O_RDONLY, 0);
+          if (rfd < 0) {{ "read failed: %d\n", -rfd; return; }}
+          I64 n = Read(rfd, buf, 64);
+          Close(rfd);
           buf[n] = 0;
           "got: %s", buf;
           "size=%d\n", FileSize("{path}");
@@ -42,7 +46,7 @@ fn lib_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib")
 }
 
-fn compile(src: &str) -> solomon::Program {
+fn compile(src: &str) -> hcc::Program {
     let program = parse_with(src, std::path::Path::new("."), &[lib_dir()])
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(check_program(&program).is_empty(), "sema errors");
@@ -78,9 +82,8 @@ fn interp_file_roundtrip() {
 const ERR_PROGRAM: &str = r#"
     #include <stdio.hc>
     U0 Main() {
-      U8 buf[16];
-      I64 n = ReadFile("/no/such/solomon/path", buf, 16);
-      if (n < 0) "error: errno=%d\n", -n;
+      I64 fd = Open("/no/such/solomon/path", O_RDONLY, 0);
+      if (fd < 0) "error: errno=%d\n", -fd;
       else "unexpected success\n";
     }
     Main;
@@ -284,10 +287,14 @@ fn fsops_program(dir: &str) -> String {
         U0 Main() {{
           "mkdir=%d\n", Mkdir("{dir}", 0700);
           U8 *msg = "hi\n";
-          "write=%d\n", WriteFile("{dir}/a.txt", msg, StrLen(msg));
+          I64 wfd = Open("{dir}/a.txt", O_WRONLY | O_CREAT | O_TRUNC, MODE_0644);
+          "write=%d\n", WriteAll(wfd, msg, StrLen(msg));
+          Close(wfd);
           "rename=%d\n", Rename("{dir}/a.txt", "{dir}/b.txt");
           U8 buf[16];
-          I64 n = ReadFile("{dir}/b.txt", buf, 16);
+          I64 rfd = Open("{dir}/b.txt", O_RDONLY, 0);
+          I64 n = Read(rfd, buf, 16);
+          Close(rfd);
           buf[n] = 0;
           "read=%d got=%s", n, buf;
           "rm_missing=%d\n", Remove("{dir}/a.txt");

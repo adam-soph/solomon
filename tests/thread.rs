@@ -9,11 +9,11 @@
 
 use std::process::Command;
 
-use solomon::codegen::Codegen;
-use solomon::interp::run_to_string;
-use solomon::parser::parse_with;
-use solomon::sema::check_program;
-use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
+use hcc::backend::Codegen;
+use hcc::irinterp::run_to_string;
+use hcc::parser::parse_with;
+use hcc::sema::check_program;
+use hcc::{Arm64Darwin, Arm64Linux, X64Linux};
 
 /// Spawn four threads computing `Square(i)` for i in 2..=5, join them, and print each
 /// result and the total. The stdout is deterministic regardless of thread interleaving.
@@ -65,14 +65,14 @@ fn lib_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib")
 }
 
-fn compile_src(src: &str) -> solomon::Program {
+fn compile_src(src: &str) -> hcc::Program {
     let program = parse_with(src, std::path::Path::new("."), &[lib_dir()])
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     assert!(check_program(&program).is_empty(), "sema errors");
     program
 }
 
-fn compile() -> solomon::Program {
+fn compile() -> hcc::Program {
     compile_src(PROGRAM)
 }
 
@@ -122,7 +122,7 @@ fn freestanding_thread_stdout(out: &std::path::Path, mut backend: impl Codegen) 
 fn freestanding_stdout(
     out: &std::path::Path,
     backend: &mut impl Codegen,
-    program: &solomon::Program,
+    program: &hcc::Program,
 ) -> String {
     backend
         .run(program)

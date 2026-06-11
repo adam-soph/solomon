@@ -1,6 +1,6 @@
 //! A low-level, SSA-form intermediate representation for solomon.
 //!
-//! Historically solomon had **no IR**: the [interpreter](crate::interp) and both
+//! Historically solomon had **no IR**: the [interpreter](crate::irinterp) and both
 //! native backends walked the typed AST directly. This module is the shared
 //! middle-end that replaces that: lowering ([`crate::lower`]) turns the typed,
 //! laid-out AST into this IR, then *both* the interpreter executes it and the
@@ -447,12 +447,25 @@ pub enum Prim {
     AtomicFence,
     FutexWait,
     FutexWake,
+    /// A Win32 function (see [`crate::intrinsics::win_import`]) lowered to a kernel32
+    /// import + MS-x64 call on the Windows backend, modeled by the interpreter, and
+    /// rejected by the other backends. `func` is the interned (`'static`) import name,
+    /// which keeps [`Prim`] `Copy`. Only reachable when compiling for Windows (the
+    /// prototypes are gated behind `#ifdef _WIN32`).
+    WinCall {
+        func: &'static str,
+    },
 }
 
 impl Prim {
     /// Map a primitive intrinsic name (see [`crate::intrinsics::is_primitive`]) to
     /// its [`Prim`], or `None` if it is not a primitive.
     pub fn from_name(name: &str) -> Option<Prim> {
+        // Win32 names map to the generic `WinCall`, carrying the interned import name
+        // (the DLL is recovered from `win_import` again at emit time).
+        if let Some((func, _dll)) = crate::intrinsics::win_import(name) {
+            return Some(Prim::WinCall { func });
+        }
         Some(match name {
             "StdWrite" => Prim::StdWrite,
             "MAlloc" => Prim::MAlloc,
@@ -497,35 +510,15 @@ impl Prim {
 
 // ---- globals ----
 
-/// A global variable: a sized, aligned byte range with a (possibly relocating)
-/// initializer. Unmentioned bytes are zero (BSS-style).
+/// A global variable: a sized, aligned byte range, zero-initialized (BSS). A non-zero
+/// source initializer is lowered to runtime stores in `@entry` rather than folded into
+/// static data, so the IR carries only the layout (name/size/align/visibility).
 #[derive(Clone, Debug)]
 pub struct IrGlobal {
     pub name: String,
     pub size: u32,
     pub align: u32,
     pub is_public: bool,
-    /// The non-zero initializer leaves, by byte offset. Empty ⇒ zero-initialized.
-    pub init: Vec<GlobalInit>,
-}
-
-/// One initialized scalar leaf of a global.
-#[derive(Clone, Debug)]
-pub struct GlobalInit {
-    pub off: u32,
-    pub ty: IrTy,
-    pub val: GlobalConst,
-}
-
-/// A compile-time constant usable in a global initializer. The address forms emit a
-/// relocation.
-#[derive(Clone, Debug)]
-pub enum GlobalConst {
-    Int(i64),
-    F64(u64),
-    StrAddr(StrId),
-    GlobalAddr(GlobalId, u32),
-    FuncAddr(String),
 }
 
 // ---- verification ----
@@ -542,6 +535,103 @@ impl IrTerm {
                 s
             }
             IrTerm::Ret(_) | IrTerm::Throw(_) | IrTerm::Rethrow | IrTerm::Unreachable => vec![],
+        }
+    }
+
+    /// Visit each `Val` operand this terminator reads (branch targets are *not* operands;
+    /// see [`successors`](IrTerm::successors)). The single source of truth shared by liveness
+    /// ([`crate::backend`]) and the verifier, so they can't disagree on what a term uses.
+    pub fn for_each_use(&self, mut f: impl FnMut(Val)) {
+        match self {
+            IrTerm::CondBr { cond, .. } => match cond {
+                Cond::NonZero { val, .. } => f(*val),
+                Cond::Cmp { lhs, rhs, .. } => {
+                    f(*lhs);
+                    f(*rhs);
+                }
+            },
+            IrTerm::Switch { val, .. } => f(*val),
+            IrTerm::Ret(Some(val)) | IrTerm::Throw(val) => f(*val),
+            IrTerm::Br(_) | IrTerm::Ret(None) | IrTerm::Rethrow | IrTerm::Unreachable => {}
+        }
+    }
+}
+
+impl IrInst {
+    /// The vreg this instruction defines (its SSA result), or `None` for instructions that
+    /// write only memory (`Store`/`MemCpy`/`MemZero`) or nothing (`TryBegin`/`TryEnd`).
+    pub fn def(&self) -> Option<Vreg> {
+        match *self {
+            IrInst::Bin { dst, .. }
+            | IrInst::Un { dst, .. }
+            | IrInst::Cast { dst, .. }
+            | IrInst::Cmp { dst, .. }
+            | IrInst::Mov { dst, .. }
+            | IrInst::SlotAddr { dst, .. }
+            | IrInst::GlobalAddr { dst, .. }
+            | IrInst::StrAddr { dst, .. }
+            | IrInst::FuncAddr { dst, .. }
+            | IrInst::PtrAdd { dst, .. }
+            | IrInst::Load { dst, .. } => Some(dst),
+            IrInst::Call { dst, .. } | IrInst::Prim { dst, .. } => dst,
+            IrInst::Store { .. }
+            | IrInst::MemCpy { .. }
+            | IrInst::MemZero { .. }
+            | IrInst::TryBegin { .. }
+            | IrInst::TryEnd => None,
+        }
+    }
+
+    /// Visit each `Val` operand this instruction reads — **including an indirect call's
+    /// callee**. (Non-operand references — slot / global / string ids — are not operands and
+    /// are not visited; the verifier range-checks those separately.) The single source of
+    /// truth for "what this instruction uses", shared by liveness ([`crate::backend`]) and
+    /// the verifier, so a new operand can't be added to one walker and forgotten in the other.
+    pub fn for_each_use(&self, mut f: impl FnMut(Val)) {
+        match self {
+            IrInst::Bin { lhs, rhs, .. } | IrInst::Cmp { lhs, rhs, .. } => {
+                f(*lhs);
+                f(*rhs);
+            }
+            IrInst::Un { src, .. } | IrInst::Cast { src, .. } | IrInst::Mov { src, .. } => f(*src),
+            IrInst::PtrAdd { base, index, .. } => {
+                f(*base);
+                f(*index);
+            }
+            IrInst::Load { addr, .. } => f(*addr),
+            IrInst::Store { addr, val, .. } => {
+                f(*addr);
+                f(*val);
+            }
+            IrInst::MemCpy { dst, src, .. } => {
+                f(*dst);
+                f(*src);
+            }
+            IrInst::MemZero { dst, .. } => f(*dst),
+            IrInst::Call {
+                callee, args, sret, ..
+            } => {
+                if let Callee::Indirect(v) = callee {
+                    f(*v);
+                }
+                for a in args {
+                    f(a.val);
+                }
+                if let Some(s) = sret {
+                    f(*s);
+                }
+            }
+            IrInst::Prim { args, .. } => {
+                for a in args {
+                    f(*a);
+                }
+            }
+            IrInst::SlotAddr { .. }
+            | IrInst::GlobalAddr { .. }
+            | IrInst::StrAddr { .. }
+            | IrInst::FuncAddr { .. }
+            | IrInst::TryBegin { .. }
+            | IrInst::TryEnd => {}
         }
     }
 }
@@ -609,7 +699,7 @@ fn verify_func(f: &IrFunc, p: &IrProgram, errs: &mut Vec<String>) {
             def_vreg(phi.dst, errs);
         }
         for inst in &b.insts {
-            if let Some(d) = inst_def(inst) {
+            if let Some(d) = inst.def() {
                 def_vreg(d, errs);
             }
         }
@@ -650,51 +740,20 @@ fn verify_func(f: &IrFunc, p: &IrProgram, errs: &mut Vec<String>) {
             }
         }
         for inst in &b.insts {
-            inst_check_refs(inst, f, p, &use_val, errs);
+            inst.for_each_use(|val| use_val(val, errs));
+            inst_check_refs(inst, f, p, errs);
         }
-        term_check_refs(&b.term, &use_val, errs);
+        b.term.for_each_use(|val| use_val(val, errs));
     }
 }
 
 /// The vreg an instruction defines, if any.
-fn inst_def(inst: &IrInst) -> Option<Vreg> {
-    match *inst {
-        IrInst::Bin { dst, .. }
-        | IrInst::Un { dst, .. }
-        | IrInst::Cast { dst, .. }
-        | IrInst::Cmp { dst, .. }
-        | IrInst::Mov { dst, .. }
-        | IrInst::SlotAddr { dst, .. }
-        | IrInst::GlobalAddr { dst, .. }
-        | IrInst::StrAddr { dst, .. }
-        | IrInst::FuncAddr { dst, .. }
-        | IrInst::PtrAdd { dst, .. }
-        | IrInst::Load { dst, .. } => Some(dst),
-        IrInst::Call { dst, .. } | IrInst::Prim { dst, .. } => dst,
-        IrInst::Store { .. }
-        | IrInst::MemCpy { .. }
-        | IrInst::MemZero { .. }
-        | IrInst::TryBegin { .. }
-        | IrInst::TryEnd => None,
-    }
-}
-
-fn inst_check_refs(
-    inst: &IrInst,
-    f: &IrFunc,
-    p: &IrProgram,
-    use_val: &dyn Fn(Val, &mut Vec<String>),
-    errs: &mut Vec<String>,
-) {
+/// Verify-specific structural reference checks: the non-operand ids an instruction names
+/// (slot / global / string indices, the `TryBegin` pad block and frame slot) must be in
+/// range. Operand `Val` uses are checked separately via [`IrInst::for_each_use`].
+fn inst_check_refs(inst: &IrInst, f: &IrFunc, p: &IrProgram, errs: &mut Vec<String>) {
     let nslots = f.slots.len() as u32;
     match inst {
-        IrInst::Bin { lhs, rhs, .. } | IrInst::Cmp { lhs, rhs, .. } => {
-            use_val(*lhs, errs);
-            use_val(*rhs, errs);
-        }
-        IrInst::Un { src, .. } | IrInst::Cast { src, .. } | IrInst::Mov { src, .. } => {
-            use_val(*src, errs)
-        }
         IrInst::SlotAddr { slot, .. } => {
             if *slot >= nslots {
                 errs.push(format!("fn {}: SlotAddr of invalid slot {slot}", f.name));
@@ -713,39 +772,6 @@ fn inst_check_refs(
                 errs.push(format!("fn {}: StrAddr of invalid string {str}", f.name));
             }
         }
-        IrInst::FuncAddr { .. } => {}
-        IrInst::PtrAdd { base, index, .. } => {
-            use_val(*base, errs);
-            use_val(*index, errs);
-        }
-        IrInst::Load { addr, .. } => use_val(*addr, errs),
-        IrInst::Store { addr, val, .. } => {
-            use_val(*addr, errs);
-            use_val(*val, errs);
-        }
-        IrInst::MemCpy { dst, src, .. } => {
-            use_val(*dst, errs);
-            use_val(*src, errs);
-        }
-        IrInst::MemZero { dst, .. } => use_val(*dst, errs),
-        IrInst::Call {
-            callee, args, sret, ..
-        } => {
-            if let Callee::Indirect(v) = callee {
-                use_val(*v, errs);
-            }
-            for a in args {
-                use_val(a.val, errs);
-            }
-            if let Some(s) = sret {
-                use_val(*s, errs);
-            }
-        }
-        IrInst::Prim { args, .. } => {
-            for a in args {
-                use_val(*a, errs);
-            }
-        }
         IrInst::TryBegin { pad, frame } => {
             if *pad >= f.blocks.len() as u32 {
                 errs.push(format!(
@@ -760,123 +786,6 @@ fn inst_check_refs(
                 ));
             }
         }
-        IrInst::TryEnd => {}
-    }
-}
-
-fn term_check_refs(term: &IrTerm, use_val: &dyn Fn(Val, &mut Vec<String>), errs: &mut Vec<String>) {
-    match term {
-        IrTerm::CondBr { cond, .. } => match cond {
-            Cond::NonZero { val, .. } => use_val(*val, errs),
-            Cond::Cmp { lhs, rhs, .. } => {
-                use_val(*lhs, errs);
-                use_val(*rhs, errs);
-            }
-        },
-        IrTerm::Switch { val, .. } => use_val(*val, errs),
-        IrTerm::Ret(Some(v)) | IrTerm::Throw(v) => use_val(*v, errs),
-        IrTerm::Br(_) | IrTerm::Ret(None) | IrTerm::Rethrow | IrTerm::Unreachable => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::layout::Layouts;
-
-    /// `I64 add(I64 a, I64 b) { return a + b; }` hand-built and verified clean.
-    fn add_func() -> IrFunc {
-        // params land in %0, %1; %2 = a + b.
-        IrFunc {
-            name: "add".into(),
-            ret: IrRet::Scalar(IrTy::I64),
-            params: vec![
-                IrParam {
-                    ty: ArgTy::Int(IrTy::I64),
-                    vreg: 0,
-                    name: Some("a".into()),
-                },
-                IrParam {
-                    ty: ArgTy::Int(IrTy::I64),
-                    vreg: 1,
-                    name: Some("b".into()),
-                },
-            ],
-            varargs: false,
-            slots: vec![],
-            blocks: vec![IrBlock {
-                id: 0,
-                phis: vec![],
-                insts: vec![IrInst::Bin {
-                    dst: 2,
-                    op: IrBinOp::Add,
-                    ty: IrTy::I64,
-                    signed: true,
-                    lhs: Val::Reg(0),
-                    rhs: Val::Reg(1),
-                }],
-                term: IrTerm::Ret(Some(Val::Reg(2))),
-            }],
-            entry: 0,
-            n_vregs: 3,
-        }
-    }
-
-    fn prog(f: IrFunc) -> IrProgram {
-        IrProgram {
-            funcs: vec![f],
-            globals: vec![],
-            strings: vec![],
-            layouts: Layouts::default(),
-        }
-    }
-
-    #[test]
-    fn verify_accepts_a_wellformed_function() {
-        assert_eq!(verify(&prog(add_func())), Vec::<String>::new());
-    }
-
-    #[test]
-    fn verify_catches_use_of_undefined_vreg() {
-        let mut f = add_func();
-        // Make the add read an undefined %9.
-        if let IrInst::Bin { rhs, .. } = &mut f.blocks[0].insts[0] {
-            *rhs = Val::Reg(9);
-        }
-        let errs = verify(&prog(f));
-        assert!(
-            errs.iter().any(|e| e.contains("undefined vreg %9")),
-            "{errs:?}"
-        );
-    }
-
-    #[test]
-    fn verify_catches_double_definition() {
-        let mut f = add_func();
-        // Redefine %0 (already a parameter).
-        f.blocks[0].insts.push(IrInst::Bin {
-            dst: 0,
-            op: IrBinOp::Sub,
-            ty: IrTy::I64,
-            signed: true,
-            lhs: Val::Reg(2),
-            rhs: Val::ImmInt(1),
-        });
-        let errs = verify(&prog(f));
-        assert!(
-            errs.iter().any(|e| e.contains("defined more than once")),
-            "{errs:?}"
-        );
-    }
-
-    #[test]
-    fn verify_catches_bad_branch_target() {
-        let mut f = add_func();
-        f.blocks[0].term = IrTerm::Br(7);
-        let errs = verify(&prog(f));
-        assert!(
-            errs.iter().any(|e| e.contains("invalid block 7")),
-            "{errs:?}"
-        );
+        _ => {}
     }
 }

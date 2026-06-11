@@ -2,7 +2,7 @@
 //!
 //! Reads HolyC source from a file, or stdin, and by default compiles a native
 //! binary for the host's architecture and OS. `-i` interprets the program with the
-//! tree-walking interpreter (the conformance oracle) instead of compiling, and the
+//! IR interpreter (the conformance oracle) instead of compiling, and the
 //! `check`/`ast`/`tokens` subcommands are front-end-only.
 //!
 //! Usage:
@@ -20,14 +20,13 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use solomon::arm64::{Arm64Darwin, Arm64Linux};
-use solomon::codegen::Codegen;
-use solomon::x86_64::{X64Linux, X64Windows};
-use solomon::{lexer, parser, sema};
+use hcc::backend::Codegen;
+use hcc::{Arm64Darwin, Arm64Linux, X64Linux, X64Windows};
+use hcc::{lexer, parser, sema};
 
 /// A code-generation target: an (architecture, OS) pair. The object format,
 /// syscalls, and ABI all depend on the OS, not just the CPU.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Target {
     Arm64Darwin,
     X64Linux,
@@ -61,6 +60,17 @@ impl Target {
             "aarch64-unknown-linux" => Some(Target::Arm64Linux),
             "x86_64-pc-windows" => Some(Target::X64Windows),
             _ => None,
+        }
+    }
+    /// The canonical triple string for this target, the inverse of [`from_triple`].
+    /// Used to seed the predefined target macros (`_WIN32`/`__linux__`/…) into the
+    /// preprocessor for the target being compiled for, via [`hcc::target_macros`].
+    fn triple(self) -> &'static str {
+        match self {
+            Target::Arm64Darwin => "aarch64-apple-darwin",
+            Target::X64Linux => "x86_64-unknown-linux",
+            Target::Arm64Linux => "aarch64-unknown-linux",
+            Target::X64Windows => "x86_64-pc-windows",
         }
     }
     fn codegen(self, out: &str) -> Box<dyn Codegen> {
@@ -205,7 +215,15 @@ fn main() -> ExitCode {
     // Angle includes (`#include <name>`) search the `-I` dirs first, then the
     // default standard-library directories.
     let mut search = include_dirs;
-    search.extend(solomon::stdlib_dirs());
+    search.extend(hcc::stdlib_dirs());
+
+    // The triple whose predefined macros the front-end-only modes (`ast`/`check`)
+    // seed: `--target` if given, else the host, else `""` (the `__solomon__`-only
+    // set). These modes never reach a backend, so an unsupported host is not an error.
+    let frontend_triple = target
+        .or_else(Target::host)
+        .map(Target::triple)
+        .unwrap_or("");
 
     match mode {
         Mode::Tokens => match lexer::tokenize(&src) {
@@ -220,7 +238,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Ast => match parser::parse_with(&src, &base_dir, &search) {
+        Mode::Ast => match parser::parse_with_target(&src, &base_dir, &search, frontend_triple) {
             Ok(program) => {
                 println!("{program:#?}");
                 ExitCode::SUCCESS
@@ -230,7 +248,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::Check => match parser::parse_with(&src, &base_dir, &search) {
+        Mode::Check => match parser::parse_with_target(&src, &base_dir, &search, frontend_triple) {
             Ok(program) => {
                 let errors = sema::check_program(&program);
                 if errors.is_empty() {
@@ -261,7 +279,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let program = match parser::parse_with(&src, &base_dir, &search) {
+            // Seed the predefined target macros for the target being compiled for, so
+            // `#ifdef _WIN32` / `#ifdef __linux__` selects the right branch.
+            let program = match parser::parse_with_target(&src, &base_dir, &search, target.triple())
+            {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{e}");
@@ -292,7 +313,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Interpret a HolyC program with the tree-walking interpreter, the conformance
+/// Interpret a HolyC program with the IR interpreter, the conformance
 /// oracle for the native backends. `rest` is everything after the `-i` flag: an
 /// optional FILE followed by the program's own arguments.
 ///
@@ -338,7 +359,7 @@ fn run_interp(rest: Vec<String>) -> ExitCode {
     };
 
     let base_dir = base_dir_of(&path);
-    let program = match parser::parse_with(&src, &base_dir, &solomon::stdlib_dirs()) {
+    let program = match parser::parse_with(&src, &base_dir, &hcc::stdlib_dirs()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -358,19 +379,19 @@ fn run_interp(rest: Vec<String>) -> ExitCode {
     // Lower to the SSA IR and run it through the IR interpreter (the same engine the
     // conformance oracle uses). The program reads the host's stdin via `Read(0, …)` (so
     // the HolyC `FGetC`/`FGetS`/`GetLine` family works), matching a compiled binary.
-    let (layouts, layout_errs) = solomon::layout::compute(&program);
+    let (layouts, layout_errs) = hcc::layout::compute(&program);
     if let Some(e) = layout_errs.first() {
         eprintln!("{}", e.message);
         return ExitCode::FAILURE;
     }
-    let ir = match solomon::lower::lower(&program, &layouts) {
+    let ir = match hcc::lower::lower(&program, &layouts) {
         Ok(ir) => ir,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
-    let mut interp = solomon::irinterp::IrInterp::new(&ir);
+    let mut interp = hcc::irinterp::IrInterp::new(&ir);
     interp.set_input(Box::new(std::io::stdin()));
     // argv[0] is the script name, or "hcc" when reading from stdin; the rest are the
     // trailing command-line arguments.
@@ -383,7 +404,7 @@ fn run_interp(rest: Vec<String>) -> ExitCode {
         Ok(out) => {
             use std::io::Write;
             let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(out.as_bytes());
+            let _ = stdout.write_all(&out); // raw bytes — the program's real stdout
             let _ = stdout.flush();
             ExitCode::SUCCESS
         }
@@ -418,7 +439,7 @@ Usage:
 With no subcommand, hcc compiles for the host's architecture and OS. FILE is
 read from stdin when omitted.
 
-`hcc -i` executes the program with the tree-walking interpreter. Arguments after
+`hcc -i` executes the program with the IR interpreter. Arguments after
 FILE become the program's argv (read with argc/argv); `--` ends option parsing so
 option-looking program arguments pass through.
 

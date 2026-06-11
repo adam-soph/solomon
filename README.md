@@ -325,21 +325,28 @@ HolyC. The modules:
 ```text
 lib/            the HolyC standard library (angle-included: `#include <math.hc>`)
 src/
-  token.rs      token + keyword definitions
-  lexer.rs      lexer (streaming) + TokenStream trait
-  preproc.rs    preprocessor (macros + conditionals), a TokenStream
-  ast.rs        the (typed) AST
-  parser.rs     recursive-descent parser, generic over a TokenStream
-  mono.rs       monomorphization pass (generics)
-  sema.rs       semantic analysis / type checking
-  layout.rs     type size/alignment/offset pass
+  token.rs      token + keyword definitions          (shared front-end output)
+  ast.rs        the (typed) AST                       (shared front-end output)
+  frontend/     the front-end passes: source → fully-concrete, type-checked AST + layouts
+    lexer.rs    lexer (streaming) + TokenStream trait
+    preproc.rs  preprocessor (macros + conditionals), a TokenStream
+    parser.rs   recursive-descent parser, generic over a TokenStream
+    mono.rs     monomorphization pass (generics)
+    sema.rs     semantic analysis / type checking
+    layout.rs   type size/alignment/offset pass
   intrinsics.rs lib-declared functions the backends lower specially
-  interp.rs     tree-walking interpreter (the conformance oracle)
-  codegen.rs    the Codegen trait + CodegenError (the shared backend interface)
-  arm64/        AArch64 backend — asm.rs (encoder), mod.rs (codegen), darwin.rs
-                (Mach-O + cc), linux.rs (freestanding static ELF)
-  x86_64/       x86-64 backend — asm.rs (encoder), mod.rs (codegen + OsTarget),
-                linux.rs (static ELF), windows.rs (self-contained PE)
+  ir.rs         the SSA IR (typed vregs, basic blocks, phi)
+  lower/        AST → SSA IR lowering (on-the-fly SSA construction)
+  irinterp.rs   the SSA IR interpreter (the conformance oracle) + run_to_* entry points
+  backend.rs    the native-codegen layer: the Codegen trait + CodegenError, the
+                IR-level shared driver (pure-IR analyses + the emit_blocks loop), and
+                the out-of-SSA + linear-scan register-promotion pass
+  arm64/        AArch64 backend — asm.rs (encoder), isel.rs (IR → machine code) +
+                isel/{prims,heap,exc}.rs (OS prims / bump heap / try-throw unwinder),
+                darwin.rs (Mach-O + cc), linux.rs (freestanding static ELF)
+  x86_64/       x86-64 backend — asm.rs (encoder), isel.rs (IR → machine code) +
+                isel/{prims,heap,exc}.rs (OS prims + Win32 calls / bump heap / unwinder),
+                mod.rs (OsTarget seam), linux.rs (static ELF), windows.rs (PE)
   main.rs       the hcc CLI: compile (default) + the `-i` interpreter mode
 tests/          lexer, parser, sema, preproc, layout, interpreter, the native
                 backends, and whole-program tests

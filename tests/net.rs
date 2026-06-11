@@ -9,11 +9,11 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 
-use solomon::codegen::Codegen;
-use solomon::interp::run_to_string;
-use solomon::parser::parse_with;
-use solomon::sema::check_program;
-use solomon::{Arm64Darwin, Arm64Linux, X64Linux};
+use hcc::backend::Codegen;
+use hcc::irinterp::run_to_string;
+use hcc::parser::parse_with;
+use hcc::sema::check_program;
+use hcc::{Arm64Darwin, Arm64Linux, X64Linux};
 
 /// Bind a one-shot TCP echo server on 127.0.0.1 (OS-assigned port) and return the
 /// port. The listener is already listening before we return, so a connecting client
@@ -42,8 +42,11 @@ fn echo_program(port: u16) -> String {
         r#"
         #include <socket.hc>
         U0 Main() {{
-          I64 fd = TcpConnect(ParseIPv4("127.0.0.1"), {port});
+          I64 fd = Socket(AF_INET, SOCK_STREAM, 0);
           if (fd < 0) {{ "connect failed: %d\n", -fd; return; }}
+          U8 sa[16];
+          MakeSockaddr(sa, ParseIPv4("127.0.0.1"), {port});
+          if (Connect(fd, sa, 16) < 0) {{ "connect failed\n"; Close(fd); return; }}
           Write(fd, "ping", 4);
           U8 buf[64];
           I64 n = Read(fd, buf, 64);

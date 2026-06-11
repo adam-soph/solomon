@@ -1,0 +1,9 @@
+validating:
+  age 30 ok
+  age -5 rejected, code=5721932
+  age 200 rejected, code=1212631368
+  age 42 ok
+  capped at 21
+  inner caught 7, re-raising
+  outer caught 7 (flag=1)
+flag now 0

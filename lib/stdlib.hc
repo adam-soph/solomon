@@ -23,10 +23,10 @@
 // digits, scale by powers of two, compare, subtract (no division, no general multiply).
 // =============================================================================
 
-public class Bn { I64 n; I64 d[72]; }
+class Bn { I64 n; I64 d[72]; }
 
 // b = v (a 64-bit value, treated as unsigned bits).
-public U0 BnSetU64(Bn *b, I64 v)
+U0 BnSetU64(Bn *b, I64 v)
 {
   I64 i;
   for (i = 0; i < 72; i++) b->d[i] = 0;
@@ -37,10 +37,10 @@ public U0 BnSetU64(Bn *b, I64 v)
   else if (b->d[0]) b->n = 1;
 }
 
-public I64 BnIsZero(Bn *b) { return b->n == 0; }
+I64 BnIsZero(Bn *b) { return b->n == 0; }
 
 // b = b*m + add, with small 0 <= m, add < 2^32 (so each limb product fits in I64).
-public U0 BnMulAddSmall(Bn *b, I64 m, I64 add)
+U0 BnMulAddSmall(Bn *b, I64 m, I64 add)
 {
   I64 carry = add, i = 0;
   while (i < b->n || carry) {
@@ -52,7 +52,7 @@ public U0 BnMulAddSmall(Bn *b, I64 m, I64 add)
   b->n = i;
 }
 
-public U0 BnCopy(Bn *dst, Bn *src)
+U0 BnCopy(Bn *dst, Bn *src)
 {
   I64 i;
   for (i = 0; i < 72; i++) dst->d[i] = src->d[i];
@@ -60,7 +60,7 @@ public U0 BnCopy(Bn *dst, Bn *src)
 }
 
 // dst = src << bits (bits >= 0). Writes every limb, so `dst` needs no pre-clear.
-public U0 BnShlBitsTo(Bn *dst, Bn *src, I64 bits)
+U0 BnShlBitsTo(Bn *dst, Bn *src, I64 bits)
 {
   I64 limbs = bits / 32, sh = bits % 32, carry = 0, i;
   for (i = 0; i < 72; i++) dst->d[i] = 0;
@@ -80,7 +80,7 @@ public U0 BnShlBitsTo(Bn *dst, Bn *src, I64 bits)
 }
 
 // b *= 2, in place.
-public U0 BnShl1(Bn *b)
+U0 BnShl1(Bn *b)
 {
   I64 carry = 0, i;
   for (i = 0; i < b->n; i++) {
@@ -92,7 +92,7 @@ public U0 BnShl1(Bn *b)
 }
 
 // Compare: -1 if a<b, 0 if a==b, 1 if a>b.
-public I64 BnCmp(Bn *a, Bn *b)
+I64 BnCmp(Bn *a, Bn *b)
 {
   if (a->n != b->n) { if (a->n > b->n) return 1; return -1; }
   I64 i;
@@ -102,7 +102,7 @@ public I64 BnCmp(Bn *a, Bn *b)
 }
 
 // a -= b, in place. Requires a >= b.
-public U0 BnSub(Bn *a, Bn *b)
+U0 BnSub(Bn *a, Bn *b)
 {
   I64 borrow = 0, i;
   for (i = 0; i < a->n; i++) {

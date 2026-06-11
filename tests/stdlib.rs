@@ -1,36 +1,74 @@
 //! Standard-library tests for the `lib/*.hc` HolyC modules. Each module is pulled in
-//! via an angle include (`#include <math.hc>`) and run through the interpreter, the
-//! conformance oracle. These tests are host-independent. The native backends are held
-//! to this output byte-for-byte by the `stdlib_math_matches_the_interpreter`
-//! conformance tests.
+//! via an angle include (`#include <math.hc>`) and run through **both** the interpreter
+//! (the oracle) and the host-native binary, with the result compared against an
+//! **independent expected value** — usually a Rust oracle (`format!("{:e}", …)` for the
+//! float formatter, `str::parse` for the parsers) or a hand-known value. So every test is
+//! a three-way agreement check: `native == interp == expected`.
+//!
+//! That independent expected is what the `native == interp` integration suite cannot
+//! provide on its own: the printf/`FmtFloat`/`StrToF64` code is pure HolyC that *both*
+//! engines run, so they'd agree on a shared bug. The Rust oracle here is the only check
+//! that catches a *current* such bug, on both the interpreter and the native path.
+//!
+//! The native half self-skips off a runnable host (and under `SOLOMON_SKIP_NATIVE`); the
+//! matching CI leg covers it there.
 
-use solomon::interp::{run_to_string, run_to_string_with_input};
-use solomon::parser::parse_with;
-use solomon::sema::check_program;
+use hcc::irinterp::run_to_bytes_with;
+use hcc::parser::parse_with;
+use hcc::sema::check_program;
 
-/// Parse `src` with the repository's `lib/` on the angle-include search path, then
-/// type-check and run it, returning captured output. The base directory is `lib/`
-/// itself, so a test may exercise private `_`-prefixed helpers. Privacy for a `_`-file
-/// or `_`-dir is keyed on the file's path, and a program rooted in `lib/` sits inside
-/// the subtree from which the stdlib's private modules are visible.
+mod support;
+
+/// Parse `src` with the repository's `lib/` on the angle-include search path, type-check,
+/// and run it through the interpreter **and** (on a runnable host) the native backend,
+/// asserting the two agree byte-for-byte before returning the output. The base directory
+/// is `lib/` itself, so a test may exercise private helpers.
+///
+/// The caller then asserts the returned string against an independent expected value,
+/// completing the `native == interp == expected` triple.
 fn run_with_stdlib(src: &str) -> String {
-    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
-    let program = parse_with(src, &lib, std::slice::from_ref(&lib))
-        .unwrap_or_else(|e| panic!("parse failed: {e}"));
-    let errs = check_program(&program);
-    assert!(errs.is_empty(), "semantic errors: {errs:?}");
-    run_to_string(&program).unwrap_or_else(|e| panic!("runtime error: {e}"))
+    run_with_stdlib_input(src, &[])
 }
 
 /// Like [`run_with_stdlib`], but with `input` as the program's standard input (fd 0),
-/// for exercising the `FGetC`/`FGetS`/`GetLine`/`ReadLine` family through the oracle.
+/// for exercising the `FGetC`/`FGetS`/`GetLine`/`ReadLine` family.
 fn run_with_stdlib_input(src: &str, input: &[u8]) -> String {
     let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
     let program = parse_with(src, &lib, std::slice::from_ref(&lib))
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
     assert!(errs.is_empty(), "semantic errors: {errs:?}");
-    run_to_string_with_input(&program, input).unwrap_or_else(|e| panic!("runtime error: {e}"))
+    let interp =
+        run_to_bytes_with(&program, &[], input).unwrap_or_else(|e| panic!("runtime error: {e}"));
+    // Hold the native backend to the same bytes (the test then checks these against the
+    // independent expected, so all three agree).
+    if let Some(native) = support::build_and_run_native(&program, &[], input) {
+        assert_eq!(
+            native,
+            interp,
+            "stdlib: native backend != interpreter\n  interp: {:?}\n  native: {:?}",
+            String::from_utf8_lossy(&interp),
+            String::from_utf8_lossy(&native),
+        );
+    }
+    String::from_utf8_lossy(&interp).into_owned()
+}
+
+/// Run `src` through the interpreter **only** (no native comparison), for the rare stdlib
+/// feature whose native lowering is intentionally host-divergent. Currently just `MSize`
+/// on hosted Darwin: `MAlloc` maps to libc `malloc`, which exposes no requested-size
+/// header, so `MSize` returns 0 there (documented at `src/arm64/isel/prims.rs`). The
+/// interpreter defines the semantics; native `MSize` parity holds on the freestanding
+/// targets by construction (the bump allocator's size header).
+fn run_interp_only(src: &str) -> String {
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let program = parse_with(src, &lib, std::slice::from_ref(&lib))
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let errs = check_program(&program);
+    assert!(errs.is_empty(), "semantic errors: {errs:?}");
+    let bytes =
+        run_to_bytes_with(&program, &[], &[]).unwrap_or_else(|e| panic!("runtime error: {e}"));
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[test]
@@ -1037,8 +1075,10 @@ fn realloc_preserves_contents() {
 #[test]
 fn msize_reports_the_requested_allocation_size() {
     // `MSize` returns the byte size MAlloc was asked for (0 for NULL), survives the
-    // size header transparently, and tracks through a ReAlloc grow.
-    let out = run_with_stdlib(
+    // size header transparently, and tracks through a ReAlloc grow. Interp-only: hosted
+    // Darwin maps `MAlloc` to libc `malloc` and cannot recover the requested size, so
+    // native `MSize` returns 0 there (a documented limitation, not a parity bug).
+    let out = run_interp_only(
         r#"
         #include <string.hc>
         #include <stdlib.hc>
