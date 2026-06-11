@@ -1,0 +1,9 @@
+# This repository is LF-only. Force LF on checkout on every platform (including the
+# Windows CI runner, which otherwise applies autocrlf), so the committed test goldens
+# compare byte-for-byte against the interpreter's LF output.
+* text=auto eol=lf
+
+# Test goldens (`<case>.out`) are exact byte references — a HolyC program may emit
+# non-UTF-8 / binary output (e.g. `"%c", 0xFF`). Treat them as binary so git never
+# rewrites a single byte (no line-ending or encoding conversion).
+*.out -text
