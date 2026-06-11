@@ -641,6 +641,13 @@ impl Asm {
     pub(super) fn store_qword_at(&mut self, base: u8, src: u8) {
         self.emit(&[rex_w(src, base), 0x89, ((src & 7) << 3) | (base & 7)]);
     }
+    /// `mov [rsp + disp32], rax` (64-bit). Places a stack-passed call argument (the 7th+
+    /// integer arg, beyond the six `ARG_GPR` registers). rsp as a base requires a SIB byte.
+    pub(super) fn store_qword_rsp(&mut self, disp: i32) {
+        // REX.W; 89; ModRM mod=10 reg=rax(000) rm=100(SIB)=0x84; SIB index=none(100) base=rsp(100)=0x24.
+        self.emit(&[0x48, 0x89, 0x84, 0x24]);
+        self.emit(&disp.to_le_bytes());
+    }
     /// `movzx dst, byte [base]` (zero-extend a byte to 64-bit).
     pub(super) fn load_byte_zx(&mut self, dst: u8, base: u8) {
         self.emit(&[

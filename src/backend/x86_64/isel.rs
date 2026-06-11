@@ -424,7 +424,16 @@ impl FnEmit<'_> {
                         fpr += 1;
                     }
                     ArgTy::Int(_) | ArgTy::AggAddr { .. } => {
-                        self.asm.mov_rax_argreg(igr);
+                        if igr < ARG_GPR.len() {
+                            self.asm.mov_rax_argreg(igr);
+                        } else {
+                            // Stack-passed (7th+ int arg): the caller placed it above the
+                            // saved rbp + return address, at `[rbp + 16 + (igr-6)*8]`.
+                            // `load_local_reg` reads `[rbp - off]`, so a negative off is a
+                            // positive displacement.
+                            let stk = (igr - ARG_GPR.len()) as i32;
+                            self.asm.load_local_reg(RAX, -(16 + stk * 8), 8, false);
+                        }
                         self.store_vreg(p.vreg, RAX);
                         igr += 1;
                     }
@@ -947,7 +956,7 @@ impl FnEmit<'_> {
                 return Ok(());
             }
         }
-        self.place_args(args, sret);
+        let stack_bytes = self.place_args(args, sret);
         match callee {
             Callee::Direct(name) => {
                 let label = *self
@@ -961,6 +970,11 @@ impl FnEmit<'_> {
                 self.asm.call_reg(RAX);
             }
         }
+        // Release any stack-argument block (caller-cleaned), restoring rsp before reading the
+        // result.
+        if stack_bytes > 0 {
+            self.asm.add_ri(RSP, stack_bytes);
+        }
         self.deliver_result(dst, ret);
         Ok(())
     }
@@ -969,9 +983,24 @@ impl FnEmit<'_> {
     /// xmm0–7, the two classes numbered independently; sret pointer in r11). Each arg is
     /// read from its stable slot, so a forward placement order never clobbers a pending
     /// source.
-    fn place_args(&mut self, args: &[ArgVal], sret: Option<Val>) {
+    /// Place call arguments and return the bytes reserved on the stack for arguments beyond
+    /// the registers (the caller restores rsp after the call). Integer/pointer args past the
+    /// six `ARG_GPR` registers are passed on the stack (the internal ABI's 7th–8th int args,
+    /// matching arm64's eight x-registers): reserve a 16-aligned block, place each overflow
+    /// arg at `[rsp + k*8]`. rsp is 16-aligned at the call site and the reservation is a
+    /// multiple of 16, so alignment is preserved through the `call`'s return-address push.
+    fn place_args(&mut self, args: &[ArgVal], sret: Option<Val>) -> i32 {
+        let n_int = args
+            .iter()
+            .filter(|a| matches!(a.ty, ArgTy::Int(_) | ArgTy::AggAddr { .. }))
+            .count();
+        let stack_bytes = align16((n_int.saturating_sub(ARG_GPR.len()) as i32) * 8);
+        if stack_bytes > 0 {
+            self.asm.sub_ri(RSP, stack_bytes);
+        }
         let mut igr = 0usize;
         let mut fpr = 0u8;
+        let mut stk = 0i32;
         for a in args {
             match a.ty {
                 ArgTy::Float => {
@@ -980,7 +1009,12 @@ impl FnEmit<'_> {
                 }
                 ArgTy::Int(_) | ArgTy::AggAddr { .. } => {
                     self.load_val(a.val, RAX);
-                    self.asm.mov_rr(ARG_GPR[igr], RAX);
+                    if igr < ARG_GPR.len() {
+                        self.asm.mov_rr(ARG_GPR[igr], RAX);
+                    } else {
+                        self.asm.store_qword_rsp(stk * 8);
+                        stk += 1;
+                    }
                     igr += 1;
                 }
             }
@@ -989,6 +1023,7 @@ impl FnEmit<'_> {
             self.load_val(s, RAX);
             self.asm.mov_rr(R11, RAX); // sret pointer in r11
         }
+        stack_bytes
     }
 
     fn deliver_result(&mut self, dst: Option<Vreg>, ret: IrRet) {

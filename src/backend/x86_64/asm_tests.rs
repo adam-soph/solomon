@@ -41,3 +41,14 @@ fn sib_load_store_encodings() {
     a.movsd_store_sib(3);
     assert_eq!(a.code, vec![0xF2, 0x0F, 0x11, 0x04, 0xF1]);
 }
+
+#[test]
+fn stack_arg_store_encoding() {
+    // mov [rsp + 0], rax  /  mov [rsp + 8], rax  — stack-passed call arguments.
+    let mut a = Asm::new();
+    a.store_qword_rsp(0);
+    assert_eq!(a.code, vec![0x48, 0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00]);
+    let mut a = Asm::new();
+    a.store_qword_rsp(8);
+    assert_eq!(a.code, vec![0x48, 0x89, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00]);
+}
