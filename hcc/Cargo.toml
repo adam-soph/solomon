@@ -1,0 +1,12 @@
+# The hcc compiler: the library crate (`src/lib.rs`) plus the `hcc` CLI binary
+# (`src/main.rs`). This is a workspace member; the virtual workspace manifest is at the
+# repo root. The standard library is the repo's `stdlib/` directory, read from disk at
+# compile time (see `hcc::stdlib_dirs`) — it is not embedded.
+[package]
+name = "hcc"
+version = "1.0.0-alpha.1"
+edition = "2024"
+
+[[bin]]
+name = "hcc"
+path = "src/main.rs"

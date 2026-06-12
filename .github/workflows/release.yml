@@ -58,9 +58,10 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # Stage the single `hcc` binary named per target (the stdlib is embedded at build
-      # time, so the binary is self-contained — nothing else to ship). `bash` is available
-      # on every runner including Windows, so one script covers all.
+      # Stage the single `hcc` binary named per target. The standard library is no longer
+      # embedded; it ships as a separate archive (the `stdlib` job below), which the install
+      # scripts drop into `$HCC_ROOT/lib`. `bash` is available on every runner including
+      # Windows, so one script covers all.
       - name: Stage binary
         shell: bash
         run: |
@@ -71,6 +72,27 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Package the standard library once — it is plain HolyC source (`stdlib/*.hh`,
+  # `stdlib/*.hc`), identical for every target — as both a tarball (POSIX installers) and a
+  # zip (the Windows installer). The install scripts extract it into `$HCC_ROOT/lib`, where
+  # the compiler resolves angle includes (`hcc::stdlib_dirs`).
+  stdlib:
+    name: stdlib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Package stdlib
+        run: |
+          mkdir -p dist
+          tar -czf dist/hcc-stdlib.tar.gz -C stdlib .
+          (cd stdlib && zip -qr - .) > dist/hcc-stdlib.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          # `bin-*` so the publish job's download pattern collects it alongside the binaries.
+          name: bin-stdlib
           path: dist/*
           if-no-files-found: error
 
@@ -97,7 +119,7 @@ jobs:
 
   # Collect every artifact and publish (or append to) the release for the tag.
   publish:
-    needs: [build, universal]
+    needs: [build, universal, stdlib]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

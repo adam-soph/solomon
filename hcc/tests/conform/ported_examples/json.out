@@ -1,0 +1,8 @@
+kind=5 count=9
+name=hcc version=2
+pi: kind=6 x100=314
+tags=3 [holyc, jit]
+path=C:\tmp\j q=say "hi"
+stable=1 meta=0
+nested.depth=3
+json={"name":"hcc","version":2,"pi":3.14,"tags":["holyc","rust","jit"],"path":"C:\\tmp\\j","q":"say \"hi\"","stable":true,"meta":null,"nested":{"depth":3}}

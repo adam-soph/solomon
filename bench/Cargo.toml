@@ -1,0 +1,21 @@
+# The HolyC-vs-C benchmark reporter, split out of the main crate into its own package so it
+# never builds or runs as part of `cargo test`. It is a custom binary (not a libtest harness):
+# `main` builds every `bench/<name>/` pair (HolyC via the `hcc` backend, C via `cc -O2`),
+# asserts byte-identical stdout, times both, and prints one C-vs-HolyC table.
+#
+#   cargo run -p hcc-bench --release            # all benchmarks
+#   cargo run -p hcc-bench --release -- matmul  # filter by name substring
+[package]
+name = "hcc-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "bench"
+path = "main.rs"
+
+[dependencies]
+# The compiler under test: the reporter drives its public backend API directly. It is the
+# `hcc/` workspace member (sibling of this `bench/` package).
+hcc = { path = "../hcc" }

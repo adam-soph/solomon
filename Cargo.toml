@@ -1,14 +1,10 @@
-[package]
-name = "hcc"
-version = "1.0.0-alpha.1"
-edition = "2024"
-
-[[bin]]
-name = "hcc"
-path = "src/main.rs"
-
-[dev-dependencies]
-# Generates the integration/comparison test functions by globbing tests/cases & tests/bench
-# at compile time (replaces the former build.rs + tools/gen_cases.py). A proc-macro must be
-# its own crate, so it lives beside the tests it serves under tests/macros/.
-hcc-test-macros = { path = "tests/macros" }
+# A virtual workspace. The compiler lives in the `hcc/` member (its `src/`, `tests/`, and
+# Cargo.toml); the HolyC-vs-C benchmark reporter lives in `bench/`, split out so it never
+# builds or runs as part of `cargo test` (run it with `cargo run -p hcc-bench --release`).
+#
+# The standard library is the repo's `stdlib/` directory, read from disk at compile time
+# (see `hcc::stdlib_dirs`) rather than embedded; the install scripts copy it to
+# `$HCC_ROOT/lib`.
+[workspace]
+members = ["hcc", "bench"]
+resolver = "2"

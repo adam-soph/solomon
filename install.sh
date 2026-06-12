@@ -1,20 +1,21 @@
 #!/bin/sh
-# install.sh — download and install the `hcc` HolyC compiler (solomon) into your PATH.
+# install.sh — download and install the `hcc` HolyC compiler.
 #
-# solomon ships a single, self-contained binary: `hcc`. The standard library is
-# embedded at build time, so there is nothing else to install. This script detects
-# your OS/arch, downloads the matching prebuilt binary from the GitHub release, and
-# drops it into a directory on your PATH.
+# hcc installs Go-style into a single root directory (HCC_ROOT, default ~/.hcc): the
+# compiler binary at $HCC_ROOT/bin/hcc and the standard library at $HCC_ROOT/lib. This
+# script detects your OS/arch, downloads the matching prebuilt binary and the stdlib
+# archive from the GitHub release, lays them out under HCC_ROOT, and adds HCC_ROOT (and
+# $HCC_ROOT/bin on your PATH) to your shell profile — just like GOROOT.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/adam-soph/solomon/main/install.sh | sh
 #   ./install.sh                       # install the latest release
 #   ./install.sh --version v0.1.0      # install a specific tag
-#   ./install.sh --dir /usr/local/bin  # choose the install directory
+#   ./install.sh --root ~/sdk/hcc      # choose the install root (HCC_ROOT)
 #
 # Environment overrides (handy when piping through `sh`):
-#   HCC_VERSION       release tag to install (default: latest)
-#   HCC_INSTALL_DIR   directory to install into (default: see "pick_install_dir")
+#   HCC_VERSION   release tag to install (default: latest)
+#   HCC_ROOT      install root (default: ~/.hcc)
 #
 # Supported hosts: Linux (x86_64, aarch64), macOS (Apple silicon + Intel, via the
 # universal binary), and Windows (x86_64, i686) when run under a POSIX shell such as
@@ -24,6 +25,7 @@ set -eu
 
 REPO="adam-soph/solomon"
 BIN="hcc"
+STDLIB_ASSET="hcc-stdlib.tar.gz"
 
 # --- pretty output ----------------------------------------------------------------
 
@@ -50,18 +52,21 @@ usage() {
 # --- argument parsing -------------------------------------------------------------
 
 VERSION="${HCC_VERSION:-latest}"
-INSTALL_DIR="${HCC_INSTALL_DIR:-}"
+ROOT="${HCC_ROOT:-}"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--version|-v) VERSION="${2:?--version needs an argument}"; shift 2 ;;
 		--version=*)  VERSION="${1#*=}"; shift ;;
-		--dir|-d)     INSTALL_DIR="${2:?--dir needs an argument}"; shift 2 ;;
-		--dir=*)      INSTALL_DIR="${1#*=}"; shift ;;
+		--root|-r)    ROOT="${2:?--root needs an argument}"; shift 2 ;;
+		--root=*)     ROOT="${1#*=}"; shift ;;
 		--help|-h)    usage 0 ;;
 		*)            die "unknown argument: $1 (try --help)" ;;
 	esac
 done
+
+# Default install root, Go's GOROOT style: a single self-contained tree.
+[ -n "$ROOT" ] || ROOT="${HOME}/.hcc"
 
 # --- host detection ---------------------------------------------------------------
 
@@ -71,7 +76,7 @@ if command -v curl >/dev/null 2>&1; then
 elif command -v wget >/dev/null 2>&1; then
 	DL="wget"
 else
-	die "need either curl or wget installed to download the binary"
+	die "need either curl or wget installed to download the release"
 fi
 
 detect_os() {
@@ -120,30 +125,21 @@ case "$OS" in
 		;;
 esac
 
-# --- where to install -------------------------------------------------------------
+# --- layout under HCC_ROOT --------------------------------------------------------
 
-# Default: a no-sudo location. Prefer /usr/local/bin only when it is writable
-# without elevation; otherwise fall back to ~/.local/bin (created if needed).
-pick_install_dir() {
-	if [ -n "$INSTALL_DIR" ]; then
-		echo "$INSTALL_DIR"; return
-	fi
-	if [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
-		echo /usr/local/bin; return
-	fi
-	echo "${HOME}/.local/bin"
-}
+BIN_DIR="${ROOT}/bin"
+LIB_DIR="${ROOT}/lib"
+DEST="${BIN_DIR}/${BIN}${EXT}"
 
-INSTALL_DIR="$(pick_install_dir)"
-DEST="${INSTALL_DIR}/${BIN}${EXT}"
-
-# --- download URL -----------------------------------------------------------------
+# --- download URLs ----------------------------------------------------------------
 
 if [ "$VERSION" = "latest" ]; then
-	URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+	base="https://github.com/${REPO}/releases/latest/download"
 else
-	URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+	base="https://github.com/${REPO}/releases/download/${VERSION}"
 fi
+BIN_URL="${base}/${ASSET}"
+STDLIB_URL="${base}/${STDLIB_ASSET}"
 
 # --- do it ------------------------------------------------------------------------
 
@@ -158,51 +154,83 @@ download() {
 }
 
 info "installing ${BOLD}${BIN}${RESET} (${VERSION}) for ${OS}/${ARCH}"
-info "asset:   ${ASSET}"
-info "from:    ${URL}"
-info "into:    ${DEST}"
+info "binary:  ${ASSET}"
+info "stdlib:  ${STDLIB_ASSET}"
+info "root:    ${ROOT}"
 
-mkdir -p "$INSTALL_DIR" || die "could not create install directory: $INSTALL_DIR"
+mkdir -p "$BIN_DIR" "$LIB_DIR" || die "could not create install root: $ROOT"
 
-# Download to a temp file first so a failed/partial download never clobbers an
+# Stage downloads in a temp dir first, so a failed/partial download never clobbers an
 # existing install.
-TMP="$(mktemp "${TMPDIR:-/tmp}/hcc-install.XXXXXX")"
-trap 'rm -f "$TMP"' EXIT INT TERM
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/hcc-install.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT INT TERM
 
-if ! download "$URL" "$TMP"; then
-	die "download failed. Check that release '${VERSION}' exists and has asset '${ASSET}'."
+info "downloading the compiler…"
+if ! download "$BIN_URL" "${TMP}/${BIN}${EXT}"; then
+	die "binary download failed. Check that release '${VERSION}' exists and has asset '${ASSET}'."
 fi
+[ -s "${TMP}/${BIN}${EXT}" ] || die "downloaded binary is empty — release asset may be missing"
 
-[ -s "$TMP" ] || die "downloaded file is empty — release asset may be missing"
-
-chmod +x "$TMP"
-
-# Move into place; retry through sudo if the destination needs elevation.
-if mv "$TMP" "$DEST" 2>/dev/null; then
-	:
-elif command -v sudo >/dev/null 2>&1; then
-	warn "no write permission for ${INSTALL_DIR}; retrying with sudo"
-	sudo mv "$TMP" "$DEST" || die "failed to install to ${DEST}"
-else
-	die "no write permission for ${INSTALL_DIR} and sudo is unavailable. Re-run with --dir <writable dir>."
+info "downloading the standard library…"
+if ! download "$STDLIB_URL" "${TMP}/${STDLIB_ASSET}"; then
+	die "stdlib download failed. Check that release '${VERSION}' has asset '${STDLIB_ASSET}'."
 fi
+[ -s "${TMP}/${STDLIB_ASSET}" ] || die "downloaded stdlib is empty — release asset may be missing"
+
+# Install the binary.
+chmod +x "${TMP}/${BIN}${EXT}"
+mv "${TMP}/${BIN}${EXT}" "$DEST" || die "failed to install the binary to ${DEST}"
+
+# Install the standard library: extract the archive into $HCC_ROOT/lib, replacing any
+# previous copy so an upgrade never leaves stale modules behind.
+rm -rf "${LIB_DIR:?}"/* 2>/dev/null || true
+tar -xzf "${TMP}/${STDLIB_ASSET}" -C "$LIB_DIR" || die "failed to extract the stdlib into ${LIB_DIR}"
+
 trap - EXIT INT TERM
+rm -rf "$TMP"
 
 ok "installed ${BIN} -> ${DEST}"
+ok "installed stdlib -> ${LIB_DIR}"
 
-# --- PATH advice ------------------------------------------------------------------
+# --- shell profile (HCC_ROOT + PATH), GOROOT-style --------------------------------
 
-# Is the install dir already on PATH?
-case ":${PATH}:" in
-	*":${INSTALL_DIR}:"*) ON_PATH=1 ;;
-	*) ON_PATH=0 ;;
-esac
+# Pick the profile for the user's login shell, falling back to ~/.profile.
+profile_for_shell() {
+	case "${SHELL##*/}" in
+		zsh)  echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
+		bash) [ -f "$HOME/.bashrc" ] && echo "$HOME/.bashrc" || echo "$HOME/.bash_profile" ;;
+		fish) echo "$HOME/.config/fish/config.fish" ;;
+		*)    echo "$HOME/.profile" ;;
+	esac
+}
+PROFILE="$(profile_for_shell)"
 
-if [ "$ON_PATH" -eq 1 ]; then
+already_on_path() {
+	case ":${PATH}:" in *":${BIN_DIR}:"*) return 0 ;; *) return 1 ;; esac
+}
+
+if [ -f "$PROFILE" ] && grep -q 'HCC_ROOT' "$PROFILE" 2>/dev/null; then
+	info "HCC_ROOT already configured in ${PROFILE}"
+else
+	mkdir -p "$(dirname "$PROFILE")"
+	{
+		printf '\n# added by the hcc installer\n'
+		if [ "${PROFILE##*/}" = "config.fish" ]; then
+			printf 'set -gx HCC_ROOT %s\n' "$ROOT"
+			printf 'set -gx PATH $HCC_ROOT/bin $PATH\n'
+		else
+			printf 'export HCC_ROOT="%s"\n' "$ROOT"
+			printf 'export PATH="$HCC_ROOT/bin:$PATH"\n'
+		fi
+	} >> "$PROFILE"
+	info "added ${BOLD}HCC_ROOT${RESET} and ${BOLD}\$HCC_ROOT/bin${RESET} to ${PROFILE}"
+fi
+
+if already_on_path; then
 	info "run it: ${BOLD}${BIN} --help${RESET}"
 else
-	warn "${INSTALL_DIR} is not on your PATH."
-	printf '\n  Add it by appending this to your shell profile (~/.bashrc, ~/.zshrc, ...):\n\n' >&2
-	printf '    export PATH="%s:$PATH"\n\n' "$INSTALL_DIR" >&2
+	warn "${BIN_DIR} is not on your PATH in this shell yet."
+	printf '\n  Open a new terminal, or run:\n\n' >&2
+	printf '    export HCC_ROOT="%s"\n    export PATH="$HCC_ROOT/bin:$PATH"\n\n' "$ROOT" >&2
 	info "then run: ${BOLD}${BIN} --help${RESET}  (or use the full path: ${DEST})"
 fi

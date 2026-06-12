@@ -3,8 +3,12 @@
 // immediately and prints nothing, so it is deterministic under the test harness (which
 // runs examples with an empty stdin), while still doing real work when piped input.
 
-#include <stdio.hc>
 
+
+#include <stdio.hh>
+#include <stdlib.hh>
+#include <string.hh>
+#include <unistd.hh>
 U0 Main()
 {
   U8 *line;

@@ -7,6 +7,8 @@
 //
 // Run it with arguments to see them echoed:  ./args one two three
 
+
+#include <stdio.hh>
 "argc=%d\n", argc;
 // Skip argv[0] (the program path, which isn't reproducible); echo the rest.
 I64 i;

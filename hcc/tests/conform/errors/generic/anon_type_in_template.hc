@@ -1,0 +1,8 @@
+//@ error: anonymous class/union types are not supported inside a generic
+#include <stdlib.hh>
+class Box<type T> { class { T v; } inner; };
+
+U0 Main()
+{
+  Box<I64> b;
+}
