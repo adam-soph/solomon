@@ -773,6 +773,19 @@ impl Mono {
                 ),
             );
         }
+        // A generic prototype with no definition: the signature was declared (e.g. in a
+        // `.hh`) but the body never arrived (its `.hc` implementation wasn't compiled in).
+        // Only an error once the generic is actually instantiated, matching C's
+        // declared-but-undefined linkage.
+        if tmpl.def.body.is_none() {
+            return self.err(
+                Pos::new(0, 0),
+                format!(
+                    "generic function `{name}` is declared but never defined; its body must \
+                     appear in an implementation (the `.hc` paired with its header)"
+                ),
+            );
+        }
         let binds = binds_of(&tmpl.params, args);
         let params = tmpl
             .def

@@ -2,17 +2,14 @@
 #define _STDLIB_HC
 // stdlib.hc — implementation (interface in stdlib.hh).
 //
-// This file is included at the foot of <stdlib.hh> (the C++ template-header idiom) and is
-// not meant to be included on its own: it relies on the prototypes, `#define`s, and
-// `<heap.hh>` re-export that precede it in that header. It opens with the generic
-// `Sort`/`BSearch` templates (which the parser must see before any use site), then the
-// non-generic bodies.
+// The generic `Sort`/`BSearch` prototypes are in <stdlib.hh>; their bodies are below.
 
+#include <stdlib.hh>
 #include <string.hh>
 #include <stdio.hh>
 #include <unistd.hh>   // STDERR (Abort)
 
-// ---- generic sorting & searching (templates; see <stdlib.hh> for the API) ----
+// ---- generic sorting & searching (templates; prototypes in <stdlib.hh>) ----
 
 // Swap two elements in place.
 U0 SortSwap<type T>(T *a, T *b) { T t = *a; *a = *b; *b = t; }
@@ -64,14 +61,11 @@ U0 SortQuick<type T>(T *base, I64 lo, I64 hi, I64 (*cmp)(T *, T *))
   SortQuick<T>(base, i + 1, hi, cmp);
 }
 
-// Sort `n` elements at `base` in place, ordered by `cmp`.
 U0 Sort<type T>(T *base, I64 n, I64 (*cmp)(T *, T *))
 {
   if (n > 1) SortQuick<T>(base, 0, n - 1, cmp);
 }
 
-// Binary-search a sorted array for `key`, a pointer to a key element. Returns a pointer
-// to a matching element, or NULL if absent.
 T *BSearch<type T>(T *key, T *base, I64 n, I64 (*cmp)(T *, T *))
 {
   I64 lo = 0;

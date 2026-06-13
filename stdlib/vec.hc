@@ -1,14 +1,9 @@
 #ifndef _VEC_HC
 #define _VEC_HC
 // vec.hc — implementation (interface in vec.hh).
-//
-// This file is included at the foot of <vec.hh> (the C++ template-header idiom) and is
-// not meant to be included on its own: it relies on the `Vec<T>` declaration and the
-// `<string.hh>`/`<stdlib.hh>` includes that precede it in that header. It holds the
-// generic `Vec` method templates (which the parser must see before any use site) plus
-// the non-generic `Environ`.
 
-// Initialise an empty Vec. Required before any other operation.
+#include <vec.hh>
+
 U0 VecInit<type T>(Vec<T> *v) { v->data = NULL; v->len = 0; v->cap = 0; }
 
 U0 VecFree<type T>(Vec<T> *v)
@@ -22,8 +17,7 @@ U0 VecFree<type T>(Vec<T> *v)
 U0 VecClear<type T>(Vec<T> *v) { v->len = 0; }
 I64 VecLen<type T>(Vec<T> *v) { return v->len; }
 
-// Ensure room for at least `need` elements, growing geometrically. `ReAlloc` extends
-// in place when the buffer is the heap's last allocation.
+// `ReAlloc` extends in place when the buffer is the heap's last allocation.
 U0 VecReserve<type T>(Vec<T> *v, I64 need)
 {
   if (v->cap >= need) return;
@@ -34,7 +28,6 @@ U0 VecReserve<type T>(Vec<T> *v, I64 need)
   v->cap = cap;
 }
 
-// Append a value.
 U0 VecPush<type T>(Vec<T> *v, T x)
 {
   VecReserve<T>(v, v->len + 1);
@@ -42,15 +35,12 @@ U0 VecPush<type T>(Vec<T> *v, T x)
   v->len++;
 }
 
-// Element `i` by value. `VecRef` returns a pointer for in-place update. `VecSet` writes.
 T VecAt<type T>(Vec<T> *v, I64 i) { return v->data[i]; }
 T *VecRef<type T>(Vec<T> *v, I64 i) { return &v->data[i]; }
 U0 VecSet<type T>(Vec<T> *v, I64 i, T x) { v->data[i] = x; }
 
-// Remove and return the last element. The caller must ensure the Vec is non-empty.
 T VecPop<type T>(Vec<T> *v) { v->len--; return v->data[v->len]; }
 
-// Deep-copy `src` into a fresh `dst`. This is the correct way to duplicate a `Vec`.
 U0 VecClone<type T>(Vec<T> *dst, Vec<T> *src)
 {
   VecInit<T>(dst);
@@ -59,15 +49,11 @@ U0 VecClone<type T>(Vec<T> *dst, Vec<T> *src)
   dst->len = src->len;
 }
 
-// Sort the elements in place by `cmp`, a `<stdlib.hh>` comparator over element pointers
-// (`I64 (*)(T *, T *)`).
 U0 VecSort<type T>(Vec<T> *v, I64 (*cmp)(T *, T *))
 {
   Sort<T>(v->data, v->len, cmp);
 }
 
-// Binary-search a sorted `Vec` for `key`, a pointer to a key value. Returns the
-// element index, or -1.
 I64 VecBSearch<type T>(Vec<T> *v, T *key, I64 (*cmp)(T *, T *))
 {
   T *p = BSearch<T>(key, v->data, v->len, cmp);

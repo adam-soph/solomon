@@ -1,20 +1,16 @@
 #ifndef _MATH_HC
 #define _MATH_HC
 // math.hc — implementation (interface in math.hh).
-//
-// This file is included at the foot of <math.hh> (the C++ template-header idiom) and is
-// not meant to be included on its own: it relies on the prototypes and `#define`s that
-// precede it in that header. It holds every math function body, including the generic
-// `Abs`/`Sign`/`Min`/`Max` templates (which the parser must see before any use site, and
-// which the non-generic `Fmin`/`Fmax` below call, so they come first).
+
+#include <math.hh>
 
 union F64Bits { F64 f; U64 u; }
 
-// `Abs` returns the element type `T`, so a float argument yields an `F64` instead of a
-// truncated `I64`. The `if type` branch — compiled only for `T is F64` — defers to `Fabs`
-// for exact IEEE semantics (clears the sign bit, so `Abs(-0.0)` is `+0.0` and a NaN stays
-// NaN); the integer instantiations use the plain negate. `Sign` is always `I64` (it
-// yields -1/0/1), so it is unchanged.
+// Generic helpers (prototypes in <math.hh>). They precede the non-generic bodies because
+// `Fmin`/`Fmax` below call `Min`/`Max`. `Abs`'s `T is F64` branch defers to `Fabs` for
+// exact IEEE semantics (so `Abs(-0.0)` is `+0.0`, a NaN stays NaN); the integer
+// instantiations use the plain negate. `Min`/`Max`'s float branch adds C `fmin`/`fmax`
+// NaN semantics (plain `a > b` would mishandle `Max(x, NaN)`).
 public T Abs<comparable T>(T n)
 {
   if type (T is F64) return Fabs(n);
@@ -23,10 +19,6 @@ public T Abs<comparable T>(T n)
 }
 public I64 Sign<comparable T>(T n) { return (n > 0) - (n < 0); }
 
-// `Min`/`Max` return the element type `T`, so the float instantiation yields an `F64`
-// rather than a truncated `I64`. The `if type` branch — compiled only for `T is F64`,
-// dropped for the integer instantiations — adds C `fmin`/`fmax` NaN semantics: a NaN
-// operand yields the other value (plain `a > b` would mishandle `Max(x, NaN)`).
 public T Min<comparable T>(T a, T b)
 {
   if type (T is F64) {

@@ -61,18 +61,17 @@ public I64 CmpI64(I64 *a, I64 *b);
 public I64 CmpU64(U64 *a, U64 *b);
 public I64 CmpF64(F64 *a, F64 *b);
 
-// `Sort`/`BSearch` and their helpers are templates the parser must register *before* any
-// use site (generics are define-before-use), so they cannot be deferred to the end like
-// an ordinary `.hc` implementation. They live in `<stdlib.hc>`, included at the foot of
-// this header — the C++ template-header idiom — so they are parsed eagerly with these
-// declarations. The prototypes are listed here for the reader; the bodies are in the
-// implementation file:
-//
-//   U0  SortSwap     <type T>(T *a, T *b);
-//   U0  SortInsertion<type T>(T *base, I64 lo, I64 hi, I64 (*cmp)(T *, T *));
-//   U0  SortQuick    <type T>(T *base, I64 lo, I64 hi, I64 (*cmp)(T *, T *));
-//   U0  Sort         <type T>(T *base, I64 n, I64 (*cmp)(T *, T *));
-//   T  *BSearch      <type T>(T *key, T *base, I64 n, I64 (*cmp)(T *, T *));
+// `Sort`/`BSearch` and their helpers are generic — prototypes here, bodies in
+// `<stdlib.hc>`. The sort is a median-of-three quicksort with an insertion-sort cutoff
+// (`SORT_CUTOFF`); it is not stable; typical cost `O(n log n)`.
+U0 SortSwap<type T>(T *a, T *b);
+U0 SortInsertion<type T>(T *base, I64 lo, I64 hi, I64 (*cmp)(T *, T *));
+U0 SortQuick<type T>(T *base, I64 lo, I64 hi, I64 (*cmp)(T *, T *));
+// Sort `n` elements at `base` in place, ordered by `cmp`.
+U0 Sort<type T>(T *base, I64 n, I64 (*cmp)(T *, T *));
+// Binary-search a sorted array for `key`, a pointer to a key element. Returns a pointer
+// to a matching element, or NULL if absent.
+T *BSearch<type T>(T *key, T *base, I64 n, I64 (*cmp)(T *, T *));
 
 // C `div`/`ldiv`: the quotient and remainder together, returned as a tuple (both are I64
 // here, so one function serves both). Truncates toward zero like C — `Div(7,2)` is `(3,1)`,
@@ -201,7 +200,5 @@ public I64 UnsetEnv(U8 *name);
 // caller keeps ownership of `str`); a `str` with no '=' unsets the name, matching the
 // common (glibc) behavior. Returns 0, or -EINVAL for an empty/'='-leading string.
 public I64 PutEnv(U8 *str);
-
-#include <stdlib.hc>
 
 #endif

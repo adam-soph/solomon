@@ -115,18 +115,14 @@ public F64 Y1(F64 x);
 public F64 Jn(I64 n, F64 x);
 public F64 Yn(I64 n, F64 x);
 
-// Generic helpers (`Abs`/`Sign`/`Min`/`Max`) are templates the parser must register
-// *before* any use site (generics are define-before-use), so they cannot be deferred to
-// the end like an ordinary `.hc` implementation. They live in `<math.hc>`, included at
-// the foot of this header — the C++ template-header idiom — so they are parsed eagerly
-// with these declarations. The prototypes are listed here for the reader; the bodies are
-// in the implementation file:
-//
-//   public T   Abs <comparable T>(T n);          // |n|, keeping T (F64 → Fabs semantics)
-//   public I64 Sign<comparable T>(T n);          // -1 / 0 / 1
-//   public T   Min <comparable T>(T a, T b);     // smaller, keeping T (F64 NaN handling)
-//   public T   Max <comparable T>(T a, T b);     // larger, keeping T (F64 NaN handling)
-
-#include <math.hc>
+// Generic helpers — prototypes here, bodies in <math.hc>. `Abs` returns the element type
+// `T`, so a float argument yields an `F64` instead of a truncated `I64` (its `T is F64`
+// path defers to `Fabs` for exact IEEE sign-bit/NaN semantics). `Sign` is always `I64`
+// (it yields -1/0/1). `Min`/`Max` return `T` and, for the float instantiation, add C
+// `fmin`/`fmax` NaN handling (a NaN operand yields the other value).
+public T Abs<comparable T>(T n);
+public I64 Sign<comparable T>(T n);
+public T Min<comparable T>(T a, T b);
+public T Max<comparable T>(T a, T b);
 
 #endif

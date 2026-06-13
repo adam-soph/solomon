@@ -2403,8 +2403,17 @@ impl<S: TokenStream> Parser<S> {
                     started = true;
                 }
                 TokenKind::RBrace => brace -= 1,
+                // A generic *prototype* (signature only, no body): a `;` at top level
+                // before any `{`. The body lives in a sibling `.hc`, streamed deferred —
+                // so the template is registered here with `body: None` (enough for the
+                // parser to treat call sites as generic), and the deferred definition
+                // re-registers it with the real body before the `mono` pass runs.
+                TokenKind::Semicolon if !started && brace == 0 => {
+                    toks.push(t);
+                    break;
+                }
                 TokenKind::Eof => {
-                    return self.err("unterminated generic function (missing `}`)");
+                    return self.err("unterminated generic function (missing `}` or `;`)");
                 }
                 _ => {}
             }

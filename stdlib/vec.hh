@@ -20,6 +20,10 @@
 //
 // The caller owns the `Vec` struct, and `VecInit(&v)` is required before use. A `Vec`
 // owns its buffer: copy it with `VecClone` (not `=`), and free it with `VecFree`.
+//
+// This header declares the API; the bodies (generic templates and all) live in <vec.hc>.
+// A generic prototype here registers the name so call sites parse as generic, and the
+// deferred <vec.hc> supplies the template body before the `mono` pass instantiates it.
 
 
 #include <string.hh>
@@ -31,26 +35,35 @@ public class Vec<type T> {
   I64 cap;    // allocated capacity, in elements
 }
 
-// The generic `Vec` operations are templates the parser must register *before* any use
-// site (generics are define-before-use), so they cannot be deferred to the end like an
-// ordinary `.hc` implementation. They live in `<vec.hc>`, included at the foot of this
-// header — the C++ template-header idiom — so they are parsed eagerly with these
-// declarations. The prototypes are listed here for the reader; the bodies are in the
-// implementation file:
-//
-//   U0  VecInit   <type T>(Vec<T> *v);
-//   U0  VecFree   <type T>(Vec<T> *v);
-//   U0  VecClear  <type T>(Vec<T> *v);
-//   I64 VecLen    <type T>(Vec<T> *v);
-//   U0  VecReserve<type T>(Vec<T> *v, I64 need);
-//   U0  VecPush   <type T>(Vec<T> *v, T x);
-//   T   VecAt     <type T>(Vec<T> *v, I64 i);
-//   T  *VecRef    <type T>(Vec<T> *v, I64 i);
-//   U0  VecSet    <type T>(Vec<T> *v, I64 i, T x);
-//   T   VecPop    <type T>(Vec<T> *v);
-//   U0  VecClone  <type T>(Vec<T> *dst, Vec<T> *src);
-//   U0  VecSort   <type T>(Vec<T> *v, I64 (*cmp)(T *, T *));
-//   I64 VecBSearch<type T>(Vec<T> *v, T *key, I64 (*cmp)(T *, T *));
+U0 VecInit<type T>(Vec<T> *v);
+U0 VecFree<type T>(Vec<T> *v);
+U0 VecClear<type T>(Vec<T> *v);
+I64 VecLen<type T>(Vec<T> *v);
+
+// Ensure room for at least `need` elements, growing geometrically.
+U0 VecReserve<type T>(Vec<T> *v, I64 need);
+
+// Append a value.
+U0 VecPush<type T>(Vec<T> *v, T x);
+
+// Element `i` by value. `VecRef` returns a pointer for in-place update. `VecSet` writes.
+T VecAt<type T>(Vec<T> *v, I64 i);
+T *VecRef<type T>(Vec<T> *v, I64 i);
+U0 VecSet<type T>(Vec<T> *v, I64 i, T x);
+
+// Remove and return the last element. The caller must ensure the Vec is non-empty.
+T VecPop<type T>(Vec<T> *v);
+
+// Deep-copy `src` into a fresh `dst`. This is the correct way to duplicate a `Vec`.
+U0 VecClone<type T>(Vec<T> *dst, Vec<T> *src);
+
+// Sort the elements in place by `cmp`, a `<stdlib.hh>` comparator over element pointers
+// (`I64 (*)(T *, T *)`).
+U0 VecSort<type T>(Vec<T> *v, I64 (*cmp)(T *, T *));
+
+// Binary-search a sorted `Vec` for `key`, a pointer to a key value. Returns the
+// element index, or -1.
+I64 VecBSearch<type T>(Vec<T> *v, T *key, I64 (*cmp)(T *, T *));
 
 // Collect every environment entry ("KEY=VALUE", a `U8 *`) into `out`, a `Vec<U8 *>`
 // initialised here, in the OS's order. Read an entry with `VecAt(&out, i)`. This builds
@@ -59,7 +72,5 @@ public class Vec<type T> {
 // the process environment and are read-only. `VecFree(&out)` frees the Vec's own buffer,
 // not the entries.
 public U0 Environ(Vec<U8 *> *out);
-
-#include <vec.hc>
 
 #endif

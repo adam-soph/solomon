@@ -340,10 +340,15 @@ The stdlib mirrors **C/POSIX headers** — filenames and groupings follow `<stri
 `<foo.hh>` header (the API + the human-readable reference) and a sibling `<foo.hc>`
 implementation that the preprocessor auto-pairs and streams deferred after the main source
 (`#include <foo.hh>` is all a user writes; a header-only module like `<fcntl.hh>` has no
-`.hc`). The exception is **generics**: a generic template must be parsed before its use site
-(define-before-use), so `vec`/`hmap`/`math`/`stdlib` keep their generic templates in the
-`.hc` and the `.hh` ends with `#include <foo.hc>` (the C++ template-header idiom) — the impl
-is parsed eagerly with the header, while the deferred auto-pair copy is a guard no-op. Map:
+`.hc`). **Generic functions split the same way as ordinary ones** — a **generic prototype**
+in the `.hh` (`U0 VecPush<type T>(Vec<T> *v, T x);`) registers the name so the parser treats
+call sites as generic (HolyC generics are define-before-use), and the **generic body** in the
+deferred `.hc` supplies the template, which the `mono` pass picks up (it runs after the whole
+translation unit — including the `.hc` — is parsed). `parser::capture_generic_fn` accepts the
+bodyless prototype (registering `body: None`); the deferred definition re-registers it with
+the body; `mono` errors if a generic is instantiated but its body never arrived. Generic
+*classes* (`Vec<T>`, `Hmap<K,V>`) stay wholly in the `.hh`, since a class definition *is* its
+interface. Map:
 
 Public C-named headers:
 - `builtin.hh` — implicit prelude (injected, no `#include`): `NULL`/`TRUE`/`FALSE`, `CTask`,

@@ -21,6 +21,10 @@
 // The caller owns the `Hmap`, and `HmapInit` is required before use. An `Hmap` owns its
 // entries, so free it with `HmapFree`. A `U8 *` string key stores the pointer, so the
 // key must outlive the map (string literals do).
+//
+// This header declares the API; the bodies live in <hmap.hc>. A generic prototype here
+// registers the name so call sites parse as generic, and the deferred <hmap.hc> supplies
+// the template body before the `mono` pass instantiates it.
 
 
 #include <vec.hh>
@@ -55,32 +59,46 @@ public class HmapKV<type K, type V> {
 
 public I64 HmapI64Hash(I64 *k);
 public Bool HmapI64Eq(I64 *a, I64 *b);
-// String keys: the key is a `U8 *`, so the op takes `U8 **` and dereferences it. `Djb2`
-// is the private djb2 helper defined in the implementation.
+// String keys: the key is a `U8 *`, so the op takes `U8 **` and dereferences it.
 public I64 HmapStrHash(U8 **k);
 public Bool HmapStrEq(U8 **a, U8 **b);
 
 // ---- core ----
-//
-// The generic `Hmap` operations are templates the parser must register *before* any use
-// site (generics are define-before-use), so they cannot be deferred to the end like an
-// ordinary `.hc` implementation. They live in `<hmap.hc>`, included at the foot of this
-// header — the C++ template-header idiom — so they are parsed eagerly with these
-// declarations. The prototypes are listed here for the reader; the bodies are in the
-// implementation file:
-//
-//   U0   HmapInit     <type K, type V>(Hmap<K, V> *m, I64 (*hash)(K *), Bool (*eq)(K *, K *));
-//   U0   HmapFree     <type K, type V>(Hmap<K, V> *m);
-//   U0   HmapPut      <type K, type V>(Hmap<K, V> *m, K key, V val);
-//   (V, Bool) HmapGet <type K, type V>(Hmap<K, V> *m, K key);
-//   Bool HmapHas      <type K, type V>(Hmap<K, V> *m, K key);
-//   Bool HmapDel      <type K, type V>(Hmap<K, V> *m, K key);
-//   I64  HmapLen      <type K, type V>(Hmap<K, V> *m);
-//   U0   HmapKeys     <type K, type V>(Hmap<K, V> *m, Vec<K> *out);
-//   U0   HmapValues   <type K, type V>(Hmap<K, V> *m, Vec<V> *out);
-//   U0   HmapSortKeys <type K, type V>(Hmap<K, V> *m, Vec<K> *out, I64 (*cmp)(K *, K *));
-//   U0   HmapEntries  <type K, type V>(Hmap<K, V> *m, Vec<HmapKV<K, V>> *out);
 
-#include <hmap.hc>
+HmapEntry<K, V> **HmapNewBuckets<type K, type V>(I64 n);
+U0 HmapInit<type K, type V>(Hmap<K, V> *m, I64 (*hash)(K *), Bool (*eq)(K *, K *));
+
+// Bucket index for a key (the sign mask keeps a negative user hash in range).
+I64 HmapBucket<type K, type V>(Hmap<K, V> *m, K *key, I64 n);
+
+U0 HmapFree<type K, type V>(Hmap<K, V> *m);
+U0 HmapRehash<type K, type V>(Hmap<K, V> *m);
+
+// Insert `key -> val`, or update the value if `key` is already present.
+U0 HmapPut<type K, type V>(Hmap<K, V> *m, K key, V val);
+
+// Look up `key`. Returns `(value, TRUE)` when present, else `(zero, FALSE)`. The flag
+// distinguishes a stored value from a miss.
+(V, Bool) HmapGet<type K, type V>(Hmap<K, V> *m, K key);
+
+Bool HmapHas<type K, type V>(Hmap<K, V> *m, K key);
+
+// Remove `key`, freeing its entry. Returns TRUE if it was present.
+Bool HmapDel<type K, type V>(Hmap<K, V> *m, K key);
+
+I64 HmapLen<type K, type V>(Hmap<K, V> *m);
+
+// Collect all keys or values into `out`, a `Vec<K>`/`Vec<V>` initialised by the call.
+// The order is unspecified (bucket order). Free `out` with `VecFree`.
+U0 HmapKeys<type K, type V>(Hmap<K, V> *m, Vec<K> *out);
+U0 HmapValues<type K, type V>(Hmap<K, V> *m, Vec<V> *out);
+
+// Collect the keys (as `HmapKeys`) and sort them by `cmp` (over key element pointers
+// `K *`, e.g. `&CmpStr` for `U8 *` keys or `&CmpI64` for `I64`).
+U0 HmapSortKeys<type K, type V>(Hmap<K, V> *m, Vec<K> *out, I64 (*cmp)(K *, K *));
+
+// Collect every entry as a `(key, val)` pair into `out`, a `Vec<HmapKV<K, V>>`
+// initialised by the call. The order is unspecified. Free `out` with `VecFree`.
+U0 HmapEntries<type K, type V>(Hmap<K, V> *m, Vec<HmapKV<K, V>> *out);
 
 #endif
