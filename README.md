@@ -275,7 +275,7 @@ on each native backend with byte-identical output.
 
 ## Standard library
 
-The standard library is written **in HolyC** and lives in `stdlib/` — each module
+The standard library is written **in HolyC** and lives in `lib/` — each module
 split into a `<foo.hh>` interface and a `<foo.hc>` implementation. Because it's
 ordinary HolyC built on the deterministic `F64`/integer ops, it computes
 identically on the interpreter and every native backend. Pull a module in with an
@@ -290,7 +290,7 @@ Main;
 The library is **read from disk** (not embedded). `#include <name>` resolves in
 order against: an explicit override (`hcc -I DIR` or the `HCC_STDLIB` env var),
 `$HCC_ROOT/lib` (where the installer puts it), the compiler's `../lib` sibling, and
-— when running from a source checkout — the repo's `stdlib/`. The `<foo.hh>` header
+— when running from a source checkout — the repo's `lib/`. The `<foo.hh>` header
 auto-pairs with its `<foo.hc>` implementation, so a single include brings in both.
 
 A few library functions are **intrinsics** — declared in lib, but the compiler

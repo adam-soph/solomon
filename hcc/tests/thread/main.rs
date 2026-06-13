@@ -31,7 +31,7 @@ const EXC_PROGRAM: &str = include_str!("exceptions.hc");
 const EXC_EXPECTED: &str = "w0=100\nw1=200\nw2=300\nw3=400\n";
 
 fn lib_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib")
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lib")
 }
 
 fn compile_src(src: &str) -> hcc::Program {

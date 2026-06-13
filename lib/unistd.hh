@@ -33,5 +33,6 @@ public I64 Chdir(U8 *path);
 public I64 Getcwd(U8 *buf, I64 size);
 public I64 Mkdir(U8 *path, I64 mode);
 public I64 WriteAll(I64 fd, U8 *buf, I64 n);
+public I64 ReadAll(I64 fd, U8 *buf, I64 n);
 
 #endif

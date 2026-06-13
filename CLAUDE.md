@@ -34,10 +34,10 @@ feeding the interpreter and both code generators.
 
 The repo is a **Cargo virtual workspace** with two members: the compiler in **`hcc/`** (its
 `src/`, `tests/`, and `Cargo.toml`) and the HolyC-vs-C benchmark reporter in **`bench/`**.
-The **standard library is the repo-root `stdlib/`** directory of `*.hh`/`*.hc` source, read
+The **standard library is the repo-root `lib/`** directory of `*.hh`/`*.hc` source, read
 from disk at compile time (not embedded — see `hcc::stdlib_dirs`). So every `src/…` path
 below means **`hcc/src/…`** and every `tests/…` means **`hcc/tests/…`**; the stdlib is
-`stdlib/…` at the root. (`cargo` is run from the repo root; `-p hcc`/`-p hcc-bench` pick a
+`lib/…` at the root. (`cargo` is run from the repo root; `-p hcc`/`-p hcc-bench` pick a
 member.)
 
 ## Commands
@@ -58,7 +58,7 @@ One binary, **`hcc`** (`hcc/src/main.rs`, named via a `[[bin]]` in `hcc/Cargo.to
 no subcommand it compiles a host-native binary (`-o OUT`, default `a.out`); `--target
 TRIPLE` cross-compiles; `check`/`ast`/`tokens` are front-end-only. Run via
 `cargo run -- …`. The compiler finds the standard library on disk via `hcc::stdlib_dirs()`
-(in order: `$HCC_STDLIB`, `$HCC_ROOT/lib`, `<exe>/../lib`, and a build-time repo-`stdlib/`
+(in order: `$HCC_STDLIB`, `$HCC_ROOT/lib`, `<exe>/../lib`, and a build-time repo-`lib/`
 fallback for `cargo run`/`cargo test`). Release binaries plus a `hcc-stdlib` archive are
 published by the `Release` GitHub Actions workflow on a `v*` tag; `install.sh`/`install.ps1`
 lay them out under `$HCC_ROOT` (Go's GOROOT model: `$HCC_ROOT/bin`, `$HCC_ROOT/lib`).
@@ -185,7 +185,7 @@ this: the preprocessor stacks `Lexer`s (one per open file) and pulls from the in
 Quoted `#include "file"` resolves relative to the including file; angle `#include <name>`
 resolves against the search path, then the **standard-library directories on disk**
 (`stdlib_dirs()`: `$HCC_STDLIB`, `$HCC_ROOT/lib`, `<exe>/../lib`, and a build-time repo-
-`stdlib/` fallback). The stdlib is **not** embedded — editing a `stdstdlib/*.hc` is picked up
+`lib/` fallback). The stdlib is **not** embedded — editing a `lib/*.hc` is picked up
 on the next run with no recompile. A `.hh` header auto-pairs with its sibling `.hc`
 implementation, streamed deferred after the main source (`queue_paired_impl`); a header-only
 module (no `.hc`) is a clean no-op.
@@ -294,7 +294,7 @@ Both backends cover the whole implemented subset; only the deliberately-excluded
 transcendentals are absent (they're lib functions, below).
 
 ### intrinsics (the one compiler-provided-behaviour seam)
-`intrinsics.rs` is the single seam: a **standard-library function declared in `stdlib/*.hc`**
+`intrinsics.rs` is the single seam: a **standard-library function declared in `lib/*.hc`**
 (resolved like any call, *with* an `#include`) that the backends lower specially. (The old
 `builtins.rs` registry is **deleted**.) Two flavours (`IntrinsicKind`):
 - **Optimization** — has a real HolyC body a backend may replace with an instruction where
@@ -314,9 +314,9 @@ function shadows a like-named primitive** (a program's own `Read`/`Join`) — a 
 `StdWrite`, no `%` processing, so it needs no include); the `"fmt", args` comma form lowers
 to a `Print` call, so it needs an explicit `#include <stdio.hc>` (there is no auto-include).
 
-The only compiler-provided names with **no `stdlib/*.hc` declaration** are the implicit
+The only compiler-provided names with **no `lib/*.hc` declaration** are the implicit
 `argc`/`argv`, the environment `envp`, and the exception task `Fs` — sema-injected
-(doc-commented in `stdlib/builtin.hh`), captured at entry. `argc`/`argv` are **scope-dual but
+(doc-commented in `lib/builtin.hh`), captured at entry. `argc`/`argv` are **scope-dual but
 not global**: at **top-level scope** they are the command line; inside a `...` function
 they are the variadic args (count + an `I64 *` of raw 8-byte slots); inside a non-variadic
 function they are *undeclared* (sema resolves the top-level case in `check_ident` only when
@@ -327,13 +327,13 @@ drags in the command line. `envp` (single meaning) is by contrast a plain global
 everywhere (e.g. `Getenv` walks it).
 (On hosted Darwin, `emit_prim` maps the heap primitives to libc — `MAlloc`→`_malloc`,
 `Free`→`_free`; freestanding emits an `mmap` bump-allocator runtime.) Everything reducible
-is pure HolyC in `stdlib/*.hc`, so
+is pure HolyC in `lib/*.hc`, so
 each function computes identically on every target; each lib file has an `#ifndef _NAME_HC`
 guard. The **impure groups** (clock, fd I/O, sockets, fs mutation, process ids, threads)
 are conformance-tested by *property* (e.g. monotonic clock, write→read round-trip), never
 interp-vs-native value.
 
-### Standard library (`stdlib/*.hh` + `stdlib/*.hc`)
+### Standard library (`lib/*.hh` + `lib/*.hc`)
 The stdlib mirrors **C/POSIX headers** — filenames and groupings follow `<string.h>`,
 `<stdio.h>`, `<stdlib.h>`, etc., though the function names stay HolyC-PascalCase
 (`StrLen`, `MAlloc`, `Print`). Each module is split **interface + implementation**: a
@@ -414,7 +414,7 @@ into `<stdio.hc>`; the IEEE bit ops into `<math.hc>`; the djb2 hash into `<hmap.
   code is trusted: `mono` stamps instances with the `GENERATED_FILE` sentinel span, and
   sema's `in_generated` flag / `ref_file == GENERATED_FILE` bypass the gate (so `Vec<Pt>`
   over a non-`public` `Pt` is fine); `#exe` output reuses the enclosing file's id.
-  `typedef` aliases are exempt (parse-time, global). Most of `stdlib/*.hc`'s API is `public`;
+  `typedef` aliases are exempt (parse-time, global). Most of `lib/*.hc`'s API is `public`;
   stdlib-internal helpers (e.g. `F64Bits`, the printf core) stay private and rely on the
   same-directory rule. A `public` function may not leak a non-`public` type through its
   **return type** (`check_public_signatures` peels pointers/arrays to the base named type;
@@ -424,7 +424,7 @@ into `<stdio.hc>`; the IEEE bit ops into `<math.hc>`; the djb2 hash into `<hmap.
 - **Exceptions — `try`/`catch`/`throw` + `Fs`:** `throw expr;` raises a value (a bare
   `throw;` re-raises); `try { } catch { }` catches it (HolyC form, no catch parameter) and
   reads it as `Fs->except_ch`. `Fs` is the sema-injected implicit global `CTask *` (`CTask`
-  defined in `stdlib/builtin.hh`). **IR interp (the oracle)** unwinds via a per-frame
+  defined in `lib/builtin.hh`). **IR interp (the oracle)** unwinds via a per-frame
   try-region stack: `TryBegin` pushes its landing-pad block, a `Throw`/`Rethrow` or a
   `Call` that returns `Outcome::Threw` pops to the nearest pad; `except_ch`/`catch_except`
   are byte writes into the `CTask`; an uncaught throw finishes cleanly after the pre-throw
@@ -542,7 +542,7 @@ errors, and the surviving arm sees the concrete type. **`if type (T is U) … [e
 (`is not` negates) is the single-case analogue: a pure parser desugar (`parse_type_if`) to
 a one-arm `TypeSwitch`, so it shares all the mono machinery — both sides are types (usually
 a type param on the left); `is`/`not` are contextual words, not reserved. Used by
-`stdlib/math.hc`'s `Min`/`Max`/`Abs` to add the float-only path (return `T`, with `fmin`/
+`lib/math.hc`'s `Min`/`Max`/`Abs` to add the float-only path (return `T`, with `fmin`/
 `fmax` NaN handling / `Fabs`). The `type` keyword
 does double duty (param introducer + switch/if marker). Stdlib `Vec<T>`/`Hmap<K,V>`/
 `Sort<T>` are generic; see `examples/generic.hc`.
@@ -562,7 +562,7 @@ consistent `typedef <type> <name>` shape) or the keyword-less bare declarator
 ordinary global, and the same shape at local scope stays a variable — `parser.rs`'s
 `top_level` flag gates this). The **C-style `typedef I64 (*Name)(I64);`, with the name
 buried inside the declarator, is a compile error** (`parse_typedef` rejects a named
-`Type::FuncPtr`). The stdlib's `ThreadFn` (`stdlib/threads.hh`) uses the keyword-less form.
+`Type::FuncPtr`). The stdlib's `ThreadFn` (`lib/threads.hh`) uses the keyword-less form.
 `#exe { … }` runs
 HolyC at compile time via the interpreter and splices its stdout.
 **Still absent:** most of the TempleOS core/standard library and DolDoc.

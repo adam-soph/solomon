@@ -75,10 +75,10 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Package the standard library once — it is plain HolyC source (`stdlib/*.hh`,
-  # `stdlib/*.hc`), identical for every target — as both a tarball (POSIX installers) and a
-  # zip (the Windows installer). The install scripts extract it into `$HCC_ROOT/lib`, where
-  # the compiler resolves angle includes (`hcc::stdlib_dirs`).
+  # Package the standard library once — it is plain HolyC source (`lib/*.hh`, `lib/*.hc`),
+  # identical for every target — as both a tarball (POSIX installers) and a zip (the
+  # Windows installer). The install scripts extract it into `$HCC_ROOT/lib`, where the
+  # compiler resolves angle includes (`hcc::stdlib_dirs`).
   stdlib:
     name: stdlib
     runs-on: ubuntu-latest
@@ -87,8 +87,8 @@ jobs:
       - name: Package stdlib
         run: |
           mkdir -p dist
-          tar -czf dist/hcc-stdlib.tar.gz -C stdlib .
-          (cd stdlib && zip -qr - .) > dist/hcc-stdlib.zip
+          tar -czf dist/hcc-stdlib.tar.gz -C lib .
+          (cd lib && zip -qr - .) > dist/hcc-stdlib.zip
       - uses: actions/upload-artifact@v4
         with:
           # `bin-*` so the publish job's download pattern collects it alongside the binaries.

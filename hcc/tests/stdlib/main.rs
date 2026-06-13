@@ -39,7 +39,7 @@ fn run_with_stdlib(src: &str) -> String {
 /// Like [`run_with_stdlib`], but with `input` as the program's standard input (fd 0),
 /// for exercising the `FGetC`/`FGetS`/`GetLine`/`ReadLine` family.
 fn run_with_stdlib_input(src: &str, input: &[u8]) -> String {
-    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lib");
     let program = parse_with(src, &lib, std::slice::from_ref(&lib))
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);
@@ -67,7 +67,7 @@ fn run_with_stdlib_input(src: &str, input: &[u8]) -> String {
 /// interpreter defines the semantics; native `MSize` parity holds on the freestanding
 /// targets by construction (the bump allocator's size header).
 fn run_interp_only(src: &str) -> String {
-    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib");
+    let lib = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lib");
     let program = parse_with(src, &lib, std::slice::from_ref(&lib))
         .unwrap_or_else(|e| panic!("parse failed: {e}"));
     let errs = check_program(&program);

@@ -42,7 +42,7 @@ fn echo_program(port: u16) -> String {
 }
 
 fn lib_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib")
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lib")
 }
 
 #[test]

@@ -40,5 +40,21 @@ public I64 WriteAll(I64 fd, U8 *buf, I64 n)
   return 0;
 }
 
+// Read up to `n` bytes into `buf`, looping over partial reads until the buffer is full
+// or EOF. Returns the number of bytes read (0..=`n`; fewer than `n` only at EOF), or a
+// negative `-errno` on a read error. Unlike a bare `Read`, it won't stop short merely
+// because one `Read` returned fewer bytes than requested — the counterpart of `WriteAll`.
+public I64 ReadAll(I64 fd, U8 *buf, I64 n)
+{
+  I64 off = 0;
+  while (off < n) {
+    I64 r = Read(fd, buf + off, n - off);
+    if (r < 0) return r;   // -errno
+    if (r == 0) break;     // EOF
+    off += r;
+  }
+  return off;
+}
+
 
 #endif

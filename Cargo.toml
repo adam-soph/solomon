@@ -2,9 +2,9 @@
 # Cargo.toml); the HolyC-vs-C benchmark reporter lives in `bench/`, split out so it never
 # builds or runs as part of `cargo test` (run it with `cargo run -p hcc-bench --release`).
 #
-# The standard library is the repo's `stdlib/` directory, read from disk at compile time
+# The standard library is the repo's `lib/` directory, read from disk at compile time
 # (see `hcc::stdlib_dirs`) rather than embedded; the install scripts copy it to
 # `$HCC_ROOT/lib`.
 [workspace]
 members = ["hcc", "bench"]
-resolver = "2"
+resolver = "3"

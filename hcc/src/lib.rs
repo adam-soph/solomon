@@ -41,12 +41,12 @@ pub use token::{Keyword, Pos, Span, Token, TokenKind};
 /// Resolution mirrors Go's `GOROOT` model:
 ///
 ///   1. `HCC_STDLIB` — an explicit `:`-separated override, highest priority. Point
-///      it at a working tree's `stdlib/` to develop against it.
+///      it at a working tree's `lib/` to develop against it.
 ///   2. `$HCC_ROOT/lib` — the installed standard library. The install scripts set
 ///      `HCC_ROOT` in your shell profile and copy the library to `$HCC_ROOT/lib`.
 ///   3. `<exe dir>/../lib` — a relocatable-install fallback, so an install tree with
 ///      `bin/hcc` beside `lib/` works even with `HCC_ROOT` unset.
-///   4. The repo's `stdlib/`, located relative to this crate at build time — a dev
+///   4. The repo's `lib/`, located relative to this crate at build time — a dev
 ///      fallback that lets `cargo run`/`cargo test` from the source tree find the
 ///      library with nothing configured. It only exists on the build machine, so it
 ///      is silently skipped on an installed binary.
@@ -69,13 +69,13 @@ pub fn stdlib_dirs() -> Vec<std::path::PathBuf> {
             dirs.push(prefix.join("lib"));
         }
     }
-    // 4. Dev fallback: the repo `stdlib/`, relative to this crate at build time. The
-    //    crate may sit at the repo root or in a `hcc/` workspace member, so try both
-    //    `<crate>/stdlib` and `<crate>/../stdlib`.
+    // 4. Dev fallback: the repo `lib/`, relative to this crate at build time. The crate
+    //    may sit at the repo root or in a `hcc/` workspace member, so try both
+    //    `<crate>/lib` and `<crate>/../lib`.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    dirs.push(manifest.join("stdlib"));
+    dirs.push(manifest.join("lib"));
     if let Some(parent) = manifest.parent() {
-        dirs.push(parent.join("stdlib"));
+        dirs.push(parent.join("lib"));
     }
     dirs
 }

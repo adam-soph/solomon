@@ -21,7 +21,7 @@ const PROGRAM: &str = include_str!("system.hc");
 const EXPECTED: &str = "before\nfrom-child\nrc0=0\nrc42=42\nrc127=127\nafter\n";
 
 fn lib_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib")
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lib")
 }
 
 fn compile(src: &str) -> hcc::Program {
